@@ -166,6 +166,10 @@ def reset():
     _cache_policies.clear()
     _origin_request_policies.clear()
     _response_headers_policies.clear()
+    _managed_cache_policies.clear()
+    _managed_origin_request_policies.clear()
+    _managed_response_headers_policies.clear()
+    _seed_all_managed_policies()
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
@@ -946,7 +950,7 @@ def _create_cache_policy(body):
 
 
 def _get_cache_policy(policy_id):
-    policy = _cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -957,7 +961,7 @@ def _get_cache_policy(policy_id):
 
 
 def _get_cache_policy_config(policy_id):
-    policy = _cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -968,6 +972,8 @@ def _get_cache_policy_config(policy_id):
 
 
 def _update_cache_policy(policy_id, headers, body):
+    if policy_id in _managed_cache_policies:
+        return _managed_policy_error("cache policy", policy_id)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1002,6 +1008,8 @@ def _update_cache_policy(policy_id, headers, body):
 
 
 def _delete_cache_policy(policy_id, headers):
+    if policy_id in _managed_cache_policies:
+        return _managed_policy_error("cache policy", policy_id)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1026,7 +1034,7 @@ def _delete_cache_policy(policy_id, headers):
 
 
 def _list_distributions_by_cache_policy(policy_id):
-    if not _cache_policies.get(policy_id):
+    if not (_cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)):
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
     dist_ids = _distributions_using_cache_policy(policy_id)
 
@@ -1137,7 +1145,7 @@ def _policy_create(store, spec, body):
 
 
 def _policy_get(store, spec, pid):
-    policy = store.get(pid)
+    policy = store.get(pid) or spec["managed"].get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
@@ -1145,7 +1153,7 @@ def _policy_get(store, spec, pid):
 
 
 def _policy_get_config(store, spec, pid):
-    policy = store.get(pid)
+    policy = store.get(pid) or spec["managed"].get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["config_tag"], lambda r: spec["build_config"](r, policy["Config"]),
@@ -1153,6 +1161,8 @@ def _policy_get_config(store, spec, pid):
 
 
 def _policy_update(store, spec, pid, headers, body):
+    if pid in spec["managed"]:
+        return _managed_policy_error(spec["label"], pid)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1177,6 +1187,8 @@ def _policy_update(store, spec, pid, headers, body):
 
 
 def _policy_delete(store, spec, pid, headers):
+    if pid in spec["managed"]:
+        return _managed_policy_error(spec["label"], pid)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1193,7 +1205,7 @@ def _policy_delete(store, spec, pid, headers):
 
 
 def _policy_list_distributions(store, spec, pid):
-    if not store.get(pid):
+    if not (store.get(pid) or spec["managed"].get(pid)):
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     dist_ids = _distributions_using_policy(pid)
 
@@ -1476,6 +1488,196 @@ _RHP_SPEC = {
 
 
 # ---------------------------------------------------------------------------
+# AWS-managed cache / origin-request / response-headers policies.
+#
+# Real AWS ships a fixed catalog of managed policies with stable IDs that
+# are identical in every account and region — there is no "owner" account,
+# unlike the per-account customer stores above (``_cache_policies`` etc.,
+# which are ``AccountScopedDict``). Terraform's
+# ``data "aws_cloudfront_cache_policy" { name = "Managed-CachingDisabled" }``
+# (and the origin-request / response-headers equivalents) resolve by NAME
+# against this catalog at PLAN time. MiniStack already implements full CRUD
+# for *custom* policies (CreateCachePolicy, CreateDistribution, ...) but
+# never seeded the managed set, so any Terraform plan referencing e.g.
+# "Managed-CachingDisabled" aborted before a single resource was created:
+#   Error: no matching CloudFront Cache Policy (Managed-CachingDisabled)
+#
+# Modeled directly on the IAM AWS-managed-policy pattern (see
+# ``_aws_managed_policies`` in services/iam.py, PR #609): a plain,
+# non-account-scoped module-level dict seeded at import time and in
+# ``reset()`` — every account/tenant reads the same catalog, and it is
+# immutable from a session's perspective (Update/Delete on a managed ID
+# are rejected the same way real AWS rejects them).
+#
+# Only the commonly-referenced subset is seeded, not AWS's full ~15-policy
+# catalog — see docs/busydone-gaps/cloudfront-managed-policies.md for the
+# exact seeded-vs-skipped list and the scope rationale. IDs, TTLs, and
+# forwarding/header behaviour below are transcribed verbatim from the AWS
+# Managed Policy Reference (fetched 2026-08-15):
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-response-headers-policies.html
+# ---------------------------------------------------------------------------
+_managed_cache_policies: dict = {}
+_managed_origin_request_policies: dict = {}
+_managed_response_headers_policies: dict = {}
+
+# Real AWS's original managed-policy set was published on this date; used
+# as a plausible fixed LastModifiedTime rather than "now" so it doesn't
+# drift on every reset. Not independently verified per-policy — low-stakes
+# relative to the Id (which callers key lookups on).
+_MANAGED_POLICY_LAST_MODIFIED = "2020-05-20T04:34:00.000Z"
+
+
+def _make_managed_policy_record(policy_id: str, config: dict) -> dict:
+    return {
+        "Id": policy_id,
+        "ETag": new_uuid(),
+        "LastModifiedTime": _MANAGED_POLICY_LAST_MODIFIED,
+        "Config": config,
+    }
+
+
+def _managed_policy_error(label: str, policy_id: str) -> tuple:
+    """Real AWS rejects Update/Delete on a managed policy's fixed Id.
+    Mirrors the AccessDenied convention IAM already uses for its own
+    AWS-managed policies (see ``_delete_policy`` in services/iam.py)."""
+    return _error(
+        "AccessDenied",
+        f"The specified {label} ({policy_id}) is an AWS-managed CloudFront policy "
+        "and cannot be modified or deleted.",
+        403,
+    )
+
+
+def _seed_managed_cache_policies() -> None:
+    seeds = [
+        ("4135ea2d-6df8-44a3-9df3-4b5a84be39ad", {
+            "Name": "Managed-CachingDisabled",
+            "Comment": "Policy with caching disabled",
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
+            "Parameters": {
+                "EnableAcceptEncodingGzip": False, "EnableAcceptEncodingBrotli": False,
+                "HeaderBehavior": "none", "Headers": [],
+                "CookieBehavior": "none", "Cookies": [],
+                "QueryStringBehavior": "none", "QueryStrings": [],
+            },
+        }),
+        ("658327ea-f89d-4fab-a63d-7e88639e58f6", {
+            "Name": "Managed-CachingOptimized",
+            "Comment": "Policy with caching enabled. Supports Gzip and Brotli compression.",
+            "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": {
+                "EnableAcceptEncodingGzip": True, "EnableAcceptEncodingBrotli": True,
+                "HeaderBehavior": "none", "Headers": [],
+                "CookieBehavior": "none", "Cookies": [],
+                "QueryStringBehavior": "none", "QueryStrings": [],
+            },
+        }),
+    ]
+    for policy_id, cfg in seeds:
+        _managed_cache_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+
+
+def _seed_managed_origin_request_policies() -> None:
+    seeds = [
+        ("216adef6-5c7f-47e4-b989-5492eafa07d3", {
+            "Name": "Managed-AllViewer",
+            "Comment": "Includes all values (headers, cookies, and query strings) in the viewer request.",
+            "HeaderBehavior": "allViewer", "Headers": [],
+            "CookieBehavior": "all", "Cookies": [],
+            "QueryStringBehavior": "all", "QueryStrings": [],
+        }),
+        ("b689b0a8-53d0-40ab-baf2-68738e2966ac", {
+            "Name": "Managed-AllViewerExceptHostHeader",
+            "Comment": "Includes all values (headers, cookies, and query strings) in the viewer request, "
+                       "except for the Host header.",
+            "HeaderBehavior": "allExcept", "Headers": ["Host"],
+            "CookieBehavior": "all", "Cookies": [],
+            "QueryStringBehavior": "all", "QueryStrings": [],
+        }),
+    ]
+    for policy_id, cfg in seeds:
+        _managed_origin_request_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+
+
+def _rhp_managed_security_headers_block() -> dict:
+    """The shared 5-header ``SecurityHeadersPolicy`` block, verbatim from the
+    AWS Managed Policy Reference — reused by both *-and-SecurityHeadersPolicy
+    combo policies below."""
+    return {
+        "XSSProtection": {"Override": False, "Protection": True, "ModeBlock": True, "ReportUri": None},
+        "FrameOptions": {"Override": False, "FrameOption": "SAMEORIGIN"},
+        "ReferrerPolicy": {"Override": False, "ReferrerPolicy": "strict-origin-when-cross-origin"},
+        "ContentTypeOptions": {"Override": True},
+        "StrictTransportSecurity": {
+            "Override": False, "IncludeSubdomains": None, "Preload": None,
+            "AccessControlMaxAgeSec": 31536000,
+        },
+    }
+
+
+def _seed_managed_response_headers_policies() -> None:
+    simple_cors = {
+        "AllowOrigins": ["*"], "AllowHeaders": ["*"], "AllowMethods": ["GET"],
+        "AllowCredentials": False, "OriginOverride": False,
+        "ExposeHeaders": None, "MaxAgeSec": None,
+    }
+    preflight_cors = {
+        "AllowOrigins": ["*"], "AllowHeaders": ["*"],
+        "AllowMethods": ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+        "AllowCredentials": False, "OriginOverride": False,
+        "ExposeHeaders": ["*"], "MaxAgeSec": None,
+    }
+    seeds = [
+        ("60669652-455b-4ae9-85a4-c4c02393f86c", {
+            "Name": "Managed-SimpleCORS",
+            "Comment": "Policy to allow simple CORS requests from any origin.",
+            "Cors": dict(simple_cors), "Security": None, "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+        ("5cc3b908-e619-4b99-88e5-2cf7f45965bd", {
+            "Name": "Managed-CORS-With-Preflight",
+            "Comment": "Policy to allow CORS requests from any origin, including preflight requests.",
+            "Cors": dict(preflight_cors), "Security": None, "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+        ("e61eb60c-9c35-4d20-a928-2b84e02af89c", {
+            "Name": "Managed-CORS-and-SecurityHeadersPolicy",
+            "Comment": "Policy to allow simple CORS requests from any origin, and add a set of security "
+                       "headers to every response.",
+            "Cors": dict(simple_cors), "Security": _rhp_managed_security_headers_block(), "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+        ("eaab4381-ed33-4a86-88ca-d9558dc6cd63", {
+            "Name": "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+            "Comment": "Policy to allow CORS requests from any origin, including preflight requests, and "
+                       "add a set of security headers to every response.",
+            "Cors": dict(preflight_cors), "Security": _rhp_managed_security_headers_block(), "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+    ]
+    for policy_id, cfg in seeds:
+        _managed_response_headers_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+
+
+def _seed_all_managed_policies() -> None:
+    _seed_managed_cache_policies()
+    _seed_managed_origin_request_policies()
+    _seed_managed_response_headers_policies()
+
+
+# Wire the managed catalogs into the shared ORP/RHP spec dicts so the
+# generic ``_policy_get``/``_policy_update``/``_policy_delete``/
+# ``_list_policies`` helpers can look them up without a third store
+# parameter at every call site.
+_ORP_SPEC["managed"] = _managed_origin_request_policies
+_RHP_SPEC["managed"] = _managed_response_headers_policies
+
+_seed_all_managed_policies()
+
+
+# ---------------------------------------------------------------------------
 # Read-only list handlers for resource families with no backing store.
 # Shapes verified against botocore cloudfront service-2.json (2020-05-31).
 # ---------------------------------------------------------------------------
@@ -1535,18 +1737,27 @@ def _list_anycast_ip_lists(query_params):
 
 
 def _list_cache_policies(query_params):
-    """CachePolicyList wrapping stored custom cache policies (Type=custom)."""
+    """CachePolicyList wrapping AWS-managed + stored custom cache policies,
+    filtered by the optional ``Type`` param (``managed`` | ``custom``);
+    omitted returns both, matching real AWS."""
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    policies = list(_cache_policies.values())
+    type_filter = _qval(query_params, "Type", "") or None
+    if type_filter not in (None, "managed", "custom"):
+        return _error("InvalidArgument", "Invalid Type value.", 400)
+    entries = []
+    if type_filter in (None, "managed"):
+        entries.extend(("managed", p) for p in _managed_cache_policies.values())
+    if type_filter in (None, "custom"):
+        entries.extend(("custom", p) for p in _cache_policies.values())
 
     def build(root):
         SubElement(root, "MaxItems").text = max_items
-        SubElement(root, "Quantity").text = str(len(policies))
-        if policies:
+        SubElement(root, "Quantity").text = str(len(entries))
+        if entries:
             items_el = SubElement(root, "Items")
-            for policy in policies:
+            for kind, policy in entries:
                 summary = SubElement(items_el, "CachePolicySummary")
-                SubElement(summary, "Type").text = "custom"
+                SubElement(summary, "Type").text = kind
                 cp = SubElement(summary, "CachePolicy")
                 _build_cache_policy_xml(cp, policy)
 
@@ -1554,22 +1765,31 @@ def _list_cache_policies(query_params):
 
 
 def _list_policies(store, spec, query_params):
-    """Generic ``*PolicyList`` wrapping stored custom policies (Type=custom).
+    """Generic ``*PolicyList`` wrapping AWS-managed + stored custom policies,
+    filtered by the optional ``Type`` param (``managed`` | ``custom``);
+    omitted returns both, matching real AWS.
 
     Shared by origin request policies and response headers policies; the
-    summary member and resource tag come from ``spec``.
+    summary member, resource tag, and managed catalog come from ``spec``.
     """
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    policies = list(store.values())
+    type_filter = _qval(query_params, "Type", "") or None
+    if type_filter not in (None, "managed", "custom"):
+        return _error("InvalidArgument", "Invalid Type value.", 400)
+    entries = []
+    if type_filter in (None, "managed"):
+        entries.extend(("managed", p) for p in spec["managed"].values())
+    if type_filter in (None, "custom"):
+        entries.extend(("custom", p) for p in store.values())
 
     def build(root):
         SubElement(root, "MaxItems").text = max_items
-        SubElement(root, "Quantity").text = str(len(policies))
-        if policies:
+        SubElement(root, "Quantity").text = str(len(entries))
+        if entries:
             items_el = SubElement(root, "Items")
-            for policy in policies:
+            for kind, policy in entries:
                 summary = SubElement(items_el, spec["summary_tag"])
-                SubElement(summary, "Type").text = "custom"
+                SubElement(summary, "Type").text = kind
                 res = SubElement(summary, spec["resource_tag"])
                 spec["build_resource"](res, policy)
 

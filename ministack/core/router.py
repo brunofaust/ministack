@@ -445,6 +445,24 @@ SERVICE_PATTERNS = {
         "credential_scope": "s3tables",
         "path_prefixes": ["/buckets", "/iceberg"],
     },
+    # S3 Vectors is REST-POST-per-fixed-path (rest-json, signingName
+    # "s3vectors" — see services/s3vectors.py's module docstring), unlike
+    # s3tables' ARN-in-path scheme: every op is `POST /<OperationName>`, so
+    # `path_prefixes` lists the literal op paths rather than a resource
+    # prefix. Routing for a properly SigV4-signed client (boto3, the AWS
+    # Terraform provider) resolves via `credential_scope` below, matched at
+    # step 2 of `detect_service()` before path/host patterns are ever
+    # consulted — `host_patterns` only matters for host-header routing.
+    "s3vectors": {
+        "host_patterns": [r"s3vectors\."],
+        "credential_scope": "s3vectors",
+        "path_prefixes": [
+            "/CreateVectorBucket", "/GetVectorBucket", "/DeleteVectorBucket", "/ListVectorBuckets",
+            "/PutVectorBucketPolicy", "/GetVectorBucketPolicy", "/DeleteVectorBucketPolicy",
+            "/CreateIndex", "/GetIndex", "/DeleteIndex", "/ListIndexes",
+            "/PutVectors", "/GetVectors", "/DeleteVectors", "/ListVectors", "/QueryVectors",
+        ],
+    },
     # NOTE: bedrock-runtime must be listed BEFORE bedrock because the host
     # `bedrock-runtime.{region}.amazonaws.com` matches both `bedrock-runtime\.`
     # and the looser `bedrock\.` regex — detect_service iterates in dict order.

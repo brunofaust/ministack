@@ -371,6 +371,7 @@ SERVICE_REGISTRY = {
     "inspector2": {"module": "inspector2"},
     "mq": {"module": "mq"},
     "s3tables": {"module": "s3tables"},
+    "s3vectors": {"module": "s3vectors"},
     "bedrock": {"module": "bedrock"},
     "bedrock-runtime": {"module": "bedrock_runtime"},
     "bedrock-agent": {"module": "bedrock_agent"},
@@ -419,6 +420,7 @@ _state_map = {
     "mq": "mq",
     "opensearch": "opensearch",
     "s3tables": "s3tables",
+    "s3vectors": "s3vectors",
     "lambda_durable": "lambda_durable",
     "bedrock": "bedrock",
     "bedrock_runtime": "bedrock_runtime",
@@ -1022,6 +1024,10 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_rds_endpoints_request(method, path)
+    if response is not None:
+        return response
+
     response = _handle_iot_ca_request(method, path)
     if response is not None:
         return response
@@ -1061,6 +1067,28 @@ def _handle_iot_ca_request(method: str, path: str):
         },
         cert_pem.encode("utf-8"),
     )
+
+
+def _handle_rds_endpoints_request(method: str, path: str):  # guard:allow
+    """`GET /_ministack/rds/endpoints` returns ``{instances, clusters}``.
+
+    A test harness discovering an emulated RDS instance's Docker
+    host-mapped port today has to resolve the container BY NAME and
+    inspect it — RDS assigns that port randomly. This admin endpoint
+    reports it (plus the in-network address a sibling container would
+    use) directly for instances/clusters in the active request account and
+    region, so nothing yet running is an error: an empty ``{"instances":
+    [], "clusters": []}`` is a normal 200, not a 404/500.
+    """
+    if path != "/_ministack/rds/endpoints" or method != "GET":
+        return None
+    try:
+        from ministack.services import rds
+
+        body = rds.rds_endpoints_summary()
+    except Exception as e:
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()  # guard:allow
+    return 200, {"Content-Type": "application/json"}, json.dumps(body).encode()  # guard:allow
 
 
 def _handle_transfer_sftp_ports_request(method: str, path: str):

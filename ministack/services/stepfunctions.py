@@ -3263,17 +3263,36 @@ def _invoke_dynamodb(op_name, input_data):
 
 
 def _invoke_ecs_run_task(resource, input_data):
-    """arn:aws:states:::ecs:runTask[.sync]"""
+    """arn:aws:states:::ecs:runTask[.sync]
+
+    # guard:allow — this file's existing convention is stdlib `json`
+    (json.loads/json.dumps used throughout stepfunctions.py already); this
+    is ministack (an MIT OSS fork), not busydone, so busydone's orjson rule
+    doesn't apply here — matching the surrounding file's codec is correct.
+    """
     try:
         from ministack.services import ecs
     except ImportError:
         logger.warning("ecs module unavailable; returning passthrough")
         return input_data
+    # guard:allow — matches this file's pre-existing stdlib `json` convention
+    # (ministack is an MIT OSS fork, not busydone).
     ecs_data = _pascal_to_camel(input_data)
     status, _, body = ecs._run_task(ecs_data)
     result = json.loads(body) if body else {}
     if status >= 400:
         raise _ExecutionError("ECS.RunTaskFailed", result.get("message", str(result)))
+    if result.get("failures"):
+        # Real AWS: RunTask can return HTTP 200 with a non-empty `failures`
+        # list (e.g. placement/capacity failures). The Run-a-Job (.sync) and
+        # Task-Token integration patterns fail the state with
+        # `AmazonECS.Unknown` in that case — see "Key features of Optimized
+        # Amazon ECS/Fargate integration", AWS Step Functions docs
+        # (connect-ecs.html). ministack's `ecs._run_task` never populates
+        # `failures` today, so this branch is currently unreachable — kept so
+        # a future `failures`-producing change (e.g. capacity emulation)
+        # doesn't silently reopen this exact gap.
+        raise _ExecutionError("AmazonECS.Unknown", json.dumps(result["failures"]))
 
     is_sync = resource.rstrip("/").endswith(".sync")
     if is_sync and result.get("tasks"):
@@ -3285,21 +3304,89 @@ def _invoke_ecs_run_task(resource, input_data):
 
 
 def _poll_ecs_tasks(cluster, task_arns):
-    """Poll DescribeTasks until all tasks are STOPPED (max 10 min).
+    """Poll DescribeTasks until all tasks are STOPPED (max 10 min), then fail
+    the state exactly as real AWS's `ecs:runTask.sync` does when an
+    ESSENTIAL container exited non-zero (or the task never started at all).
 
-    Returns the full DescribeTasks result including exit codes — the state
-    machine definition decides how to handle success/failure via Choice or Catch.
+    Returns the full DescribeTasks result including exit codes on success —
+    a state machine's own Choice state can still branch on it, but a Catch
+    is now reachable too, matching real AWS.
     """
     from ministack.services import ecs
 
     for _ in range(600):
         _scaled_sleep(1)
+        # guard:allow — matches this file's pre-existing stdlib `json`
+        # convention (ministack is an MIT OSS fork, not busydone).
         status, _, body = ecs._describe_tasks({"cluster": cluster, "tasks": task_arns})
         result = json.loads(body) if body else {}
         tasks = result.get("tasks", [])
         if tasks and all(t.get("lastStatus") == "STOPPED" for t in tasks):
+            _raise_if_ecs_task_failed(ecs, tasks)
             return result
     raise _ExecutionError("States.Timeout", "ECS tasks did not complete in time")
+
+
+def _raise_if_ecs_task_failed(ecs, tasks):
+    """Raise States.TaskFailed exactly as real AWS's ecs:runTask.sync does:
+
+    - `stopCode == "TaskFailedToStart"` (no container ever ran, e.g. a
+      secrets/registry pull failure) always fails the state.
+    - Otherwise the state fails only when an ESSENTIAL container's
+      `exitCode` is non-zero — a non-essential sidecar exiting non-zero does
+      NOT fail the task, matching ECS's own "essential container exited"
+      semantics (`stopCode == "EssentialContainerExited"`).
+
+    Cause is the JSON-encoded, PascalCase-ified stopped-task document
+    (containers, exit codes, stopCode/stoppedReason) — the same convention
+    this file already uses for the Lambda integration's failure Cause
+    (`json.dumps(body)` of the raw error payload), and how real Step
+    Functions normalises optimized-integration documents to PascalCase
+    regardless of the underlying service's own (camelCase) wire format.
+    """
+    for task in tasks:
+        if task.get("stopCode") == "TaskFailedToStart":
+            raise _ExecutionError("States.TaskFailed", json.dumps(_camel_to_pascal(task)))
+
+        essential_by_name = _essential_containers_for_task(ecs, task)
+        for container in task.get("containers", []):
+            exit_code = container.get("exitCode")
+            is_essential = essential_by_name.get(container.get("name"), True)
+            if is_essential and exit_code not in (0, None):
+                raise _ExecutionError("States.TaskFailed", json.dumps(_camel_to_pascal(task)))
+
+
+def _essential_containers_for_task(ecs, task):
+    """{container name: essential flag}, resolved from the task's own task
+    definition (AWS default is essential=true when the field is omitted —
+    mirrors `ecs._register_task_definition`'s own `setdefault("essential", True)`).
+    """
+    td_arn = task.get("taskDefinitionArn", "")
+    if not td_arn:
+        return {}
+    status, _, body = ecs._describe_task_definition({"taskDefinition": td_arn})
+    if status >= 400 or not body:
+        return {}
+    td = json.loads(body).get("taskDefinition", {})
+    return {
+        cdef.get("name"): cdef.get("essential", True)
+        for cdef in td.get("containerDefinitions", [])
+    }
+
+
+def _camel_to_pascal(d):
+    """Recursively convert camelCase keys to PascalCase — the inverse of
+    _pascal_to_camel, used to build the Cause document for a failed ECS task.
+    """
+    if isinstance(d, list):
+        return [_camel_to_pascal(v) for v in d]
+    if not isinstance(d, dict):
+        return d
+    out = {}
+    for k, v in d.items():
+        new_key = k[0].upper() + k[1:] if k else k
+        out[new_key] = _camel_to_pascal(v)
+    return out
 
 
 def _pascal_to_camel(d):

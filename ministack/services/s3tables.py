@@ -64,6 +64,8 @@ def _gateway_url() -> str:
 _table_buckets = AccountRegionScopedDict()
 _namespaces = AccountRegionScopedDict()        # "bucket_arn\x00namespace" -> ns dict
 _tables = AccountRegionScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
+_bucket_maintenance = AccountRegionScopedDict()  # bucket_arn -> {type: {status, settings}}
+_table_maintenance = AccountRegionScopedDict()   # "bucket_arn\x00namespace\x00table" -> {type: {status, settings}}
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -73,6 +75,8 @@ def get_state():
         "table_buckets": copy.deepcopy(_table_buckets),
         "namespaces": copy.deepcopy(_namespaces),
         "tables": copy.deepcopy(_tables),
+        "bucket_maintenance": copy.deepcopy(_bucket_maintenance),
+        "table_maintenance": copy.deepcopy(_table_maintenance),
     }
 
 
@@ -80,12 +84,16 @@ def restore_state(data):
     _table_buckets.update(data.get("table_buckets", {}))
     _namespaces.update(data.get("namespaces", {}))
     _tables.update(data.get("tables", {}))
+    _bucket_maintenance.update(data.get("bucket_maintenance", {}))
+    _table_maintenance.update(data.get("table_maintenance", {}))
 
 
 def reset():
     _table_buckets.clear()
     _namespaces.clear()
     _tables.clear()
+    _bucket_maintenance.clear()
+    _table_maintenance.clear()
 
 
 if PERSIST_STATE:
@@ -224,6 +232,11 @@ def _create_table_bucket(data):
     # underlying storage transparently.
     import ministack.services.s3 as _s3
     _s3._buckets.setdefault(name, {"created": now_iso(), "objects": {}, "region": get_region()})
+    # AWS auto-provisions the unreferenced-file-removal maintenance config for
+    # every new table bucket — seed it now so a GetTableBucketMaintenanceConfiguration
+    # right after create (what the Terraform provider does) returns a populated
+    # settings object instead of an empty one.
+    _bucket_maintenance[arn] = _default_bucket_maintenance_configuration()
     logger.info("S3Tables: created table bucket %s", name)
     return json_response({"arn": arn})
 
@@ -254,13 +267,94 @@ def _delete_table_bucket(arn):
     for key in list(_tables.keys()):
         if key.startswith(arn + "\x00"):
             del _tables[key]
+            _table_maintenance.pop(key, None)
     for key in list(_namespaces.keys()):
         if key.startswith(arn + "\x00"):
             del _namespaces[key]
     del _table_buckets[name]
+    _bucket_maintenance.pop(arn, None)
     import ministack.services.s3 as _s3
     _s3._buckets.pop(name, None)
     return 204, {}, b""  # AWS answers 204 No Content on the deletes
+
+
+_BUCKET_MAINTENANCE_TYPES = ("icebergUnreferencedFileRemoval",)
+_TABLE_MAINTENANCE_TYPES = ("icebergCompaction", "icebergSnapshotManagement")
+
+
+def _default_bucket_maintenance_configuration():
+    return {
+        "icebergUnreferencedFileRemoval": {
+            "status": "enabled",
+            "settings": {
+                "icebergUnreferencedFileRemoval": {"unreferencedDays": 3, "nonCurrentDays": 10},
+            },
+        },
+    }
+
+
+def _default_table_maintenance_configuration():
+    return {
+        "icebergCompaction": {
+            "status": "enabled",
+            "settings": {"icebergCompaction": {"targetFileSizeMB": 512, "strategy": "auto"}},
+        },
+        "icebergSnapshotManagement": {
+            "status": "enabled",
+            "settings": {
+                "icebergSnapshotManagement": {"minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120},
+            },
+        },
+    }
+
+
+def _get_table_bucket_maintenance_configuration(bucket_ref):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    config = _bucket_maintenance.get(bucket_arn) or _default_bucket_maintenance_configuration()
+    return json_response({"tableBucketARN": bucket_arn, "configuration": config})
+
+
+def _put_table_bucket_maintenance_configuration(bucket_ref, maint_type, data):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    if maint_type not in _BUCKET_MAINTENANCE_TYPES:
+        return error_response_json("ValidationException", f"Unknown table bucket maintenance type: {maint_type}", 400)
+    value = data.get("value", {}) if isinstance(data, dict) else {}
+    config = copy.deepcopy(_bucket_maintenance.get(bucket_arn) or _default_bucket_maintenance_configuration())
+    config[maint_type] = {"status": value.get("status", "enabled"), "settings": value.get("settings", {})}
+    _bucket_maintenance[bucket_arn] = config
+    return json_response({}, 204)
+
+
+def _get_table_maintenance_configuration(bucket_ref, namespace, table_name):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    key = _table_key(bucket_arn, namespace, table_name)
+    table = _tables.get(key)
+    if not table:
+        return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
+    config = _table_maintenance.get(key) or _default_table_maintenance_configuration()
+    return json_response({"tableARN": table["tableARN"], "configuration": config})
+
+
+def _put_table_maintenance_configuration(bucket_ref, namespace, table_name, maint_type, data):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    key = _table_key(bucket_arn, namespace, table_name)
+    if key not in _tables:
+        return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
+    if maint_type not in _TABLE_MAINTENANCE_TYPES:
+        return error_response_json("ValidationException", f"Unknown table maintenance type: {maint_type}", 400)
+    value = data.get("value", {}) if isinstance(data, dict) else {}
+    config = copy.deepcopy(_table_maintenance.get(key) or _default_table_maintenance_configuration())
+    config[maint_type] = {"status": value.get("status", "enabled"), "settings": value.get("settings", {})}
+    _table_maintenance[key] = config
+    return json_response({}, 204)
 
 
 def _create_namespace(bucket_arn, data):
@@ -356,6 +450,10 @@ def _create_table(bucket_arn, namespace, data):
         if b["arn"] == bucket_arn:
             b["tableCount"] = b.get("tableCount", 0) + 1
             break
+
+    # AWS auto-provisions compaction + snapshot-management maintenance for
+    # every new table — seed it now, same reasoning as table-bucket creation.
+    _table_maintenance[key] = _default_table_maintenance_configuration()
 
     logger.info("S3Tables: created table %s/%s", namespace, table_name)
     return json_response({"tableARN": arn, "versionToken": new_uuid()[:8]})
@@ -623,6 +721,10 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
         "_schema_fields": schema_fields,
     }
     _set_bucket_region_value(_tables, bucket_arn, key, table)
+    # Same auto-provisioned maintenance defaults as the control-plane CreateTable
+    # path — a table can be created via either route and both are read through
+    # the same Get/PutTableMaintenanceConfiguration control-plane operations.
+    _set_bucket_region_value(_table_maintenance, bucket_arn, key, _default_table_maintenance_configuration())
     return json_response({"metadata-location": metadata_location, "metadata": iceberg_metadata})
 
 
@@ -716,18 +818,28 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _list_table_buckets()
 
-    # GET|DELETE /buckets/{arn...} -> GetTableBucket|DeleteTableBucket
+    # GET|DELETE /buckets/{arn...}                    -> GetTableBucket|DeleteTableBucket
+    # GET        /buckets/{arn...}/maintenance         -> GetTableBucketMaintenanceConfiguration
+    # PUT        /buckets/{arn...}/maintenance/{type}  -> PutTableBucketMaintenanceConfiguration
     if len(parts) >= 2 and parts[0] == "buckets":
-        arn = "/".join(parts[1:])
+        remaining = "/".join(parts[1:])
+        arn, suffix = _split_arn_and_suffix(remaining, "bucket")
         if not arn.startswith("arn:"):
             arn = f"arn:aws:s3tables:{get_region()}:{get_account_id()}:bucket/{arn}"
-        # Check for sub-resource paths
-        if parts[-1] in ("encryption", "maintenance", "metrics", "policy", "storage-class"):
+        if suffix == "maintenance":
+            if method == "GET":
+                return _get_table_bucket_maintenance_configuration(arn)
+        elif suffix.startswith("maintenance/"):
+            maint_type = suffix[len("maintenance/"):]
+            if method == "PUT":
+                return _put_table_bucket_maintenance_configuration(arn, maint_type, data)
+        elif suffix in ("encryption", "metrics", "policy", "storage-class"):
             return json_response({})  # stub
-        if method == "GET":
-            return _get_table_bucket(arn)
-        if method == "DELETE":
-            return _delete_table_bucket(arn)
+        elif not suffix:
+            if method == "GET":
+                return _get_table_bucket(arn)
+            if method == "DELETE":
+                return _delete_table_bucket(arn)
 
     # PUT /namespaces/{arn...} -> CreateNamespace
     # GET /namespaces/{arn...} -> ListNamespaces
@@ -756,6 +868,8 @@ async def handle_request(method, path, headers, body, query_params):
     # DELETE /tables/{arn...}/{namespace}/{name} -> DeleteTable
     # GET /tables/{arn...}/{namespace}/{name}/metadata-location -> GetTableMetadataLocation
     # PUT /tables/{arn...}/{namespace}/{name}/metadata-location -> UpdateTableMetadataLocation
+    # GET /tables/{arn...}/{namespace}/{name}/maintenance -> GetTableMaintenanceConfiguration
+    # PUT /tables/{arn...}/{namespace}/{name}/maintenance/{type} -> PutTableMaintenanceConfiguration
     if len(parts) >= 2 and parts[0] == "tables":
         remaining = "/".join(parts[1:])
         arn, suffix = _split_arn_and_suffix(remaining, "bucket")
@@ -763,7 +877,8 @@ async def handle_request(method, path, headers, body, query_params):
             # GET /tables/{arn} -> ListTables
             namespace = query_params.get("namespace", [""])[0] if isinstance(query_params.get("namespace"), list) else query_params.get("namespace", "")
             return _list_tables(arn, namespace or None)
-        # suffix could be "namespace", "namespace/table", or "namespace/table/metadata-location"
+        # suffix could be "namespace", "namespace/table", "namespace/table/metadata-location",
+        # "namespace/table/maintenance", or "namespace/table/maintenance/{type}"
         suffix_parts = suffix.split("/")
         if len(suffix_parts) == 1:
             # PUT /tables/{arn}/{namespace} -> CreateTable
@@ -778,6 +893,13 @@ async def handle_request(method, path, headers, body, query_params):
                 return _get_table_metadata_location(arn, suffix_parts[0], suffix_parts[1])
             if method == "PUT":
                 return _update_table_metadata_location(arn, suffix_parts[0], suffix_parts[1], data)
+        elif len(suffix_parts) == 3 and suffix_parts[2] == "maintenance":
+            if method == "GET":
+                return _get_table_maintenance_configuration(arn, suffix_parts[0], suffix_parts[1])
+        elif len(suffix_parts) == 4 and suffix_parts[2] == "maintenance":
+            if method == "PUT":
+                return _put_table_maintenance_configuration(
+                    arn, suffix_parts[0], suffix_parts[1], suffix_parts[3], data)
 
     # GET /get-table?tableBucketARN=&namespace=&name= -> GetTable
     if parts == ["get-table"] and method == "GET":

@@ -1102,6 +1102,7 @@ def _build_task_containers(td, container_overrides):
             "memory": str(cdef.get("memory") or cdef.get("memoryReservation", 0)),
             "runtimeId": new_uuid()[:12],
             "healthStatus": "UNKNOWN",
+            "_essential": cdef.get("essential", True),
         })
     return containers
 
@@ -1446,6 +1447,21 @@ def _run_task(data):
                 except Exception as e:
                     ecs_metadata.unregister_token(metadata_token)
                     logger.warning("ECS: Docker run failed for %s: %s", cdef.get('image'), e)
+                    now = _iso()
+                    task["lastStatus"] = "STOPPED"
+                    task["desiredStatus"] = "STOPPED"
+                    task["stoppingAt"] = now
+                    task["stoppedAt"] = now
+                    task["stopCode"] = "TaskFailedToStart"
+                    task["stoppedReason"] = f"CannotStartContainerError: {e}"
+                    for launched_id in task["_docker_ids"]:
+                        try:
+                            docker_client.containers.get(launched_id).stop(timeout=5)
+                        except Exception:
+                            pass
+                    for task_container in task.get("containers", []):
+                        task_container["lastStatus"] = "STOPPED"
+                    break
 
         _tasks[task_arn] = task
         if req_tags:
@@ -1526,7 +1542,7 @@ def _describe_tasks(data):
 
 
 def _maybe_mark_stopped(task):
-    """Check Docker containers and transition task to STOPPED if all have exited."""
+    """Transition a task once all containers or any essential container exits."""
     if task.get("lastStatus") != "RUNNING" or not task.get("_docker_ids"):
         return
 
@@ -1535,10 +1551,19 @@ def _maybe_mark_stopped(task):
         return
 
     all_stopped = True
-    exit_code = 0
-    for docker_id in task["_docker_ids"]:
+    essential_stopped = False
+    # Per-docker-container exit code, in `_docker_ids` order — NOT collapsed
+    # to a single shared value. `_docker_ids[i]` corresponds to
+    # `containers[i]` because `_run_task` appends to both in the same
+    # containerDefinitions iteration, in order, on a successful launch (see
+    # below for the one case that breaks this correspondence).
+    exit_codes = []
+    docker_containers = []
+    task_containers = task.get("containers", [])
+    for index, docker_id in enumerate(task["_docker_ids"]):
         try:
             container = docker_client.containers.get(docker_id)
+            docker_containers.append(container)
             # docker SDK caches status; refresh before checking lifecycle
             try:
                 container.reload()
@@ -1546,15 +1571,28 @@ def _maybe_mark_stopped(task):
                 pass
             if getattr(container, "status", None) != "exited":
                 all_stopped = False
-                break
+                exit_codes.append(None)
+                continue
             result = container.wait()
-            exit_code = max(exit_code, result.get("StatusCode", 0))
+            exit_codes.append(result.get("StatusCode", 0))
+            if index < len(task_containers) and task_containers[index].get("_essential", True):
+                essential_stopped = True
         except Exception:
-            # Container removed or unreachable — treat as stopped
-            pass
+            # Container removed or unreachable — treat as stopped, exit 0
+            docker_containers.append(None)
+            exit_codes.append(0)
 
-    if not all_stopped:
+    if not all_stopped and not essential_stopped:
         return
+
+    if essential_stopped and not all_stopped:
+        for container, code in zip(docker_containers, exit_codes):
+            if container is not None and code is None:
+                try:
+                    container.stop(timeout=5)
+                except Exception:
+                    pass
+        exit_codes = [0 if code is None else code for code in exit_codes]
 
     now = _iso()
     task["lastStatus"] = "STOPPED"
@@ -1563,9 +1601,29 @@ def _maybe_mark_stopped(task):
     task["stoppedAt"] = now
     task["stoppedReason"] = "Essential container exited"
     task["stopCode"] = "EssentialContainerExited"
-    for c in task.get("containers", []):
-        c["lastStatus"] = "STOPPED"
-        c["exitCode"] = exit_code
+    containers = task_containers
+    if len(exit_codes) == len(containers):
+        # Common case: every container launched, so index i in both lists
+        # is the same container — each gets its OWN exit code. This is what
+        # makes an essential/non-essential distinction meaningful upstream
+        # (stepfunctions.py's ecs:runTask.sync failure check): a failing
+        # non-essential sidecar must not be attributed to an essential
+        # container that actually exited 0.
+        for c, code in zip(containers, exit_codes):
+            c["lastStatus"] = "STOPPED"
+            c["exitCode"] = code
+    else:
+        # A container whose `docker_client.containers.run()` call itself
+        # raised (see _run_task) is never appended to `_docker_ids`, which
+        # breaks the index correspondence for every container after it —
+        # there is no docker_id-to-container mapping to recover the true
+        # per-container assignment in that case. Fall back to the previous,
+        # imprecise "max exit code shared by every container" behavior
+        # rather than mis-attributing one container's exit code to another.
+        shared_exit_code = max(exit_codes, default=0)
+        for c in containers:
+            c["lastStatus"] = "STOPPED"
+            c["exitCode"] = shared_exit_code
 
     cname = _cluster_name_from_arn(task.get("clusterArn", ""))
     if cname:

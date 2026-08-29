@@ -953,7 +953,7 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     ecs.create_cluster(clusterName=cluster)
     ecs.register_task_definition(
         family="tdu-td",
-        containerDefinitions=[{"name": "app", "image": "nginx:1.0", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "nginx:latest", "cpu": 64, "memory": 128}],
     )
     ecs.create_service(
         cluster=cluster, serviceName="tdu-svc", taskDefinition="tdu-td:1", desiredCount=2,
@@ -964,7 +964,7 @@ def test_ecs_service_td_update_replaces_tasks(ecs):
     # Register new revision and update service
     resp2 = ecs.register_task_definition(
         family="tdu-td",
-        containerDefinitions=[{"name": "app", "image": "nginx:2.0", "cpu": 64, "memory": 128}],
+        containerDefinitions=[{"name": "app", "image": "nginx:alpine", "cpu": 64, "memory": 128}],
     )
     new_td_arn = resp2["taskDefinition"]["taskDefinitionArn"]
     ecs.update_service(cluster=cluster, service="tdu-svc", taskDefinition="tdu-td:2")

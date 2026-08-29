@@ -3422,6 +3422,89 @@ def _sync_cluster_endpoints(cluster):
     cluster["Port"] = int(endpoint.get("Port", cluster.get("Port", 0)))
 
 
+def rds_endpoints_summary():
+    """Report reachability for emulated RDS resources in the active request scope.
+
+    Backs ``GET /_ministack/rds/endpoints``. RDS assigns the Docker
+    host-mapped port randomly (``_next_port()``/``_HostPort``), so a caller
+    outside the emulator (e.g. a test harness on the Docker host) has no way
+    to predict it — today the only alternative is resolving the emulated
+    container BY NAME and inspecting it, which requires reconstructing this
+    module's private naming scheme (``_rds_docker_name``/
+    ``_rds_cluster_docker_name``, both salted with a scope hash). This
+    collects that same data from the in-memory instance/cluster stores
+    instead of shelling out to Docker.
+
+    Reports BOTH addresses because they are not interchangeable: the
+    host-mapped port (``host_mapped``) is what a process on the Docker host
+    uses; the in-network address (``in_network``, the container's IP + the
+    engine's native port on the ministack Docker network) is what a sibling
+    container uses. Conflating the two is exactly the class of bug that left
+    spawned Lambdas unreachable in this stack before (see ``RDS_PUBLIC_ENDPOINT``
+    above). Either address is ``None`` when Docker is unavailable/the
+    container hasn't started yet — never a guessed value.
+
+    The admin route inherits the active request account and region. Restricting
+    discovery to that scope prevents resource metadata leaking across tenants.
+    """
+    active_account = get_account_id()
+    active_region = get_region()
+    instances = []
+    for (account_id, region, db_id), instance in _instances.to_dict().items():
+        if account_id != active_account or region != active_region:
+            continue
+        cluster_id = instance.get("_shared_cluster_id")
+        if cluster_id:
+            # Aurora members don't get their own container — they share the
+            # cluster's writer container (`_attach_instance_to_shared_cluster`).
+            container_name = _rds_cluster_docker_name(cluster_id, account_id, region)
+        else:
+            container_name = _rds_docker_name(db_id, account_id, region)
+        host_port = instance.get("_HostPort")
+        internal_address = instance.get("_internal_address")
+        internal_port = instance.get("_internal_port")
+        instances.append({
+            "db_instance_identifier": db_id,
+            "db_cluster_identifier": cluster_id,
+            "account_id": account_id,
+            "region": region,
+            "container_name": container_name,
+            "status": instance.get("DBInstanceStatus"),
+            "host_mapped": (
+                {"host": _MINISTACK_HOST, "port": host_port} if host_port else None
+            ),
+            "in_network": (
+                {"host": internal_address, "port": internal_port}
+                if internal_address and internal_port else None
+            ),
+        })
+
+    clusters = []
+    for (account_id, region, cluster_id), cluster in _clusters.to_dict().items():
+        if account_id != active_account or region != active_region:
+            continue
+        container_name = _rds_cluster_docker_name(cluster_id, account_id, region)
+        host_port = cluster.get("_shared_host_port")
+        internal_address = cluster.get("_shared_internal_address")
+        internal_port = cluster.get("_shared_internal_port")
+        clusters.append({
+            "db_cluster_identifier": cluster_id,
+            "account_id": account_id,
+            "region": region,
+            "container_name": container_name,
+            "status": cluster.get("Status"),
+            "host_mapped": (
+                {"host": _MINISTACK_HOST, "port": host_port} if host_port else None
+            ),
+            "in_network": (
+                {"host": internal_address, "port": internal_port}
+                if internal_address and internal_port else None
+            ),
+        })
+
+    return {"instances": instances, "clusters": clusters}
+
+
 def _register_instance_in_cluster(instance):
     """Append instance to parent cluster ``DBClusterMembers`` (Aurora parity)."""
     cid = instance.get("DBClusterIdentifier")

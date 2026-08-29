@@ -1,10 +1,13 @@
 """Cognito tests — user pools, identity pools, OAuth2/OIDC flows, auth-code persistence."""
 
 import base64
+import hashlib
+import hmac
 import importlib
 import io
 import json
 import os
+import struct
 import time
 import urllib.error
 import urllib.request
@@ -21,6 +24,101 @@ from botocore.exceptions import ClientError
 from ministack.core import persistence
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+
+
+def _totp_code(secret_code):
+    """Generate an independent RFC 6238 SHA-1 code for Cognito MFA tests."""
+    padded = secret_code + "=" * (-len(secret_code) % 8)
+    key = base64.b32decode(padded, casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30)), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    return str((int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF) % 1_000_000).zfill(6)
+
+
+def _secret_hash(client_secret, username, client_id):
+    """Generate Cognito's client-secret proof independently of production code."""
+    digest = hmac.new(
+        client_secret.encode(),
+        f"{username}{client_id}".encode(),
+        hashlib.sha256,
+    ).digest()
+    return base64.b64encode(digest).decode()
+
+
+def test_cognito_secret_client_rejects_password_auth_without_valid_hash(cognito_idp):
+    """USER_PASSWORD_AUTH must fail closed for secret-bearing app clients."""
+    pool_id = cognito_idp.create_user_pool(PoolName="secret-auth-pool")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName="secret-auth-client",
+        GenerateSecret=True,
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username="secret-user", TemporaryPassword="TempPass1!")
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id,
+        Username="secret-user",
+        Password="Password1!",
+        Permanent=True,
+    )
+    base = {
+        "ClientId": client["ClientId"],
+        "AuthFlow": "USER_PASSWORD_AUTH",
+        "AuthParameters": {"USERNAME": "secret-user", "PASSWORD": "Password1!"},
+    }
+    for supplied in (None, "wrong"):
+        request = {**base, "AuthParameters": dict(base["AuthParameters"])}
+        if supplied is not None:
+            request["AuthParameters"]["SECRET_HASH"] = supplied
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(**request)
+        assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    base["AuthParameters"]["SECRET_HASH"] = _secret_hash(
+        client["ClientSecret"], "secret-user", client["ClientId"]
+    )
+    assert "AuthenticationResult" in cognito_idp.initiate_auth(**base)
+
+
+def test_cognito_secret_client_rejects_new_password_challenge_without_valid_hash(cognito_idp):
+    """ChallengeResponses must carry SECRET_HASH for secret-bearing clients."""
+    pool_id = cognito_idp.create_user_pool(PoolName="secret-challenge-pool")["UserPool"]["Id"]
+    client = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id,
+        ClientName="secret-challenge-client",
+        GenerateSecret=True,
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]
+    username = "challenge-user"
+    cognito_idp.admin_create_user(UserPoolId=pool_id, Username=username, TemporaryPassword="TempPass1!")
+    proof = _secret_hash(client["ClientSecret"], username, client["ClientId"])
+    challenge = cognito_idp.initiate_auth(
+        ClientId=client["ClientId"],
+        AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": username, "PASSWORD": "TempPass1!", "SECRET_HASH": proof},
+    )
+    for supplied in (None, "wrong"):
+        responses = {"USERNAME": username, "NEW_PASSWORD": "ChangedPass1!"}
+        if supplied is not None:
+            responses["SECRET_HASH"] = supplied
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.respond_to_auth_challenge(
+                ClientId=client["ClientId"],
+                ChallengeName="NEW_PASSWORD_REQUIRED",
+                Session=challenge["Session"],
+                ChallengeResponses=responses,
+            )
+        assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+    result = cognito_idp.respond_to_auth_challenge(
+        ClientId=client["ClientId"],
+        ChallengeName="NEW_PASSWORD_REQUIRED",
+        Session=challenge["Session"],
+        ChallengeResponses={
+            "USERNAME": username,
+            "NEW_PASSWORD": "ChangedPass1!",
+            "SECRET_HASH": proof,
+        },
+    )
+    assert "AuthenticationResult" in result
 
 
 def _advertised_endpoint():
@@ -1387,7 +1485,7 @@ def test_cognito_force_change_password_challenge(cognito_idp):
 def test_cognito_totp_full_flow(cognito_idp):
     """Full TOTP MFA flow: SetUserPoolMfaConfig ON → AssociateSoftwareToken →
     VerifySoftwareToken → InitiateAuth returns SOFTWARE_TOKEN_MFA challenge →
-    RespondToAuthChallenge with any code returns tokens."""
+    RespondToAuthChallenge with the current TOTP returns tokens."""
     pid = cognito_idp.create_user_pool(PoolName="qa-totp-full")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
         UserPoolId=pid,
@@ -1424,8 +1522,11 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert "SecretCode" in assoc
     assert len(assoc["SecretCode"]) > 0
 
-    # Verify (accept any code)
-    verify = cognito_idp.verify_software_token(AccessToken=access_token, UserCode="123456")
+    # Verify the code derived independently from the shared secret.
+    verify = cognito_idp.verify_software_token(
+        AccessToken=access_token,
+        UserCode=_totp_code(assoc["SecretCode"]),
+    )
     assert verify["Status"] == "SUCCESS"
 
     # Now auth should return SOFTWARE_TOKEN_MFA challenge
@@ -1438,12 +1539,15 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
     assert "Session" in auth2
 
-    # Respond with any TOTP code → get tokens
+    # Respond with the current TOTP code → get tokens
     result = cognito_idp.admin_respond_to_auth_challenge(
         UserPoolId=pid,
         ClientId=cid,
         ChallengeName="SOFTWARE_TOKEN_MFA",
-        ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "123456"},
+        ChallengeResponses={
+            "USERNAME": "totp-user",
+            "SOFTWARE_TOKEN_MFA_CODE": _totp_code(assoc["SecretCode"]),
+        },
     )
     assert "AuthenticationResult" in result
     assert "AccessToken" in result["AuthenticationResult"]
@@ -4482,18 +4586,21 @@ def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     )
     client_id = client["ClientId"]
     client_secret = client.get("ClientSecret", "")
+    secret_hash = _secret_hash(client_secret, "testuser", client_id)
 
     # InitiateAuth (USER_PASSWORD_AUTH) -> TokenGeneration_Authentication
     auth = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        AuthParameters={
+            "USERNAME": "testuser", "PASSWORD": "TestPass1!", "SECRET_HASH": secret_hash,
+        },
     )["AuthenticationResult"]
     assert _decode_jwt_claims(auth["AccessToken"])["seen_trigger_source"] == "TokenGeneration_Authentication"
 
     # REFRESH_TOKEN_AUTH (InitiateAuth) -> TokenGeneration_RefreshTokens
     refreshed = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"], "SECRET_HASH": secret_hash},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(refreshed["AccessToken"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
 
@@ -4563,12 +4670,15 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     )
     client_id = client["ClientId"]
     client_secret = client["ClientSecret"]
+    testuser_hash = _secret_hash(client_secret, "testuser", client_id)
 
     # InitiateAuth(USER_PASSWORD_AUTH) — real AWS never forwards ClientMetadata
     # here, so the trigger must see none, even though the caller passed one.
     auth = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        AuthParameters={
+            "USERNAME": "testuser", "PASSWORD": "TestPass1!", "SECRET_HASH": testuser_hash,
+        },
         ClientMetadata={"orgId": "org-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(auth["AccessToken"])["seen_org_id"] == ""
@@ -4576,7 +4686,7 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     # InitiateAuth(REFRESH_TOKEN_AUTH) — same exclusion.
     refreshed = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"], "SECRET_HASH": testuser_hash},
         ClientMetadata={"orgId": "org-refresh"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(refreshed["AccessToken"])["seen_org_id"] == ""
@@ -4584,7 +4694,9 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     # AdminInitiateAuth(ADMIN_USER_PASSWORD_AUTH) — same exclusion.
     admin_auth = cognito_idp.admin_initiate_auth(
         UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
+        AuthParameters={
+            "USERNAME": "testuser", "PASSWORD": "TestPass1!", "SECRET_HASH": testuser_hash,
+        },
         ClientMetadata={"orgId": "org-admin-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(admin_auth["AccessToken"])["seen_org_id"] == ""
@@ -4592,7 +4704,7 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     # AdminInitiateAuth(REFRESH_TOKEN_AUTH) — same exclusion.
     admin_refreshed = cognito_idp.admin_initiate_auth(
         UserPoolId=pool_id, ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"], "SECRET_HASH": testuser_hash},
         ClientMetadata={"orgId": "org-admin-refresh"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(admin_refreshed["AccessToken"])["seen_org_id"] == ""
@@ -4611,12 +4723,20 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
         UserPoolId=pool_id, Username="newpwduser", Password="TempPass1!", Permanent=False)
     challenge = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "newpwduser", "PASSWORD": "TempPass1!"},
+        AuthParameters={
+            "USERNAME": "newpwduser",
+            "PASSWORD": "TempPass1!",
+            "SECRET_HASH": _secret_hash(client_secret, "newpwduser", client_id),
+        },
     )
     assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
     respond_result = cognito_idp.respond_to_auth_challenge(
         ClientId=client_id, ChallengeName="NEW_PASSWORD_REQUIRED", Session=challenge["Session"],
-        ChallengeResponses={"USERNAME": "newpwduser", "NEW_PASSWORD": "FinalPass1!"},
+        ChallengeResponses={
+            "USERNAME": "newpwduser",
+            "NEW_PASSWORD": "FinalPass1!",
+            "SECRET_HASH": _secret_hash(client_secret, "newpwduser", client_id),
+        },
         ClientMetadata={"orgId": "org-new-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(respond_result["AccessToken"])["seen_org_id"] == "org-new-password"
@@ -4627,13 +4747,21 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
         UserPoolId=pool_id, Username="adminnewpwduser", Password="TempPass1!", Permanent=False)
     admin_challenge = cognito_idp.admin_initiate_auth(
         UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "adminnewpwduser", "PASSWORD": "TempPass1!"},
+        AuthParameters={
+            "USERNAME": "adminnewpwduser",
+            "PASSWORD": "TempPass1!",
+            "SECRET_HASH": _secret_hash(client_secret, "adminnewpwduser", client_id),
+        },
     )
     assert admin_challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
     admin_respond_result = cognito_idp.admin_respond_to_auth_challenge(
         UserPoolId=pool_id, ClientId=client_id, ChallengeName="NEW_PASSWORD_REQUIRED",
         Session=admin_challenge["Session"],
-        ChallengeResponses={"USERNAME": "adminnewpwduser", "NEW_PASSWORD": "FinalPass1!"},
+        ChallengeResponses={
+            "USERNAME": "adminnewpwduser",
+            "NEW_PASSWORD": "FinalPass1!",
+            "SECRET_HASH": _secret_hash(client_secret, "adminnewpwduser", client_id),
+        },
         ClientMetadata={"orgId": "org-admin-new-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(admin_respond_result["AccessToken"])["seen_org_id"] == "org-admin-new-password"
@@ -5283,7 +5411,7 @@ def test_cognito_unsigned_user_pool_operations_pin_the_owning_region():
     assert software_token["SecretCode"]
     assert west.verify_software_token(
         AccessToken=access_token,
-        UserCode="123456",
+        UserCode=_totp_code(software_token["SecretCode"]),
     )["Status"] == "SUCCESS"
     west.set_user_mfa_preference(
         AccessToken=access_token,

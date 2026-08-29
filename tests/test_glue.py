@@ -1801,7 +1801,12 @@ def test_glue_reset_clears_every_store_across_regions():
 
     gluemod.reset()
 
-    assert all(not store.has_any() for store in regional_stores.values())
+    assert list(gluemod._databases.keys()) == ["default"]
+    assert all(
+        not store.has_any()
+        for key, store in regional_stores.items()
+        if key != "databases"
+    )
     assert not gluemod._tags._data
 
 
@@ -2116,7 +2121,11 @@ def test_list_namespaces_returns_glue_databases():
     _svc("glue")._databases["db_a"] = {"Name": "db_a"}
     _svc("glue")._databases["db_b"] = {"Name": "db_b"}
     _, _, payload = _call("GET", "/iceberg/v1/catalogs/000000000000/namespaces")
-    assert payload["namespaces"] == [["db_a"], ["db_b"]]
+    assert {tuple(namespace) for namespace in payload["namespaces"]} == {
+        ("default",),
+        ("db_a",),
+        ("db_b",),
+    }
 
 
 def test_get_namespace_404s_when_database_missing():

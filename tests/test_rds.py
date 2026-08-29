@@ -10575,6 +10575,200 @@ def test_rds_cluster_reader_endpoint_resolves_shared_endpoint():
 
 
 # ---------------------------------------------------------------------------
+# /_ministack/rds/endpoints — reports host-mapped + in-network reachability
+# ---------------------------------------------------------------------------
+
+
+def _rds_endpoints_summary_scoped(m, account_id, region):
+    """Filter `rds_endpoints_summary()` down to one account/region.
+
+    The summary intentionally spans every account/region (same convention as
+    the SES/SQS messages admin endpoints), so under a live server shared with
+    concurrent tests (pytest-xdist), asserting the WHOLE store is empty is
+    inherently flaky — some other worker's test may legitimately have live
+    instances under a different account/region at the exact same moment.
+    Scoping to this test's own account/region makes the assertion exact
+    without requiring the rest of the server to be quiet.
+    """
+    summary = m.rds_endpoints_summary()
+    return {
+        "instances": [
+            i for i in summary["instances"]
+            if i["account_id"] == account_id and i["region"] == region
+        ],
+        "clusters": [
+            c for c in summary["clusters"]
+            if c["account_id"] == account_id and c["region"] == region
+        ],
+    }
+
+
+def test_rds_endpoints_summary_empty_and_populated():
+    """`rds_endpoints_summary()` backs GET /_ministack/rds/endpoints.
+
+    Empty account/region -> empty collections (a caller polling during
+    startup must be able to tell "nothing yet" apart from "broken"). Once an
+    instance/cluster is registered, BOTH the host-mapped port and the
+    in-network address are reported — and they must never be conflated
+    (see MINISTACK_RDS_PUBLIC_ENDPOINT's docstring above: that exact
+    conflation once made spawned Lambdas unreachable in this stack). An
+    Aurora member shares its cluster's container, not one of its own.
+    """
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "999999999999"
+    region = "us-endpoints-test-1"
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+
+        # Nothing registered yet under THIS account/region — a 200 with
+        # empty collections, not an error. (Scoped, not a global-store
+        # assertion — see `_rds_endpoints_summary_scoped`'s docstring.)
+        assert _rds_endpoints_summary_scoped(m, account_id, region) == {
+            "instances": [], "clusters": [],
+        }
+
+        m._instances["standalone-db"] = {
+            "DBInstanceIdentifier": "standalone-db",
+            "DBInstanceStatus": "available",
+            "_HostPort": 15499,
+            "_internal_address": "172.19.0.5",
+            "_internal_port": 5432,
+        }
+        m._clusters["aurora-cluster"] = {
+            "DBClusterIdentifier": "aurora-cluster",
+            "Status": "available",
+            "_shared_host_port": 15500,
+            "_shared_internal_address": "172.19.0.6",
+            "_shared_internal_port": 5432,
+        }
+        m._instances["aurora-member"] = {
+            "DBInstanceIdentifier": "aurora-member",
+            "DBInstanceStatus": "available",
+            "_shared_cluster_id": "aurora-cluster",
+            "_HostPort": 15500,
+            "_internal_address": "172.19.0.6",
+            "_internal_port": 5432,
+        }
+
+        summary = _rds_endpoints_summary_scoped(m, account_id, region)
+        instances_by_id = {i["db_instance_identifier"]: i for i in summary["instances"]}
+        assert set(instances_by_id) == {"standalone-db", "aurora-member"}
+
+        standalone = instances_by_id["standalone-db"]
+        assert standalone["account_id"] == account_id
+        assert standalone["region"] == region
+        assert standalone["db_cluster_identifier"] is None
+        assert "instance-standalone-db" in standalone["container_name"]
+        assert standalone["host_mapped"] == {"host": m._MINISTACK_HOST, "port": 15499}
+        assert standalone["in_network"] == {"host": "172.19.0.5", "port": 5432}
+
+        member = instances_by_id["aurora-member"]
+        assert member["db_cluster_identifier"] == "aurora-cluster"
+        # A cluster member shares the cluster's container, not one of its own.
+        assert "cluster-aurora-cluster" in member["container_name"]
+        assert member["host_mapped"] == {"host": m._MINISTACK_HOST, "port": 15500}
+
+        assert len(summary["clusters"]) == 1
+        cluster = summary["clusters"][0]
+        assert cluster["db_cluster_identifier"] == "aurora-cluster"
+        assert cluster["account_id"] == account_id
+        assert cluster["region"] == region
+        assert "cluster-aurora-cluster" in cluster["container_name"]
+        assert cluster["host_mapped"] == {"host": m._MINISTACK_HOST, "port": 15500}
+        assert cluster["in_network"] == {"host": "172.19.0.6", "port": 5432}
+    finally:
+        m._instances.pop("standalone-db", None)
+        m._instances.pop("aurora-member", None)
+        m._clusters.pop("aurora-cluster", None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_rds_endpoints_summary_missing_ports_are_none_not_guessed():
+    """An instance whose container hasn't finished starting (no `_HostPort`/
+    `_internal_address` yet) reports `None` for the missing address rather
+    than a fabricated port — never a silent guess."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import rds as m
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "999999999998"
+    region = "us-endpoints-test-2"
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        m._instances["pending-db"] = {
+            "DBInstanceIdentifier": "pending-db",
+            "DBInstanceStatus": "creating",
+        }
+        summary = _rds_endpoints_summary_scoped(m, account_id, region)
+        assert len(summary["instances"]) == 1
+        entry = summary["instances"][0]
+        assert entry["host_mapped"] is None
+        assert entry["in_network"] is None
+        assert entry["status"] == "creating"
+    finally:
+        m._instances.pop("pending-db", None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_rds_endpoints_admin_endpoint_reports_created_instance(rds):
+    """Live GET /_ministack/rds/endpoints reflects a real CreateDBInstance —
+    the identifier appears with a container name built from it, and both
+    address fields are present (populated when Docker started a real
+    container, `None` otherwise — never guessed)."""
+    import urllib.request
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    iid = f"intg-rds-endpoints-{_uuid_mod.uuid4().hex[:8]}"
+    rds.create_db_instance(
+        DBInstanceIdentifier=iid,
+        DBInstanceClass="db.t3.micro",
+        Engine="postgres",
+        MasterUsername="admin",
+        MasterUserPassword="secret123",
+        AllocatedStorage=20,
+    )
+    try:
+        with urllib.request.urlopen(f"{endpoint}/_ministack/rds/endpoints") as r:
+            assert r.status == 200
+            data = json.loads(r.read())
+
+        assert "instances" in data and "clusters" in data
+        matches = [i for i in data["instances"] if i["db_instance_identifier"] == iid]
+        assert len(matches) == 1, f"expected exactly one entry for {iid}, got {matches}"
+        entry = matches[0]
+        assert iid in entry["container_name"]
+        assert "host_mapped" in entry and "in_network" in entry
+        for addr in (entry["host_mapped"], entry["in_network"]):
+            if addr is not None:
+                assert set(addr) == {"host", "port"}
+                assert addr["port"]
+    finally:
+        try:
+            rds.delete_db_instance(DBInstanceIdentifier=iid, SkipFinalSnapshot=True)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Aurora PostgreSQL per-instance replicating readers (#1325 slice 2)
 # ---------------------------------------------------------------------------
 

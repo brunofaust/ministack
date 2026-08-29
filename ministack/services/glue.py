@@ -145,6 +145,24 @@ _ALL_STATE = {
     "partition_column_statistics": _partition_column_statistics,
 }
 
+# AWS auto-provisions this database in every account and region.
+_DEFAULT_DATABASE_NAME = "default"
+
+
+def _ensure_default_database():
+    if _DEFAULT_DATABASE_NAME not in _databases:
+        _databases[_DEFAULT_DATABASE_NAME] = {
+            "Name": _DEFAULT_DATABASE_NAME,
+            "Description": "",
+            "LocationUri": None,
+            "Parameters": {},
+            "CreateTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        }
+
+
+_ensure_default_database()
+
 
 def get_state():
     return copy.deepcopy(_ALL_STATE)
@@ -2153,6 +2171,7 @@ def reset():
     _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
+    _ensure_default_database()
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -2168,5 +2187,6 @@ async def handle_request(method, path, headers, body, query_params):
     dispatch is still running. A bounded pool would queue that nested request
     behind the call waiting on it.
     """
+    _ensure_default_database()
     return await run_reentrant(
         _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-glue-dispatch")

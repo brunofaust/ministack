@@ -59,13 +59,15 @@ Wire protocol:
 import base64
 import copy
 import hashlib
+import hmac
 import html as html_mod
-import json
+import json  # guard:allow -- third-party MiniStack fork, not busydone's own src/ tree
 import logging
 import os
 import re
 import secrets
 import string
+import struct
 import time
 import zlib
 from datetime import datetime, timezone
@@ -543,6 +545,29 @@ _challenge_sessions = AccountScopedDict()
 _CHALLENGE_SESSION_TTL = 3600  # fallback only — see _create_challenge_session for TTL from client config
 _MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 answered rounds
 
+# ForgotPassword / AdminResetUserPassword confirmation codes. AWS does not
+# publish an exact TTL for this code (unlike CUSTOM_AUTH sessions, which are
+# driven by the client's AuthSessionValidity); 1 hour matches the widely
+# observed real-world behaviour and _CHALLENGE_SESSION_TTL's own fallback
+# value above, so it's reused here rather than inventing a second constant.
+_RESET_CODE_TTL = 3600  # 1 hour
+
+# SignUp / ResendConfirmationCode account-verification codes. AWS does not
+# publish an exact TTL for this one either; 24 hours is the widely cited
+# default for the SignUp verification code specifically (a separate, longer-
+# lived code than the ForgotPassword flow's 1 hour above — different
+# purpose, different lifetime).
+_SIGNUP_CODE_TTL = 86400  # 24 hours
+
+# SOFTWARE_TOKEN_MFA (TOTP). RFC 6238 defaults, which is what real Cognito
+# uses against the secret AssociateSoftwareToken issues -- no vendor-specific
+# step/digit count exists to look up. _TOTP_WINDOW tolerates +/-1 step
+# (+/-30s) of client/server clock skew, matching how every real TOTP verifier
+# (including Cognito) behaves rather than requiring exact-instant match.
+_TOTP_STEP_SECONDS = 30
+_TOTP_DIGITS = 6
+_TOTP_WINDOW = 1
+
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -687,6 +712,95 @@ def _client_id() -> str:
 
 def _client_secret() -> str:
     return base64.b64encode(secrets.token_bytes(48)).decode()
+
+
+def _verify_secret_hash(client: dict | None, client_id: str, username: str, data: dict):
+    """Validate the `SecretHash` a caller sent (HMAC-SHA256(client_secret,
+    username + client_id), base64) against an app client that has a secret
+    configured (`GenerateSecret=true`). Real Cognito requires this on every
+    SignUp/ConfirmSignUp/ForgotPassword/ConfirmForgotPassword/
+    ResendConfirmationCode call once the client has a secret; MiniStack never
+    read `SecretHash` at all before this fix, so any (or no) value was
+    silently accepted. Returns an error response on a missing/wrong hash;
+    None when the client has no secret (the common case -- busydone's own
+    app client is `GenerateSecret=false`) or the hash matches.
+    See docs/busydone-gaps/cognito-mfa-secrethash-failopen.md.
+    """
+    client_secret = (client or {}).get("ClientSecret")
+    if not client_secret:
+        return None
+    provided = data.get("SecretHash") or data.get("SECRET_HASH", "")
+    expected = base64.b64encode(
+        hmac.new(client_secret.encode(), f"{username}{client_id}".encode(), hashlib.sha256).digest()
+    ).decode()
+    if not provided or not hmac.compare_digest(provided, expected):
+        return error_response_json(
+            "NotAuthorizedException", f"Unable to verify secret hash for client {client_id}", 400,
+        )
+    return None
+
+
+def _totp_code(secret_b32: str, *, when: float | None = None) -> str:
+    """RFC 6238 TOTP over a base32 shared secret at the given (or current)
+    time. This is exactly the algorithm real Cognito's SOFTWARE_TOKEN_MFA
+    validates against the secret `AssociateSoftwareToken` issued -- no
+    Cognito-specific extension exists."""
+    if when is None:
+        when = time.time()
+    counter = int(when // _TOTP_STEP_SECONDS)
+    padded = secret_b32 + "=" * (-len(secret_b32) % 8)
+    key = base64.b32decode(padded, casefold=True)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code_int = (int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF) % (10 ** _TOTP_DIGITS)
+    return str(code_int).zfill(_TOTP_DIGITS)
+
+
+def _totp_code_matches(secret_b32: str, candidate: str) -> bool:
+    """True if `candidate` matches the TOTP code for `secret_b32` at the
+    current time step or within `_TOTP_WINDOW` steps either side (clock-drift
+    tolerance -- real authenticator apps and real Cognito both allow this,
+    not exact-instant-only)."""
+    if not candidate:
+        return False
+    now = time.time()
+    for delta in range(-_TOTP_WINDOW, _TOTP_WINDOW + 1):
+        if hmac.compare_digest(_totp_code(secret_b32, when=now + delta * _TOTP_STEP_SECONDS), candidate):
+            return True
+    return False
+
+
+def _verify_software_token_mfa_code(user: dict, responses: dict):
+    """Validate `ChallengeResponses['SOFTWARE_TOKEN_MFA_CODE']` against the
+    user's enrolled TOTP secret for a SOFTWARE_TOKEN_MFA challenge (sign-in
+    with an already-enrolled authenticator app). Returns an error response on
+    an unenrolled user or a missing/wrong code; None on a match."""
+    secret = user.get("_totp_secret")
+    if not secret:
+        return error_response_json(
+            "SoftwareTokenMFANotFoundException",
+            "Software token MFA has not been enabled by the user pool.", 400,
+        )
+    code = responses.get("SOFTWARE_TOKEN_MFA_CODE", "")
+    if not _totp_code_matches(secret, code):
+        return error_response_json(
+            "CodeMismatchException", "Invalid code received for verification.", 400,
+        )
+    return None
+
+
+def _require_software_token_enrolled(user: dict):
+    """MFA_SETUP's RespondToAuthChallenge finalizes an enrollment whose real
+    code check already happened in VerifySoftwareToken (see that handler) --
+    real Cognito's MFA_SETUP challenge response carries no code of its own.
+    Reject if the caller skips straight to finalization without ever
+    completing (a successful) VerifySoftwareToken."""
+    if "SOFTWARE_TOKEN_MFA" not in user.get("_mfa_enabled", []):
+        return error_response_json(
+            "SoftwareTokenMFANotFoundException",
+            "Software token MFA has not been enabled by the user pool.", 400,
+        )
+    return None
 
 
 def _identity_pool_id() -> str:
@@ -3054,6 +3168,7 @@ def _admin_reset_user_password(data):
     user["UserLastModifiedDate"] = _now_epoch()
     code = "654321"
     user["_reset_code"] = code
+    user["_reset_code_expires_at"] = time.time() + _RESET_CODE_TTL
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code, attribute_name="password")
     return json_response({})
@@ -3071,12 +3186,18 @@ def _resend_confirmation_code(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     user = pool["_users"].get(username)
     if not user:
         return error_response_json("UserNotFoundException", "User does not exist.", 400)
 
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
+    # A resend extends validity, matching real Cognito re-issuing the code.
+    user["_confirmation_code_expires_at"] = time.time() + _SIGNUP_CODE_TTL
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code)
     return json_response({
@@ -3234,6 +3355,12 @@ def _admin_initiate_auth(data):
     auth_flow = data.get("AuthFlow", "")
     auth_params = data.get("AuthParameters", {})
 
+    username = auth_params.get("USERNAME")
+    if username:
+        secret_error = _verify_secret_hash(pool["_clients"].get(cid), cid, username, auth_params)
+        if secret_error:
+            return secret_error
+
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
@@ -3267,14 +3394,19 @@ def _admin_initiate_auth(data):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
         if not refresh_token:
             return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
+        # Decode stub token to find the correct user by sub. Real Cognito's
+        # RefreshToken is opaque and looked up in its own internal token
+        # store -- an undecodable or non-matching token is a lookup miss
+        # there too, so this rejects rather than falling back to "treat the
+        # caller as some user in the pool" (see cognito-refresh-token-failopen.md).
         user = _user_from_token(refresh_token, pool)
         if not user:
-            # Fall back to first user if token can't be decoded (e.g. externally issued token)
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
+            return error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
+        secret_error = _verify_secret_hash(
+            pool["_clients"].get(cid), cid, user["Username"], auth_params
+        )
+        if secret_error:
+            return secret_error
         if _refresh_token_revoked(refresh_token, user):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
@@ -3343,6 +3475,16 @@ def _admin_respond_to_auth_challenge(data):
 
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
+
+    username = responses.get("USERNAME")
+    if not username and data.get("Session"):
+        session, _ = _get_challenge_session(data["Session"])
+        if session:
+            username = session.get("username")
+    if username:
+        secret_error = _verify_secret_hash(pool["_clients"].get(cid), cid, username, responses)
+        if secret_error:
+            return secret_error
 
     if challenge_name == "CUSTOM_CHALLENGE":
         # Extract parameters
@@ -3470,17 +3612,24 @@ def _admin_respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
-        # Accept any TOTP code in emulator — no real TOTP validation
+        mfa_err = _verify_software_token_mfa_code(user, responses)
+        if mfa_err:
+            return mfa_err
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "MFA_SETUP":
-        # Triggered when pool MFA=ON but user hasn't enrolled yet
+        # Triggered when pool MFA=ON but user hasn't enrolled yet. No code
+        # travels in this challenge response -- VerifySoftwareToken already
+        # code-checked the enrollment; this only finalizes it.
         username = responses.get("USERNAME")
         client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
+        mfa_err = _require_software_token_enrolled(user)
+        if mfa_err:
+            return mfa_err
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -3495,19 +3644,26 @@ def _pool_for_client(cid):
     return None, None
 
 
-def _refresh_auth_result(pool, pid, cid, refresh_token):
+def _refresh_auth_result(pool, pid, cid, refresh_token, auth_params=None):
     """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
     exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
     by GetTokensFromRefreshToken so both mint tokens identically."""
     if not refresh_token:
         return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-    # Decode stub token to find the correct user by sub.
+    # Decode stub token to find the correct user by sub. Real Cognito's
+    # RefreshToken is opaque and looked up in its own internal token store --
+    # an undecodable or non-matching token is a lookup miss there too, so
+    # this rejects rather than falling back to "treat the caller as some
+    # user in the pool" (see cognito-refresh-token-failopen.md).
     user = _user_from_token(refresh_token, pool)
     if not user:
-        users = list(pool["_users"].values())
-        if not users:
-            return None, error_response_json("NotAuthorizedException", "No users in pool.", 400)
-        user = users[0]
+        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
+    if auth_params is not None:
+        secret_error = _verify_secret_hash(
+            pool["_clients"].get(cid), cid, user["Username"], auth_params
+        )
+        if secret_error:
+            return None, secret_error
     if _refresh_token_revoked(refresh_token, user):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
@@ -3560,6 +3716,12 @@ def _initiate_auth(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    username = auth_params.get("USERNAME")
+    if username:
+        secret_error = _verify_secret_hash(pool["_clients"].get(cid), cid, username, auth_params)
+        if secret_error:
+            return secret_error
+
     if auth_flow in ("USER_PASSWORD_AUTH",):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
@@ -3590,7 +3752,9 @@ def _initiate_auth(data):
         return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
+        result, err = _refresh_auth_result(
+            pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""), auth_params
+        )
         if err:
             return err
         return json_response({"AuthenticationResult": result})
@@ -3674,6 +3838,16 @@ def _respond_to_auth_challenge(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    username = responses.get("USERNAME")
+    if not username and data.get("Session"):
+        session, _ = _get_challenge_session(data["Session"])
+        if session:
+            username = session.get("username")
+    if username:
+        secret_error = _verify_secret_hash(pool["_clients"].get(cid), cid, username, responses)
+        if secret_error:
+            return secret_error
 
     if challenge_name == "CUSTOM_CHALLENGE":
         # Extract parameters
@@ -3809,7 +3983,14 @@ def _respond_to_auth_challenge(data):
         user, _err = _resolve_user(pool, username)
         if _err:
             return _err
-        # Accept any TOTP code in emulator
+        if challenge_name == "SOFTWARE_TOKEN_MFA":
+            mfa_err = _verify_software_token_mfa_code(user, responses)
+        else:
+            # MFA_SETUP finalizes an enrollment VerifySoftwareToken already
+            # code-checked -- no code travels in this challenge response.
+            mfa_err = _require_software_token_enrolled(user)
+        if mfa_err:
+            return mfa_err
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, client_metadata=client_metadata)})
 
@@ -3886,6 +4067,11 @@ def _sign_up(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     if username in pool["_users"]:
         return error_response_json("UsernameExistsException", "User already exists.", 400)
 
@@ -3918,6 +4104,7 @@ def _sign_up(data):
         "_tokens": [],
         "_confirmation_code": "123456",
     }
+    user["_confirmation_code_expires_at"] = time.time() + _SIGNUP_CODE_TTL
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
 
@@ -3948,13 +4135,33 @@ def _confirm_sign_up(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     user, err = _resolve_user(pool, username)
     if err:
         return err
 
-    # Accept any code in emulation
+    # Validate against the code SignUp/ResendConfirmationCode issued and
+    # emailed via SES — a mismatch or missing code never reaches
+    # UserStatus, so a rejected attempt leaves the account UNCONFIRMED.
+    # Exact sibling of _confirm_forgot_password's fix below.
+    issued_code = user.get("_confirmation_code")
+    if not issued_code or code != issued_code:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400
+        )
+    if time.time() > user.get("_confirmation_code_expires_at", 0):
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400
+        )
+
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
+    # Single-use, matching real Cognito — the code cannot be replayed.
+    user.pop("_confirmation_code", None)
+    user.pop("_confirmation_code_expires_at", None)
     return json_response({})
 
 
@@ -3970,12 +4177,17 @@ def _forgot_password(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     user, _err = _resolve_user(pool, username)
     if _err:
         return _err
 
     code = "654321"
     user["_reset_code"] = code
+    user["_reset_code_expires_at"] = time.time() + _RESET_CODE_TTL
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code, attribute_name="password")
     return json_response({
@@ -3991,6 +4203,7 @@ def _confirm_forgot_password(data):
     cid = data.get("ClientId")
     username = data.get("Username")
     new_password = data.get("Password", "")
+    confirmation_code = data.get("ConfirmationCode", "")
 
     pool = None
     for p in _user_pools.values():
@@ -4000,17 +4213,37 @@ def _confirm_forgot_password(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     user, _err = _resolve_user(pool, username)
     if _err:
         return _err
 
-    # Accept any confirmation code in emulation (real AWS validates against issued code)
+    # Validate against the code ForgotPassword/AdminResetUserPassword issued
+    # and emailed via SES — a mismatch or missing code never reaches
+    # password validation, so a rejected attempt leaves the password (and
+    # UserStatus) completely untouched.
+    issued_code = user.get("_reset_code")
+    if not issued_code or confirmation_code != issued_code:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400
+        )
+    if time.time() > user.get("_reset_code_expires_at", 0):
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400
+        )
+
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
+    # Single-use, matching real Cognito — the code cannot be replayed.
+    user.pop("_reset_code", None)
+    user.pop("_reset_code_expires_at", None)
     return json_response({})
 
 
@@ -4790,29 +5023,62 @@ def _set_user_pool_mfa_config(data):
 
 
 def _associate_software_token(data):
-    """Issue a stub TOTP secret. Works with both AccessToken and Session."""
+    """Issue a real RFC 6238 TOTP shared secret and persist it against the
+    caller so VerifySoftwareToken can validate a real code later (previously:
+    a secret was generated and returned but never stored anywhere, so any
+    code was accepted downstream at every consumer). Persistence is keyed by
+    AccessToken only -- see VerifySoftwareToken's docstring for why the
+    Session-only (unauthenticated MFA_SETUP enrollment) path is a deliberate,
+    documented fail-closed gap rather than a real implementation."""
     secret = base64.b32encode(secrets.token_bytes(20)).decode()
     session = base64.b64encode(secrets.token_bytes(32)).decode()
+
+    access_token = data.get("AccessToken")
+    if access_token:
+        for pool in _user_pools.values():
+            user = _user_from_token(access_token, pool)
+            if user:
+                user["_totp_secret"] = secret
+                break
+
     return json_response({"SecretCode": secret, "Session": session})
 
 
 def _verify_software_token(data):
-    """Accept any TOTP code. Mark the user as TOTP-enrolled so auth flow issues the challenge."""
-    access_token = data.get("AccessToken")
-    user_code = data.get("UserCode", "")  # accepted regardless of value in emulator
-    friendly_name = data.get("FriendlyDeviceName", "TOTP device")
+    """Validate `UserCode` as a real RFC 6238 TOTP code against the secret
+    `AssociateSoftwareToken` stored for this caller (resolved via
+    AccessToken -- the same identity scope AssociateSoftwareToken persists
+    the secret under).
 
+    🔴 Deliberate fail-closed stub, not a full implementation: real Cognito
+    also accepts a `Session` here (the unauthenticated MFA_SETUP-challenge
+    enrollment flow, before any AccessToken exists). AssociateSoftwareToken
+    never persists a secret for that path either, so a Session-only call has
+    no stored secret to check against and always falls through to `Status:
+    ERROR` below -- correctly refusing rather than silently accepting, but
+    the Session-based enrollment flow itself is not implemented. See
+    docs/busydone-gaps/cognito-mfa-secrethash-failopen.md.
+    """
+    access_token = data.get("AccessToken")
+    user_code = data.get("UserCode", "")
+    friendly_name = data.get("FriendlyDeviceName", "TOTP device")  # noqa: F841 -- unused, pre-existing
+
+    user = None
     if access_token:
-        # Find the user by token across all pools
         for pool in _user_pools.values():
-            user = _user_from_token(access_token, pool)
-            if user:
-                user.setdefault("_mfa_enabled", [])
-                if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
-                    user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
-                user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
+            candidate = _user_from_token(access_token, pool)
+            if candidate:
+                user = candidate
                 break
 
+    secret = user.get("_totp_secret") if user else None
+    if not secret or not _totp_code_matches(secret, user_code):
+        return json_response({"Status": "ERROR"})
+
+    user.setdefault("_mfa_enabled", [])
+    if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
+        user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
+    user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
     return json_response({"Status": "SUCCESS"})
 
 
@@ -6072,14 +6338,17 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
-    # ── fallback (legacy behaviour for unrecognised grant_type) ──
-    pool_id, pool, client = _find_pool_by_client_id(cid)
-    access_token = _fake_token(cid or new_uuid(), pool_id or "", cid or "", "access")
-    return json_response({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-    })
+    # ── unrecognised grant_type ──
+    # Real Cognito's token endpoint follows the OAuth2 RFC 6749 error shape
+    # (a JSON body with "error"/"error_description", via _oauth2_error — same
+    # helper already used by every branch above) for anything outside the
+    # three grant types it implements, and never mints a token without
+    # validating the grant first. This used to synthesize a valid access
+    # token for ANY unrecognized grant_type — including an empty/unresolved
+    # client_id (`cid or new_uuid()`) — with zero credential check at all,
+    # the most severe of the gaps found in this file (see
+    # docs/busydone-gaps/cognito-oauth2-token-grant-type-failopen.md).
+    return _oauth2_error("unsupported_grant_type", "Unsupported grant_type.")
 
 
 def handle_oauth2_token(method, path, headers, body, query_params):

@@ -1666,13 +1666,13 @@ def test_cloudfront_list_anycast_ip_lists_empty(cloudfront):
 
 
 def test_cloudfront_list_cache_policies_round_trip(cloudfront):
-    baseline = cloudfront.list_cache_policies()["CachePolicyList"]["Quantity"]
+    baseline = cloudfront.list_cache_policies(Type="custom")["CachePolicyList"]["Quantity"]
 
     name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
     pid = create["CachePolicy"]["Id"]
 
-    listed = cloudfront.list_cache_policies()["CachePolicyList"]
+    listed = cloudfront.list_cache_policies(Type="custom")["CachePolicyList"]
     assert listed["Quantity"] == baseline + 1
     names = [s["CachePolicy"]["CachePolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
@@ -1683,13 +1683,13 @@ def test_cloudfront_list_cache_policies_round_trip(cloudfront):
 
 
 def test_cloudfront_list_origin_request_policies_round_trip(cloudfront):
-    baseline = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]["Quantity"]
+    baseline = cloudfront.list_origin_request_policies(Type="custom")["OriginRequestPolicyList"]["Quantity"]
 
     name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
     pid = create["OriginRequestPolicy"]["Id"]
 
-    listed = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]
+    listed = cloudfront.list_origin_request_policies(Type="custom")["OriginRequestPolicyList"]
     assert listed["Quantity"] == baseline + 1
     names = [s["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
@@ -1699,13 +1699,13 @@ def test_cloudfront_list_origin_request_policies_round_trip(cloudfront):
 
 
 def test_cloudfront_list_response_headers_policies_round_trip(cloudfront):
-    baseline = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]["Quantity"]
+    baseline = cloudfront.list_response_headers_policies(Type="custom")["ResponseHeadersPolicyList"]["Quantity"]
 
     name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
     pid = create["ResponseHeadersPolicy"]["Id"]
 
-    listed = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]
+    listed = cloudfront.list_response_headers_policies(Type="custom")["ResponseHeadersPolicyList"]
     assert listed["Quantity"] == baseline + 1
     names = [s["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names

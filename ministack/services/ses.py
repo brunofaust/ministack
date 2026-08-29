@@ -10,7 +10,10 @@ v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             DeleteIdentity, GetSendQuota, GetSendStatistics,
             ListVerifiedEmailAddresses, CreateConfigurationSet,
             DeleteConfigurationSet, DescribeConfigurationSet,
-            ListConfigurationSets, CreateTemplate, GetTemplate, DeleteTemplate,
+            ListConfigurationSets, CreateConfigurationSetEventDestination,
+            UpdateConfigurationSetEventDestination,
+            DeleteConfigurationSetEventDestination,
+            CreateTemplate, GetTemplate, DeleteTemplate,
             ListTemplates, UpdateTemplate, GetIdentityDkimAttributes,
             SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled.
 
@@ -148,6 +151,9 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteConfigurationSet": _delete_configuration_set,
         "DescribeConfigurationSet": _describe_configuration_set,
         "ListConfigurationSets": _list_configuration_sets,
+        "CreateConfigurationSetEventDestination": _create_configuration_set_event_destination,
+        "UpdateConfigurationSetEventDestination": _update_configuration_set_event_destination,
+        "DeleteConfigurationSetEventDestination": _delete_configuration_set_event_destination,
         "CreateTemplate": _create_template,
         "GetTemplate": _get_template,
         "DeleteTemplate": _delete_template,
@@ -602,10 +608,14 @@ def _describe_configuration_set(params):
     if not cs:
         return _error("ConfigurationSetDoesNotExist",
                        f"Configuration set {name} does not exist", 400)
+    result = f"<ConfigurationSet><Name>{cs['Name']}</Name></ConfigurationSet>"
+    attr_names = _collect_list(params, "ConfigurationSetAttributeNames.member")
+    if "eventDestinations" in attr_names:
+        destinations = cs.get("EventDestinations", {})
+        members = "".join(_event_destination_xml(d) for d in destinations.values())
+        result += f"<EventDestinations>{members}</EventDestinations>"
     return _xml(200, "DescribeConfigurationSetResponse",
-                f"<DescribeConfigurationSetResult>"
-                f"<ConfigurationSet><Name>{cs['Name']}</Name></ConfigurationSet>"
-                f"</DescribeConfigurationSetResult>")
+                f"<DescribeConfigurationSetResult>{result}</DescribeConfigurationSetResult>")
 
 
 def _list_configuration_sets(params):
@@ -617,6 +627,198 @@ def _list_configuration_sets(params):
                 f"<ListConfigurationSetsResult>"
                 f"<ConfigurationSets>{members}</ConfigurationSets>"
                 f"</ListConfigurationSetsResult>")
+
+
+# ---------------------------------------------------------------------------
+# v1 — Configuration set event destinations
+# ---------------------------------------------------------------------------
+#
+# An event destination tells SES where to publish email sending events
+# (send/bounce/complaint/delivery/...) for a configuration set. AWS allows
+# exactly one of three mutually-exclusive destination sub-shapes per event
+# destination: SNSDestination, CloudWatchDestination, or
+# KinesisFirehoseDestination (botocore ses/2010-12-01 service-2.json,
+# shape "EventDestination"). All three are parsed/stored/echoed back here;
+# only SNSDestination is exercised by the CLI round-trip in this change's
+# verification, matching the one sub-shape the consuming Terraform module
+# (`infra/modules/ses/main.tf`'s `aws_ses_event_destination.sns`) actually
+# uses. CloudWatch/Firehose parsing follows the identical code path and the
+# same wire shapes but has no driving test yet.
+#
+# Destinations are stored as a plain dict nested inside each configuration
+# set's own value (itself held in the existing `_configuration_sets`
+# AccountRegionScopedDict), so they inherit that dict's per-account/per-region
+# isolation and are cleared for free by `reset()` — no new module-level store.
+
+def _create_configuration_set_event_destination(params):
+    cs_name = _p(params, "ConfigurationSetName")
+    cs = _configuration_sets.get(cs_name)
+    if not cs:
+        return _error("ConfigurationSetDoesNotExist",
+                       f"Configuration set {cs_name} does not exist", 400)
+    destination, validation_error = _validated_event_destination(params, "EventDestination")
+    if validation_error:
+        return validation_error
+    dest_name = destination["Name"]
+    destinations = cs.setdefault("EventDestinations", {})
+    if dest_name in destinations:
+        return _error("EventDestinationAlreadyExists",
+                       f"Event destination {dest_name} already exists", 400)
+    destinations[dest_name] = destination
+    return _xml(200, "CreateConfigurationSetEventDestinationResponse",
+                "<CreateConfigurationSetEventDestinationResult/>")
+
+
+def _update_configuration_set_event_destination(params):
+    cs_name = _p(params, "ConfigurationSetName")
+    cs = _configuration_sets.get(cs_name)
+    if not cs:
+        return _error("ConfigurationSetDoesNotExist",
+                       f"Configuration set {cs_name} does not exist", 400)
+    destination, validation_error = _validated_event_destination(params, "EventDestination")
+    if validation_error:
+        return validation_error
+    dest_name = destination["Name"]
+    destinations = cs.setdefault("EventDestinations", {})
+    if dest_name not in destinations:
+        return _error("EventDestinationDoesNotExist",
+                       f"Event destination {dest_name} does not exist", 400)
+    destinations[dest_name] = destination
+    return _xml(200, "UpdateConfigurationSetEventDestinationResponse",
+                "<UpdateConfigurationSetEventDestinationResult/>")
+
+
+def _delete_configuration_set_event_destination(params):
+    cs_name = _p(params, "ConfigurationSetName")
+    cs = _configuration_sets.get(cs_name)
+    if not cs:
+        return _error("ConfigurationSetDoesNotExist",
+                       f"Configuration set {cs_name} does not exist", 400)
+    dest_name = _p(params, "EventDestinationName")
+    destinations = cs.setdefault("EventDestinations", {})
+    if dest_name not in destinations:
+        return _error("EventDestinationDoesNotExist",
+                       f"Event destination {dest_name} does not exist", 400)
+    del destinations[dest_name]
+    return _xml(200, "DeleteConfigurationSetEventDestinationResponse",
+                "<DeleteConfigurationSetEventDestinationResult/>")
+
+
+def _parse_event_destination(params, prefix):
+    """Parse an EventDestination structure (botocore shape "EventDestination")
+    from Query API dotted form params rooted at `prefix`."""
+    dest = {
+        "Name": _p(params, f"{prefix}.Name"),
+        "Enabled": _p(params, f"{prefix}.Enabled").lower() == "true",
+        "MatchingEventTypes": _collect_list(params, f"{prefix}.MatchingEventTypes.member"),
+    }
+
+    sns_topic = _p(params, f"{prefix}.SNSDestination.TopicARN")
+    if sns_topic:
+        dest["SNSDestination"] = {"TopicARN": sns_topic}
+
+    iam_role = _p(params, f"{prefix}.KinesisFirehoseDestination.IAMRoleARN")
+    stream_arn = _p(params, f"{prefix}.KinesisFirehoseDestination.DeliveryStreamARN")
+    if iam_role or stream_arn:
+        dest["KinesisFirehoseDestination"] = {
+            "IAMRoleARN": iam_role,
+            "DeliveryStreamARN": stream_arn,
+        }
+
+    dims = []
+    i = 1
+    dim_prefix = f"{prefix}.CloudWatchDestination.DimensionConfigurations.member"
+    while _p(params, f"{dim_prefix}.{i}.DimensionName"):
+        dims.append({
+            "DimensionName": _p(params, f"{dim_prefix}.{i}.DimensionName"),
+            "DimensionValueSource": _p(params, f"{dim_prefix}.{i}.DimensionValueSource"),
+            "DefaultDimensionValue": _p(params, f"{dim_prefix}.{i}.DefaultDimensionValue"),
+        })
+        i += 1
+    if dims:
+        dest["CloudWatchDestination"] = {"DimensionConfigurations": dims}
+
+    return dest
+
+
+def _validated_event_destination(params, prefix):
+    """Parse and validate the required, mutually exclusive SES destination shape."""
+    destination = _parse_event_destination(params, prefix)
+    if not destination["Name"]:
+        return None, _error("ValidationError", "Event destination Name must not be empty", 400)
+    if not destination["MatchingEventTypes"]:
+        return None, _error(
+            "ValidationError", "MatchingEventTypes must contain at least one event type", 400
+        )
+
+    sns_prefix = f"{prefix}.SNSDestination."
+    firehose_prefix = f"{prefix}.KinesisFirehoseDestination."
+    cloudwatch_prefix = f"{prefix}.CloudWatchDestination."
+    supplied = {
+        "SNSDestination": any(key.startswith(sns_prefix) for key in params),
+        "KinesisFirehoseDestination": any(key.startswith(firehose_prefix) for key in params),
+        "CloudWatchDestination": any(key.startswith(cloudwatch_prefix) for key in params),
+    }
+    if sum(supplied.values()) != 1:
+        return None, _error(
+            "ValidationError", "Exactly one event destination type must be supplied", 400
+        )
+    if supplied["SNSDestination"] and not _p(params, f"{sns_prefix}TopicARN"):
+        return None, _error("ValidationError", "SNSDestination.TopicARN is required", 400)
+    if supplied["KinesisFirehoseDestination"] and (
+        not _p(params, f"{firehose_prefix}IAMRoleARN")
+        or not _p(params, f"{firehose_prefix}DeliveryStreamARN")
+    ):
+        return None, _error(
+            "ValidationError",
+            "KinesisFirehoseDestination requires IAMRoleARN and DeliveryStreamARN",
+            400,
+        )
+    if supplied["CloudWatchDestination"]:
+        dimensions = destination.get("CloudWatchDestination", {}).get(
+            "DimensionConfigurations", []
+        )
+        if not dimensions or any(not all(dimension.values()) for dimension in dimensions):
+            return None, _error(
+                "ValidationError",
+                "CloudWatchDestination requires complete DimensionConfigurations",
+                400,
+            )
+    return destination, None
+
+
+def _event_destination_xml(dest):
+    types_xml = "".join(f"<member>{_esc(t)}</member>" for t in dest.get("MatchingEventTypes", []))
+    inner = (
+        f"<Name>{_esc(dest.get('Name', ''))}</Name>"
+        f"<Enabled>{'true' if dest.get('Enabled') else 'false'}</Enabled>"
+        f"<MatchingEventTypes>{types_xml}</MatchingEventTypes>"
+    )
+    sns = dest.get("SNSDestination")
+    if sns:
+        inner += (f"<SNSDestination><TopicARN>{_esc(sns['TopicARN'])}"
+                   f"</TopicARN></SNSDestination>")
+    kinesis = dest.get("KinesisFirehoseDestination")
+    if kinesis:
+        inner += (
+            "<KinesisFirehoseDestination>"
+            f"<IAMRoleARN>{_esc(kinesis['IAMRoleARN'])}</IAMRoleARN>"
+            f"<DeliveryStreamARN>{_esc(kinesis['DeliveryStreamARN'])}</DeliveryStreamARN>"
+            "</KinesisFirehoseDestination>"
+        )
+    cw = dest.get("CloudWatchDestination")
+    if cw:
+        dims_xml = "".join(
+            "<member>"
+            f"<DimensionName>{_esc(d['DimensionName'])}</DimensionName>"
+            f"<DimensionValueSource>{_esc(d['DimensionValueSource'])}</DimensionValueSource>"
+            f"<DefaultDimensionValue>{_esc(d['DefaultDimensionValue'])}</DefaultDimensionValue>"
+            "</member>"
+            for d in cw.get("DimensionConfigurations", [])
+        )
+        inner += (f"<CloudWatchDestination><DimensionConfigurations>{dims_xml}"
+                   f"</DimensionConfigurations></CloudWatchDestination>")
+    return f"<member>{inner}</member>"
 
 
 # ---------------------------------------------------------------------------
