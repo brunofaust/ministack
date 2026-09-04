@@ -1244,6 +1244,17 @@ def _container_override_for(container_overrides, container_name):
     return {}
 
 
+def _ecs_docker_flags():
+    """Parse ECS_DOCKER_FLAGS into (environment overrides, other docker-py run kwargs)."""
+    flags = os.environ.get("ECS_DOCKER_FLAGS", "").strip()
+    if not flags:
+        return {}, {}
+    from ministack.services.lambda_svc import _parse_docker_flags
+
+    kwargs = _parse_docker_flags(flags)
+    return kwargs.pop("environment", {}), kwargs
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
                       cluster_arn):
@@ -1483,6 +1494,13 @@ def _run_task(data):
                         c["lastStatus"] = "STOPPED"
                     break
                 env.update(env_override)
+                # ECS_DOCKER_FLAGS: extra `docker run` flags for every task
+                # container, the ECS twin of LAMBDA_DOCKER_FLAGS. `-e KEY=VALUE`
+                # entries override the task definition's environment, so a local
+                # stack can point a Terraform-registered task at its mock
+                # endpoints without re-registering the task definition.
+                flags_env, flags_kwargs = _ecs_docker_flags()
+                env.update(flags_env)
                 effective_cdef = dict(cdef)
                 if "command" in container_override:
                     effective_cdef["command"] = container_override["command"]
@@ -1507,6 +1525,9 @@ def _run_task(data):
                     host_mode, task_id, task_arn, ministack_net_ip,
                     _clusters[cluster_name]["clusterArn"],
                 )
+                if flags_kwargs.get("mounts"):
+                    run_kwargs["mounts"] = [*run_kwargs.get("mounts", []), *flags_kwargs.pop("mounts")]
+                run_kwargs.update(flags_kwargs)
 
                 try:
                     try:
