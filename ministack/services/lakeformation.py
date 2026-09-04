@@ -18,7 +18,7 @@ read (ListPermissions filtered by Principal + Resource) finds what it wrote.
 import json
 import logging
 import threading
-from datetime import datetime, timezone
+import time
 
 from ministack.core.responses import AccountScopedDict, get_account_id
 
@@ -35,8 +35,9 @@ _resources = AccountScopedDict()
 _lf_tags = AccountScopedDict()
 
 
-def _now_iso():
-    return datetime.now(timezone.utc).isoformat()
+def _now_ts():
+    """LastUpdated is a JSON timestamp: epoch seconds as a number, never an ISO string."""
+    return time.time()
 
 
 def _json_resp(status, body):
@@ -125,14 +126,14 @@ def _grant(body):
             if _principal_id(entry["Principal"]) == _principal_id(principal) and _same_resource(entry["Resource"], resource):
                 entry["Permissions"] = list(dict.fromkeys(entry["Permissions"] + permissions))
                 entry["PermissionsWithGrantOption"] = list(dict.fromkeys(entry["PermissionsWithGrantOption"] + grant_option))
-                entry["LastUpdated"] = _now_iso()
+                entry["LastUpdated"] = _now_ts()
                 return _json_resp(200, {})
         _account_grants().append({
             "Principal": principal,
             "Resource": resource,
             "Permissions": permissions,
             "PermissionsWithGrantOption": grant_option,
-            "LastUpdated": _now_iso(),
+            "LastUpdated": _now_ts(),
             "LastUpdatedBy": f"arn:aws:iam::{get_account_id()}:root",
         })
     return _json_resp(200, {})
@@ -220,7 +221,7 @@ def _register_resource(body):
         _resources.setdefault(get_account_id(), {})[arn] = {
             "ResourceArn": arn,
             "RoleArn": body.get("RoleArn") or f"arn:aws:iam::{get_account_id()}:role/aws-service-role/lakeformation.amazonaws.com/AWSServiceRoleForLakeFormationDataAccess",
-            "LastModified": _now_iso(),
+            "LastModified": _now_ts(),
             "WithFederation": bool(body.get("WithFederation", False)),
             "HybridAccessEnabled": bool(body.get("HybridAccessEnabled", False)),
         }
