@@ -109,6 +109,7 @@ def _is_spark_job(job):
 
 
 _databases = AccountRegionScopedDict()
+_catalogs = AccountRegionScopedDict()     # catalog name -> catalog dict (federated S3 Tables catalogs)
 _tables = AccountRegionScopedDict()  # "db_name/table_name" -> table dict
 _partitions = AccountRegionScopedDict()  # "db_name/table_name" -> [partition, ...]
 _partition_indexes = AccountRegionScopedDict()  # "db_name/table_name" -> [index, ...]
@@ -128,6 +129,7 @@ _partition_column_statistics = AccountRegionScopedDict()  # "db/table" -> [{"Val
 
 _ALL_STATE = {
     "databases": _databases,
+    "catalogs": _catalogs,
     "tables": _tables,
     "partitions": _partitions,
     "partition_indexes": _partition_indexes,
@@ -388,6 +390,12 @@ def _handle_request_sync(method, path, headers, body, query_params):
         "DeleteUserDefinedFunction": _delete_user_defined_function,
         "GetUserDefinedFunction": _get_user_defined_function,
         "GetUserDefinedFunctions": _get_user_defined_functions,
+        # Catalogs (federated: s3tablescatalog)
+        "CreateCatalog": _create_catalog,
+        "GetCatalog": _get_catalog,
+        "GetCatalogs": _get_catalogs,
+        "UpdateCatalog": _update_catalog,
+        "DeleteCatalog": _delete_catalog,
         # Tags
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
@@ -798,6 +806,96 @@ def _handle_iceberg_rest(method, path, query_params, body=None):
 
 
 # ---- Databases ----
+
+
+# ---- Catalogs ----
+# A Glue Data Catalog "catalog" resource (GA 2024-12): the S3 Tables
+# integration registers a federated catalog named `s3tablescatalog` whose
+# FederatedCatalog.Identifier is the S3 Tables bucket ARN pattern. Terraform's
+# aws_glue_catalog resource creates it, reads it back (GetCatalog), tags it
+# through the shared Tag* operations, and deletes it.
+
+def _catalog_arn(name):
+    return _arn("catalog", name)
+
+
+def _catalog_response(catalog):
+    return {k: v for k, v in catalog.items() if not k.startswith("_")}
+
+
+def _create_catalog(data):
+    name = data.get("Name")
+    catalog_input = data.get("CatalogInput") or {}
+    if not name:
+        return error_response_json("InvalidInputException", "Name is required", 400)
+    if not isinstance(catalog_input, dict) or not catalog_input:
+        return error_response_json("InvalidInputException", "CatalogInput is required", 400)
+    if name in _catalogs:
+        return error_response_json("AlreadyExistsException", f"Catalog {name} already exists", 400)
+    now = int(time.time())
+    catalog = {
+        "CatalogId": get_account_id(),
+        "Name": name,
+        "ResourceArn": _catalog_arn(name),
+        "Description": catalog_input.get("Description", ""),
+        "Parameters": catalog_input.get("Parameters", {}),
+        "CreateTime": now,
+        "UpdateTime": now,
+        "CatalogProperties": catalog_input.get("CatalogProperties", {}),
+        "CreateTableDefaultPermissions": catalog_input.get("CreateTableDefaultPermissions", []),
+        "CreateDatabaseDefaultPermissions": catalog_input.get("CreateDatabaseDefaultPermissions", []),
+        "AllowFullTableExternalDataAccess": catalog_input.get("AllowFullTableExternalDataAccess", "False"),
+    }
+    if catalog_input.get("FederatedCatalog"):
+        catalog["FederatedCatalog"] = dict(catalog_input["FederatedCatalog"])
+    if catalog_input.get("TargetRedshiftCatalog"):
+        catalog["TargetRedshiftCatalog"] = dict(catalog_input["TargetRedshiftCatalog"])
+    _catalogs[name] = catalog
+    if isinstance(data.get("Tags"), dict):
+        _tags[catalog["ResourceArn"]] = {str(k): str(v) for k, v in data["Tags"].items()}
+    logger.info("Glue: created catalog %s", name)
+    return json_response({})
+
+
+def _resolve_catalog(catalog_id):
+    """CatalogId is the catalog's name for a nested catalog ("<account>:<name>" also accepted)."""
+    if not catalog_id:
+        return None
+    name = catalog_id.split(":", 1)[1] if ":" in catalog_id else catalog_id
+    return _catalogs.get(name)
+
+
+def _get_catalog(data):
+    catalog = _resolve_catalog(data.get("CatalogId"))
+    if catalog is None:
+        return error_response_json("EntityNotFoundException", f"Catalog {data.get('CatalogId')} not found", 400)
+    return json_response({"Catalog": _catalog_response(catalog)})
+
+
+def _get_catalogs(data):
+    return json_response({"CatalogList": [_catalog_response(c) for c in _catalogs.values()]})
+
+
+def _update_catalog(data):
+    catalog = _resolve_catalog(data.get("CatalogId"))
+    if catalog is None:
+        return error_response_json("EntityNotFoundException", f"Catalog {data.get('CatalogId')} not found", 400)
+    catalog_input = data.get("CatalogInput") or {}
+    for key in ("Description", "Parameters", "CatalogProperties", "CreateTableDefaultPermissions",
+                "CreateDatabaseDefaultPermissions", "AllowFullTableExternalDataAccess", "FederatedCatalog"):
+        if key in catalog_input:
+            catalog[key] = catalog_input[key]
+    catalog["UpdateTime"] = int(time.time())
+    return json_response({})
+
+
+def _delete_catalog(data):
+    catalog = _resolve_catalog(data.get("CatalogId"))
+    if catalog is None:
+        return error_response_json("EntityNotFoundException", f"Catalog {data.get('CatalogId')} not found", 400)
+    del _catalogs[catalog["Name"]]
+    _tags.pop(catalog["ResourceArn"], None)
+    return json_response({})
 
 
 def _create_database(data):

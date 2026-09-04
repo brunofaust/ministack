@@ -2588,3 +2588,26 @@ def test_glue_extract_python_error_finds_last_traceback():
     assert out.startswith("Traceback")
     assert "ValueError: real" in out and "OldError" not in out
     assert _extract_python_error("just INFO lines") == ""
+
+
+def test_federated_catalog_round_trip(glue):
+    """The S3 Tables integration registers a federated catalog Terraform creates, reads, tags and deletes."""
+    glue.create_catalog(
+        Name="s3tablescatalog",
+        CatalogInput={"FederatedCatalog": {"Identifier": "arn:aws:s3tables:us-east-1:000000000000:bucket/*", "ConnectionName": "aws:s3tables"}},
+        Tags={"Name": "busydone-dev"},
+    )
+    try:
+        catalog = glue.get_catalog(CatalogId="s3tablescatalog")["Catalog"]
+        assert catalog["Name"] == "s3tablescatalog"
+        assert catalog["FederatedCatalog"]["ConnectionName"] == "aws:s3tables"
+        assert catalog["ResourceArn"].endswith(":catalog/s3tablescatalog")
+        assert glue.get_tags(ResourceArn=catalog["ResourceArn"])["Tags"] == {"Name": "busydone-dev"}
+        assert [c["Name"] for c in glue.get_catalogs()["CatalogList"]] == ["s3tablescatalog"]
+        glue.update_catalog(CatalogId="s3tablescatalog", CatalogInput={"Description": "federated"})
+        assert glue.get_catalog(CatalogId="000000000000:s3tablescatalog")["Catalog"]["Description"] == "federated"
+    finally:
+        glue.delete_catalog(CatalogId="s3tablescatalog")
+    with pytest.raises(ClientError) as excinfo:
+        glue.get_catalog(CatalogId="s3tablescatalog")
+    assert excinfo.value.response["Error"]["Code"] == "EntityNotFoundException"
