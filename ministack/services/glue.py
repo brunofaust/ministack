@@ -837,19 +837,17 @@ def _create_catalog(data):
         "CatalogId": get_account_id(),
         "Name": name,
         "ResourceArn": _catalog_arn(name),
-        "Description": catalog_input.get("Description", ""),
-        "Parameters": catalog_input.get("Parameters", {}),
         "CreateTime": now,
         "UpdateTime": now,
-        "CatalogProperties": catalog_input.get("CatalogProperties", {}),
-        "CreateTableDefaultPermissions": catalog_input.get("CreateTableDefaultPermissions", []),
-        "CreateDatabaseDefaultPermissions": catalog_input.get("CreateDatabaseDefaultPermissions", []),
-        "AllowFullTableExternalDataAccess": catalog_input.get("AllowFullTableExternalDataAccess", "False"),
     }
-    if catalog_input.get("FederatedCatalog"):
-        catalog["FederatedCatalog"] = dict(catalog_input["FederatedCatalog"])
-    if catalog_input.get("TargetRedshiftCatalog"):
-        catalog["TargetRedshiftCatalog"] = dict(catalog_input["TargetRedshiftCatalog"])
+    # Echo only what the caller set: the Terraform provider compares the read
+    # against its plan and refuses a Description/Parameters that "was null,
+    # but now" an empty string/map.
+    for key in ("Description", "Parameters", "CatalogProperties", "CreateTableDefaultPermissions",
+                "CreateDatabaseDefaultPermissions", "AllowFullTableExternalDataAccess",
+                "FederatedCatalog", "TargetRedshiftCatalog"):
+        if catalog_input.get(key) not in (None, "", {}, []):
+            catalog[key] = catalog_input[key]
     _catalogs[name] = catalog
     if isinstance(data.get("Tags"), dict):
         _tags[catalog["ResourceArn"]] = {str(k): str(v) for k, v in data["Tags"].items()}
