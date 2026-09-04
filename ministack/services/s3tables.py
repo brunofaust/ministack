@@ -66,6 +66,8 @@ _namespaces = AccountRegionScopedDict()        # "bucket_arn\x00namespace" -> ns
 _tables = AccountRegionScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
 _bucket_maintenance = AccountRegionScopedDict()  # bucket_arn -> {type: {status, settings}}
 _table_maintenance = AccountRegionScopedDict()   # "bucket_arn\x00namespace\x00table" -> {type: {status, settings}}
+_bucket_encryption = AccountRegionScopedDict()  # bucket_arn -> {"sseAlgorithm": ..., "kmsKeyArn"?: ...}
+_resource_tags = AccountRegionScopedDict()  # resource arn -> {key: value}
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -77,6 +79,8 @@ def get_state():
         "tables": copy.deepcopy(_tables),
         "bucket_maintenance": copy.deepcopy(_bucket_maintenance),
         "table_maintenance": copy.deepcopy(_table_maintenance),
+        "bucket_encryption": copy.deepcopy(_bucket_encryption),
+        "resource_tags": copy.deepcopy(_resource_tags),
     }
 
 
@@ -86,6 +90,8 @@ def restore_state(data):
     _tables.update(data.get("tables", {}))
     _bucket_maintenance.update(data.get("bucket_maintenance", {}))
     _table_maintenance.update(data.get("table_maintenance", {}))
+    _bucket_encryption.update(data.get("bucket_encryption", {}))
+    _resource_tags.update(data.get("resource_tags", {}))
 
 
 def reset():
@@ -94,6 +100,8 @@ def reset():
     _tables.clear()
     _bucket_maintenance.clear()
     _table_maintenance.clear()
+    _bucket_encryption.clear()
+    _resource_tags.clear()
 
 
 if PERSIST_STATE:
@@ -237,12 +245,64 @@ def _create_table_bucket(data):
     # right after create (what the Terraform provider does) returns a populated
     # settings object instead of an empty one.
     _bucket_maintenance[arn] = _default_bucket_maintenance_configuration()
+    if isinstance(data.get("encryptionConfiguration"), dict):
+        _bucket_encryption[arn] = dict(data["encryptionConfiguration"])
+    if isinstance(data.get("tags"), dict):
+        _resource_tags[arn] = {str(k): str(v) for k, v in data["tags"].items()}
     logger.info("S3Tables: created table bucket %s", name)
     return json_response({"arn": arn})
 
 
 def _list_table_buckets():
     return json_response({"tableBuckets": list(_table_buckets.values())})
+
+
+_DEFAULT_ENCRYPTION = {"sseAlgorithm": "AES256"}
+
+
+def _get_table_bucket_encryption(arn):
+    """GetTableBucketEncryption: AWS reports SSE-S3 when nothing was ever put."""
+    if not _find_bucket_by_arn(arn):
+        return _bucket_not_found(arn)
+    config = _bucket_encryption.get(_canonical_bucket_arn(arn)) or _DEFAULT_ENCRYPTION
+    return json_response({"encryptionConfiguration": dict(config)})
+
+
+def _put_table_bucket_encryption(arn, data):
+    if not _find_bucket_by_arn(arn):
+        return _bucket_not_found(arn)
+    config = data.get("encryptionConfiguration") or {}
+    if config.get("sseAlgorithm") not in ("AES256", "aws:kms"):
+        return error_response_json("BadRequestException", "encryptionConfiguration.sseAlgorithm must be AES256 or aws:kms", 400)
+    _bucket_encryption[_canonical_bucket_arn(arn)] = dict(config)
+    return 200, {"Content-Type": "application/json"}, b""
+
+
+def _delete_table_bucket_encryption(arn):
+    if not _find_bucket_by_arn(arn):
+        return _bucket_not_found(arn)
+    _bucket_encryption.pop(_canonical_bucket_arn(arn), None)
+    return 204, {}, b""
+
+
+def _list_tags_for_resource(arn):
+    """ListTagsForResource (GET /tag/{arn}) for table buckets and tables."""
+    return json_response({"tags": dict(_resource_tags.get(arn) or {})})
+
+
+def _tag_resource(arn, data):
+    tags = data.get("tags") or {}
+    if not isinstance(tags, dict):
+        return error_response_json("BadRequestException", "tags must be a map", 400)
+    _resource_tags.setdefault(arn, {}).update({str(k): str(v) for k, v in tags.items()})
+    return 204, {}, b""
+
+
+def _untag_resource(arn, tag_keys):
+    current = _resource_tags.setdefault(arn, {})
+    for key in tag_keys:
+        current.pop(key, None)
+    return 204, {}, b""
 
 
 def _get_table_bucket(arn):
@@ -833,13 +893,32 @@ async def handle_request(method, path, headers, body, query_params):
             maint_type = suffix[len("maintenance/"):]
             if method == "PUT":
                 return _put_table_bucket_maintenance_configuration(arn, maint_type, data)
-        elif suffix in ("encryption", "metrics", "policy", "storage-class"):
+        elif suffix == "encryption":
+            if method == "GET":
+                return _get_table_bucket_encryption(arn)
+            if method == "PUT":
+                return _put_table_bucket_encryption(arn, data)
+            if method == "DELETE":
+                return _delete_table_bucket_encryption(arn)
+        elif suffix in ("metrics", "policy", "storage-class"):
             return json_response({})  # stub
         elif not suffix:
             if method == "GET":
                 return _get_table_bucket(arn)
             if method == "DELETE":
                 return _delete_table_bucket(arn)
+
+    # GET|POST|DELETE /tag/{arn...} -> ListTagsForResource | TagResource | UntagResource
+    if len(parts) >= 2 and parts[0] == "tag":
+        arn = "/".join(parts[1:])
+        if method == "GET":
+            return _list_tags_for_resource(arn)
+        if method == "POST":
+            return _tag_resource(arn, data)
+        if method == "DELETE":
+            raw_keys = query_params.get("tagKeys", [])
+            keys = raw_keys if isinstance(raw_keys, list) else [raw_keys]
+            return _untag_resource(arn, [k for key in keys for k in str(key).split(",") if k])
 
     # PUT /namespaces/{arn...} -> CreateNamespace
     # GET /namespaces/{arn...} -> ListNamespaces

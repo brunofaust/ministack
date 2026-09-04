@@ -1022,3 +1022,31 @@ def test_s3tables_deletes_answer_204(s3tables):
     assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
     r = s3tables.delete_table_bucket(tableBucketARN=arn)
     assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+
+def test_table_bucket_encryption_defaults_to_sse_s3_and_round_trips(s3tables):
+    arn = s3tables.create_table_bucket(name="enc-roundtrip")["arn"]
+    try:
+        default = s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"]
+        assert default == {"sseAlgorithm": "AES256"}
+        s3tables.put_table_bucket_encryption(
+            tableBucketARN=arn, encryptionConfiguration={"sseAlgorithm": "aws:kms", "kmsKeyArn": "arn:aws:kms:us-east-1:000000000000:key/k"}
+        )
+        stored = s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"]
+        assert stored["sseAlgorithm"] == "aws:kms"
+        s3tables.delete_table_bucket_encryption(tableBucketARN=arn)
+        assert s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"] == {"sseAlgorithm": "AES256"}
+    finally:
+        s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_table_bucket_tags_round_trip(s3tables):
+    arn = s3tables.create_table_bucket(name="tag-roundtrip", tags={"Name": "tag-roundtrip"})["arn"]
+    try:
+        assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"Name": "tag-roundtrip"}
+        s3tables.tag_resource(resourceArn=arn, tags={"env": "dev"})
+        assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"Name": "tag-roundtrip", "env": "dev"}
+        s3tables.untag_resource(resourceArn=arn, tagKeys=["Name"])
+        assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"env": "dev"}
+    finally:
+        s3tables.delete_table_bucket(tableBucketARN=arn)

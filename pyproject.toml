@@ -32,6 +32,12 @@ dependencies = [
     # is a runtime dependency rather than a dev one. Pinned to the version the
     # images already carry: awscli==1.45.63 requires botocore==1.43.63.
     "botocore==1.43.63",
+    # CloudWatch (and other smithy-rpc-v2-cbor services) decode CBOR bodies:
+    # AWS SDK Go v2 / Terraform speak CBOR to CloudWatch, so without it every
+    # PutMetricAlarm from Terraform is a 500 the provider retries forever. The
+    # Dockerfile and requirements.txt already carry it; a source checkout
+    # synced with `uv sync` must too.
+    "cbor2>=5.4.0",
     # Step Functions JSONata expressions (QueryLanguage: JSONata) are evaluated
     # by this pure-Python port of the reference jsonata-js engine, which AWS
     # documents Step Functions as implementing per the JSONata 2.0.6 spec. Pure
