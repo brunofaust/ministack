@@ -708,6 +708,20 @@ class TestExtractS3VhostBucket:
     def test_bare_bucket(self):
         assert _extract_s3_vhost_bucket("mybucket.localhost") == "mybucket"
 
+    def test_loopback_tails_match_even_when_ministack_host_is_a_container_name(self, monkeypatch):
+        # A host process reaching the published port says `<bucket>.localhost` while
+        # the container is addressed as MINISTACK_HOST=ministack. Before the fix the
+        # first path segment was parsed as the bucket (Terraform's S3 backend got
+        # NoSuchBucket for `busydone/dev/terraform.tfstate.tflock`).
+        import ministack.app as app_mod
+
+        monkeypatch.setattr(app_mod, "_S3_VHOST_BASE_HOSTS", frozenset({"ministack", "localhost", "localhost.localstack.cloud"}))
+        assert _extract_s3_vhost_bucket("busydone-terraform-state.localhost:41080") == "busydone-terraform-state"
+        assert _extract_s3_vhost_bucket("mybucket.localhost.localstack.cloud:4566") == "mybucket"
+        assert _extract_s3_vhost_bucket("mybucket.ministack:4566") == "mybucket"
+        assert _extract_s3_vhost_bucket("ministack:4566") is None
+        assert _extract_s3_vhost_bucket("mybucket.other.example") is None
+
     def test_single_segment_s3_nested_bucket(self):
         assert _extract_s3_vhost_bucket("mybucket.s3.localhost") == "mybucket"
 

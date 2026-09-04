@@ -24,6 +24,15 @@ import uuid
 from urllib.parse import parse_qs, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+# Base hosts a virtual-hosted S3 request may carry besides MINISTACK_HOST: a host
+# process reaching a container's published port says `<bucket>.localhost` (and
+# `<bucket>.localhost.localstack.cloud`, the LocalStack convention), while the
+# container itself is addressed as MINISTACK_HOST. `MINISTACK_EXTRA_HOSTS` adds more.
+_S3_VHOST_BASE_HOSTS = frozenset(
+    h.strip().lower()
+    for h in [_MINISTACK_HOST, "localhost", "localhost.localstack.cloud", *os.environ.get("MINISTACK_EXTRA_HOSTS", "").split(",")]
+    if h.strip()
+)
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
@@ -136,7 +145,7 @@ def _extract_s3_vhost_bucket(host: str):
         return None
     if ".." in candidate or _IPV4_RE.match(candidate):
         return None
-    if tail == _MINISTACK_HOST or tail.endswith("." + _MINISTACK_HOST):
+    if any(tail == base or tail.endswith("." + base) for base in _S3_VHOST_BASE_HOSTS):
         return candidate
     first_tail_segment = tail.split(".", 1)[0]
     if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
@@ -353,6 +362,7 @@ SERVICE_REGISTRY = {
     "s3": {"module": "s3"},
     "s3files": {"module": "s3files"},
     "scheduler": {"module": "scheduler"},
+    "lakeformation": {"module": "lakeformation"},
     "secretsmanager": {"module": "secretsmanager"},
     "servicediscovery": {"module": "servicediscovery"},
     "ses": {"module": "ses"},
@@ -410,7 +420,7 @@ _state_map = {
     "ses": "ses", "ses_v2": "ses_v2",
     "servicediscovery": "servicediscovery", "s3files": "s3files",
     "appconfig": "appconfig", "transfer": "transfer",
-    "scheduler": "scheduler", "autoscaling": "autoscaling",
+    "scheduler": "scheduler", "autoscaling": "autoscaling", "lakeformation": "lakeformation",
     "eks": "eks", "backup": "backup", "pipes": "pipes",
     "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
     "resource_groups": "resource_groups",

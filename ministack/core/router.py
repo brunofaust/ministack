@@ -375,6 +375,15 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/schedules", "/schedule-groups"],
         "credential_scope": "scheduler",
     },
+    "lakeformation": {
+        "host_patterns": [r"lakeformation\."],
+        "path_prefixes": ["/GrantPermissions", "/RevokePermissions", "/ListPermissions",
+                          "/GetDataLakeSettings", "/PutDataLakeSettings", "/BatchGrantPermissions",
+                          "/BatchRevokePermissions", "/RegisterResource", "/DeregisterResource",
+                          "/DescribeResource", "/ListResources", "/CreateLFTag", "/GetLFTag",
+                          "/UpdateLFTag", "/DeleteLFTag", "/ListLFTags"],
+        "credential_scope": "lakeformation",
+    },
     "pipes": {
         "host_patterns": [r"pipes\."],
         "path_prefixes": ["/v1/pipes"],
@@ -631,6 +640,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfig": "appconfig",
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
+                "lakeformation": "lakeformation",
                 "eks": "eks",
                 "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
