@@ -2009,6 +2009,80 @@ def _instance_available_unless_stopped(instance):
         instance["DBInstanceStatus"] = "available"
 
 
+
+# ── In-container endpoint proxy ─────────────────────────────────────────────
+# An instance's endpoint is reported as MINISTACK_HOST + the sidecar's published
+# host port, which is what a HOST process dials. A workload container on the
+# same Docker network dials `<MINISTACK_HOST>:<engine port>` — the exact
+# `host:port` a Terraform-written secret carries (real RDS listens on 5432) —
+# and that is MiniStack's own container, which listened on nothing but 4566.
+# Forward both the engine port and the published port from inside this process
+# to the sidecar, so the one address every consumer already holds resolves
+# wherever it is dialed from. A port another instance (or MiniStack itself)
+# already owns is skipped, never fought over.
+_endpoint_proxies: dict = {}  # listen port -> (target_host, target_port)
+_endpoint_proxy_lock = threading.Lock()
+
+
+def _ensure_endpoint_proxy(db_id, target_host, target_port, listen_ports):
+    """Idempotently forward each listen port (in this process) to the sidecar."""
+    import asyncio
+    import socket as _socket
+
+    targets = []
+    with _endpoint_proxy_lock:
+        for port in dict.fromkeys(int(p) for p in listen_ports if p):
+            if port in _endpoint_proxies:
+                continue
+            _endpoint_proxies[port] = (target_host, int(target_port))
+            targets.append(port)
+    if not targets:
+        return
+
+    async def _pipe(reader, writer):
+        try:
+            while chunk := await reader.read(65536):
+                writer.write(chunk)
+                await writer.drain()
+        except (ConnectionError, asyncio.CancelledError, OSError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+    async def _serve(port):
+        async def _on_client(client_reader, client_writer):
+            try:
+                upstream_reader, upstream_writer = await asyncio.open_connection(target_host, int(target_port))
+            except OSError as exc:
+                logger.warning("RDS: endpoint proxy %s: cannot reach %s:%s: %s", db_id, target_host, target_port, exc)
+                client_writer.close()
+                return
+            await asyncio.gather(
+                _pipe(client_reader, upstream_writer),
+                _pipe(upstream_reader, client_writer),
+            )
+
+        try:
+            server = await asyncio.start_server(_on_client, host="0.0.0.0", port=port, reuse_address=True)
+        except OSError as exc:
+            with _endpoint_proxy_lock:
+                _endpoint_proxies.pop(port, None)
+            logger.info("RDS: endpoint proxy for %s not bound on :%s (%s)", db_id, port, exc)
+            return
+        logger.info("RDS: endpoint proxy for %s: :%s -> %s:%s", db_id, port, target_host, target_port)
+        async with server:
+            await server.serve_forever()
+
+    def _run():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(asyncio.gather(*(_serve(port) for port in targets)))
+
+    threading.Thread(target=_run, name=f"ministack-rds-proxy-{db_id}", daemon=True).start()
+
 def _start_rds_container_for_instance(db_id, instance):
     """Re-spin (or re-attach to) the Docker container for a restored instance.
 
@@ -4644,6 +4718,8 @@ def _create_db_instance_impl(p):
                 ready_host, ready_port, engine, readiness_user,
                 readiness_master_pass, readiness_db_name, _container_alive,
             )
+            if database_ready and ms_network and internal_host and internal_port:
+                _ensure_endpoint_proxy(db_id, internal_host, internal_port, [internal_port, endpoint_port])
             if database_ready and _is_mysql_engine(engine):
                 _ensure_mysql_compatibility(
                     container_id,
