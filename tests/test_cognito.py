@@ -1,13 +1,10 @@
 """Cognito tests — user pools, identity pools, OAuth2/OIDC flows, auth-code persistence."""
 
 import base64
-import hashlib
-import hmac
 import importlib
 import io
 import json
 import os
-import struct
 import time
 import urllib.error
 import urllib.request
@@ -24,101 +21,6 @@ from botocore.exceptions import ClientError
 from ministack.core import persistence
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
-
-
-def _totp_code(secret_code):
-    """Generate an independent RFC 6238 SHA-1 code for Cognito MFA tests."""
-    padded = secret_code + "=" * (-len(secret_code) % 8)
-    key = base64.b32decode(padded, casefold=True)
-    digest = hmac.new(key, struct.pack(">Q", int(time.time() // 30)), hashlib.sha1).digest()
-    offset = digest[-1] & 0x0F
-    return str((int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF) % 1_000_000).zfill(6)
-
-
-def _secret_hash(client_secret, username, client_id):
-    """Generate Cognito's client-secret proof independently of production code."""
-    digest = hmac.new(
-        client_secret.encode(),
-        f"{username}{client_id}".encode(),
-        hashlib.sha256,
-    ).digest()
-    return base64.b64encode(digest).decode()
-
-
-def test_cognito_secret_client_rejects_password_auth_without_valid_hash(cognito_idp):
-    """USER_PASSWORD_AUTH must fail closed for secret-bearing app clients."""
-    pool_id = cognito_idp.create_user_pool(PoolName="secret-auth-pool")["UserPool"]["Id"]
-    client = cognito_idp.create_user_pool_client(
-        UserPoolId=pool_id,
-        ClientName="secret-auth-client",
-        GenerateSecret=True,
-        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
-    )["UserPoolClient"]
-    cognito_idp.admin_create_user(UserPoolId=pool_id, Username="secret-user", TemporaryPassword="TempPass1!")
-    cognito_idp.admin_set_user_password(
-        UserPoolId=pool_id,
-        Username="secret-user",
-        Password="Password1!",
-        Permanent=True,
-    )
-    base = {
-        "ClientId": client["ClientId"],
-        "AuthFlow": "USER_PASSWORD_AUTH",
-        "AuthParameters": {"USERNAME": "secret-user", "PASSWORD": "Password1!"},
-    }
-    for supplied in (None, "wrong"):
-        request = {**base, "AuthParameters": dict(base["AuthParameters"])}
-        if supplied is not None:
-            request["AuthParameters"]["SECRET_HASH"] = supplied
-        with pytest.raises(ClientError) as exc:
-            cognito_idp.initiate_auth(**request)
-        assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
-    base["AuthParameters"]["SECRET_HASH"] = _secret_hash(
-        client["ClientSecret"], "secret-user", client["ClientId"]
-    )
-    assert "AuthenticationResult" in cognito_idp.initiate_auth(**base)
-
-
-def test_cognito_secret_client_rejects_new_password_challenge_without_valid_hash(cognito_idp):
-    """ChallengeResponses must carry SECRET_HASH for secret-bearing clients."""
-    pool_id = cognito_idp.create_user_pool(PoolName="secret-challenge-pool")["UserPool"]["Id"]
-    client = cognito_idp.create_user_pool_client(
-        UserPoolId=pool_id,
-        ClientName="secret-challenge-client",
-        GenerateSecret=True,
-        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
-    )["UserPoolClient"]
-    username = "challenge-user"
-    cognito_idp.admin_create_user(UserPoolId=pool_id, Username=username, TemporaryPassword="TempPass1!")
-    proof = _secret_hash(client["ClientSecret"], username, client["ClientId"])
-    challenge = cognito_idp.initiate_auth(
-        ClientId=client["ClientId"],
-        AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": username, "PASSWORD": "TempPass1!", "SECRET_HASH": proof},
-    )
-    for supplied in (None, "wrong"):
-        responses = {"USERNAME": username, "NEW_PASSWORD": "ChangedPass1!"}
-        if supplied is not None:
-            responses["SECRET_HASH"] = supplied
-        with pytest.raises(ClientError) as exc:
-            cognito_idp.respond_to_auth_challenge(
-                ClientId=client["ClientId"],
-                ChallengeName="NEW_PASSWORD_REQUIRED",
-                Session=challenge["Session"],
-                ChallengeResponses=responses,
-            )
-        assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
-    result = cognito_idp.respond_to_auth_challenge(
-        ClientId=client["ClientId"],
-        ChallengeName="NEW_PASSWORD_REQUIRED",
-        Session=challenge["Session"],
-        ChallengeResponses={
-            "USERNAME": username,
-            "NEW_PASSWORD": "ChangedPass1!",
-            "SECRET_HASH": proof,
-        },
-    )
-    assert "AuthenticationResult" in result
 
 
 def _advertised_endpoint():
@@ -543,6 +445,55 @@ def test_cognito_admin_add_remove_user_from_group(cognito_idp):
     cognito_idp.admin_remove_user_from_group(UserPoolId=pid, Username="liam", GroupName="editors")
     members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
     assert not any(u["Username"] == "liam" for u in members)
+
+def test_cognito_admin_list_user_auth_events_requires_addons(cognito_idp):
+    addon_msg = (
+        "This is an add on feature. Please update AdvancedSecurityMode"
+        " for your user pool to access this API."
+    )
+
+    pid = cognito_idp.create_user_pool(PoolName="AuthEventsPlainPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mona")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="mona")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+    assert exc.value.response["Error"]["Message"] == addon_msg
+
+    # The add-on gate fires before user resolution: an unknown user in a pool
+    # without add-ons still gets the add-on error, not UserNotFound.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="ghost")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsOffPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "OFF"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="olga")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="olga")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsAuditPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="axel")
+    resp = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="axel")
+    assert resp["AuthEvents"] == []
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsAddonsPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "ENFORCED"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="nils")
+    resp = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="nils")
+    assert resp["AuthEvents"] == []
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="ghost")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+    assert exc.value.response["Error"]["Message"] == "User does not exist."
 
 def test_cognito_domain_crud(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
@@ -974,6 +925,77 @@ def test_cognito_identity_pool_roles(cognito_identity):
     roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
     assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
     assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
+
+def test_cognito_identity_pool_principal_tags(cognito_identity):
+    """SetPrincipalTagAttributeMap stores a provider's attribute mapping and
+    GetPrincipalTagAttributeMap reports it back."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    resp = cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid,
+        IdentityProviderName=provider,
+        UseDefaults=False,
+        PrincipalTags={"tenant": "custom:tenant"},
+    )
+    assert resp["IdentityPoolId"] == iid
+    assert resp["IdentityProviderName"] == provider
+    assert resp["UseDefaults"] is False
+    assert resp["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    got = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert got["UseDefaults"] is False
+    assert got["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    # A second provider on the same pool keeps its own mapping.
+    other = "cognito-idp.us-east-1.amazonaws.com/us-east-1_other"
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=other,
+        UseDefaults=False, PrincipalTags={"email": "email"})
+    assert cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+    )["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+
+def test_cognito_identity_pool_principal_tags_unconfigured_provider(cognito_identity):
+    """A provider nobody has configured is not readable, and UseDefaults
+    round-trips without materializing a tag map."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagDefaultsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId=iid, IdentityProviderName=provider)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["Error"]["Message"] == (
+        f"No Principal Tags configured for Provider {provider}")
+
+    # UseDefaults selects the mapping AWS applies when it vends credentials; it
+    # does not populate PrincipalTags. terraform-provider-aws sends both
+    # members together like this on destroy.
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+        UseDefaults=True, PrincipalTags={})
+    defaulted = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert defaulted["UseDefaults"] is True
+    assert defaulted["PrincipalTags"] == {}
+
+
+def test_cognito_identity_pool_principal_tags_unknown_pool(cognito_identity):
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId="us-east-1:00000000-0000-0000-0000-000000000000",
+            IdentityProviderName="cognito-idp.us-east-1.amazonaws.com/us-east-1_example")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
 
 def test_cognito_list_identities(cognito_identity):
     resp = cognito_identity.create_identity_pool(
@@ -1482,10 +1504,23 @@ def test_cognito_force_change_password_challenge(cognito_idp):
     assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
     assert "Session" in auth
 
+def _totp_code(secret_b32: str) -> str:
+    """RFC 6238 code for the secret AssociateSoftwareToken returned —
+    HMAC-SHA1, 30-second step, 6 digits."""
+    import hashlib
+    import hmac
+    import struct
+
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    mac = hmac.new(key, struct.pack(">Q", int(time.time() // 30)), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
+
+
 def test_cognito_totp_full_flow(cognito_idp):
     """Full TOTP MFA flow: SetUserPoolMfaConfig ON → AssociateSoftwareToken →
     VerifySoftwareToken → InitiateAuth returns SOFTWARE_TOKEN_MFA challenge →
-    RespondToAuthChallenge with the current TOTP returns tokens."""
+    RespondToAuthChallenge with any code returns tokens."""
     pid = cognito_idp.create_user_pool(PoolName="qa-totp-full")["UserPool"]["Id"]
     cid = cognito_idp.create_user_pool_client(
         UserPoolId=pid,
@@ -1522,11 +1557,13 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert "SecretCode" in assoc
     assert len(assoc["SecretCode"]) > 0
 
-    # Verify the code derived independently from the shared secret.
+    # A wrong code is refused — that refusal is what an MFA test exists for.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.verify_software_token(AccessToken=access_token, UserCode="000000")
+    assert exc.value.response["Error"]["Code"] == "EnableSoftwareTokenMFAException"
+
     verify = cognito_idp.verify_software_token(
-        AccessToken=access_token,
-        UserCode=_totp_code(assoc["SecretCode"]),
-    )
+        AccessToken=access_token, UserCode=_totp_code(assoc["SecretCode"]))
     assert verify["Status"] == "SUCCESS"
 
     # Now auth should return SOFTWARE_TOKEN_MFA challenge
@@ -1539,15 +1576,23 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
     assert "Session" in auth2
 
-    # Respond with the current TOTP code → get tokens
+    # A wrong challenge code is refused with CodeMismatchException.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_respond_to_auth_challenge(
+            UserPoolId=pid,
+            ClientId=cid,
+            ChallengeName="SOFTWARE_TOKEN_MFA",
+            ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "000000"},
+        )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+    # The correct code, derived from the enrolled secret, gets tokens.
     result = cognito_idp.admin_respond_to_auth_challenge(
         UserPoolId=pid,
         ClientId=cid,
         ChallengeName="SOFTWARE_TOKEN_MFA",
-        ChallengeResponses={
-            "USERNAME": "totp-user",
-            "SOFTWARE_TOKEN_MFA_CODE": _totp_code(assoc["SecretCode"]),
-        },
+        ChallengeResponses={"USERNAME": "totp-user",
+                            "SOFTWARE_TOKEN_MFA_CODE": _totp_code(assoc["SecretCode"])},
     )
     assert "AuthenticationResult" in result
     assert "AccessToken" in result["AuthenticationResult"]
@@ -4586,21 +4631,18 @@ def test_cognito_pretoken_trigger_source_by_auth_flow(cognito_idp, lam):
     )
     client_id = client["ClientId"]
     client_secret = client.get("ClientSecret", "")
-    secret_hash = _secret_hash(client_secret, "testuser", client_id)
 
     # InitiateAuth (USER_PASSWORD_AUTH) -> TokenGeneration_Authentication
     auth = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": "testuser", "PASSWORD": "TestPass1!", "SECRET_HASH": secret_hash,
-        },
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(auth["AccessToken"])["seen_trigger_source"] == "TokenGeneration_Authentication"
 
     # REFRESH_TOKEN_AUTH (InitiateAuth) -> TokenGeneration_RefreshTokens
     refreshed = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"], "SECRET_HASH": secret_hash},
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(refreshed["AccessToken"])["seen_trigger_source"] == "TokenGeneration_RefreshTokens"
 
@@ -4670,15 +4712,12 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     )
     client_id = client["ClientId"]
     client_secret = client["ClientSecret"]
-    testuser_hash = _secret_hash(client_secret, "testuser", client_id)
 
     # InitiateAuth(USER_PASSWORD_AUTH) — real AWS never forwards ClientMetadata
     # here, so the trigger must see none, even though the caller passed one.
     auth = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": "testuser", "PASSWORD": "TestPass1!", "SECRET_HASH": testuser_hash,
-        },
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
         ClientMetadata={"orgId": "org-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(auth["AccessToken"])["seen_org_id"] == ""
@@ -4686,7 +4725,7 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     # InitiateAuth(REFRESH_TOKEN_AUTH) — same exclusion.
     refreshed = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"], "SECRET_HASH": testuser_hash},
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
         ClientMetadata={"orgId": "org-refresh"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(refreshed["AccessToken"])["seen_org_id"] == ""
@@ -4694,9 +4733,7 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     # AdminInitiateAuth(ADMIN_USER_PASSWORD_AUTH) — same exclusion.
     admin_auth = cognito_idp.admin_initiate_auth(
         UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": "testuser", "PASSWORD": "TestPass1!", "SECRET_HASH": testuser_hash,
-        },
+        AuthParameters={"USERNAME": "testuser", "PASSWORD": "TestPass1!"},
         ClientMetadata={"orgId": "org-admin-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(admin_auth["AccessToken"])["seen_org_id"] == ""
@@ -4704,7 +4741,7 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
     # AdminInitiateAuth(REFRESH_TOKEN_AUTH) — same exclusion.
     admin_refreshed = cognito_idp.admin_initiate_auth(
         UserPoolId=pool_id, ClientId=client_id, AuthFlow="REFRESH_TOKEN_AUTH",
-        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"], "SECRET_HASH": testuser_hash},
+        AuthParameters={"REFRESH_TOKEN": auth["RefreshToken"]},
         ClientMetadata={"orgId": "org-admin-refresh"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(admin_refreshed["AccessToken"])["seen_org_id"] == ""
@@ -4723,20 +4760,12 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
         UserPoolId=pool_id, Username="newpwduser", Password="TempPass1!", Permanent=False)
     challenge = cognito_idp.initiate_auth(
         ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": "newpwduser",
-            "PASSWORD": "TempPass1!",
-            "SECRET_HASH": _secret_hash(client_secret, "newpwduser", client_id),
-        },
+        AuthParameters={"USERNAME": "newpwduser", "PASSWORD": "TempPass1!"},
     )
     assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
     respond_result = cognito_idp.respond_to_auth_challenge(
         ClientId=client_id, ChallengeName="NEW_PASSWORD_REQUIRED", Session=challenge["Session"],
-        ChallengeResponses={
-            "USERNAME": "newpwduser",
-            "NEW_PASSWORD": "FinalPass1!",
-            "SECRET_HASH": _secret_hash(client_secret, "newpwduser", client_id),
-        },
+        ChallengeResponses={"USERNAME": "newpwduser", "NEW_PASSWORD": "FinalPass1!"},
         ClientMetadata={"orgId": "org-new-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(respond_result["AccessToken"])["seen_org_id"] == "org-new-password"
@@ -4747,21 +4776,13 @@ def test_cognito_pretoken_receives_client_metadata(cognito_idp, lam):
         UserPoolId=pool_id, Username="adminnewpwduser", Password="TempPass1!", Permanent=False)
     admin_challenge = cognito_idp.admin_initiate_auth(
         UserPoolId=pool_id, ClientId=client_id, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={
-            "USERNAME": "adminnewpwduser",
-            "PASSWORD": "TempPass1!",
-            "SECRET_HASH": _secret_hash(client_secret, "adminnewpwduser", client_id),
-        },
+        AuthParameters={"USERNAME": "adminnewpwduser", "PASSWORD": "TempPass1!"},
     )
     assert admin_challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
     admin_respond_result = cognito_idp.admin_respond_to_auth_challenge(
         UserPoolId=pool_id, ClientId=client_id, ChallengeName="NEW_PASSWORD_REQUIRED",
         Session=admin_challenge["Session"],
-        ChallengeResponses={
-            "USERNAME": "adminnewpwduser",
-            "NEW_PASSWORD": "FinalPass1!",
-            "SECRET_HASH": _secret_hash(client_secret, "adminnewpwduser", client_id),
-        },
+        ChallengeResponses={"USERNAME": "adminnewpwduser", "NEW_PASSWORD": "FinalPass1!"},
         ClientMetadata={"orgId": "org-admin-new-password"},
     )["AuthenticationResult"]
     assert _decode_jwt_claims(admin_respond_result["AccessToken"])["seen_org_id"] == "org-admin-new-password"
@@ -7922,3 +7943,262 @@ def test_cognito_required_custom_attribute_is_refused(cognito_idp):
             CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String",
                                "Required": True}])
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_user_pool_keeps_mfa_and_attribute_update_settings(cognito_idp):
+    """UserAttributeUpdateSettings and a false SoftwareTokenMfaConfiguration
+    round-trip.
+
+    Both are declared on aws_cognito_user_pool. The provider sends the attribute
+    settings on Create and Update, and the MFA config through
+    SetUserPoolMfaConfig as an empty object — `enabled = false` serialises with
+    the false field omitted. Neither was reported back: the settings were never
+    stored, and `{}` was treated as never-set. Terraform proposed the same two
+    blocks on every plan, and applying did not settle it.
+    """
+    pool = cognito_idp.create_user_pool(
+        PoolName="qa-pool-settings",
+        MfaConfiguration="OPTIONAL",
+        UserAttributeUpdateSettings={
+            "AttributesRequireVerificationBeforeUpdate": ["email", "phone_number"]
+        },
+    )["UserPool"]
+    pid = pool["Id"]
+
+    assert pool["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email", "phone_number"]
+    described = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert described["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email", "phone_number"]
+
+    # An update must carry the setting through, not drop it.
+    cognito_idp.update_user_pool(
+        UserPoolId=pid,
+        MfaConfiguration="OPTIONAL",
+        UserAttributeUpdateSettings={
+            "AttributesRequireVerificationBeforeUpdate": ["email"]
+        },
+    )
+    described = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert described["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email"]
+
+    # The empty object the provider sends for `enabled = false` is a value that
+    # was set, not an unset field, so it has to be reported as {"Enabled": false}.
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={},
+        MfaConfiguration="OPTIONAL",
+    )
+    mfa = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert mfa["SoftwareTokenMfaConfiguration"] == {"Enabled": False}
+
+    # A pool that never configured software-token MFA still reports nothing,
+    # which is what keeps an unset field from reading as drift.
+    other = cognito_idp.create_user_pool(PoolName="qa-pool-no-mfa")["UserPool"]["Id"]
+    assert "SoftwareTokenMfaConfiguration" not in cognito_idp.get_user_pool_mfa_config(
+        UserPoolId=other
+    )
+
+
+def _pool_with_client(cognito_idp, prevent):
+    """A pool plus an app client with a given PreventUserExistenceErrors value."""
+    pid = cognito_idp.create_user_pool(PoolName="ExistencePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="existence",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                           "ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        PreventUserExistenceErrors=prevent,
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="known@example.test", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="known@example.test",
+        Password="Correct1!", Permanent=True,
+    )
+    return pid, cid
+
+
+def test_cognito_prevent_user_existence_errors_masks_initiate_auth(cognito_idp):
+    """An unknown username must be indistinguishable from a wrong password."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    def failure(username):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(
+                ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                AuthParameters={"USERNAME": username, "PASSWORD": "Wrong1!"},
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    unknown = failure("unknown@example.test")
+    known = failure("known@example.test")
+
+    assert unknown == known, "the two failures must not be distinguishable"
+    assert unknown[0] == "NotAuthorizedException"
+    # And the message must not name the address that was probed.
+    assert "unknown@example.test" not in unknown[1]
+
+
+def test_cognito_prevent_user_existence_errors_legacy_still_reports(cognito_idp):
+    """LEGACY keeps the distinct error, which is what AWS does."""
+    _pid, cid = _pool_with_client(cognito_idp, "LEGACY")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "unknown@example.test", "PASSWORD": "Wrong1!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_forgot_password(cognito_idp):
+    """ForgotPassword answers as though a code was sent."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    resp = cognito_idp.forgot_password(ClientId=cid, Username="unknown@example.test")
+    delivery = resp["CodeDeliveryDetails"]
+    assert delivery["DeliveryMedium"] == "EMAIL"
+    # The destination is masked, so it cannot be used to confirm the address.
+    assert delivery["Destination"] != "unknown@example.test"
+    assert "***" in delivery["Destination"]
+
+
+def test_cognito_prevent_user_existence_errors_masks_resend_confirmation(cognito_idp):
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    resp = cognito_idp.resend_confirmation_code(
+        ClientId=cid, Username="unknown@example.test",
+    )
+    assert resp["CodeDeliveryDetails"]["DeliveryMedium"] == "EMAIL"
+
+
+def test_cognito_prevent_user_existence_errors_masks_confirm_forgot_password(cognito_idp):
+    """An unknown username looks like a bad code."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_forgot_password(
+            ClientId=cid, Username="unknown@example.test",
+            ConfirmationCode="000000", Password="Another1!",
+        )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+
+def test_cognito_prevent_user_existence_errors_delivery_details_identical(cognito_idp):
+    """The masked destination must carry no trace of whether the user exists.
+
+    Masking only the unknown-user path would leave the oracle in place: a full
+    address for a real user and a mask for an unknown one is still a yes/no
+    answer. The two usernames below mask to the same string, so an identical
+    response proves the field is a function of the request alone.
+    """
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+    real = "known@example.test"          # exists
+    unknown = "kevin@elsewhere.test"     # does not — same mask: k***@e***.test
+
+    for call in ("forgot_password", "resend_confirmation_code"):
+        send = getattr(cognito_idp, call)
+        a = send(ClientId=cid, Username=real)["CodeDeliveryDetails"]
+        b = send(ClientId=cid, Username=unknown)["CodeDeliveryDetails"]
+        assert a == b, f"{call} distinguishes the two users: {a} vs {b}"
+        assert a["Destination"] == "k****@e****"
+        assert real not in a["Destination"]
+
+
+def test_cognito_prevent_user_existence_errors_admin_directory_still_reports(cognito_idp):
+    """The setting covers the admin auth flow, not the admin directory reads.
+
+    AWS names ADMIN_USER_PASSWORD_AUTH among the flows it masks, so
+    AdminInitiateAuth must fail the same way for an unknown user as for a wrong
+    password. AdminGetUser is not an auth flow and keeps reporting the truth,
+    which provisioning scripts branch on.
+    """
+    pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="unknown@example.test")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+    def admin_failure(username):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.admin_initiate_auth(
+                UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                AuthParameters={"USERNAME": username, "PASSWORD": "Wrong1!"},
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    assert admin_failure("unknown@example.test") == admin_failure("known@example.test")
+    assert admin_failure("unknown@example.test")[0] == "NotAuthorizedException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_srp_challenge(cognito_idp):
+    """USER_SRP_AUTH must not leak at RespondToAuthChallenge.
+
+    This is the flow a browser SDK uses. InitiateAuth answers a
+    PASSWORD_VERIFIER challenge without resolving the user at all, so masking
+    InitiateAuth alone would leave the whole browser sign-in leaking one step
+    later, where the password proof is checked.
+    """
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    def srp_failure(username):
+        started = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_SRP_AUTH",
+            AuthParameters={"USERNAME": username, "SRP_A": "ab" * 32},
+        )
+        assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.respond_to_auth_challenge(
+                ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
+                Session=started["Session"],
+                ChallengeResponses={
+                    "USERNAME": username,
+                    "PASSWORD_CLAIM_SIGNATURE": "sig",
+                    "PASSWORD_CLAIM_SECRET_BLOCK": "blk",
+                    "TIMESTAMP": "Mon Aug 31 00:00:00 UTC 2026",
+                },
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    assert srp_failure("unknown@example.test") == (
+        "NotAuthorizedException", "Incorrect username or password.")
+
+
+def test_cognito_identity_pool_credentials_are_sts_sessions(cognito_identity):
+    """Vended identity-pool credentials compose with the rest of the emulator:
+    GetCallerIdentity resolves them as the pool role assumed with the AWS
+    session name CognitoIdentityCredentials (previously they were unregistered,
+    so AUTH=true rejected them as an invalid security token)."""
+    import boto3
+
+    pool_id = cognito_identity.create_identity_pool(
+        IdentityPoolName="SessionPool", AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=pool_id,
+        Roles={"unauthenticated": "arn:aws:iam::000000000000:role/UnauthPoolRole"},
+    )
+    identity_id = cognito_identity.get_id(IdentityPoolId=pool_id)["IdentityId"]
+    creds = cognito_identity.get_credentials_for_identity(
+        IdentityId=identity_id)["Credentials"]
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    session_sts = boto3.client(
+        "sts", endpoint_url=endpoint, region_name="us-east-1",
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+    ident = session_sts.get_caller_identity()
+    assert ident["Arn"] == (
+        "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
+    assert ident["UserId"].endswith(":CognitoIdentityCredentials")

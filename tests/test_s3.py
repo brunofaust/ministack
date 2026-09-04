@@ -5067,8 +5067,9 @@ def test_s3_post_object_field_with_filename_is_not_body(s3):
     """A form field carrying a filename (HTTP libraries set one on every field)
     must NOT be treated as the object body — only the field named `file` is.
     Regression for #1322 defect 1."""
-    import requests
     from collections import OrderedDict
+
+    import requests
     bucket = "intg-s3-post-filename-field"
     s3.create_bucket(Bucket=bucket)
     # `key` is an ordinary form field that carries a filename; `file` is the body.
@@ -6034,7 +6035,7 @@ def test_s3_replication_copies_object_and_stamps_status(s3):
 def test_s3_replication_honors_prefix_and_failure(s3):
     """A key outside the rule's Prefix carries no status; a destination that
     stops being usable stamps the source FAILED."""
-    src, dst = f"qa-repl-src-pref", f"qa-repl-dst-pref"
+    src, dst = "qa-repl-src-pref", "qa-repl-dst-pref"
     for b in (src, dst):
         s3.create_bucket(Bucket=b)
         s3.put_bucket_versioning(Bucket=b, VersioningConfiguration={"Status": "Enabled"})
@@ -6086,3 +6087,62 @@ def test_s3_replication_covers_copy_and_versioned_reads(s3):
     finally:
         _purge_versioned(s3, src)
         _purge_versioned(s3, dst)
+
+
+def test_s3_control_list_tags_uses_the_tag_element_aws_uses(s3):
+    """ListTagsForResource must wrap each tag in <Tag>, not <member>.
+
+    The two tests above assert through boto3, which is lenient about the element
+    name and so passes either way. AWS's own model is explicit — s3control's
+    TagList declares `locationName: "Tag"` — and aws-sdk-go-v2 honours it
+    strictly: given <member> wrappers it parses an empty tag list and reports no
+    tags at all. That is what the Terraform AWS provider uses, so a bucket's
+    `tags_all` refreshes to empty and every plan shows the same tag diff, which
+    survives being applied.
+
+    #447 fixed the TagResource *write* path to read <Tag>; the read path was
+    left emitting <member>. Asserting on the wire format is the only way to
+    catch that from Python.
+    """
+    from urllib.parse import quote
+
+    import requests
+
+    bkt = "intg-s3control-tag-element"
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_tagging(
+        Bucket=bkt, Tagging={"TagSet": [{"Key": "team", "Value": "platform"}]}
+    )
+
+    arn = quote(f"arn:aws:s3:::{bkt}", safe="")
+    resp = requests.get(f"{ENDPOINT}/v20180820/tags/{arn}", timeout=10)
+    assert resp.status_code == 200
+    body = resp.text
+
+    assert "<Tag><Key>team</Key><Value>platform</Value></Tag>" in body, body
+    assert "<member>" not in body, body
+
+
+def test_unicode_s3_object_key(s3):
+    s3.create_bucket(Bucket="unicode-keys")
+    key = "données/résumé/文件.txt"
+    body = "Ünïcödé cöntënt 日本語".encode("utf-8")
+    s3.put_object(Bucket="unicode-keys", Key=key, Body=body)
+    resp = s3.get_object(Bucket="unicode-keys", Key=key)
+    assert resp["Body"].read() == body
+
+
+def test_unicode_s3_metadata(s3):
+    # S3 metadata values must be ASCII per AWS/botocore; encode non-ASCII with percent-encoding
+    from urllib.parse import quote, unquote
+
+    s3.create_bucket(Bucket="unicode-meta")
+    s3.put_object(
+        Bucket="unicode-meta",
+        Key="file.bin",
+        Body=b"data",
+        Metadata={"filename": quote("résumé.pdf"), "author": quote("Ñoño")},
+    )
+    head = s3.head_object(Bucket="unicode-meta", Key="file.bin")
+    assert unquote(head["Metadata"]["filename"]) == "résumé.pdf"
+    assert unquote(head["Metadata"]["author"]) == "Ñoño"

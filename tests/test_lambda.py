@@ -5409,6 +5409,76 @@ def test_poll_sqs_backs_off_failing_esm_without_starving_other_esms(esm_poll_sta
     assert len(_sqs._queues[broken_queue_url]["messages"]) == 1
 
 
+def test_poll_sqs_record_carries_trace_header_and_fifo_attributes(esm_poll_state, monkeypatch):
+    """The record's attributes map carries AWSTraceHeader when the producer set
+    it, and the FIFO sequencing attributes on a FIFO message — the keys AWS
+    documents in the SQS event shape, which X-Ray/OpenTelemetry consumers read.
+    A message without them omits the keys rather than sending empty ones."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    queue_name = "esm-trace-attrs"
+    queue_url = f"http://localhost:4566/000000000000/{queue_name}"
+    trace = "Root=1-6893a2b4-aaaabbbbccccddddeeeeffff;Parent=0123456789abcdef;Sampled=1"
+    base = {
+        "md5_body": "", "sent_at": time.time(), "visible_at": 0,
+        "receive_count": 0, "first_receive_at": None, "message_attributes": {},
+    }
+    _sqs._queues[queue_url] = {
+        "name": queue_name,
+        "messages": [
+            {**base, "id": "msg-plain", "body": "plain", "receipt_handle": "rh-1"},
+            {**base, "id": "msg-traced", "body": "traced", "receipt_handle": "rh-2",
+             "sys": {"SenderId": "000000000000", "SentTimestamp": "0",
+                     "AWSTraceHeader": trace},
+             "group_id": "g1", "dedup_id": "d1", "seq": 18849496460467696128},
+        ],
+        "attributes": {
+            "QueueArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+            "VisibilityTimeout": "0",
+        },
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions["esm-trace-attrs-fn"] = {
+        "config": {
+            "FunctionName": "esm-trace-attrs-fn",
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:esm-trace-attrs-fn",
+        },
+        "versions": {}, "aliases": {},
+    }
+    _lsvc._esms["esm-trace-attrs"] = {
+        "UUID": "esm-trace-attrs",
+        "EventSourceArn": f"arn:aws:sqs:us-east-1:000000000000:{queue_name}",
+        "FunctionName": "esm-trace-attrs-fn",
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+    }
+    events = []
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, event: (events.append(event), {"body": "ok"})[1],
+    )
+
+    _lsvc._poll_sqs()
+
+    records = {r["messageId"]: r for e in events for r in e["Records"]}
+    plain = records["msg-plain"]["attributes"]
+    assert "AWSTraceHeader" not in plain
+    assert "MessageGroupId" not in plain and "SequenceNumber" not in plain
+
+    traced = records["msg-traced"]["attributes"]
+    assert traced["AWSTraceHeader"] == trace
+    assert traced["MessageGroupId"] == "g1"
+    assert traced["MessageDeduplicationId"] == "d1"
+    assert traced["SequenceNumber"] == "18849496460467696128"
+    # The standard four are still present alongside.
+    for key in ("ApproximateReceiveCount", "SentTimestamp", "SenderId",
+                "ApproximateFirstReceiveTimestamp"):
+        assert key in traced, key
+
+
 def test_poll_sqs_retries_esm_after_backoff_expires(esm_poll_state, monkeypatch):
     """Once the cooldown elapses, a previously-failing ESM is retried again —
     the backoff paces retries, it doesn't disable the ESM."""
@@ -10688,3 +10758,580 @@ def test_lambda_invoke_with_response_stream_missing_function_is_plain_error(lam)
     with pytest.raises(ClientError) as exc:
         lam.invoke_with_response_stream(FunctionName="stream-does-not-exist")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_lambda_event_source_mapping_response_carries_its_arn(lam, sqs):
+    """CreateEventSourceMapping / Get / List must return EventSourceMappingArn.
+
+    ListTags already works when given the ARN, but a caller has no way to build
+    that ARN itself — the Terraform provider reads EventSourceMappingArn off the
+    ESM and calls ListTags with it. With the field absent the provider reads no
+    tags at all, so `tags_all` comes back empty and every plan shows a tag diff
+    on every mapping, forever.
+    """
+    code = _zip_lambda("def handler(e,c): return 'ok'")
+    fn = "qa-esm-arn-fn"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": code},
+    )
+    q = sqs.create_queue(QueueName="qa-esm-arn-queue")
+    q_arn = sqs.get_queue_attributes(
+        QueueUrl=q["QueueUrl"], AttributeNames=["QueueArn"]
+    )["Attributes"]["QueueArn"]
+
+    created = lam.create_event_source_mapping(
+        FunctionName=fn, EventSourceArn=q_arn, Tags={"Team": "billing"}
+    )
+    uuid = created["UUID"]
+    expected = f"arn:aws:lambda:us-east-1:000000000000:event-source-mapping:{uuid}"
+
+    assert created.get("EventSourceMappingArn") == expected
+
+    got = lam.get_event_source_mapping(UUID=uuid)
+    assert got.get("EventSourceMappingArn") == expected
+
+    listed = [
+        m for m in lam.list_event_source_mappings(FunctionName=fn)["EventSourceMappings"]
+        if m["UUID"] == uuid
+    ]
+    assert listed and listed[0].get("EventSourceMappingArn") == expected
+
+    # The ARN the response hands back must be the one ListTags accepts, which is
+    # the whole point of returning it.
+    assert lam.list_tags(Resource=created["EventSourceMappingArn"])["Tags"] == {
+        "Team": "billing"
+    }
+@pytest.mark.skipif(
+    os.environ.get("LAMBDA_EXECUTOR", "").lower() != "docker",
+    reason="requires LAMBDA_EXECUTOR=docker and Docker daemon",
+)
+@pytest.mark.parametrize(
+    "declared,expected_machine",
+    [("arm64", "aarch64"), ("x86_64", "x86_64")],
+)
+def test_lambda_runs_on_the_architecture_it_declares(lam, declared, expected_machine):
+    """A function runs as the architecture it declares, not as the host's.
+
+    The container was created without a platform, so Docker used the host's
+    architecture whatever the function said. That is invisible until a layer
+    carries a native wheel: an arm64 layer in an x86_64 container fails at
+    import, naming the library rather than the mismatch.
+
+    The handler reports what it is actually running on, which is the only thing
+    that distinguishes the fix from the bug on a host of either architecture.
+    """
+    fname = f"lam-arch-{declared}-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import platform\n"
+        "def handler(event, context):\n"
+        "    return {'machine': platform.machine()}\n"
+    )
+
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+        Architectures=[declared],
+    )
+
+    try:
+        resp = lam.invoke(FunctionName=fname, Payload=json.dumps({}))
+        payload = json.loads(resp["Payload"].read())
+        if resp.get("FunctionError") and "exec format" in str(payload).lower():
+            pytest.skip(f"host cannot run linux/{declared} — no binfmt handler registered")
+        assert resp.get("FunctionError") is None, payload
+        assert payload.get("machine") == expected_machine, payload
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_lambda_platform_pinned_only_when_architectures_declared(monkeypatch):
+    """The Docker platform is pinned only for an explicitly chosen architecture.
+
+    Every stored config carries Architectures because the x86_64 default is
+    echoed on the wire, so the executor must not read the config alone: pinning
+    the stored default onto functions that never declared one would break arm64
+    hosts without an amd64 binfmt handler, whose functions ran natively before.
+    A record persisted before the marker existed counts as undeclared.
+    """
+    from ministack.services import lambda_svc as _lam
+
+    monkeypatch.setattr(_lam, "_functions", {
+        "declared-arm": {"architectures_declared": True},
+        "declared-x86": {"architectures_declared": True},
+        "undeclared": {"architectures_declared": False},
+        "pre-marker-record": {},
+    })
+
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "declared-arm", "Architectures": ["arm64"]}) == "linux/arm64"
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "declared-x86", "Architectures": ["x86_64"]}) == "linux/amd64"
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "undeclared", "Architectures": ["x86_64"]}) is None
+    assert _lam._declared_docker_platform(
+        {"FunctionName": "pre-marker-record", "Architectures": ["x86_64"]}) is None
+    assert _lam._declared_docker_platform({"FunctionName": "never-created"}) is None
+
+
+# ─────────────────────────────── SnapStart ───────────────────────────────
+
+
+def _snap_wait_active(lam, fname, qualifier=None):
+    kw = {"FunctionName": fname}
+    if qualifier:
+        kw["Qualifier"] = qualifier
+    for _ in range(40):
+        cfg = lam.get_function_configuration(**kw)
+        if cfg["State"] == "Active":
+            return cfg
+        time.sleep(0.25)
+    raise AssertionError(f"{fname}:{qualifier} never became Active")
+
+
+def test_snapstart_defaults_off(lam):
+    fname = f"snap-default-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+    )
+    try:
+        cfg = lam.get_function_configuration(FunctionName=fname)
+        assert cfg["SnapStart"] == {"ApplyOn": "None", "OptimizationStatus": "Off"}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_lifecycle_published_version_reports_on(lam):
+    """AWS: $LATEST echoes ApplyOn with OptimizationStatus Off; publishing
+    takes the snapshot, so the version reports On and transitions
+    Pending → Active."""
+    fname = f"snap-life-{_uuid_mod.uuid4().hex[:8]}"
+    created = lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        assert created["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off",
+        }
+        _snap_wait_active(lam, fname)
+
+        ver = lam.publish_version(FunctionName=fname)
+        assert ver["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "On",
+        }
+        vcfg = _snap_wait_active(lam, fname, qualifier=ver["Version"])
+        assert vcfg["SnapStart"]["OptimizationStatus"] == "On"
+
+        # $LATEST never has a snapshot.
+        latest = lam.get_function_configuration(FunctionName=fname)
+        assert latest["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off",
+        }
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_create_with_publish_stamps_version_one(lam):
+    fname = f"snap-pub1-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+        SnapStart={"ApplyOn": "PublishedVersions"}, Publish=True,
+    )
+    try:
+        vcfg = _snap_wait_active(lam, fname, qualifier="1")
+        assert vcfg["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "On",
+        }
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_update_function_configuration_roundtrip(lam):
+    fname = f"snap-upd-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        updated = lam.update_function_configuration(
+            FunctionName=fname, SnapStart={"ApplyOn": "PublishedVersions"},
+        )
+        assert updated["SnapStart"] == {
+            "ApplyOn": "PublishedVersions", "OptimizationStatus": "Off",
+        }
+        _snap_wait_active(lam, fname)
+        back = lam.update_function_configuration(
+            FunctionName=fname, SnapStart={"ApplyOn": "None"},
+        )
+        assert back["SnapStart"] == {"ApplyOn": "None", "OptimizationStatus": "Off"}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_rejected_for_unsupported_runtime(lam):
+    fname = f"snap-badrt-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        lam.create_function(
+            FunctionName=fname, Runtime="nodejs20.x", Role=_LAMBDA_ROLE,
+            Handler="index.handler", Code={"ZipFile": _make_zip_js(_NODE_CODE)},
+            SnapStart={"ApplyOn": "PublishedVersions"},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # Enabling it later on an unsupported runtime is refused the same way.
+    lam.create_function(
+        FunctionName=fname, Runtime="nodejs20.x", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip_js(_NODE_CODE)},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        with pytest.raises(ClientError) as exc:
+            lam.update_function_configuration(
+                FunctionName=fname, SnapStart={"ApplyOn": "PublishedVersions"},
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_rejected_with_large_ephemeral_storage(lam):
+    fname = f"snap-eph-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        lam.create_function(
+            FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+            Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+            SnapStart={"ApplyOn": "PublishedVersions"},
+            EphemeralStorage={"Size": 1024},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+
+    # Raising ephemeral storage past 512 MB while SnapStart is on is refused.
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(_LAMBDA_CODE)},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        with pytest.raises(ClientError) as exc:
+            lam.update_function_configuration(
+                FunctionName=fname, EphemeralStorage={"Size": 1024},
+            )
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValueException"
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+# ──────────────── docker executor: no extraction-dir leak ────────────────
+
+
+_SPAWN_LEAK_CONFIG = {
+    "FunctionName": "leak-fn", "Runtime": "python3.12",
+    "Handler": "index.handler", "PackageType": "Zip", "Timeout": 3,
+    "MemorySize": 128,
+    "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:leak-fn",
+}
+
+
+def _capture_mkdtemp(monkeypatch):
+    import tempfile as _tf
+    created = []
+    real = _tf.mkdtemp
+
+    def _capture(*a, **kw):
+        d = real(*a, **kw)
+        created.append(d)
+        return d
+
+    monkeypatch.setattr(_tf, "mkdtemp", _capture)
+    return created
+
+
+def test_spawn_failure_on_corrupt_zip_leaves_no_tmpdir(monkeypatch):
+    """A corrupt code zip raises out of the extraction block; the tmpdir made
+    just before must not be orphaned (issue #1600)."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
+    created = _capture_mkdtemp(monkeypatch)
+
+    with pytest.raises(zipfile.BadZipFile):
+        lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), b"this is not a zip")
+
+    assert created, "spawn never created an extraction dir"
+    assert not any(os.path.exists(d) for d in created)
+
+
+def test_spawn_failure_on_docker_api_timeout_leaves_no_tmpdir(monkeypatch):
+    """images.get raising anything other than ImageNotFound (the reported
+    case: a socket read timeout) propagates after extraction; the tmpdir must
+    be removed on the way out (issue #1600)."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    fake_client = MagicMock()
+    fake_client.images.get.side_effect = TimeoutError("Read timed out.")
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+    created = _capture_mkdtemp(monkeypatch)
+
+    with pytest.raises(TimeoutError):
+        lsvc._spawn_lambda_container(
+            dict(_SPAWN_LEAK_CONFIG), _make_zip("def handler(e, c): pass"),
+        )
+
+    assert created, "spawn never created an extraction dir"
+    assert not any(os.path.exists(d) for d in created)
+
+
+def _make_zip_multi(files: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, code in files.items():
+            zf.writestr(name, code)
+    return buf.getvalue()
+
+
+def _snap_wait_state(lam, fname, qualifier, want, attempts=60):
+    for _ in range(attempts):
+        cfg = lam.get_function_configuration(FunctionName=fname, Qualifier=qualifier)
+        if cfg["State"] == want:
+            return cfg
+        time.sleep(0.25)
+    raise AssertionError(f"{fname}:{qualifier} never reached {want} (last: {cfg['State']})")
+
+
+def test_snapstart_publish_initializes_and_pending_version_conflicts(lam):
+    """SnapStart moves init to PublishVersion: while the environment spins up
+    the version is Pending and Invoke answers ResourceConflictException; once
+    Active the first invoke hits the pre-warmed environment."""
+    fname = f"snap-pend-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import time\n"
+        "time.sleep(2)\n"
+        "def handler(event, context):\n"
+        "    return {'ok': True}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _zip_lambda(code)},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        ver = lam.publish_version(FunctionName=fname)
+        assert ver["State"] == "Pending"
+        with pytest.raises(ClientError) as exc:
+            lam.invoke(FunctionName=fname, Qualifier=ver["Version"], Payload=b"{}")
+        assert exc.value.response["Error"]["Code"] == "ResourceConflictException"
+
+        _snap_wait_state(lam, fname, ver["Version"], "Active")
+        resp = lam.invoke(FunctionName=fname, Qualifier=ver["Version"], Payload=b"{}")
+        assert json.loads(resp["Payload"].read()) == {"ok": True}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_publish_fails_version_on_broken_init(lam):
+    """An init that raises fails the *publish*: the version lands State=Failed
+    (AWS's failed-snapshot surface) instead of erroring at first invoke."""
+    fname = f"snap-fail-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _zip_lambda("raise RuntimeError('boom-init')\n")},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        ver = lam.publish_version(FunctionName=fname)
+        cfg = _snap_wait_state(lam, fname, ver["Version"], "Failed")
+        assert cfg["StateReasonCode"] == "FunctionError"
+        assert "boom-init" in cfg["StateReason"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+_SNAP_HOOK_LIB = (
+    "_before = []\n"
+    "_after = []\n"
+    "def register_before_snapshot(func, *args, **kwargs):\n"
+    "    _before.append((func, args, kwargs))\n"
+    "    return func\n"
+    "def register_after_restore(func, *args, **kwargs):\n"
+    "    _after.append((func, args, kwargs))\n"
+    "    return func\n"
+    "def get_before_snapshot():\n"
+    "    return _before\n"
+    "def get_after_restore():\n"
+    "    return _after\n"
+)
+
+_SNAP_HOOK_HANDLER = (
+    "import snapshot_restore_py as srp\n"
+    "CALLS = []\n"
+    "srp.register_before_snapshot(lambda: CALLS.append('before1'))\n"
+    "srp.register_before_snapshot(lambda: CALLS.append('before2'))\n"
+    "srp.register_after_restore(lambda: CALLS.append('after1'))\n"
+    "srp.register_after_restore(lambda: CALLS.append('after2'))\n"
+    "def handler(event, context):\n"
+    "    return {'calls': CALLS}\n"
+)
+
+
+def test_snapstart_runtime_hooks_fire_on_published_version_only(lam):
+    """snapshot-restore-py hooks run during a published version's init —
+    before-snapshot hooks in reverse registration order, after-restore hooks
+    in registration order — and never for $LATEST, which has no snapshot."""
+    fname = f"snap-hook-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip_multi({
+            "index.py": _SNAP_HOOK_HANDLER,
+            "snapshot_restore_py.py": _SNAP_HOOK_LIB,
+        })},
+        SnapStart={"ApplyOn": "PublishedVersions"},
+    )
+    try:
+        _snap_wait_active(lam, fname)
+        ver = lam.publish_version(FunctionName=fname)
+        _snap_wait_state(lam, fname, ver["Version"], "Active")
+
+        resp = lam.invoke(FunctionName=fname, Qualifier=ver["Version"], Payload=b"{}")
+        payload = json.loads(resp["Payload"].read())
+        assert payload == {"calls": ["before2", "before1", "after1", "after2"]}
+
+        latest = lam.invoke(FunctionName=fname, Payload=b"{}")
+        assert json.loads(latest["Payload"].read()) == {"calls": []}
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_snapstart_version_worker_is_reapable():
+    """A published SnapStart version's pre-warmed worker must not be pinned by
+    the keep-the-first-worker rule, or every publish holds a subprocess
+    forever; the $LATEST first worker keeps its exemption."""
+    from ministack.core import lambda_runtime as lr
+
+    def _mk(version, snap_status):
+        cfg = {
+            "FunctionName": "reap-probe", "Runtime": "python3.12",
+            "Version": version,
+            "SnapStart": {"ApplyOn": "PublishedVersions",
+                          "OptimizationStatus": snap_status},
+            "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:reap-probe",
+        }
+        w = lr.Worker("reap-probe", cfg, b"")
+        w.in_use = False
+        w.last_used = time.time() - 10_000
+        return w
+
+    latest = _mk("$LATEST", "Off")
+    snap_ver = _mk("1", "On")
+    with lr._lock:
+        lr._workers["000000000000:us-east-1:reap-probe:$LATEST"] = [latest]
+        lr._workers["000000000000:us-east-1:reap-probe:1"] = [snap_ver]
+    try:
+        lr.reap_idle_workers(ttl=1)
+        with lr._lock:
+            assert lr._workers.get("000000000000:us-east-1:reap-probe:$LATEST") == [latest]
+            assert "000000000000:us-east-1:reap-probe:1" not in lr._workers
+    finally:
+        with lr._lock:
+            lr._workers.pop("000000000000:us-east-1:reap-probe:$LATEST", None)
+            lr._workers.pop("000000000000:us-east-1:reap-probe:1", None)
+
+
+def test_snapstart_pending_version_reprovisions_on_restore():
+    """A SnapStart version persisted while Pending (crash mid-publish) must be
+    re-provisioned by restore_state — otherwise it answers 409 forever."""
+    import copy as _copy
+
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:snap-restore-fn"
+    ver_cfg = {
+        "FunctionName": "snap-restore-fn", "FunctionArn": f"{arn}:1",
+        "Runtime": "python3.12", "Handler": "index.handler",
+        "MemorySize": 128, "Timeout": 3, "Version": "1",
+        "State": "Pending", "StateReason": "The function is being created.",
+        "StateReasonCode": "Creating",
+        "SnapStart": {"ApplyOn": "PublishedVersions", "OptimizationStatus": "On"},
+        "PackageType": "Zip",
+    }
+    func = {
+        "config": {**_copy.deepcopy(ver_cfg), "FunctionArn": arn,
+                   "Version": "$LATEST", "State": "Active",
+                   "SnapStart": {"ApplyOn": "PublishedVersions",
+                                 "OptimizationStatus": "Off"}},
+        "code_zip": _make_zip("def handler(e, c):\n    return {}\n"),
+        "versions": {"1": {"config": ver_cfg,
+                           "code_zip": _make_zip("def handler(e, c):\n    return {}\n")}},
+        "next_version": 2, "tags": {}, "aliases": {},
+        "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+        "event_invoke_config": None, "event_invoke_configs": {},
+        "concurrency": None, "provisioned_concurrency": {},
+    }
+    key = ("000000000000", "us-east-1", "snap-restore-fn")
+    try:
+        lsvc.restore_state({"functions": {"snap-restore-fn": func}})
+        for _ in range(60):
+            state = ver_cfg["State"]
+            if state != "Pending":
+                break
+            time.sleep(0.25)
+        assert ver_cfg["State"] == "Active", f"stuck in {ver_cfg['State']}"
+    finally:
+        lsvc._functions._data.pop(key, None)
+        from ministack.core import lambda_runtime as _lr
+        _lr.invalidate_worker("snap-restore-fn", account="000000000000",
+                              region="us-east-1")
+
+
+def test_lambda_rie_sentinel_arn_resolves_in_caller_scope():
+    """An ARN carrying the RIE's hardcoded scope (us-east-1 / 012345678912 —
+    what context.invoked_function_arn reports inside an unshimmed docker
+    container) resolves as "self": in the caller's own account and region."""
+    account_id = "555566667777"
+    function_name = f"rie-sentinel-{_uuid_mod.uuid4().hex}"
+    real_arn = f"arn:aws:lambda:eu-central-1:{account_id}:function:{function_name}"
+    sentinel_arn = f"arn:aws:lambda:us-east-1:012345678912:function:{function_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+
+    lsvc._functions.set_scoped(
+        account_id, "eu-central-1", function_name,
+        {
+            "config": {"FunctionName": function_name, "FunctionArn": real_arn},
+            "versions": {},
+            "aliases": {},
+        },
+    )
+    try:
+        set_request_account_id(account_id)
+        set_request_region("eu-central-1")
+
+        record, config, resolved_name = lsvc._get_func_record_for_ref(sentinel_arn)
+        assert record is not None
+        assert resolved_name == function_name
+        assert config["FunctionArn"] == real_arn
+
+        base_record, base_config, _ = lsvc._get_base_func_record_for_ref(sentinel_arn)
+        assert base_record is not None
+        assert base_config["FunctionArn"] == real_arn
+
+        # Any OTHER foreign account is still rejected — the fallback is only
+        # for the exact RIE-manufactured scope.
+        other = f"arn:aws:lambda:eu-central-1:999999999999:function:{function_name}"
+        rejected, _, _ = lsvc._get_func_record_for_ref(other)
+        assert rejected is None
+    finally:
+        lsvc._functions.pop_scoped(account_id, "eu-central-1", function_name, None)
+        set_request_account_id(original_account)
+        set_request_region(original_region)

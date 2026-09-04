@@ -194,6 +194,20 @@ AGENT_IMAGE = "public.ecr.aws/codebuild/local-builds:latest"
 # agent container; not an AWS concept, so not configurable.
 WORKSPACE = "/tmp/ministack-codebuild"
 
+# Extra `docker run` flags for the AGENT container, with the same syntax and the
+# same parser as LAMBDA_DOCKER_FLAGS.
+#
+# The agent's entire job is to drive the Docker socket it is handed, so on an
+# SELinux-enforcing host it needs `--security-opt label=disable` to function at
+# all: it is otherwise denied both the socket connect and its own env-file
+# mount, and `:z` does not help because relabelling the socket file is a
+# different permission from connecting to it.
+#
+# Without this hook there is no configuration that makes CodeBuild work under
+# SELinux, and the failure is silent — the agent exits 0 after starting nothing,
+# and _execute_build reads that exit code as SUCCEEDED.
+CODEBUILD_DOCKER_FLAGS = os.environ.get("CODEBUILD_DOCKER_FLAGS", "")
+
 _PHASE_COMPLETE_RE = re.compile(r"Phase complete: ([A-Z_]+) State: ([A-Z_]+)")
 
 _docker = None
@@ -391,8 +405,7 @@ def _execute_build(build_id, project):
         _record_phase(build, "QUEUED", "SUCCEEDED")
         build["buildStatus"] = "IN_PROGRESS"
 
-        container = client.containers.run(
-            AGENT_IMAGE,
+        run_kwargs = dict(
             detach=True,
             environment={
                 "LOCAL_AGENT_IMAGE_NAME": AGENT_IMAGE,
@@ -411,6 +424,21 @@ def _execute_build(build_id, project):
             },
             labels=container_reaper.own_labels("codebuild", **{"ministack.codebuild.build": build_id}),
         )
+
+        if CODEBUILD_DOCKER_FLAGS:
+            # Imported here rather than at module scope: the services package
+            # loads its modules eagerly, and a top-level cross-service import
+            # would order codebuild after lambda.
+            from ministack.services.lambda_svc import _parse_docker_flags
+
+            extra = _parse_docker_flags(CODEBUILD_DOCKER_FLAGS)
+            # The volumes above are what the agent contract requires; a --volume
+            # in the flags would silently replace them, so it is dropped.
+            extra.pop("mounts", None)
+            run_kwargs["environment"].update(extra.pop("environment", {}))
+            run_kwargs.update(extra)
+
+        container = client.containers.run(AGENT_IMAGE, **run_kwargs)
     except Exception:
         logger.exception("Failed to start build %s", build_id)
         _finish_build(build, "FAULT")
@@ -462,7 +490,19 @@ def _execute_build(build_id, project):
             _finish_build(build, "TIMED_OUT")
         else:
             exit_code = container.wait().get("StatusCode", 1)
-            _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
+            if exit_code == 0 and not saw_phase:
+                # The agent exits 0 even when it started nothing (e.g. it was
+                # denied the Docker socket under SELinux), so a bare exit code
+                # would report a build that never ran as SUCCEEDED. No "Phase
+                # complete" line means no build phase executed: that is an
+                # infrastructure failure, not a build result.
+                logger.error(
+                    "Build %s: agent exited 0 without completing any phase; "
+                    "reporting FAULT", build_id,
+                )
+                _finish_build(build, "FAULT")
+            else:
+                _finish_build(build, "SUCCEEDED" if exit_code == 0 else "FAILED")
         logger.info("Build %s finished: %s", build_id, build["buildStatus"])
     except Exception:
         if _stop_requested(build_id):

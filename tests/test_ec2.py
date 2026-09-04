@@ -541,9 +541,41 @@ def test_ec2_run_multiple_instances(ec2):
     ec2.terminate_instances(InstanceIds=ids)
 
 def test_ec2_describe_images(ec2):
-    resp = ec2.describe_images(Owners=["self"])
-    assert len(resp["Images"]) >= 1
+    resp = ec2.describe_images()
+    assert len(resp["Images"]) >= 3
     assert all("ImageId" in img for img in resp["Images"])
+
+
+def test_ec2_describe_images_amazon_owner_matches_aws_shape(ec2):
+    """Owners=["amazon"] selects the Amazon-published images with their real
+    publishing accounts and ImageOwnerAlias, as on AWS — a Terraform aws_ami
+    data source with owners = ["amazon"] must find them."""
+    amazon = ec2.describe_images(Owners=["amazon"])["Images"]
+    names = {img["Name"] for img in amazon}
+    assert any(n.startswith("amzn2-ami-hvm") for n in names)
+    assert any(n.startswith("Windows_Server") for n in names)
+    assert not any("ubuntu" in n for n in names)
+    by_name = {img["Name"]: img for img in amazon}
+    al2 = next(img for n, img in by_name.items() if n.startswith("amzn2-ami-hvm"))
+    assert al2["OwnerId"] == "137112412989"
+    assert al2["ImageOwnerAlias"] == "amazon"
+
+    # Canonical's Ubuntu carries its real account and no amazon alias.
+    ubuntu = ec2.describe_images(Owners=["099720109477"])["Images"]
+    assert any("ubuntu" in img["Name"] for img in ubuntu)
+    assert all("ImageOwnerAlias" not in img or img["ImageOwnerAlias"] != "amazon"
+               for img in ubuntu)
+
+    # owner-alias filter, same selection.
+    via_filter = ec2.describe_images(
+        Filters=[{"Name": "owner-alias", "Values": ["amazon"]}])["Images"]
+    assert {img["ImageId"] for img in via_filter} == {img["ImageId"] for img in amazon}
+
+    # The seeded public images are not the caller's: self selects only
+    # registered/created images, empty when there are none — as on AWS.
+    mine = ec2.describe_images(Owners=["self"])["Images"]
+    assert not any(img["Name"].startswith(("amzn2-ami-hvm", "Windows_Server"))
+                   or "ubuntu" in img["Name"] for img in mine)
 
 
 def test_ec2_describe_images_has_root_device_and_block_mappings(ec2):
@@ -4254,14 +4286,18 @@ def test_ec2_image_with_an_entrypoint_is_left_alone(monkeypatch):
 
 
 def test_ec2_describe_images_scopes_by_owner(ec2):
-    """Owner.N: account ids and `self` select ours; an alias or another account selects nothing."""
+    """Owner.N: account ids and `self` select ours; `amazon` selects the
+    Amazon-published public images (their real publishing accounts, as on
+    AWS); an alias nothing carries, or a foreign account, selects nothing."""
     ami = ec2.register_image(Name=f"owned-{_uuid_mod.uuid4().hex[:8]}",
                              ImageLocation="alpine:3")["ImageId"]
     try:
         assert ami in [i["ImageId"] for i in ec2.describe_images(Owners=["self"])["Images"]]
         assert ami in [i["ImageId"] for i in
                        ec2.describe_images(Owners=["000000000000"])["Images"]]
-        for scope in (["amazon"], ["aws-marketplace"], ["123456789012"]):
+        amazon = [i["ImageId"] for i in ec2.describe_images(Owners=["amazon"])["Images"]]
+        assert "ami-0abcdef1234567890" in amazon and ami not in amazon
+        for scope in (["aws-marketplace"], ["123456789012"]):
             assert ec2.describe_images(Owners=scope)["Images"] == [], scope
     finally:
         ec2.deregister_image(ImageId=ami)
@@ -4278,3 +4314,62 @@ def test_ec2_describe_images_scopes_by_executable_by(ec2):
         assert ec2.describe_images(ExecutableUsers=["self"])["Images"] == []
     finally:
         ec2.deregister_image(ImageId=ami)
+
+
+def test_ec2_cross_account_ami_sharing():
+    """The normal AMI sharing flow: launch permissions make another account's
+    image visible (owner preserved), Group=all makes it public, reset revokes."""
+    import uuid as _uuid
+
+    def _acct(account):
+        return boto3.client(
+            "ec2", endpoint_url=ENDPOINT, region_name="us-east-1",
+            aws_access_key_id=account, aws_secret_access_key="test",
+        )
+
+    owner = _acct("111100002222")
+    consumer = _acct("333300004444")
+    name = f"xacct-share-{_uuid.uuid4().hex[:8]}"
+    ami = owner.register_image(Name=name, ImageLocation="alpine:3.20")["ImageId"]
+
+    def _consumer_sees():
+        images = consumer.describe_images(
+            Owners=["111100002222"],
+            Filters=[{"Name": "name", "Values": [name]}])["Images"]
+        return images
+
+    assert _consumer_sees() == []
+
+    owner.modify_image_attribute(
+        ImageId=ami,
+        LaunchPermission={"Add": [{"UserId": "333300004444"}]})
+    shared = _consumer_sees()
+    assert [i["ImageId"] for i in shared] == [ami]
+    assert shared[0]["OwnerId"] == "111100002222"
+    assert shared[0]["Public"] is False
+
+    by_self = consumer.describe_images(ExecutableUsers=["self"])["Images"]
+    assert ami in [i["ImageId"] for i in by_self]
+
+    perms = owner.describe_image_attribute(
+        ImageId=ami, Attribute="launchPermission")["LaunchPermissions"]
+    assert perms == [{"UserId": "333300004444"}]
+
+    owner.modify_image_attribute(
+        ImageId=ami, LaunchPermission={"Add": [{"Group": "all"}]})
+    assert consumer.describe_images(ImageIds=[ami])["Images"][0]["Public"] is True
+
+    owner.reset_image_attribute(ImageId=ami, Attribute="launchPermission")
+    assert _consumer_sees() == []
+
+    # The consumer never gains modify rights: the image is not in their scope.
+    from botocore.exceptions import ClientError
+    import pytest as _pytest
+    with _pytest.raises(ClientError) as exc:
+        consumer.modify_image_attribute(
+            ImageId=ami, LaunchPermission={"Add": [{"Group": "all"}]})
+    # Real EC2 answers a non-owner with AuthFailure "Not authorized for image:...".
+    assert exc.value.response["Error"]["Code"] == "AuthFailure"
+    assert f"Not authorized for image:{ami}" in exc.value.response["Error"]["Message"]
+
+    owner.deregister_image(ImageId=ami)

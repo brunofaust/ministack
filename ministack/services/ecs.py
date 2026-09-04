@@ -44,6 +44,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 from ministack.services import ecs_metadata, secretsmanager
 
@@ -83,6 +84,10 @@ _docker = None
 # exit on their own and accumulate indefinitely. A background daemon thread
 # sweeps them every ECS_REAP_INTERVAL_SECONDS (default 60).
 _ECS_REAP_INTERVAL = int(os.environ.get("ECS_REAP_INTERVAL_SECONDS", "60"))
+# Give the process a moment to finish binding before pulling images and starting
+# containers for restored services.
+_ECS_RESTORE_RECONCILE_DELAY = float(
+    os.environ.get("ECS_RESTORE_RECONCILE_DELAY_SECONDS", "2"))
 _ecs_reaper_started = False
 _ecs_reaper_lock = threading.Lock()
 
@@ -238,10 +243,59 @@ def restore_state(data):
             _tasks.set_scoped(get_account_id(), region, arn, restored_task)
 
 
+def _reconcile_restored_services():
+    """Relaunch the tasks of every ACTIVE service after a restore.
+
+    restore_state marks each restored task STOPPED — its container went with the
+    process that ran it. Without this the service still reports its persisted
+    runningCount while nothing is running, and any load balancer in front of it
+    keeps forwarding to addresses nothing is listening on. Real ECS relaunches:
+    keeping desiredCount satisfied is the service scheduler's whole job.
+
+    Failures are logged and skipped rather than raised, so one unreachable image
+    cannot stop the remaining services from coming back.
+    """
+    # This runs on a daemon thread with no request scope, so plain .items()
+    # would only see the default account and region — a service persisted under
+    # any other tenant would never come back. Walk every stored service and pin
+    # its own account and region around the relaunch.
+    for (account_id, region, svc_key), svc in _services.all_items():
+        if not isinstance(svc, dict) or svc.get("status") != "ACTIVE":
+            continue
+        cluster_name = svc_key.split("/", 1)[0]
+        try:
+            with request_scope(account_id, region):
+                _reconcile_service_tasks(cluster_name, svc_key)
+        except Exception as exc:
+            logger.warning(
+                "ECS: could not relaunch service %s after restore: %s",
+                svc.get("serviceName", svc_key), exc)
+
+
+def _start_restored_service_reconciler():
+    """Run the reconcile off the import path.
+
+    restore_state runs at import; pulling images and starting containers there
+    would block startup behind the Docker daemon, so this happens on a daemon
+    thread once the process is up.
+    """
+    def _run():
+        time.sleep(_ECS_RESTORE_RECONCILE_DELAY)
+        try:
+            _reconcile_restored_services()
+        except Exception:
+            logger.exception("ECS: restored-service reconcile failed")
+
+    threading.Thread(
+        target=_run, daemon=True, name="ministack-ecs-restore-reconcile"
+    ).start()
+
+
 try:
     _restored = load_state("ecs")
     if _restored:
         restore_state(_restored)
+        _start_restored_service_reconciler()
 except Exception:
     import logging
     logging.getLogger(__name__).exception(
@@ -1202,6 +1256,19 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
     cap_add = caps.get("Add") or caps.get("add") or []
     binds = _docker_binds_from_taskdef(td, cdef)
 
+    # A task definition's runtimePlatform says which architecture its image is
+    # built for, and AWS launches it on that. Docker otherwise picks the host's,
+    # so an ARM64 task definition on an x86_64 host produced a container that
+    # could not execute its own entrypoint — and the task still reported as
+    # started, because creating the container is what succeeds.
+    rp = td.get("runtimePlatform") or {}
+    cpu_arch = (rp.get("cpuArchitecture") or rp.get("CpuArchitecture") or "").upper()
+    docker_platform = (
+        "linux/arm64" if cpu_arch == "ARM64"
+        else "linux/amd64" if cpu_arch == "X86_64"
+        else None
+    )
+
     kwargs = dict(
         detach=True,
         environment=env,
@@ -1232,6 +1299,12 @@ def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
             # Docker-Desktop fallback: when we couldn't discover Ministack's
             # IP on the shared network, route via host.docker.internal.
             kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
+
+    # Only when the task definition asked for one. An absent runtimePlatform
+    # means no preference was expressed, and the host default is then correct.
+    if docker_platform:
+        kwargs["platform"] = docker_platform
+
     return kwargs
 
 
@@ -1436,7 +1509,56 @@ def _run_task(data):
                 )
 
                 try:
-                    container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    try:
+                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    except Exception as exc:
+                        # Best-effort platform pin: a host that cannot run the
+                        # declared runtimePlatform (no emulation handler, or a
+                        # cached image of the other architecture) logs the
+                        # mismatch and runs on its own architecture, as every
+                        # setup did before the pin existed.
+                        pinned = run_kwargs.pop("platform", None)
+                        if not pinned:
+                            raise
+                        logger.warning(
+                            "ECS: task definition declares %s but this host cannot "
+                            "run it (%s); running %s on the host architecture "
+                            "instead. Install a binfmt/qemu handler for real "
+                            "cross-architecture execution.",
+                            pinned, exc, cdef.get("image"))
+                        container = docker_client.containers.run(cdef["image"], **run_kwargs)
+                    pinned = run_kwargs.get("platform")
+                    if pinned:
+                        # No emulation handler makes the container start cleanly
+                        # and die on its first instruction — docker raises
+                        # nothing. Only an exec-format death triggers the
+                        # fallback: an instant exit for any other reason is the
+                        # task's own business.
+                        time.sleep(0.25)
+                        exec_dead = False
+                        try:
+                            container.reload()
+                            exec_dead = (container.status == "exited"
+                                         and b"exec format error"
+                                         in (container.logs(tail=5) or b""))
+                        except Exception:
+                            # The death-check is best-effort; if it cannot even
+                            # be performed, keep the container that started.
+                            exec_dead = False
+                        if exec_dead:
+                            logger.warning(
+                                "ECS: task definition declares %s but this host "
+                                "cannot execute it; running %s on the host "
+                                "architecture instead. Install a binfmt/qemu "
+                                "handler for real cross-architecture execution.",
+                                pinned, cdef.get("image"))
+                            try:
+                                container.remove(force=True)
+                            except Exception:
+                                pass
+                            run_kwargs.pop("platform", None)
+                            container = docker_client.containers.run(
+                                cdef["image"], **run_kwargs)
                     task["_docker_ids"].append(container.id)
                     ecs_metadata.set_docker_id(metadata_token, container.id)
                     task.setdefault("_metadata_tokens", []).append(metadata_token)

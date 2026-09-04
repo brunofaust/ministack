@@ -1692,6 +1692,102 @@ def test_ecs_sync_service_targets_does_not_publish_a_stale_view(monkeypatch):
     assert final == ["10.3.0.1"], f"a stale view was published: {final}"
 
 
+def test_ecs_restored_services_relaunch_their_tasks(monkeypatch):
+    """A service must satisfy desiredCount again after a restore — in every
+    account and region, not only the default.
+
+    restore_state marks every restored task STOPPED, because its container is
+    gone with the process that ran it. Nothing then reconciles the services, so
+    a restarted ministack reports runningCount from the persisted record while
+    no container exists, and the load balancer keeps forwarding to addresses
+    nothing is listening on. Real ECS relaunches: the service scheduler exists
+    to keep desiredCount satisfied.
+
+    The reconciler runs on a daemon thread with no request scope, so it must
+    walk the stores with all_items() and pin each service's own account and
+    region — a plain .items() only ever saw the default tenant, and a service
+    persisted under any other account or region never came back.
+    """
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+    )
+    from ministack.services import ecs as _ecs
+
+    launched = []
+
+    def _capture_run_task(data):
+        # Record the scope the reconciler pinned: the spawned task must land in
+        # the service's own account and region.
+        launched.append({**data, "_scope": (get_account_id(), get_region())})
+
+    monkeypatch.setattr(_ecs, "_run_task", _capture_run_task)
+    monkeypatch.setattr(_ecs, "_clusters", {"c1": {"clusterName": "c1"}})
+
+    task_defs = AccountRegionScopedDict()
+    task_defs.set_scoped(
+        "000000000000", "us-east-1", "web:1",
+        {"taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1",
+         "family": "web"})
+    task_defs.set_scoped(
+        "222222222222", "eu-west-1", "api:1",
+        {"taskDefinitionArn": "arn:aws:ecs:eu-west-1:222222222222:task-definition/api:1",
+         "family": "api"})
+    monkeypatch.setattr(_ecs, "_task_defs", task_defs)
+
+    services = AccountRegionScopedDict()
+    services.set_scoped(
+        "000000000000", "us-east-1", "c1/web",
+        {"serviceName": "web", "status": "ACTIVE", "desiredCount": 2,
+         "taskDefinition": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1",
+         "clusterArn": "arn:cluster/c1",
+         "launchType": "FARGATE", "deployments": [{"runningCount": 2}]})
+    # An inactive service must not be relaunched.
+    services.set_scoped(
+        "000000000000", "us-east-1", "c1/old",
+        {"serviceName": "old", "status": "INACTIVE", "desiredCount": 3,
+         "taskDefinition": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1",
+         "clusterArn": "arn:cluster/c1",
+         "launchType": "FARGATE", "deployments": []})
+    # A service persisted by another tenant, in another region.
+    services.set_scoped(
+        "222222222222", "eu-west-1", "c2/api",
+        {"serviceName": "api", "status": "ACTIVE", "desiredCount": 1,
+         "taskDefinition": "arn:aws:ecs:eu-west-1:222222222222:task-definition/api:1",
+         "clusterArn": "arn:cluster/c2",
+         "launchType": "FARGATE", "deployments": [{"runningCount": 1}]})
+    monkeypatch.setattr(_ecs, "_services", services)
+
+    # What restore_state leaves behind: the tasks exist but are STOPPED.
+    tasks = AccountRegionScopedDict()
+    tasks.set_scoped(
+        "000000000000", "us-east-1", "arn:task/1",
+        {"group": "service:web", "clusterArn": "arn:cluster/c1",
+         "lastStatus": "STOPPED",
+         "taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1"})
+    tasks.set_scoped(
+        "000000000000", "us-east-1", "arn:task/2",
+        {"group": "service:web", "clusterArn": "arn:cluster/c1",
+         "lastStatus": "STOPPED",
+         "taskDefinitionArn": "arn:aws:ecs:us-east-1:000000000000:task-definition/web:1"})
+    monkeypatch.setattr(_ecs, "_tasks", tasks)
+
+    _ecs._reconcile_restored_services()
+
+    by_group = {c["group"]: c for c in launched}
+    assert "service:old" not in by_group
+    assert set(by_group) == {"service:web", "service:api"}, \
+        f"expected both ACTIVE services relaunched, got {launched}"
+
+    web = by_group["service:web"]
+    assert web["count"] == 2, "both stopped tasks must be replaced"
+    assert web["_scope"] == ("000000000000", "us-east-1")
+
+    api = by_group["service:api"]
+    assert api["count"] == 1
+    assert api["_scope"] == ("222222222222", "eu-west-1"), \
+        "the relaunch must run pinned to the service's own account and region"
 def test_ecs_service_reconcile_spares_foreign_targets(monkeypatch):
     """A service withdraws only its own registrations: targets registered by
     hand (or by another service sharing the group) survive its reconcile and
@@ -1749,3 +1845,40 @@ def test_ecs_service_reconcile_spares_foreign_targets(monkeypatch):
 
     _ecs._delete_service({"cluster": "lb-shared-c", "service": "lb-shared-svc", "force": True})
     assert _alb._targets.get(tg_arn) == [{"Id": "10.9.9.9", "Port": 80}]
+@pytest.mark.parametrize(
+    "cpu_architecture,expected_platform",
+    [
+        ("ARM64", "linux/arm64"),
+        ("X86_64", "linux/amd64"),
+        (None, None),
+    ],
+)
+def test_ecs_task_runs_on_its_declared_runtime_platform(cpu_architecture, expected_platform):
+    """A task definition's runtimePlatform decides the container's platform.
+
+    It was stored and never read, so Docker chose the host's architecture. An
+    ARM64 task definition on an x86_64 host then started a container that could
+    not execute its own entrypoint — and the task still reported as started,
+    because creating the container is the part that succeeds.
+
+    An absent runtimePlatform must stay absent rather than defaulting to the
+    host explicitly, so existing single-architecture setups are untouched.
+    """
+    td = {"networkMode": "bridge"}
+    if cpu_architecture:
+        td["runtimePlatform"] = {"cpuArchitecture": cpu_architecture}
+
+    kwargs = ecs_service._build_run_kwargs(
+        {"name": "app", "image": "busybox:latest"},
+        td,
+        {},                      # env
+        {},                      # port_bindings
+        None,                    # ecs_network
+        False,                   # host_mode
+        "task1234",              # task_id
+        "arn:aws:ecs:us-east-1:000000000000:task/c/task1234",
+        None,                    # ministack_net_ip
+        "arn:aws:ecs:us-east-1:000000000000:cluster/c",
+    )
+
+    assert kwargs.get("platform") == expected_platform

@@ -1967,3 +1967,164 @@ def test_kms_create_key_rsa_3072_signs(kms_client):
         Signature=signature,
         SigningAlgorithm="RSASSA_PSS_SHA_256",
     )["SignatureValid"]
+
+
+def test_kms_generate_random_returns_requested_bytes(kms_client):
+    """GenerateRandom is keyless; the response Plaintext is exactly the
+    requested number of bytes, and two calls do not repeat."""
+    first = kms_client.generate_random(NumberOfBytes=32)["Plaintext"]
+    second = kms_client.generate_random(NumberOfBytes=32)["Plaintext"]
+    assert len(first) == 32
+    assert len(second) == 32
+    assert first != second
+    assert len(kms_client.generate_random(NumberOfBytes=1)["Plaintext"]) == 1
+    assert len(kms_client.generate_random(NumberOfBytes=1024)["Plaintext"]) == 1024
+
+
+def test_kms_generate_random_validation(kms_client):
+    """An omitted or out-of-range NumberOfBytes is a ValidationException, a
+    CustomKeyStoreId a CustomKeyStoreNotFoundException — botocore validates the
+    range client-side, so the raw-request path is exercised via the wire."""
+    import requests as _requests
+
+    def _raw(payload):
+        return _requests.post(
+            ENDPOINT,
+            json=payload,
+            headers={
+                "x-amz-target": "TrentService.GenerateRandom",
+                "content-type": "application/x-amz-json-1.1",
+            },
+            timeout=10,
+        )
+
+    resp = _raw({})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+    assert resp.json().get("message") == "NumberOfBytes is required."
+
+    resp = _raw({"NumberOfBytes": 0})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+    assert resp.json().get("message") == (
+        "1 validation error detected: Value '0' at 'numberOfBytes' failed to "
+        "satisfy constraint: Member must have value greater than or equal to 1"
+    )
+
+    resp = _raw({"NumberOfBytes": 2000})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+
+    resp = _raw({"NumberOfBytes": 16, "CustomKeyStoreId": "cks-does-not-exist"})
+    assert resp.status_code == 400
+    assert "CustomKeyStoreNotFoundException" in resp.json().get("__type", "")
+
+
+def test_kms_generate_random_refuses_a_recipient(kms_client):
+    """The Nitro-enclave Recipient parameter is refused, not silently ignored.
+
+    A caller sending Recipient expects CiphertextForRecipient and a null
+    Plaintext; MiniStack cannot encrypt to an enclave attestation key, and
+    answering Plaintext anyway is a response shape the request never gets from
+    the real service.
+    """
+    with pytest.raises(ClientError) as e:
+        kms_client.generate_random(
+            NumberOfBytes=32,
+            Recipient={
+                "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256",
+                "AttestationDocument": b"not-a-real-attestation-document",
+            },
+        )
+    assert e.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+# ---------------------------------------------------------------------------
+# Multi-Region keys and ReplicateKey
+# ---------------------------------------------------------------------------
+
+def test_kms_multi_region_key_metadata(kms_client):
+    """A MultiRegion key carries the mrk- id prefix and reports its
+    MultiRegionConfiguration; a plain key reports MultiRegion false."""
+    plain = kms_client.create_key()["KeyMetadata"]
+    assert plain["MultiRegion"] is False
+    assert "MultiRegionConfiguration" not in plain
+
+    meta = kms_client.create_key(MultiRegion=True)["KeyMetadata"]
+    assert meta["KeyId"].startswith("mrk-")
+    assert meta["MultiRegion"] is True
+    cfg = meta["MultiRegionConfiguration"]
+    assert cfg["MultiRegionKeyType"] == "PRIMARY"
+    assert cfg["PrimaryKey"]["Region"] == "us-east-1"
+    assert cfg["PrimaryKey"]["Arn"].endswith(f":key/{meta['KeyId']}")
+    assert cfg["ReplicaKeys"] == []
+
+
+def test_kms_replicate_key_cross_region_decrypt():
+    """ReplicateKey creates a same-id replica in the target region sharing the
+    key material, so a ciphertext produced against the primary decrypts
+    against the replica — the S3 SSE-KMS cross-region case."""
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+
+    resp = east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2",
+                              Description="the west copy")
+    replica = resp["ReplicaKeyMetadata"]
+    assert replica["KeyId"] == key_id
+    assert replica["Arn"] == f"arn:aws:kms:us-west-2:000000000000:key/{key_id}"
+    assert replica["MultiRegionConfiguration"]["MultiRegionKeyType"] == "REPLICA"
+    assert replica["Description"] == "the west copy"
+    assert resp["ReplicaPolicy"]
+    assert resp["ReplicaTags"] == []
+
+    # Both members report the full topology.
+    for client, kind in ((east, "PRIMARY"), (west, "REPLICA")):
+        cfg = client.describe_key(KeyId=key_id)["KeyMetadata"]["MultiRegionConfiguration"]
+        assert cfg["MultiRegionKeyType"] == kind
+        assert cfg["PrimaryKey"]["Region"] == "us-east-1"
+        assert [r["Region"] for r in cfg["ReplicaKeys"]] == ["us-west-2"]
+
+    # Shared key material: encrypt east, decrypt west.
+    blob = east.encrypt(KeyId=key_id, Plaintext=b"cross-region")["CiphertextBlob"]
+    out = west.decrypt(CiphertextBlob=blob)
+    assert out["Plaintext"] == b"cross-region"
+    assert out["KeyId"].endswith(f":key/{key_id}")
+
+    # The same region twice is a conflict.
+    with pytest.raises(ClientError) as ei:
+        east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    assert ei.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+
+def test_kms_replicate_key_refusals(kms_client):
+    """A plain key cannot be replicated, and a replica cannot be the source."""
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+
+    plain = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as ei:
+        kms_client.replicate_key(KeyId=plain, ReplicaRegion="us-west-2")
+    assert ei.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    with pytest.raises(ClientError) as ei:
+        west.replicate_key(KeyId=key_id, ReplicaRegion="eu-west-1")
+    assert ei.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def test_kms_primary_with_replicas_waits_on_deletion():
+    """Scheduling deletion on a primary with a live replica lands
+    PendingReplicaDeletion; once the replica is scheduled away, the primary
+    moves on to PendingDeletion."""
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+
+    resp = east.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    assert resp["KeyState"] == "PendingReplicaDeletion"
+    meta = east.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeyState"] == "PendingReplicaDeletion"
+    assert meta["PendingDeletionWindowInDays"] == 7
+
+    west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    assert east.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingDeletion"
