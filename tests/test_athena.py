@@ -784,3 +784,27 @@ def test_athena_mixed_glue_and_s3_uri(athena, glue, monkeypatch, tmp_path):
 @pytest.fixture(scope="module", autouse=True)
 def _create_s3_results_bucket(s3):
     s3.create_bucket(Bucket="athena-results")
+
+
+def test_athena_managed_results_workgroup_creates_default_bucket(athena, s3):
+    """A managed-results workgroup query succeeds: the emulator creates the default results bucket itself."""
+    name = f"managed-{_uuid_mod.uuid4().hex[:8]}"
+    athena.create_work_group(
+        Name=name,
+        Configuration={"EnforceWorkGroupConfiguration": True, "ManagedQueryResultsConfiguration": {"Enabled": True}},
+    )
+    query_id = athena.start_query_execution(
+        QueryString="SELECT 42 AS answer", QueryExecutionContext={"Database": "default"}, WorkGroup=name
+    )["QueryExecutionId"]
+    status = None
+    for _ in range(20):
+        status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]
+        if status["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.2)
+    assert status["State"] == "SUCCEEDED", status.get("StateChangeReason")
+    rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+    assert rows[-1]["Data"][0]["VarCharValue"] == "42"
+    location = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["ResultConfiguration"]["OutputLocation"]
+    bucket = location.removeprefix("s3://").split("/", 1)[0]
+    assert bucket in {b["Name"] for b in s3.list_buckets()["Buckets"]}

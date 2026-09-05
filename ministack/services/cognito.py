@@ -3364,14 +3364,12 @@ def _admin_initiate_auth(data):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
         if not refresh_token:
             return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
+        # Decode stub token to find the correct user by sub. A token this pool
+        # never issued is rejected like real Cognito does; the old fallback to
+        # the first pool user minted a session for whoever was created first.
         user = _user_from_token(refresh_token, pool)
         if not user:
-            # Fall back to first user if token can't be decoded (e.g. externally issued token)
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
+            return error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
         if _refresh_token_revoked(refresh_token, user):
             return error_response_json("NotAuthorizedException",
                                        "Refresh Token has been revoked", 400)
@@ -3606,13 +3604,12 @@ def _refresh_auth_result(pool, pid, cid, refresh_token):
     by GetTokensFromRefreshToken so both mint tokens identically."""
     if not refresh_token:
         return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-    # Decode stub token to find the correct user by sub.
+    # Decode stub token to find the correct user by sub; a token this pool never
+    # issued is rejected (real Cognito does the same, and the previous fallback to
+    # the first pool user minted a session for an arbitrary account).
     user = _user_from_token(refresh_token, pool)
     if not user:
-        users = list(pool["_users"].values())
-        if not users:
-            return None, error_response_json("NotAuthorizedException", "No users in pool.", 400)
-        user = users[0]
+        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
     if _refresh_token_revoked(refresh_token, user):
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has been revoked", 400)
@@ -4122,10 +4119,17 @@ def _confirm_forgot_password(data):
             )
         return _err
 
-    # Accept any confirmation code in emulation (real AWS validates against issued code)
+    # The code must be the one ForgotPassword issued for this user (real Cognito
+    # answers CodeMismatchException otherwise; accepting any code let a caller
+    # reset a password without ever requesting a code).
+    if not user.get("_reset_code") or data.get("ConfirmationCode", "") != user["_reset_code"]:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400
+        )
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
+    user.pop("_reset_code", None)
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
