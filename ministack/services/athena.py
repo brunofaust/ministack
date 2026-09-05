@@ -566,6 +566,10 @@ async def _save_query_results(query_id):
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
     bucket_name = p.netloc
+    # A workgroup with Athena-managed results (no OutputLocation) falls back to
+    # the default location; real Athena owns that storage, so nothing created
+    # the bucket here and every query failed "while writing to S3".
+    s3_svc._ensure_bucket(bucket_name)
     key_prefix = p.path.lstrip("/").rstrip("/")
     # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
     # prefix. If the prefix is empty (output_location == "s3://bucket/"),
