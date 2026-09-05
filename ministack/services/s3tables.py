@@ -672,7 +672,7 @@ def _iceberg_config(query_params=None, headers=None):
         warehouse = query_params.get("warehouse", "")
         if isinstance(warehouse, list):
             warehouse = warehouse[0] if warehouse else ""
-    s3_endpoint = _reachable_s3_endpoint()
+    s3_endpoint = _reachable_s3_endpoint(headers)
     # S3 connection properties go in ``defaults`` so a client that already
     # supplies them (e.g. a Spark job with its own s3.endpoint pointing at
     # host.docker.internal) is not overridden. Iceberg REST spec: ``defaults``
@@ -721,15 +721,27 @@ def _resolve_container_ip():
     return None
 
 
-def _reachable_s3_endpoint():
-    """S3 endpoint URL that both host-side and container-side callers can reach.
+def _reachable_s3_endpoint(headers=None):
+    """S3 endpoint URL the caller of this request can reach.
 
     Used in every Iceberg REST response that carries s3.endpoint — the
     /v1/config response and each LoadTable response. The Iceberg S3FileIO
-    builds its S3 client from this value, so returning localhost when the
-    caller is a Docker container means every S3 write (PutObject during
-    S3OutputStream.close) fails with Connection refused.
+    builds its S3 client from this value, so it must be an address the CALLER
+    resolves: the request's own ``Host`` header when present (a host-side
+    client reached us at ``localhost:<published port>``, a sibling container
+    at ``ministack:4566``), else this container's network IP (a Docker caller
+    with no Host header), else the gateway URL.
     """
+    host = ""
+    if headers:
+        for name, value in headers.items():
+            if str(name).lower() == "host" and value:
+                host = str(value).strip()
+                break
+    if host:
+        from ministack.core import tls as _tls
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        return f"{scheme}://{host}"
     resolved = _resolve_container_ip()
     if resolved:
         from ministack.core import tls as _tls
@@ -814,7 +826,7 @@ def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
     return json_response({"identifiers": result})
 
 
-def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter=None):
+def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter=None, headers=None):
     def _pred(table):
         if _namespace_name(table) != namespace or table["name"] != table_name:
             return False
@@ -866,7 +878,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
                 "metadata-location": meta_loc,
                 "metadata": metadata,
                 "config": {
-                    "s3.endpoint": _reachable_s3_endpoint(),
+                    "s3.endpoint": _reachable_s3_endpoint(headers),
                     "s3.access-key-id": "test",
                     "s3.secret-access-key": "test",
                     "s3.path-style-access": "true",
@@ -1137,7 +1149,7 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         if len(table_rest) == 1:
             table_name = table_rest[0]
             if method == "GET":
-                return _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter)
+                return _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter, headers=headers)
             if method == "POST":
                 data = json.loads(body) if body else {}
                 return _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter)
