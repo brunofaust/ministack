@@ -1131,3 +1131,68 @@ def test_table_bucket_tags_round_trip(s3tables):
         assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"env": "dev"}
     finally:
         s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_s3tables_iceberg_commit_rejects_stale_ref_requirement(s3tables):
+    """A commit whose ``assert-ref-snapshot-id`` no longer matches ``main`` must get
+    409 CommitFailedException instead of silently replacing the newer snapshot —
+    the lost-update that made concurrent DuckDB writers drop each other's rows."""
+    import urllib.error
+
+    bucket_name = f"tb-req-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+
+    def commit(snapshot_id, expected_ref_snapshot):
+        return _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [
+                    {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": expected_ref_snapshot}
+                ],
+                "updates": [
+                    {
+                        "action": "add-snapshot",
+                        "snapshot": {
+                            "snapshot-id": snapshot_id,
+                            "sequence-number": 1,
+                            "timestamp-ms": 1700000000000,
+                            "manifest-list": f"s3://{bucket_name}/{ns}/{table}/metadata/snap-{snapshot_id}.avro",
+                            "summary": {"operation": "append"},
+                        },
+                    },
+                    {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id},
+                ],
+            },
+        )
+
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        commit(1001, None)  # first writer: main must not exist yet
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            commit(1002, None)  # stale writer: still believes main does not exist
+        assert exc.value.code == 409
+        body = json.loads(exc.value.read().decode("utf-8"))
+        assert body["error"]["type"] == "CommitFailedException"
+        assert "has changed" in body["error"]["message"]
+        commit(1003, 1001)  # refreshed writer: expects the current tip
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = loaded.get("metadata", {})
+        snap_ids = [s.get("snapshot-id") for s in metadata.get("snapshots", [])]
+        assert snap_ids == [1001, 1003], snap_ids
+        assert metadata.get("current-snapshot-id") == 1003
+    finally:
+        for call in (
+            lambda: s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table),
+            lambda: s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns),
+            lambda: s3tables.delete_table_bucket(tableBucketARN=bucket_arn),
+        ):
+            try:
+                call()
+            except Exception:
+                pass

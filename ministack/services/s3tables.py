@@ -965,6 +965,41 @@ def _apply_iceberg_updates(metadata, updates):
             metadata["location"] = update.get("location", "")
 
 
+def _iceberg_requirement_failure(metadata, requirements):
+    """Return the message of the first violated Iceberg REST commit ``requirement``,
+    or None when the commit may proceed. Without this check two writers that both
+    read snapshot S0 could each append a snapshot whose manifest list omits the
+    other's data files, and the second commit silently discarded the first's rows
+    (last-writer-wins). Real S3 Tables answers a stale ``assert-ref-snapshot-id``
+    with 409 CommitFailedException so the client refreshes and retries."""
+    refs = metadata.get("refs") or {}
+    for requirement in requirements or []:
+        kind = requirement.get("type", "")
+        if kind == "assert-ref-snapshot-id":
+            ref = requirement.get("ref", "main")
+            expected = requirement.get("snapshot-id")
+            actual = refs.get(ref, {}).get("snapshot-id")
+            if actual is None and ref == "main" and metadata.get("current-snapshot-id", -1) not in (-1, None):
+                actual = metadata["current-snapshot-id"]
+            if expected != actual:
+                return f"Requirement failed: branch {ref} has changed: expected id {expected} != {actual}"
+        elif kind == "assert-table-uuid":
+            if requirement.get("uuid") != metadata.get("table-uuid"):
+                return (
+                    "Requirement failed: table UUID does not match: expected "
+                    f"{requirement.get('uuid')} != {metadata.get('table-uuid')}"
+                )
+        elif kind == "assert-current-schema-id":
+            if requirement.get("current-schema-id") != metadata.get("current-schema-id"):
+                return (
+                    "Requirement failed: current schema changed: expected id "
+                    f"{requirement.get('current-schema-id')} != {metadata.get('current-schema-id')}"
+                )
+        elif kind == "assert-create":
+            return "Requirement failed: table already exists"
+    return None
+
+
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter=None):
     def _pred(table):
         if _namespace_name(table) != namespace or table["name"] != table_name:
@@ -977,6 +1012,9 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
     if matches:
         table = matches[0]
         metadata = table.get("_iceberg_metadata", {})
+        failure = _iceberg_requirement_failure(metadata, data.get("requirements", []))
+        if failure:
+            return _iceberg_error(failure, "CommitFailedException", 409)
         _apply_iceberg_updates(metadata, data.get("updates", []))
 
         table["_metadata_version"] = table.get("_metadata_version", 0) + 1
