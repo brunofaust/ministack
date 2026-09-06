@@ -58,8 +58,9 @@ def test_athena_query_returns_timestamptz_values(athena):
     assert state == "SUCCEEDED", f"Query ended in state: {state} ({reason})"
     rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
     values = [cell["VarCharValue"] for cell in rows[-1]["Data"]]
-    # Rendered in UTC whatever the host's zone, the way Athena renders it.
-    assert values[0].startswith("2026-01-01 00:00:00"), values
+    # Rendered in UTC whatever the host's zone, millisecond precision and a
+    # trailing " UTC" — exactly what Athena's GetQueryResults returns.
+    assert values[0] == "2026-01-01 00:00:00.000 UTC", values
     assert values[1] == "1"
 
 def test_athena_workgroup(athena):

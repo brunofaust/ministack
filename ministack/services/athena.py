@@ -15,6 +15,7 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
 import asyncio
 import copy
 import csv
+import datetime
 import io
 import json
 import logging
@@ -477,6 +478,28 @@ async def _run_duckdb(query, database):
 _S3TABLES_CATALOG_RE = re.compile(r'"s3tablescatalog/([A-Za-z0-9._-]+)"\s*\.\s*"([^"]+)"\s*\.\s*"([^"]+)"')
 
 
+def _render_cell(value):
+    """Render one result cell the way Athena's GetQueryResults does.
+
+    Athena hands every value back as text: timestamps as
+    ``YYYY-MM-DD HH:MM:SS.mmm`` (millisecond precision), ``TIMESTAMP WITH
+    TIME ZONE`` values with a trailing `` UTC``, dates as ISO-8601, NULL as
+    an empty string. DuckDB's ``str(datetime)`` would give microseconds and
+    a ``+00:00`` offset, which Athena consumers do not parse.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime.datetime):
+        zone = value.tzinfo
+        if zone is not None:
+            value = value.astimezone(datetime.timezone.utc)
+        text = value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return f"{text} UTC" if zone is not None else text
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    return str(value)
+
+
 def _s3tables_catalog_prelude(query):
     """Attach every S3 Tables bucket the query names as a DuckDB Iceberg catalog.
 
@@ -751,9 +774,7 @@ def _get_query_results(data):
     result_rows = []
     result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
     for row in page_rows:
-        result_rows.append(
-            {"Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]}
-        )
+        result_rows.append({"Data": [{"VarCharValue": _render_cell(v)} for v in row]})
 
     column_info = []
     for i, col in enumerate(columns):
