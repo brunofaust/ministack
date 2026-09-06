@@ -996,7 +996,11 @@ def _iceberg_requirement_failure(metadata, requirements):
                     f"{requirement.get('current-schema-id')} != {metadata.get('current-schema-id')}"
                 )
         elif kind == "assert-create":
-            return "Requirement failed: table already exists"
+            # The first commit of a staged create (DuckDB's CREATE TABLE + INSERT)
+            # asserts the table did not exist before it; a table nobody has
+            # committed a snapshot to yet is exactly that table.
+            if refs or metadata.get("current-snapshot-id", -1) not in (-1, None):
+                return "Requirement failed: table already exists"
     return None
 
 

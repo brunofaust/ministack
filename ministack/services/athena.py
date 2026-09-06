@@ -438,10 +438,13 @@ async def _run_duckdb(query, database):
     import duckdb
 
     rewritten = await _rewrite_data_paths(query, database)
+    prelude, rewritten = _s3tables_catalog_prelude(rewritten)
 
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            for statement in prelude:
+                conn.execute(statement)
             result = conn.execute(rewritten)
             columns = []
             column_types = []
@@ -465,6 +468,55 @@ async def _run_duckdb(query, database):
             conn.close()
 
     return await asyncio.to_thread(_execute_blocking)
+
+
+# Athena's federated S3 Tables catalog: "s3tablescatalog/<bucket>"."<ns>"."<table>".
+_S3TABLES_CATALOG_RE = re.compile(r'"s3tablescatalog/([A-Za-z0-9._-]+)"\s*\.\s*"([^"]+)"\s*\.\s*"([^"]+)"')
+
+
+def _s3tables_catalog_prelude(query):
+    """Attach every S3 Tables bucket the query names as a DuckDB Iceberg catalog.
+
+    Returns ``(prelude_statements, rewritten_query)``. On AWS, Athena reaches an
+    S3 Tables bucket through the Glue-federated ``s3tablescatalog`` catalog; here
+    DuckDB attaches this emulator's own Iceberg REST endpoint (the same catalog a
+    writer such as ``duckdb`` or Spark used to commit the table) and reads the
+    data files back through the emulator's S3, so the rows are the committed ones.
+    """
+    from ministack.services import s3tables as s3tables_svc
+
+    aliases: dict[str, str] = {}
+
+    def _replace(match):
+        bucket, namespace, table = match.groups()
+        alias = aliases.setdefault(bucket, f"s3tablescatalog_{len(aliases)}")
+        return f'{alias}."{namespace}"."{table}"'
+
+    rewritten = _S3TABLES_CATALOG_RE.sub(_replace, query)
+    if not aliases:
+        return [], query
+    gateway = s3tables_svc._gateway_url()
+    parsed = urlparse(gateway)
+    # The image bakes both extensions into DUCKDB_EXTENSION_DIR (never a
+    # download at query time); a source checkout installs them on first use.
+    extension_dir = os.environ.get("DUCKDB_EXTENSION_DIR", "")
+    prelude = []
+    if extension_dir:
+        prelude.append(f"SET extension_directory = '{extension_dir}'")
+        prelude += ["LOAD httpfs", "LOAD iceberg"]
+    else:
+        prelude += ["INSTALL httpfs", "LOAD httpfs", "INSTALL iceberg", "LOAD iceberg"]
+    prelude += [
+        "CREATE SECRET ministack_s3 (TYPE s3, KEY_ID 'test', SECRET 'test', "
+        f"REGION '{get_region()}', ENDPOINT '{parsed.netloc}', URL_STYLE 'path', "
+        f"USE_SSL {'true' if parsed.scheme == 'https' else 'false'})",
+    ]
+    for bucket, alias in aliases.items():
+        arn = s3tables_svc._bucket_arn(bucket)
+        prelude.append(
+            f"ATTACH '{arn}' AS {alias} (TYPE iceberg, ENDPOINT '{gateway}/iceberg', AUTHORIZATION_TYPE 'none')"
+        )
+    return prelude, rewritten
 
 
 async def _rewrite_data_paths(query, database):
