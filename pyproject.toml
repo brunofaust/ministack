@@ -52,6 +52,9 @@ dependencies = [
 [project.optional-dependencies]
 full = [
     "duckdb>=0.10.0",
+    # DuckDB materialises TIMESTAMP WITH TIME ZONE values through pytz; without
+    # it every Athena query over an Iceberg `timestamptz` column fails.
+    "pytz>=2024.1",
     "docker>=7.0.0",
     "cryptography>=41.0",
     "psycopg2-binary>=2.9",
@@ -65,6 +68,7 @@ dev = [
     "pytest-xdist>=3.6",
     "pytest-cov>=5.0",
     "duckdb>=0.10.0",
+    "pytz>=2024.1",
     "docker>=7.0.0",
     "cryptography>=41.0",
     "psycopg2-binary>=2.9",

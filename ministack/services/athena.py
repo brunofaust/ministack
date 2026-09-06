@@ -443,6 +443,9 @@ async def _run_duckdb(query, database):
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            # Athena renders TIMESTAMP WITH TIME ZONE values in UTC; DuckDB
+            # defaults to the host's zone, which would leak into results.
+            conn.execute("SET TimeZone = 'UTC'")
             for statement in prelude:
                 conn.execute(statement)
             result = conn.execute(rewritten)

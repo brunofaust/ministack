@@ -38,6 +38,30 @@ def test_athena_query(athena):
     results = athena.get_query_results(QueryExecutionId=query_id)
     assert len(results["ResultSet"]["Rows"]) >= 1
 
+def test_athena_query_returns_timestamptz_values(athena):
+    """A TIMESTAMP WITH TIME ZONE column round-trips: DuckDB needs pytz to hand the value back."""
+    resp = athena.start_query_execution(
+        QueryString="SELECT TIMESTAMPTZ '2026-01-01 00:00:00+00' AS ts, 1 AS num",
+        QueryExecutionContext={"Database": "default"},
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
+    )
+    query_id = resp["QueryExecutionId"]
+    state = None
+    reason = None
+    for _ in range(20):
+        status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]
+        state = status["State"]
+        reason = status.get("StateChangeReason")
+        if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.2)
+    assert state == "SUCCEEDED", f"Query ended in state: {state} ({reason})"
+    rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+    values = [cell["VarCharValue"] for cell in rows[-1]["Data"]]
+    # Rendered in UTC whatever the host's zone, the way Athena renders it.
+    assert values[0].startswith("2026-01-01 00:00:00"), values
+    assert values[1] == "1"
+
 def test_athena_workgroup(athena):
     athena.create_work_group(
         Name="test-wg",

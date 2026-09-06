@@ -11,6 +11,7 @@ FROM python:3.13-slim-bookworm AS builder
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
         "duckdb>=1.4" \
+        "pytz>=2024.1" \
         "cbor2>=5.4.0" \
         "defusedxml>=0.7" \
         "docker>=7.0.0" \
