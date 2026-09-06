@@ -201,17 +201,21 @@ def _set_bucket_region_value(store, bucket_arn, key, value):
     store.set_scoped(spec.account_id, spec.region, key, value)
 
 
+# Iceberg primitive type names S3 Tables accepts verbatim. Anything else used to
+# collapse to "string", so a `timestamptz` column came back as VARCHAR and every
+# `ts >= current_timestamp - interval ...` query failed with a binder error.
+_ICEBERG_PRIMITIVE_TYPES = frozenset(
+    {"string", "int", "long", "boolean", "date", "time", "timestamp", "timestamptz", "timestamp_ns",
+     "timestamptz_ns", "float", "double", "uuid", "binary"}
+)
+
+
 def _to_iceberg_type(kind):
-    return {
-        "string": "string",
-        "int": "int",
-        "long": "long",
-        "boolean": "boolean",
-        "date": "date",
-        "timestamp": "timestamptz",
-        "float": "float",
-        "double": "double",
-    }.get(kind, "string")
+    if kind in _ICEBERG_PRIMITIVE_TYPES:
+        return kind
+    if isinstance(kind, str) and (kind.startswith("decimal(") or kind.startswith("fixed[")):
+        return kind
+    return "string"
 
 
 def _initial_iceberg_metadata(table_name, schema_fields, location):

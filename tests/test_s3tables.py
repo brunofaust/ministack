@@ -1196,3 +1196,37 @@ def test_s3tables_iceberg_commit_rejects_stale_ref_requirement(s3tables):
                 call()
             except Exception:
                 pass
+
+
+def test_s3tables_create_table_keeps_timestamptz_and_decimal_field_types(s3tables):
+    """A `timestamptz`/`decimal` field is stored with that Iceberg type, not collapsed to `string`."""
+    import urllib.parse
+    import urllib.request
+
+    bucket = f"types-{_uuid()[:8]}" if "_uuid" in globals() else f"types-{__import__('uuid').uuid4().hex[:8]}"
+    arn = s3tables.create_table_bucket(name=bucket)["arn"]
+    s3tables.create_namespace(tableBucketARN=arn, namespace=["ns"])
+    s3tables.create_table(
+        tableBucketARN=arn,
+        namespace="ns",
+        name="events",
+        format="ICEBERG",
+        metadata={
+            "iceberg": {
+                "schema": {
+                    "fields": [
+                        {"name": "ts", "type": "timestamptz", "required": True},
+                        {"name": "amount", "type": "decimal(10,2)"},
+                        {"name": "note", "type": "mystery"},
+                    ]
+                }
+            }
+        },
+    )
+    endpoint = __import__("os").environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    url = f"{endpoint}/iceberg/v1/{urllib.parse.quote(arn, safe='')}/namespaces/ns/tables/events"
+    with urllib.request.urlopen(url) as response:
+        metadata = __import__("json").load(response)["metadata"]
+    schema = metadata["schemas"][-1] if metadata.get("schemas") else metadata["schema"]
+    types = {field["name"]: field["type"] for field in schema["fields"]}
+    assert types == {"ts": "timestamptz", "amount": "decimal(10,2)", "note": "string"}
