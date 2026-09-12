@@ -6272,14 +6272,9 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
-    # ── fallback (legacy behaviour for unrecognised grant_type) ──
-    pool_id, pool, client = _find_pool_by_client_id(cid)
-    access_token = _fake_token(cid or new_uuid(), pool_id or "", cid or "", "access")
-    return json_response({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-    })
+    if not grant_type:
+        return _oauth2_error("invalid_request", "Missing grant_type parameter.")
+    return _oauth2_error("unsupported_grant_type", "Unsupported grant type.")
 
 
 def handle_oauth2_token(method, path, headers, body, query_params):

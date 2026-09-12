@@ -1793,12 +1793,31 @@ def test_glue_legacy_account_scoped_state_falls_back_to_ambient_region():
         set_request_region(original_region)
 
 
-def test_glue_reset_clears_every_store_across_regions():
+def test_bd_1138_glue_reset_clears_every_store_across_regions():
+    """BD-1138: reset clears the complete registered inventory in every region."""
     from ministack.services import glue as gluemod
 
     account = "123456789012"
     regional_stores = {key: store for key, store in gluemod._ALL_STATE.items() if key != "tags"}
-    assert len(regional_stores) == 16
+    assert set(regional_stores) == {
+        "databases",
+        "catalogs",
+        "tables",
+        "partitions",
+        "partition_indexes",
+        "connections",
+        "crawlers",
+        "jobs",
+        "job_runs",
+        "security_configs",
+        "classifiers",
+        "triggers",
+        "workflows",
+        "workflow_runs",
+        "user_defined_functions",
+        "table_column_statistics",
+        "partition_column_statistics",
+    }
 
     for index, store in enumerate(regional_stores.values()):
         store.set_scoped(account, "us-east-1", f"east-{index}", {"scope": "east"})

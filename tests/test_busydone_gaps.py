@@ -131,20 +131,58 @@ def test_cognito_rejects_bad_confirmation_codes():
     assert _payload(bad_reset)["__type"] == "CodeMismatchException"
 
 
-def test_cognito_rejects_invalid_refresh_and_unknown_grant():
-    """Refresh lookup and OAuth token grant handling fail closed."""
+def test_cognito_rejects_invalid_refresh_token():
+    """A recognized refresh flow rejects a token absent from the token store."""
     from ministack.services import cognito
 
     result, error = cognito._refresh_auth_result({"_users": {}}, "pool", "client", "garbage")
     assert result is None
     assert _payload(error)["__type"] == "NotAuthorizedException"
-    oauth = cognito._oauth2_token({"grant_type": "made-up"}, {})
+
+    oauth = cognito.handle_oauth2_token(
+        "POST",
+        "/oauth2/token",
+        {"content-type": "application/x-www-form-urlencoded"},
+        urlencode({"grant_type": "refresh_token", "refresh_token": "garbage"}).encode(),
+        {},
+    )
+    assert oauth[0] == 400
+    assert _payload(oauth)["error"] == "invalid_grant"
+
+
+def test_bd_1135_cognito_rejects_unknown_oauth_grant_from_raw_form():
+    """BD-1135: a nonempty unknown raw-form grant is unsupported."""
+    from ministack.services import cognito
+
+    oauth = cognito.handle_oauth2_token(
+        "POST",
+        "/oauth2/token",
+        {"content-type": "application/x-www-form-urlencoded"},
+        urlencode({"grant_type": "made-up"}).encode(),
+        {},
+    )
     assert oauth[0] == 400
     assert _payload(oauth)["error"] == "unsupported_grant_type"
 
 
-def test_cognito_validates_secret_hash_and_totp():
-    """SecretHash and software-token MFA codes are cryptographically checked."""
+@pytest.mark.parametrize("form", ({}, {"grant_type": ""}), ids=("missing", "blank"))
+def test_bd_1135_cognito_rejects_absent_oauth_grant_from_raw_form(form):
+    """BD-1135: a missing or blank raw-form grant is an invalid request."""
+    from ministack.services import cognito
+
+    oauth = cognito.handle_oauth2_token(
+        "POST",
+        "/oauth2/token",
+        {"content-type": "application/x-www-form-urlencoded"},
+        urlencode(form).encode(),
+        {},
+    )
+    assert oauth[0] == 400
+    assert _payload(oauth)["error"] == "invalid_request"
+
+
+def test_cognito_validates_secret_hash():
+    """SecretHash values are cryptographically checked."""
     from ministack.services import cognito
 
     secret = "client-secret"
@@ -152,10 +190,17 @@ def test_cognito_validates_secret_hash_and_totp():
     verify_hash = getattr(cognito, "_verify_secret_hash")
     assert verify_hash({"ClientSecret": secret}, "client-id", "alice", {"SecretHash": expected}) is None
     assert _payload(verify_hash({"ClientSecret": secret}, "client-id", "alice", {"SecretHash": "bad"}))["__type"] == "NotAuthorizedException"
-    totp = getattr(cognito, "_totp_code")
-    code = totp("JBSWY3DPEHPK3PXP", when=1_700_000_000)
-    assert len(code) == 6 and code.isdigit()
-    assert code != "123456"
+
+
+def test_bd_1137_cognito_totp_accepts_current_and_adjacent_time_steps():
+    """BD-1137: TOTP verification accepts the current step and its two neighbors."""
+    from ministack.services import cognito
+
+    secret = "JBSWY3DPEHPK3PXP"
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(cognito.time, "time", lambda: 1_700_000_000)
+        codes = [cognito._totp_code(secret, offset) for offset in (-1, 0, 1)]
+        assert all(cognito._totp_matches(secret, code) for code in codes)
 
 
 class _FakeEcs:

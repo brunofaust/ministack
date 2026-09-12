@@ -81,3 +81,32 @@ def test_batch_grant_reports_per_entry_failures(lf):
     ])
     assert [f["RequestEntry"]["Id"] for f in out["Failures"]] == ["bad"]
     lf.revoke_permissions(Principal={"DataLakePrincipalIdentifier": ROLE}, Resource=DATABASE, Permissions=["DESCRIBE"])
+
+
+@pytest.mark.parametrize("invalid_store", ([], "", 0, None), ids=("list", "string", "integer", "none"))
+def test_bd_1133_restore_rejects_corrupt_snapshot_atomically(monkeypatch, invalid_store):
+    """BD-1133: a corrupt final store cannot partially replace live state."""
+    from ministack.core.responses import AccountScopedDict
+    from ministack.services import lakeformation
+
+    stores = {
+        "grants": AccountScopedDict(),
+        "settings": AccountScopedDict(),
+        "resources": AccountScopedDict(),
+        "lf_tags": AccountScopedDict(),
+    }
+    for key, store in stores.items():
+        monkeypatch.setattr(lakeformation, f"_{key}", store)
+        store[f"seed-{key}"] = {"store": key}
+
+    original = lakeformation.get_state()
+    corrupt = dict(original)
+    corrupt["lf_tags"] = invalid_store
+
+    with pytest.raises(TypeError, match="Invalid persisted Lake Formation lf_tags store"):
+        lakeformation.restore_state(corrupt)
+
+    retained = lakeformation.get_state()
+    assert {key: store._data for key, store in retained.items()} == {
+        key: store._data for key, store in original.items()
+    }

@@ -2730,23 +2730,8 @@ def _simple_glob_match(pattern, name):
 
 
 def reset():
-    _databases.clear()
-    _tables.clear()
-    _partitions.clear()
-    _partition_indexes.clear()
-    _connections.clear()
-    _crawlers.clear()
-    _jobs.clear()
-    _job_runs.clear()
-    _tags.clear()
-    _security_configs.clear()
-    _classifiers.clear()
-    _triggers.clear()
-    _workflows.clear()
-    _workflow_runs.clear()
-    _user_defined_functions.clear()
-    _table_column_statistics.clear()
-    _partition_column_statistics.clear()
+    for store in _ALL_STATE.values():
+        store.clear()
     _ensure_default_database()
 
 

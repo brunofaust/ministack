@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir --no-compile \
         "pymysql>=1.1" \
         "psycopg2-binary>=2.9" \
         "duckdb>=0.10.0" \
+        "pytz>=2024.1" \
         "asyncssh>=2.14" \
         "aws-sam-translator>=1.90" \
         "boto3>=1.34" \

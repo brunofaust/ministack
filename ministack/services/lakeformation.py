@@ -15,11 +15,13 @@ State is in-memory and scoped by account. Grants are matched on the exact
 read (ListPermissions filtered by Principal + Resource) finds what it wrote.
 """
 
+import copy
 import json
 import logging
 import threading
 import time
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id
 
 logger = logging.getLogger(__name__)
@@ -33,6 +35,65 @@ _settings = AccountScopedDict()
 _resources = AccountScopedDict()
 # account -> {tag_key: [values]}
 _lf_tags = AccountScopedDict()
+
+
+def reset():
+    _grants.clear()
+    _settings.clear()
+    _resources.clear()
+    _lf_tags.clear()
+
+
+def get_state():
+    return {
+        "grants": copy.deepcopy(_grants),
+        "settings": copy.deepcopy(_settings),
+        "resources": copy.deepcopy(_resources),
+        "lf_tags": copy.deepcopy(_lf_tags),
+    }
+
+
+def restore_state(data):
+    if not isinstance(data, dict):
+        return
+    restored = []
+    for key in ("grants", "settings", "resources", "lf_tags"):
+        # Missing keys are legacy snapshots with an empty store. Explicitly
+        # supplied values must still satisfy the persisted store contract.
+        saved = data.get(key, {})
+        if not isinstance(saved, (AccountScopedDict, dict)):
+            raise TypeError(f"Invalid persisted Lake Formation {key} store")
+        if isinstance(saved, AccountScopedDict) and any(
+            not isinstance(scoped_key, tuple)
+            or len(scoped_key) != 2
+            or not isinstance(scoped_key[0], str)
+            for scoped_key in saved._data
+        ):
+            raise ValueError(f"Invalid persisted Lake Formation {key} scope")
+        snapshot = AccountScopedDict()
+        snapshot.update(copy.deepcopy(saved))
+        restored.append(snapshot)
+
+    with _lock:
+        for store, snapshot in zip(
+            (_grants, _settings, _resources, _lf_tags),
+            restored,
+            strict=True,
+        ):
+            store.clear()
+            store.update(snapshot)
+
+
+def load_persisted_state(data):
+    restore_state(data)
+
+
+try:
+    _restored = load_state("lakeformation")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted Lake Formation state; continuing with fresh store")
 
 
 def _now_ts():
