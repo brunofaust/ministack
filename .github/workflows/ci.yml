@@ -56,6 +56,7 @@ jobs:
           TMPDIR="$RUNNER_TEMP/ministack-serial/tmp" \
             S3_DATA_DIR="$RUNNER_TEMP/ministack-serial/s3" \
             STATE_DIR="$RUNNER_TEMP/ministack-serial/state" \
+            MINISTACK_HOSTNAME="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-serial" \
             REDIS_HOST=localhost \
             python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 \
             > ministack-serial.log 2>&1 &
@@ -87,24 +88,60 @@ jobs:
               *) return 0 ;;
             esac
           }
+          wait_until_stopped() {
+            pid=$1
+            attempts=$2
+            for _ in $(seq 1 "$attempts"); do
+              if ! is_running "$pid"; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+          cleanup_owned_containers() {
+            instance_id=$1
+            if ! owned=$(docker ps -aq --filter "label=ministack.instance=$instance_id"); then
+              return 1
+            fi
+            if [ -n "$owned" ]; then
+              timeout 30s docker rm --force --volumes $owned || true
+            fi
+            if ! survivors=$(docker ps -aq --filter "label=ministack.instance=$instance_id"); then
+              return 1
+            fi
+            if [ -n "$survivors" ]; then
+              echo "MiniStack-owned containers survived cleanup for $instance_id" >&2
+              docker ps -a --filter "label=ministack.instance=$instance_id" \
+                --format '{{.ID}} {{.Status}} {{.Names}}' >&2 || true
+              return 1
+            fi
+          }
+          process_clean=1
           if [ -f "$RUNNER_TEMP/ministack-serial.pid" ]; then
             pid=$(cat "$RUNNER_TEMP/ministack-serial.pid")
             if is_running "$pid"; then
               kill "$pid"
             fi
-            for _ in $(seq 1 15); do
-              if ! is_running "$pid"; then
-                exit 0
+            if ! wait_until_stopped "$pid" 15; then
+              echo "Serial MiniStack did not exit after SIGTERM; forcing shutdown" >&2
+              ps -o pid=,ppid=,stat=,etime=,cmd= -p "$pid" >&2 || true
+              kill -KILL "$pid" 2>/dev/null || true
+              if ! wait_until_stopped "$pid" 5; then
+                echo "Serial MiniStack survived SIGKILL" >&2
+                ps -o pid=,ppid=,stat=,etime=,cmd= -p "$pid" >&2 || true
+                process_clean=0
               fi
-              sleep 1
-            done
-            echo "Serial MiniStack did not stop" >&2
-            exit 1
+            fi
           fi
+          containers_clean=1
+          cleanup_owned_containers \
+            "ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-serial:4566" || containers_clean=0
+          [ "$process_clean" = 1 ] && [ "$containers_clean" = 1 ]
 
       - name: Start MiniStack for parallel tests
         id: parallel_runtime
-        if: always()
+        if: ${{ always() && steps.stop_serial.outcome == 'success' }}
         run: |
           is_running() {
             state=$(ps -o stat= -p "$1" 2>/dev/null || true)
@@ -141,6 +178,7 @@ jobs:
           TMPDIR="$RUNNER_TEMP/ministack-parallel/tmp" \
             S3_DATA_DIR="$RUNNER_TEMP/ministack-parallel/s3" \
             STATE_DIR="$RUNNER_TEMP/ministack-parallel/state" \
+            MINISTACK_HOSTNAME="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-parallel" \
             REDIS_HOST=localhost \
             python -m hypercorn ministack.app:app --bind 0.0.0.0:4566 --keep-alive 75 \
             > ministack-parallel.log 2>&1 &
@@ -154,7 +192,7 @@ jobs:
 
       - name: Run parallel tests
         id: parallel_tests
-        if: always()
+        if: ${{ always() && steps.parallel_runtime.outcome == 'success' }}
         env:
           TMPDIR: ${{ runner.temp }}/ministack-parallel/tmp
           S3_DATA_DIR: ${{ runner.temp }}/ministack-parallel/s3
@@ -172,20 +210,56 @@ jobs:
               *) return 0 ;;
             esac
           }
+          wait_until_stopped() {
+            pid=$1
+            attempts=$2
+            for _ in $(seq 1 "$attempts"); do
+              if ! is_running "$pid"; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+          cleanup_owned_containers() {
+            instance_id=$1
+            if ! owned=$(docker ps -aq --filter "label=ministack.instance=$instance_id"); then
+              return 1
+            fi
+            if [ -n "$owned" ]; then
+              timeout 30s docker rm --force --volumes $owned || true
+            fi
+            if ! survivors=$(docker ps -aq --filter "label=ministack.instance=$instance_id"); then
+              return 1
+            fi
+            if [ -n "$survivors" ]; then
+              echo "MiniStack-owned containers survived cleanup for $instance_id" >&2
+              docker ps -a --filter "label=ministack.instance=$instance_id" \
+                --format '{{.ID}} {{.Status}} {{.Names}}' >&2 || true
+              return 1
+            fi
+          }
+          process_clean=1
           if [ -f "$RUNNER_TEMP/ministack-parallel.pid" ]; then
             pid=$(cat "$RUNNER_TEMP/ministack-parallel.pid")
             if is_running "$pid"; then
               kill "$pid"
             fi
-            for _ in $(seq 1 15); do
-              if ! is_running "$pid"; then
-                exit 0
+            if ! wait_until_stopped "$pid" 15; then
+              echo "Parallel MiniStack did not exit after SIGTERM; forcing shutdown" >&2
+              ps -o pid=,ppid=,stat=,etime=,cmd= -p "$pid" >&2 || true
+              kill -KILL "$pid" 2>/dev/null || true
+              if ! wait_until_stopped "$pid" 5; then
+                echo "Parallel MiniStack survived SIGKILL" >&2
+                ps -o pid=,ppid=,stat=,etime=,cmd= -p "$pid" >&2 || true
+                process_clean=0
               fi
-              sleep 1
-            done
-            echo "Parallel MiniStack did not stop" >&2
-            exit 1
+            fi
           fi
+          containers_clean=1
+          cleanup_owned_containers \
+            "ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-parallel:4566" || containers_clean=0
+          [ "$process_clean" = 1 ] && [ "$containers_clean" = 1 ]
 
       - name: Upload MiniStack logs
         id: logs
