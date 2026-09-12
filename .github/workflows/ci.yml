@@ -80,11 +80,20 @@ jobs:
         id: stop_serial
         if: always()
         run: |
+          is_running() {
+            state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+            case "$state" in
+              ""|*Z*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
           if [ -f "$RUNNER_TEMP/ministack-serial.pid" ]; then
             pid=$(cat "$RUNNER_TEMP/ministack-serial.pid")
-            kill "$pid"
+            if is_running "$pid"; then
+              kill "$pid"
+            fi
             for _ in $(seq 1 15); do
-              if ! kill -0 "$pid" 2>/dev/null; then
+              if ! is_running "$pid"; then
                 exit 0
               fi
               sleep 1
@@ -97,17 +106,24 @@ jobs:
         id: parallel_runtime
         if: always()
         run: |
+          is_running() {
+            state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+            case "$state" in
+              ""|*Z*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
           if [ -f "$RUNNER_TEMP/ministack-serial.pid" ]; then
             serial_pid=$(cat "$RUNNER_TEMP/ministack-serial.pid")
-            if kill -0 "$serial_pid" 2>/dev/null; then
+            if is_running "$serial_pid"; then
               kill "$serial_pid"
               for _ in $(seq 1 15); do
-                if ! kill -0 "$serial_pid" 2>/dev/null; then
+                if ! is_running "$serial_pid"; then
                   break
                 fi
                 sleep 1
               done
-              ! kill -0 "$serial_pid" 2>/dev/null
+              ! is_running "$serial_pid"
             fi
           fi
           mkdir -p \
@@ -149,11 +165,20 @@ jobs:
         id: stop_parallel
         if: always()
         run: |
+          is_running() {
+            state=$(ps -o stat= -p "$1" 2>/dev/null || true)
+            case "$state" in
+              ""|*Z*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
           if [ -f "$RUNNER_TEMP/ministack-parallel.pid" ]; then
             pid=$(cat "$RUNNER_TEMP/ministack-parallel.pid")
-            kill "$pid"
+            if is_running "$pid"; then
+              kill "$pid"
+            fi
             for _ in $(seq 1 15); do
-              if ! kill -0 "$pid" 2>/dev/null; then
+              if ! is_running "$pid"; then
                 exit 0
               fi
               sleep 1
