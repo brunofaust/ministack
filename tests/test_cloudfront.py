@@ -826,6 +826,28 @@ def test_cloudfront_function_create_publish_describe_get_delete(cloudfront):
     assert exc.value.response["Error"]["Code"] == "NoSuchFunctionExists"
 
 
+def test_bd958_cloudfront_function_arn_tags_round_trip(cloudfront):
+    """BD-958: CloudFront function ARNs support TagResource and ListTagsForResource."""
+    name = f"fn-tags-{_uuid_mod.uuid4().hex[:8]}"
+    created = cloudfront.create_function(
+        Name=name,
+        FunctionConfig={"Comment": "taggable", "Runtime": "cloudfront-js-1.0"},
+        FunctionCode=b"function handler(event) { return event.request; }",
+    )
+    function_arn = created["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+
+    cloudfront.tag_resource(
+        Resource=function_arn,
+        Tags={"Items": [{"Key": "environment", "Value": "test"}]},
+    )
+
+    tags = cloudfront.list_tags_for_resource(Resource=function_arn)["Tags"]["Items"]
+
+    assert tags == [{"Key": "environment", "Value": "test"}]
+
+    cloudfront.delete_function(Name=name, IfMatch=_cf_resp_etag(created))
+
+
 def test_cloudfront_function_duplicate_name(cloudfront):
     name = f"fn-dup-{_uuid_mod.uuid4().hex[:8]}"
     cloudfront.create_function(
@@ -1502,6 +1524,37 @@ def _rhp_config(name):
         },
         "RemoveHeadersConfig": {"Quantity": 1, "Items": [{"Header": "Server"}]},
     }
+
+
+def test_cloudfront_response_headers_policy_omits_absent_header_configs(cloudfront):
+    config = _rhp_config(f"rhp-{_uuid_mod.uuid4().hex[:8]}")
+    config.pop("CustomHeadersConfig")
+    config.pop("RemoveHeadersConfig")
+
+    created = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=config)
+    policy_id = created["ResponseHeadersPolicy"]["Id"]
+    returned_config = cloudfront.get_response_headers_policy_config(Id=policy_id)["ResponseHeadersPolicyConfig"]
+
+    assert "CustomHeadersConfig" not in returned_config
+    assert "RemoveHeadersConfig" not in returned_config
+
+    cloudfront.delete_response_headers_policy(Id=policy_id, IfMatch=created["ETag"])
+
+
+def test_cloudfront_response_headers_policy_serializes_explicitly_empty_header_configs(cloudfront):
+    config = _rhp_config(f"rhp-{_uuid_mod.uuid4().hex[:8]}")
+    config["CustomHeadersConfig"] = {"Quantity": 0}
+    config["RemoveHeadersConfig"] = {"Quantity": 0}
+
+    created = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=config)
+    returned_config = created["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+
+    assert returned_config["CustomHeadersConfig"]["Quantity"] == 0
+    assert returned_config["RemoveHeadersConfig"]["Quantity"] == 0
+
+    cloudfront.delete_response_headers_policy(
+        Id=created["ResponseHeadersPolicy"]["Id"], IfMatch=created["ETag"]
+    )
 
 
 def test_cloudfront_create_and_get_response_headers_policy(cloudfront):

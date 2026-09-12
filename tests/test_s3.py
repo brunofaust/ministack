@@ -2930,6 +2930,235 @@ def test_s3_bucket_lifecycle(s3):
         s3.get_bucket_lifecycle_configuration(Bucket="intg-s3-lifecycle")
     assert exc.value.response["Error"]["Code"] == "NoSuchLifecycleConfiguration"
 
+
+def test_s3_intelligent_tiering_configuration_round_trip_and_delete(s3):
+    """BD-958: Intelligent-Tiering preserves the complete AWS configuration shape."""
+    bucket = f"intg-s3-tiering-roundtrip-{_uuid_mod.uuid4().hex[:8]}"
+    config_id = "archive-logs"
+    configuration = {
+        "Id": config_id,
+        "Filter": {
+            "And": {
+                "Prefix": "logs/",
+                "Tags": [
+                    {"Key": "environment", "Value": "production"},
+                    {"Key": "retention", "Value": "long-term"},
+                ],
+            }
+        },
+        "Status": "Enabled",
+        "Tierings": [
+            {"Days": 90, "AccessTier": "ARCHIVE_ACCESS"},
+            {"Days": 180, "AccessTier": "DEEP_ARCHIVE_ACCESS"},
+        ],
+    }
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_intelligent_tiering_configuration(
+        Bucket=bucket,
+        Id=config_id,
+        IntelligentTieringConfiguration=configuration,
+    )
+
+    response = s3.get_bucket_intelligent_tiering_configuration(
+        Bucket=bucket,
+        Id=config_id,
+    )
+    assert response["IntelligentTieringConfiguration"] == configuration
+
+    deleted = s3.delete_bucket_intelligent_tiering_configuration(
+        Bucket=bucket,
+        Id=config_id,
+    )
+    assert deleted["ResponseMetadata"]["HTTPStatusCode"] == 204
+    with pytest.raises(ClientError) as exc:
+        s3.get_bucket_intelligent_tiering_configuration(Bucket=bucket, Id=config_id)
+    assert exc.value.response["Error"]["Code"] == "NoSuchConfiguration"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_s3_intelligent_tiering_put_replaces_only_matching_configuration(s3):
+    """BD-958: putting an existing ID replaces it without changing other configurations."""
+    bucket = f"intg-s3-tiering-update-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    configurations = {
+        "archive": {
+            "Id": "archive",
+            "Filter": {"Prefix": "archive/"},
+            "Status": "Enabled",
+            "Tierings": [{"Days": 90, "AccessTier": "ARCHIVE_ACCESS"}],
+        },
+        "records": {
+            "Id": "records",
+            "Filter": {"Tag": {"Key": "class", "Value": "records"}},
+            "Status": "Enabled",
+            "Tierings": [{"Days": 180, "AccessTier": "DEEP_ARCHIVE_ACCESS"}],
+        },
+    }
+    for config_id, configuration in configurations.items():
+        s3.put_bucket_intelligent_tiering_configuration(
+            Bucket=bucket,
+            Id=config_id,
+            IntelligentTieringConfiguration=configuration,
+        )
+
+    updated = {
+        "Id": "archive",
+        "Filter": {"Prefix": "cold/"},
+        "Status": "Disabled",
+        "Tierings": [{"Days": 365, "AccessTier": "DEEP_ARCHIVE_ACCESS"}],
+    }
+    s3.put_bucket_intelligent_tiering_configuration(
+        Bucket=bucket,
+        Id="archive",
+        IntelligentTieringConfiguration=updated,
+    )
+
+    response = s3.list_bucket_intelligent_tiering_configurations(Bucket=bucket)
+    listed = {
+        item["Id"]: item
+        for item in response["IntelligentTieringConfigurationList"]
+    }
+    assert response["IsTruncated"] is False
+    assert listed == {"archive": updated, "records": configurations["records"]}
+
+
+@pytest.mark.parametrize(
+    "operation,kwargs",
+    [
+        (
+            "put_bucket_intelligent_tiering_configuration",
+            {
+                "Id": "missing",
+                "IntelligentTieringConfiguration": {
+                    "Id": "missing",
+                    "Status": "Enabled",
+                    "Tierings": [
+                        {"Days": 90, "AccessTier": "ARCHIVE_ACCESS"}
+                    ],
+                },
+            },
+        ),
+        ("get_bucket_intelligent_tiering_configuration", {"Id": "missing"}),
+        ("delete_bucket_intelligent_tiering_configuration", {"Id": "missing"}),
+        ("list_bucket_intelligent_tiering_configurations", {}),
+    ],
+)
+def test_s3_intelligent_tiering_operations_reject_missing_bucket(
+    s3,
+    operation,
+    kwargs,
+):
+    """BD-958: every Intelligent-Tiering operation rejects an unknown bucket."""
+    bucket = f"intg-s3-tiering-missing-{_uuid_mod.uuid4().hex[:8]}"
+
+    with pytest.raises(ClientError) as exc:
+        getattr(s3, operation)(Bucket=bucket, **kwargs)
+
+    assert exc.value.response["Error"]["Code"] == "NoSuchBucket"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+def test_s3_delete_missing_intelligent_tiering_configuration_is_idempotent(s3):
+    """BD-958: deleting an unknown configuration succeeds like AWS S3."""
+    bucket = f"intg-s3-tiering-no-config-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+
+    response = s3.delete_bucket_intelligent_tiering_configuration(
+        Bucket=bucket,
+        Id="missing",
+    )
+
+    assert response["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+
+def test_s3_delete_bucket_removes_intelligent_tiering_configurations(s3):
+    """BD-958: deleting a bucket removes its Intelligent-Tiering state."""
+    bucket = f"intg-s3-tiering-bucket-delete-{_uuid_mod.uuid4().hex[:8]}"
+    configuration = {
+        "Id": "archive",
+        "Status": "Enabled",
+        "Tierings": [{"Days": 90, "AccessTier": "ARCHIVE_ACCESS"}],
+    }
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_intelligent_tiering_configuration(
+        Bucket=bucket,
+        Id="archive",
+        IntelligentTieringConfiguration=configuration,
+    )
+
+    s3.delete_bucket(Bucket=bucket)
+    s3.create_bucket(Bucket=bucket)
+
+    response = s3.list_bucket_intelligent_tiering_configurations(Bucket=bucket)
+    assert response["IsTruncated"] is False
+    assert response.get("IntelligentTieringConfigurationList", []) == []
+
+
+@pytest.mark.parametrize(
+    "case,xml_body",
+    [
+        (
+            "invalid-root",
+            "<NotIntelligentTieringConfiguration>"
+            "<Id>invalid-root</Id><Status>Enabled</Status>"
+            "<Tiering><Days>90</Days><AccessTier>ARCHIVE_ACCESS</AccessTier>"
+            "</Tiering></NotIntelligentTieringConfiguration>",
+        ),
+        (
+            "nested-tiering",
+            "<IntelligentTieringConfiguration>"
+            "<Id>nested-tiering</Id><Status>Enabled</Status><ArchiveRules>"
+            "<Tiering><Days>90</Days><AccessTier>ARCHIVE_ACCESS</AccessTier>"
+            "</Tiering></ArchiveRules></IntelligentTieringConfiguration>",
+        ),
+        (
+            "multiple-filter-alternatives",
+            "<IntelligentTieringConfiguration>"
+            "<Id>multiple-filter-alternatives</Id><Filter>"
+            "<Prefix>logs/</Prefix><Tag><Key>class</Key><Value>records</Value>"
+            "</Tag></Filter><Status>Enabled</Status>"
+            "<Tiering><Days>90</Days><AccessTier>ARCHIVE_ACCESS</AccessTier>"
+            "</Tiering></IntelligentTieringConfiguration>",
+        ),
+        (
+            "deep-unknown-elements",
+            "<IntelligentTieringConfiguration><Id>deep-unknown-elements</Id>"
+            "<Unknown>"
+            + "<Node>" * 1_100
+            + "value"
+            + "</Node>" * 1_100
+            + "</Unknown><Status>Enabled</Status>"
+            "<Tiering><Days>90</Days><AccessTier>ARCHIVE_ACCESS</AccessTier>"
+            "</Tiering></IntelligentTieringConfiguration>",
+        ),
+    ],
+)
+def test_s3_intelligent_tiering_rejects_invalid_xml_without_persisting(
+    s3,
+    case,
+    xml_body,
+):
+    """BD-958: invalid Intelligent-Tiering XML returns AWS 400 without state."""
+    import requests
+
+    bucket = f"intg-s3-tiering-invalid-{_uuid_mod.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+
+    response = requests.put(
+        f"{ENDPOINT}/{bucket}?intelligent-tiering&id={case}",
+        data=xml_body.encode(),
+        headers={"Content-Type": "application/xml"},
+        timeout=10,
+    )
+
+    assert response.status_code == 400, (
+        f"{case} returned {response.status_code}: {response.text[:200]}"
+    )
+    assert "<Code>InvalidArgument</Code>" in response.text
+    listing = s3.list_bucket_intelligent_tiering_configurations(Bucket=bucket)
+    assert listing.get("IntelligentTieringConfigurationList", []) == []
+
+
 def test_s3_bucket_cors(s3):
     s3.create_bucket(Bucket="intg-s3-cors")
     s3.put_bucket_cors(

@@ -1321,7 +1321,7 @@ def _parse_rhp_config(el):
     if not name:
         return None, _error("InvalidArgument", "The response headers policy name is required.", 400)
     cfg = {"Name": name, "Comment": _text(el, "Comment"), "Cors": None, "Security": None,
-           "ServerTiming": None, "CustomHeaders": [], "RemoveHeaders": []}
+           "ServerTiming": None}
 
     cors_el = _find(el, "CorsConfig")
     if cors_el is not None:
@@ -1390,6 +1390,7 @@ def _parse_rhp_config(el):
 
     ch_el = _find(el, "CustomHeadersConfig")
     if ch_el is not None:
+        cfg["CustomHeaders"] = []
         items_el = _find(ch_el, "Items")
         if items_el is not None:
             for it in items_el:
@@ -1402,6 +1403,7 @@ def _parse_rhp_config(el):
 
     rh_el = _find(el, "RemoveHeadersConfig")
     if rh_el is not None:
+        cfg["RemoveHeaders"] = []
         items_el = _find(rh_el, "Items")
         if items_el is not None:
             for it in items_el:
@@ -1471,23 +1473,25 @@ def _build_rhp_config_xml(parent, cfg):
         if st.get("SamplingRate") is not None:
             SubElement(stel, "SamplingRate").text = _fmt_rate(st["SamplingRate"])
 
-    ch = SubElement(parent, "CustomHeadersConfig")
-    SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
-    if cfg["CustomHeaders"]:
-        items = SubElement(ch, "Items")
-        for hdr in cfg["CustomHeaders"]:
-            it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
-            SubElement(it, "Header").text = hdr["Header"]
-            SubElement(it, "Value").text = hdr["Value"]
-            SubElement(it, "Override").text = _bstr(hdr["Override"])
+    if "CustomHeaders" in cfg:
+        ch = SubElement(parent, "CustomHeadersConfig")
+        SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
+        if cfg["CustomHeaders"]:
+            items = SubElement(ch, "Items")
+            for hdr in cfg["CustomHeaders"]:
+                it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
+                SubElement(it, "Header").text = hdr["Header"]
+                SubElement(it, "Value").text = hdr["Value"]
+                SubElement(it, "Override").text = _bstr(hdr["Override"])
 
-    rh = SubElement(parent, "RemoveHeadersConfig")
-    SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
-    if cfg["RemoveHeaders"]:
-        items = SubElement(rh, "Items")
-        for hdr in cfg["RemoveHeaders"]:
-            it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
-            SubElement(it, "Header").text = hdr["Header"]
+    if "RemoveHeaders" in cfg:
+        rh = SubElement(parent, "RemoveHeadersConfig")
+        SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
+        if cfg["RemoveHeaders"]:
+            items = SubElement(rh, "Items")
+            for hdr in cfg["RemoveHeaders"]:
+                it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
+                SubElement(it, "Header").text = hdr["Header"]
 
 
 def _build_rhp_xml(parent, policy):

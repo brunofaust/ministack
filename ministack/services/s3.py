@@ -16,6 +16,7 @@ Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
           PutObjectLegalHold, GetObjectLegalHold),
           Replication (PutBucketReplication, GetBucketReplication,
           DeleteBucketReplication),
+          Intelligent-Tiering configuration (Put, Get, Delete, List),
           Range requests (206 Partial Content),
           Content-MD5 validation, encoding-type=url,
           x-amz-metadata-directive, x-amz-copy-source-if-match preconditions.
@@ -76,6 +77,7 @@ _bucket_tags = AccountScopedDict()
 _bucket_versioning = AccountScopedDict()
 _bucket_encryption = AccountScopedDict()
 _bucket_lifecycle = AccountScopedDict()
+_bucket_intelligent_tiering = AccountScopedDict()
 _bucket_cors = AccountScopedDict()
 _bucket_acl = AccountScopedDict()
 _bucket_websites = AccountScopedDict()
@@ -115,6 +117,7 @@ _PERSISTED_BUCKET_DICTS = {
     "bucket_policies": _bucket_policies,
     "bucket_encryption": _bucket_encryption,
     "bucket_lifecycle": _bucket_lifecycle,
+    "bucket_intelligent_tiering": _bucket_intelligent_tiering,
     "bucket_cors": _bucket_cors,
     "bucket_acl": _bucket_acl,
     "bucket_websites": _bucket_websites,
@@ -1776,6 +1779,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
             return _get_bucket_acl(bucket)
         if "lifecycle" in query_params:
             return _get_bucket_lifecycle(bucket)
+        if "intelligent-tiering" in query_params:
+            return _get_bucket_intelligent_tiering(bucket, query_params)
         if "accelerate" in query_params:
             return _get_bucket_accelerate(bucket)
         if "request-payment" in query_params:
@@ -1805,6 +1810,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
             return _put_bucket_encryption(bucket, body)
         if "lifecycle" in query_params:
             return _put_bucket_lifecycle(bucket, body)
+        if "intelligent-tiering" in query_params:
+            return _put_bucket_intelligent_tiering(bucket, body, query_params)
         if "cors" in query_params:
             return _put_bucket_cors(bucket, body)
         if "acl" in query_params:
@@ -1836,6 +1843,8 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
             return _delete_bucket_cors(bucket)
         if "lifecycle" in query_params:
             return _delete_bucket_lifecycle(bucket)
+        if "intelligent-tiering" in query_params:
+            return _delete_bucket_intelligent_tiering(bucket, query_params)
         if "encryption" in query_params:
             return _delete_bucket_encryption(bucket)
         if "website" in query_params:
@@ -2006,6 +2015,10 @@ def _delete_bucket(name: str):
     _bucket_versioning.pop(name, None)
     _bucket_encryption.pop(name, None)
     _bucket_lifecycle.pop(name, None)
+    for config_key in [
+        config_key for config_key in _bucket_intelligent_tiering if config_key[0] == name
+    ]:
+        del _bucket_intelligent_tiering[config_key]
     _bucket_cors.pop(name, None)
     _bucket_acl.pop(name, None)
     _bucket_websites.pop(name, None)
@@ -2397,6 +2410,231 @@ def _delete_bucket_lifecycle(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     _bucket_lifecycle.pop(name, None)
+    return 204, {}, b""
+
+
+def _xml_local_name(element: Element) -> str:
+    """Return an element's namespace-independent local name."""
+    return element.tag.rsplit("}", 1)[-1]
+
+
+def _direct_xml_children(element: Element, name: str) -> list[Element]:
+    """Return direct children with the requested local name."""
+    return [child for child in element if _xml_local_name(child) == name]
+
+
+def _valid_intelligent_tiering_tag(element: Element) -> bool:
+    """Validate the fixed Key/Value shape used by an intelligent-tiering tag."""
+    children = list(element)
+    return (
+        [_xml_local_name(child) for child in children] == ["Key", "Value"]
+        and all(not list(child) for child in children)
+        and children[0].text is not None
+    )
+
+
+def _valid_intelligent_tiering_filter(element: Element) -> bool:
+    """Validate the exclusive Prefix, Tag, or And filter union."""
+    children = list(element)
+    if len(children) != 1:
+        return False
+    predicate = children[0]
+    predicate_name = _xml_local_name(predicate)
+    if predicate_name == "Prefix":
+        return not list(predicate)
+    if predicate_name == "Tag":
+        return _valid_intelligent_tiering_tag(predicate)
+    if predicate_name != "And":
+        return False
+    predicates = list(predicate)
+    names = [_xml_local_name(child) for child in predicates]
+    return (
+        len(predicates) >= 2
+        and set(names) <= {"Prefix", "Tag"}
+        and names.count("Prefix") <= 1
+        and all(
+            not list(child) if _xml_local_name(child) == "Prefix" else _valid_intelligent_tiering_tag(child)
+            for child in predicates
+        )
+    )
+
+
+def _append_intelligent_tiering_filter(source: Element, target: Element) -> None:
+    """Serialize one already-validated filter without generic recursion."""
+    predicate = list(source)[0]
+    predicate_name = _xml_local_name(predicate)
+    output_predicate = SubElement(target, predicate_name)
+    if predicate_name == "Prefix":
+        output_predicate.text = predicate.text or ""
+        return
+    if predicate_name == "Tag":
+        for child in predicate:
+            SubElement(output_predicate, _xml_local_name(child)).text = child.text or ""
+        return
+    for child in predicate:
+        output_child = SubElement(output_predicate, _xml_local_name(child))
+        if _xml_local_name(child) == "Prefix":
+            output_child.text = child.text or ""
+        else:
+            for tag_part in child:
+                SubElement(output_child, _xml_local_name(tag_part)).text = tag_part.text or ""
+
+
+def _append_intelligent_tiering_configuration(source: Element, target: Element) -> None:
+    """Serialize an already-validated configuration in the AWS response order."""
+    SubElement(target, "Id").text = _direct_xml_children(source, "Id")[0].text
+    filters = _direct_xml_children(source, "Filter")
+    if filters:
+        _append_intelligent_tiering_filter(filters[0], SubElement(target, "Filter"))
+    SubElement(target, "Status").text = _direct_xml_children(source, "Status")[0].text
+    for tiering in _direct_xml_children(source, "Tiering"):
+        output_tiering = SubElement(target, "Tiering")
+        SubElement(output_tiering, "AccessTier").text = _direct_xml_children(tiering, "AccessTier")[0].text
+        SubElement(output_tiering, "Days").text = _direct_xml_children(tiering, "Days")[0].text
+
+
+def _intelligent_tiering_error(name: str, config_id: str):
+    """Return S3's missing intelligent-tiering configuration response."""
+    return _error(
+        "NoSuchConfiguration",
+        "The specified configuration does not exist.",
+        404,
+        f"/{name}?intelligent-tiering&id={config_id}",
+    )
+
+
+def _get_bucket_intelligent_tiering(name: str, query_params: dict):
+    """Get one configuration by ID, or list configurations when ID is absent."""
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    config_id = _qp(query_params, "id")
+    if not config_id:
+        return _list_bucket_intelligent_tiering(name, query_params)
+    config = _bucket_intelligent_tiering.get((name, config_id))
+    if config is None:
+        return _intelligent_tiering_error(name, config_id)
+    return 200, {"Content-Type": "application/xml"}, config
+
+
+def _list_bucket_intelligent_tiering(name: str, query_params: dict):
+    """List a bucket's intelligent-tiering configurations in stable ID order."""
+    continuation = _qp(query_params, "continuation-token")
+    configurations = sorted(
+        (
+            (config_id, config)
+            for (bucket_name, config_id), config in _bucket_intelligent_tiering.items()
+            if bucket_name == name and config_id > continuation
+        ),
+        key=lambda item: item[0],
+    )
+    page = configurations[:100]
+    is_truncated = len(configurations) > len(page)
+    root = Element("ListBucketIntelligentTieringConfigurationsOutput", xmlns=S3_NS)
+    if continuation:
+        SubElement(root, "ContinuationToken").text = continuation
+    for _, config in page:
+        parsed = fromstring(config)
+        output_config = SubElement(root, "IntelligentTieringConfiguration")
+        _append_intelligent_tiering_configuration(parsed, output_config)
+    SubElement(root, "IsTruncated").text = "true" if is_truncated else "false"
+    if is_truncated:
+        SubElement(root, "NextContinuationToken").text = page[-1][0]
+    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def _put_bucket_intelligent_tiering(name: str, body: bytes, query_params: dict):
+    """Validate and persist an intelligent-tiering configuration by ID."""
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    config_id = _qp(query_params, "id")
+    try:
+        root = fromstring(body)
+    except ParseError:
+        return _error("MalformedXML", "The XML you provided was not well-formed or did not validate", 400, f"/{name}")
+
+    children = list(root)
+    child_names = [_xml_local_name(child) for child in children]
+    body_ids = _direct_xml_children(root, "Id")
+    statuses = _direct_xml_children(root, "Status")
+    filters = _direct_xml_children(root, "Filter")
+    tierings = _direct_xml_children(root, "Tiering")
+    expected_child_names = ["Id"]
+    if filters:
+        expected_child_names.append("Filter")
+    expected_child_names.extend(["Status", *(["Tiering"] * len(tierings))])
+    if (
+        not config_id
+        or _xml_local_name(root) != "IntelligentTieringConfiguration"
+        or set(child_names) - {"Id", "Filter", "Status", "Tiering"}
+        or child_names != expected_child_names
+        or len(body_ids) != 1
+        or body_ids[0].text != config_id
+        or list(body_ids[0])
+        or len(statuses) != 1
+        or statuses[0].text not in {"Enabled", "Disabled"}
+        or list(statuses[0])
+        or len(filters) > 1
+        or (filters and not _valid_intelligent_tiering_filter(filters[0]))
+        or not 1 <= len(tierings) <= 2
+    ):
+        return _error("InvalidArgument", "Invalid Argument", 400, f"/{name}")
+
+    configured_access_tiers = set()
+    for tiering in tierings:
+        tiering_children = list(tiering)
+        tiering_child_names = [_xml_local_name(child) for child in tiering_children]
+        days_elements = _direct_xml_children(tiering, "Days")
+        access_tiers = _direct_xml_children(tiering, "AccessTier")
+        if (
+            set(tiering_child_names) - {"Days", "AccessTier"}
+            or len(days_elements) != 1
+            or len(access_tiers) != 1
+            or list(days_elements[0])
+            or list(access_tiers[0])
+        ):
+            return _error("InvalidArgument", "Invalid Argument", 400, f"/{name}")
+        days = days_elements[0]
+        access_tier = access_tiers[0]
+        try:
+            days_value = int(days.text) if days.text is not None else 0
+        except ValueError:
+            days_value = 0
+        minimum_days = 180 if access_tier.text == "DEEP_ARCHIVE_ACCESS" else 90
+        if (
+            days_value < minimum_days
+            or days_value > 730
+            or access_tier.text not in {"ARCHIVE_ACCESS", "DEEP_ARCHIVE_ACCESS"}
+            or access_tier.text in configured_access_tiers
+        ):
+            return _error("InvalidArgument", "Invalid Argument", 400, f"/{name}")
+        configured_access_tiers.add(access_tier.text)
+
+    key = (name, config_id)
+    bucket_config_count = sum(
+        1 for bucket_name, _ in _bucket_intelligent_tiering if bucket_name == name
+    )
+    if key not in _bucket_intelligent_tiering and bucket_config_count >= 1000:
+        return _error(
+            "TooManyConfigurations",
+            "You have attempted to create more configurations than allowed",
+            400,
+            f"/{name}",
+        )
+
+    canonical = Element("IntelligentTieringConfiguration", xmlns=S3_NS)
+    _append_intelligent_tiering_configuration(root, canonical)
+    _bucket_intelligent_tiering[key] = _xml_body(canonical)
+    return 200, {}, b""
+
+
+def _delete_bucket_intelligent_tiering(name: str, query_params: dict):
+    """Delete an intelligent-tiering configuration; absent IDs are idempotent."""
+    if name not in _buckets:
+        return _no_such_bucket(name)
+    config_id = _qp(query_params, "id")
+    if not config_id:
+        return _error("InvalidArgument", "Invalid Argument", 400, f"/{name}")
+    _bucket_intelligent_tiering.pop((name, config_id), None)
     return 204, {}, b""
 
 
@@ -6500,7 +6738,8 @@ _load_persisted_data()
 def reset():
     """Wipe all in-memory state (used by /_ministack/reset)."""
     global _buckets, _bucket_policies, _bucket_notifications, _bucket_tags
-    global _bucket_versioning, _bucket_encryption, _bucket_lifecycle, _bucket_cors
+    global _bucket_versioning, _bucket_encryption, _bucket_lifecycle
+    global _bucket_intelligent_tiering, _bucket_cors
     global _bucket_acl, _bucket_websites, _bucket_logging_config
     global _bucket_accelerate_config, _bucket_request_payment_config
     global _object_tags, _multipart_uploads, _object_versions, _object_acl
@@ -6513,6 +6752,7 @@ def reset():
         _bucket_versioning,
         _bucket_encryption,
         _bucket_lifecycle,
+        _bucket_intelligent_tiering,
         _bucket_cors,
         _bucket_acl,
         _bucket_websites,
