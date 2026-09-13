@@ -319,6 +319,125 @@ def test_cloudwatch_tags_v2(cw):
     assert any(t["Key"] == "team" for t in resp2["Tags"])
 
 
+@pytest.mark.serial
+def test_bd_958_metric_math_alarm_round_trips_terraform_readback(cw):
+    """BD-958: a metric-math alarm preserves Terraform's optional-field shape,
+    creation tags, and explicit DatapointsToAlarm through AWS SDK read-back.
+    """
+    alarm_name = f"bd-958-metric-math-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(
+            AlarmName=alarm_name,
+            ComparisonOperator="GreaterThanThreshold",
+            DatapointsToAlarm=1,
+            EvaluationPeriods=2,
+            Threshold=1.0,
+            Tags=[
+                {"Key": "managed-by", "Value": "terraform"},
+                {"Key": "ticket", "Value": "BD-958"},
+            ],
+            Metrics=[
+                {
+                    "Id": "errors",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/Lambda",
+                            "MetricName": "Errors",
+                        },
+                        "Period": 60,
+                        "Stat": "Sum",
+                    },
+                    "ReturnData": False,
+                },
+                {
+                    "Id": "error_rate",
+                    "Expression": "errors",
+                    "ReturnData": True,
+                },
+            ],
+        )
+
+        alarm = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        assert "MetricName" not in alarm
+        assert "Namespace" not in alarm
+        assert "Statistic" not in alarm
+        assert "Period" not in alarm
+        assert alarm["DatapointsToAlarm"] == 1
+        assert alarm["Metrics"] == [
+            {
+                "Id": "errors",
+                "MetricStat": {
+                    "Metric": {"Namespace": "AWS/Lambda", "MetricName": "Errors"},
+                    "Period": 60,
+                    "Stat": "Sum",
+                },
+                "ReturnData": False,
+            },
+            {"Id": "error_rate", "Expression": "errors", "ReturnData": True},
+        ]
+        tags = cw.list_tags_for_resource(ResourceARN=alarm["AlarmArn"])["Tags"]
+        assert {tag["Key"]: tag["Value"] for tag in tags} == {
+            "managed-by": "terraform",
+            "ticket": "BD-958",
+        }
+    finally:
+        cw.delete_alarms(AlarmNames=[alarm_name])
+
+
+@pytest.mark.serial
+def test_bd_958_anomaly_detection_alarm_omits_threshold_on_readback(cw):
+    """BD-958: anomaly alarms return ThresholdMetricId without inventing Threshold."""
+    alarm_name = f"bd-958-anomaly-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(
+            AlarmName=alarm_name,
+            ComparisonOperator="LessThanLowerOrGreaterThanUpperThreshold",
+            EvaluationPeriods=1,
+            ThresholdMetricId="anomaly_band",
+            Metrics=[
+                {
+                    "Id": "errors",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/Lambda",
+                            "MetricName": "Errors",
+                        },
+                        "Period": 60,
+                        "Stat": "Sum",
+                    },
+                    "ReturnData": False,
+                },
+                {
+                    "Id": "anomaly_band",
+                    "Expression": "ANOMALY_DETECTION_BAND(errors, 2)",
+                    "ReturnData": True,
+                },
+            ],
+        )
+
+        alarm = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        assert "Threshold" not in alarm
+        assert alarm["ThresholdMetricId"] == "anomaly_band"
+        assert alarm["Metrics"] == [
+            {
+                "Id": "errors",
+                "MetricStat": {
+                    "Metric": {"Namespace": "AWS/Lambda", "MetricName": "Errors"},
+                    "Period": 60,
+                    "Stat": "Sum",
+                },
+                "ReturnData": False,
+            },
+            {
+                "Id": "anomaly_band",
+                "Expression": "ANOMALY_DETECTION_BAND(errors, 2)",
+                "ReturnData": True,
+            },
+        ]
+    finally:
+        cw.delete_alarms(AlarmNames=[alarm_name])
+
+
 def test_cloudwatch_alarms_are_region_isolated(cw):
     """Alarms are region-specific: DescribeAlarms in another region must not
     list an alarm created here (was account-scoped, so it leaked across regions)."""

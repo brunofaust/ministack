@@ -304,6 +304,37 @@ def test_sns_tags(sns):
     assert tags["env"] == "staging"
 
 
+def test_sns_create_topic_tags_are_readable_and_survive_tag_crud(sns):
+    """BD-958: tags supplied to CreateTopic round-trip through later tag CRUD."""
+    topic_name = f"intg-sns-create-topic-tags-{_uuid_mod.uuid4().hex[:8]}"
+    topic_arn = sns.create_topic(
+        Name=topic_name,
+        Tags=[
+            {"Key": "environment", "Value": "terraform"},
+            {"Key": "managed-by", "Value": "terraform"},
+        ],
+    )["TopicArn"]
+
+    created_tags = {
+        tag["Key"]: tag["Value"]
+        for tag in sns.list_tags_for_resource(ResourceArn=topic_arn)["Tags"]
+    }
+
+    assert created_tags == {"environment": "terraform", "managed-by": "terraform"}
+
+    sns.tag_resource(
+        ResourceArn=topic_arn,
+        Tags=[{"Key": "team", "Value": "platform"}],
+    )
+    sns.untag_resource(ResourceArn=topic_arn, TagKeys=["managed-by"])
+    final_tags = {
+        tag["Key"]: tag["Value"]
+        for tag in sns.list_tags_for_resource(ResourceArn=topic_arn)["Tags"]
+    }
+
+    assert final_tags == {"environment": "terraform", "team": "platform"}
+
+
 def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
     arn = sns.create_topic(Name=f"intg-sns-empty-account-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
     empty_account_arn = arn.replace(":000000000000:", "::")

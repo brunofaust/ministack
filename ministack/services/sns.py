@@ -290,9 +290,9 @@ def _create_topic(params):
 
         # Store tags from CreateTopic
         i = 1
-        while _p(params, f"Tag.member.{i}.Key"):
-            key = _p(params, f"Tag.member.{i}.Key")
-            val = _p(params, f"Tag.member.{i}.Value")
+        while _p(params, f"Tags.member.{i}.Key"):
+            key = _p(params, f"Tags.member.{i}.Key")
+            val = _p(params, f"Tags.member.{i}.Value")
             topic["tags"][key] = val
             i += 1
 
