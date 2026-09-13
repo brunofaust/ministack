@@ -2011,6 +2011,31 @@ def test_s3_event_notification_to_lambda_boto3_default(s3, lam, logs):
         "Lambda was not invoked for boto3-shaped notification config"
 
 
+def test_s3_put_notification_no_test_event_to_lambda(s3, lam, logs):
+    """AWS delivers the s3:TestEvent only to SQS and SNS destinations. A Lambda
+    target must not be invoked at configuration time, otherwise every deploy
+    logs failures for handlers that assume the Records array is present.
+    """
+    fname = "s3-no-test-evt-lam"
+    bkt = "s3-no-test-evt-bkt"
+    arn = _create_event_lambda(lam, fname)
+    s3.create_bucket(Bucket=bkt)
+    s3.put_bucket_notification_configuration(
+        Bucket=bkt,
+        NotificationConfiguration={
+            "LambdaFunctionConfigurations": [
+                {"LambdaFunctionArn": arn, "Events": ["s3:ObjectCreated:*"]},
+            ],
+        },
+    )
+    assert not _wait_lambda_invoked(logs, fname, "s3:TestEvent", timeout=3.0), \
+        "s3:TestEvent was delivered to the Lambda target; AWS sends it to SQS and SNS only"
+
+    s3.put_object(Bucket=bkt, Key="real.txt", Body=b"hi")
+    assert _wait_lambda_invoked(logs, fname, "real.txt"), \
+        "Lambda was not invoked for a real object event"
+
+
 def test_s3_event_notification_to_lambda_validates_bucket_region(s3, lam):
     fname = "s3-evt-lam-region"
     _create_event_lambda(lam, fname, marker="east")
@@ -2161,7 +2186,8 @@ def test_s3_eventbridge_notification(s3, sqs, eb):
     # Rule matches the AWS-documented detail-type, not source alone.
     eb.put_rule(
         Name="s3-to-sqs-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"],
+                                 "detail": {"bucket": {"name": ["s3-eb-bkt"]}}}),
         State="ENABLED",
     )
     eb.put_targets(
@@ -2208,7 +2234,8 @@ def test_s3_eventbridge_notification_dispatches_in_bucket_region(s3):
     )
     west_eb.put_rule(
         Name=rule_name,
-        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Created"],
+                                 "detail": {"bucket": {"name": [bucket_name]}}}),
         State="ENABLED",
     )
     west_eb.put_targets(
@@ -2245,7 +2272,7 @@ def test_s3_eventbridge_notification_copy_reason(s3, sqs, eb):
             {
                 "source": ["aws.s3"],
                 "detail-type": ["Object Created"],
-                "detail": {"reason": ["CopyObject"]},
+                "detail": {"reason": ["CopyObject"], "bucket": {"name": ["s3-eb-copy-bkt"]}},
             }
         ),
         State="ENABLED",
@@ -2279,7 +2306,8 @@ def test_s3_eventbridge_notification_object_deleted(s3, sqs, eb):
     )
     eb.put_rule(
         Name="s3-del-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Deleted"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"], "detail-type": ["Object Deleted"],
+                                 "detail": {"bucket": {"name": ["s3-eb-del-bkt"]}}}),
         State="ENABLED",
     )
     eb.put_targets(Rule="s3-del-rule", Targets=[{"Id": "t", "Arn": queue_arn}])
@@ -3991,6 +4019,229 @@ def test_s3_presigned_url_signature_is_verified():
     assert status(urllib.request.Request(u, method="GET")) == 200
 
 
+def test_s3_presigned_url_uses_iam_access_key_secret_and_status():
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    account_id = "123456789012"
+    user_name = f"presign-user-{uuid.uuid4().hex[:8]}"
+    bucket = f"presign-iam-{uuid.uuid4().hex[:8]}"
+    key = "hello.txt"
+    tenant_iam = boto3.client(
+        "iam",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+    )
+    tenant_s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        config=Config(s3={"addressing_style": "path"}),
+    )
+    tenant_iam.create_user(UserName=user_name)
+    access_key = tenant_iam.create_access_key(UserName=user_name)["AccessKey"]
+    tenant_s3.create_bucket(Bucket=bucket)
+    tenant_s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
+
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=access_key["AccessKeyId"],
+        aws_secret_access_key=access_key["SecretAccessKey"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    url = client.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
+    )
+
+    try:
+        assert urllib.request.urlopen(url).status == 200
+        tenant_iam.update_access_key(
+            UserName=user_name,
+            AccessKeyId=access_key["AccessKeyId"],
+            Status="Inactive",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(url)
+        assert exc.value.code == 403
+        assert b"<Code>InvalidAccessKeyId</Code>" in exc.value.read()
+    finally:
+        tenant_iam.delete_access_key(
+            UserName=user_name,
+            AccessKeyId=access_key["AccessKeyId"],
+        )
+        tenant_iam.delete_user(UserName=user_name)
+
+
+def test_s3_presigned_url_requires_exact_sts_session_token(s3, sts):
+    import urllib.error
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    bucket = f"presign-sts-{uuid.uuid4().hex[:8]}"
+    key = "hello.txt"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
+    credentials = sts.get_session_token(DurationSeconds=900)["Credentials"]
+    config = Config(signature_version="s3v4", s3={"addressing_style": "path"})
+
+    def presign(session_token=None):
+        client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=session_token,
+            config=config,
+        )
+        return client.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
+        )
+
+    assert urllib.request.urlopen(presign(credentials["SessionToken"])).status == 200
+    for bad_token in (None, "wrong-session-token"):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(presign(bad_token))
+        # S3's error table: InvalidToken is 400, not 403.
+        assert exc.value.code == 400
+        assert b"<Code>InvalidToken</Code>" in exc.value.read()
+
+
+def test_s3_presigned_url_accepts_lenient_session_origin(s3):
+    import urllib.request
+    import uuid
+
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    bucket = f"presign-lenient-sts-{uuid.uuid4().hex[:8]}"
+    key = "hello.txt"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key=key, Body=b"hi")
+    lenient_sts = boto3.client(
+        "sts",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id="unknown-lenient-caller",
+        aws_secret_access_key="unknown-lenient-secret",
+    )
+    credentials = lenient_sts.get_session_token(DurationSeconds=900)["Credentials"]
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        region_name="us-east-1",
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    url = client.generate_presigned_url(
+        "get_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300
+    )
+
+    assert urllib.request.urlopen(url).status == 200
+
+
+@pytest.mark.parametrize("auth_enabled", [False, True])
+@pytest.mark.parametrize("bad_token", [False, True])
+def test_s3_presign_verifies_in_both_auth_modes(monkeypatch, auth_enabled, bad_token):
+    from urllib.parse import parse_qs, urlsplit
+
+    import boto3
+    from botocore.config import Config
+
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import s3 as s3_svc
+
+    key = "test-presign-mode-key"
+    owner = "123456789012"
+    monkeypatch.setattr(app_mod, "AUTH", auth_enabled)
+    iam_svc._access_keys.set_scoped(owner, None, key, {
+        "UserName": "alice", "Status": "Active", "SecretAccessKey": "secret",
+    })
+    client = boto3.client(
+        "s3", endpoint_url="http://localhost:4566", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key="secret",
+        aws_session_token="unexpected-token" if bad_token else None,
+        config=Config(signature_version="s3v4"),
+    )
+    url = urlsplit(client.generate_presigned_url(
+        "get_object", Params={"Bucket": "test-bucket", "Key": "object"},
+    ))
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            error = s3_svc._verify_presigned_sigv4(
+                "GET", url.path, {"host": url.netloc}, parse_qs(url.query),
+            )
+            assert get_account_id() == owner
+            if bad_token:
+                assert error[0] == 400
+            else:
+                assert error is None
+    finally:
+        iam_svc._access_keys.pop_scoped(owner, None, key, None)
+
+
+def test_presigned_mrap_resolves_alias_in_iam_owner_account(monkeypatch):
+    import asyncio
+    from urllib.parse import parse_qs, urlsplit
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    from ministack import app as app_mod
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+    from ministack.services import s3 as s3_svc
+
+    key, owner, alias = "test-mrap-owner-key", "123456789012", "testalias.mrap"
+    host = f"{alias}.accesspoint.s3-global.amazonaws.com"
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    request = AWSRequest(method="GET", url=f"http://{host}/object")
+    S3SigV4QueryAuth(Credentials(key, "secret"), "s3", "us-east-1").add_auth(request)
+    url = urlsplit(request.url)
+    routed = []
+
+    async def capture(method, path, headers, body, query_params, **kwargs):
+        routed.append((get_account_id(), path))
+        return 200, {}, b"object"
+
+    monkeypatch.setattr(s3_svc, "handle_request", capture)
+    iam_svc._access_keys.set_scoped(owner, None, key, {
+        "UserName": "alice", "Status": "Active", "SecretAccessKey": "secret",
+    })
+    s3_svc._mraps.set_scoped(owner, None, alias, {"Regions": ["member-bucket"]})
+    try:
+        with request_scope("000000000000", "us-east-1"):
+            result = asyncio.run(app_mod._handle_s3_vhost_request(
+                host, url.path, "GET", {"host": host}, b"", parse_qs(url.query),
+            ))
+        assert result[0] == 200
+        assert routed == [(owner, "/member-bucket/object")]
+    finally:
+        iam_svc._access_keys.pop_scoped(owner, None, key, None)
+        s3_svc._mraps.pop_scoped(owner, None, alias, None)
+
+
 def test_s3_presigned_url_virtual_hosted_style_is_verified():
     """A virtual-hosted-style presigned URL signs the bucket-less canonical URI
     against the `{bucket}.host` Host header. MiniStack rewrites vhost → path-style
@@ -4068,6 +4319,145 @@ def test_s3_presigned_put_metadata_hoisted_into_query(s3):
     ]
 
 
+def test_s3_presigned_put_query_checksum_is_not_verified(s3):
+    """A presigned URL's `x-amz-checksum-*` query parameter describes the empty
+    body the presigner had, not the body the holder of the URL later uploads,
+    so it cannot be an integrity value. Since v3.729.0 the JS SDK signs one into
+    every presigned PutObject by default, and AWS answers 200 for a body that
+    does not match it. Verifying it rejects a request real S3 accepts."""
+    import urllib.request
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-qs-checksum-bkt"
+    key = "probe.txt"
+    s3.create_bucket(Bucket=bucket)
+
+    # `AAAAAA==` is CRC32 of the empty body — the literal value the JS SDK
+    # signs in, and the one AWS's own recorded snapshot carries.
+    signed = AWSRequest(
+        method="PUT",
+        url=f"{ENDPOINT}/{bucket}/{key}"
+            "?x-amz-checksum-crc32=AAAAAA%3D%3D"
+            "&x-amz-sdk-checksum-algorithm=CRC32",
+    )
+    S3SigV4QueryAuth(
+        Credentials("test", "test"), "s3", "us-east-1", expires=300
+    ).add_auth(signed)
+
+    resp = urllib.request.urlopen(
+        urllib.request.Request(signed.url, data=b"123456", method="PUT"))
+    assert resp.status == 200
+
+    # AWS stores the body it was sent, mismatching checksum parameter and all.
+    head = s3.head_object(Bucket=bucket, Key=key, ChecksumMode="ENABLED")
+    assert head["ContentLength"] == 6
+    assert s3.get_object(Bucket=bucket, Key=key)["Body"].read() == b"123456"
+
+    # `x-amz-sdk-checksum-algorithm` names an algorithm to compute rather than
+    # carrying a value, so it keeps hoisting: the stored checksum is CRC32 of
+    # the body that actually arrived, never the empty-body value off the URL.
+    assert head.get("ChecksumCRC32") == "CXLTYQ==", (
+        "the hoisted algorithm selector was not honoured")
+
+
+def test_s3_presigned_put_query_checksum_still_covered_by_signature(s3):
+    """The other half of the AWS contract: the parameter is ignored as an
+    integrity value but still signed, so rewriting it after the fact breaks the
+    signature. Ignoring it must not mean stripping it before verification."""
+    import urllib.error
+    import urllib.request
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-qs-checksum-sig-bkt"
+    key = "probe.txt"
+    s3.create_bucket(Bucket=bucket)
+
+    signed = AWSRequest(
+        method="PUT",
+        url=f"{ENDPOINT}/{bucket}/{key}?x-amz-checksum-crc32=AAAAAA%3D%3D",
+    )
+    S3SigV4QueryAuth(
+        Credentials("test", "test"), "s3", "us-east-1", expires=300
+    ).add_auth(signed)
+
+    tampered = signed.url.replace("AAAAAA%3D%3D", "BBBBBB%3D%3D")
+    assert tampered != signed.url
+    try:
+        status = urllib.request.urlopen(
+            urllib.request.Request(tampered, data=b"123456", method="PUT")).status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 403, f"tampered checksum parameter accepted with {status}"
+
+
+def test_s3_put_header_checksum_is_still_verified(s3):
+    """Excluding the query parameter must not loosen the header case: a
+    `x-amz-checksum-*` sent as a real header is a value the client computed over
+    the body it is sending, and a mismatch is still `BadDigest`."""
+    import urllib.error
+    import urllib.request
+
+    bucket = "presign-hdr-checksum-bkt"
+    key = "probe.txt"
+    s3.create_bucket(Bucket=bucket)
+
+    url = s3.generate_presigned_url(
+        "put_object", Params={"Bucket": bucket, "Key": key}, ExpiresIn=300)
+    try:
+        status = urllib.request.urlopen(urllib.request.Request(
+            url, data=b"123456", method="PUT",
+            headers={"x-amz-checksum-crc32": "AAAAAA=="})).status
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+    assert status == 400, f"mismatching checksum header accepted with {status}"
+
+
+def test_s3_presigned_multipart_hoisted_checksum_algorithm_is_honoured(s3):
+    """The exclusion covers checksum *values* only. `x-amz-checksum-algorithm`
+    and `x-amz-sdk-checksum-algorithm` name an algorithm for the server to
+    compute rather than carrying a value, so they cannot disagree with a body;
+    a presigned CreateMultipartUpload hoists one of them to choose the algorithm
+    its parts are digested with, and the completed object must carry it."""
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    from botocore.auth import S3SigV4QueryAuth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    bucket = "presign-mpu-algo-bkt"
+    s3.create_bucket(Bucket=bucket)
+
+    for param in ("x-amz-checksum-algorithm", "x-amz-sdk-checksum-algorithm"):
+        key = f"multipart/{param}.bin"
+        signed = AWSRequest(
+            method="POST", url=f"{ENDPOINT}/{bucket}/{key}?uploads&{param}=CRC32")
+        S3SigV4QueryAuth(
+            Credentials("test", "test"), "s3", "us-east-1", expires=300
+        ).add_auth(signed)
+
+        body = urllib.request.urlopen(urllib.request.Request(
+            signed.url, data=b"", method="POST")).read()
+        ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+        upload_id = ET.fromstring(body).findtext(f"{ns}UploadId")
+        assert upload_id
+
+        part = s3.upload_part(Bucket=bucket, Key=key, UploadId=upload_id,
+                              PartNumber=1, Body=b"x" * 16)
+        done = s3.complete_multipart_upload(
+            Bucket=bucket, Key=key, UploadId=upload_id,
+            MultipartUpload={"Parts": [
+                {"ETag": part["ETag"], "PartNumber": 1}]})
+        assert done.get("ChecksumCRC32"), (
+            f"{param} hoisted into the query string was not honoured")
+
+
 def test_s3_presigned_put_metadata_sent_as_signed_headers(s3):
     """The other half of the contract: when the presigner leaves the metadata
     in `X-Amz-SignedHeaders` instead of hoisting it, the uploader sends the
@@ -4133,7 +4523,8 @@ def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     # Create EventBridge rule matching S3 events -> SQS target
     eb.put_rule(
         Name="s3-del-to-sqs-rule",
-        EventPattern=json.dumps({"source": ["aws.s3"]}),
+        EventPattern=json.dumps({"source": ["aws.s3"],
+                                 "detail": {"bucket": {"name": [bucket]}}}),
         State="ENABLED",
     )
     eb.put_targets(
@@ -6375,3 +6766,129 @@ def test_unicode_s3_metadata(s3):
     head = s3.head_object(Bucket="unicode-meta", Key="file.bin")
     assert unquote(head["Metadata"]["filename"]) == "résumé.pdf"
     assert unquote(head["Metadata"]["author"]) == "Ñoño"
+
+
+def _wait_stack(cfn, name, timeout=30):
+    """Poll until the stack reaches a terminal status; a deleted stack is
+    addressable only by its id, so describe-by-name failing means gone."""
+    deadline = time.time() + timeout
+    status = "UNKNOWN"
+    while time.time() < deadline:
+        try:
+            stack = cfn.describe_stacks(StackName=name)["Stacks"][0]
+        except ClientError as exc:
+            if "does not exist" in str(exc):
+                return {"StackStatus": "DELETE_COMPLETE", "StackName": name}
+            raise
+        status = stack["StackStatus"]
+        if status.endswith("_COMPLETE") or status.endswith("_FAILED"):
+            return stack
+        time.sleep(0.2)
+    raise AssertionError(f"stack {name} stuck in {status}")
+
+
+def _mrap_template(name, buckets):
+    return json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            **{f"B{i}": {"Type": "AWS::S3::Bucket", "Properties": {"BucketName": b}}
+               for i, b in enumerate(buckets)},
+            "Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
+                     "DependsOn": [f"B{i}" for i in range(len(buckets))],
+                     "Properties": {"Name": name,
+                                    "Regions": [{"Bucket": b} for b in buckets]}},
+        },
+        "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+
+
+def _mrap_get(alias, key, region=None):
+    """GET through the MRAP hostname. The host is sent explicitly rather than
+    resolved: <alias>.mrap.accesspoint.s3-global.amazonaws.com is a real public
+    suffix, so letting DNS see it would leave the test dependent on egress."""
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    req = urllib.request.Request(f"{endpoint}/{key}")
+    # The alias itself ends in ".mrap"; the hostname appends only the suffix.
+    req.add_header("Host", f"{alias}.accesspoint.s3-global.amazonaws.com")
+    if region:
+        req.add_header("Authorization",
+                       "AWS4-HMAC-SHA256 "
+                       f"Credential=test/20260101/{region}/s3/aws4_request, "
+                       "SignedHeaders=host, Signature=unsigned")
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status, resp.read().decode()
+
+
+def test_s3_mrap_alias_serves_the_region_member(cfn, s3):
+    """The MRAP hostname resolved nowhere — it is not a bucket name and matched
+    no virtual-host rule. It now lands on the existing vhost path, and the
+    member whose *stored* bucket region matches the request region is served
+    rather than whichever is listed first. The buckets are created through the
+    S3 API (one per region, like a real MRAP's members) and only the access
+    point comes from the stack."""
+    us_bucket, eu_bucket = "mrap-serve-us-app", "mrap-serve-eu-app"
+    s3.create_bucket(Bucket=us_bucket)  # the client's own region, us-east-1
+    s3.create_bucket(Bucket=eu_bucket, CreateBucketConfiguration={
+        "LocationConstraint": "eu-west-1"})
+    template = json.dumps({
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {"Mrap": {"Type": "AWS::S3::MultiRegionAccessPoint",
+                               "Properties": {"Name": "serve-mrap-app",
+                                              "Regions": [{"Bucket": us_bucket},
+                                                          {"Bucket": eu_bucket}]}}},
+        "Outputs": {"Alias": {"Value": {"Fn::GetAtt": ["Mrap", "Alias"]}}},
+    })
+    cfn.create_stack(StackName="cfn-s3-mrap-serve", TemplateBody=template)
+    try:
+        stack = _wait_stack(cfn, "cfn-s3-mrap-serve")
+        assert stack["StackStatus"] == "CREATE_COMPLETE"
+        alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
+
+        s3.put_object(Bucket=us_bucket, Key="who.txt", Body=b"US BUCKET")
+        s3.put_object(Bucket=eu_bucket, Key="who.txt", Body=b"EU BUCKET")
+
+        # us-east-1 is listed first, so serving the eu-west-1 member proves the
+        # member is chosen by its stored region rather than taken off the front.
+        assert _mrap_get(alias, "who.txt", region="eu-west-1") == (200, "EU BUCKET")
+        assert _mrap_get(alias, "who.txt", region="us-east-1") == (200, "US BUCKET")
+
+        # A request whose credential scope names a region with no member falls
+        # back to the first member rather than failing (SigV4A carries no
+        # region at all and lands the same way).
+        assert _mrap_get(alias, "who.txt", region="ap-south-1") == (200, "US BUCKET")
+    finally:
+        cfn.delete_stack(StackName="cfn-s3-mrap-serve")
+        _wait_stack(cfn, "cfn-s3-mrap-serve")
+        for bucket in (us_bucket, eu_bucket):
+            s3.delete_object(Bucket=bucket, Key="who.txt")
+            s3.delete_bucket(Bucket=bucket)
+
+
+def _reset():
+    import urllib.request
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
+    urllib.request.urlopen(
+        urllib.request.Request(f"{endpoint}/_ministack/reset", data=b"", method="POST"),
+        timeout=10)
+
+
+@pytest.mark.serial
+def test_s3_mrap_cleared_by_reset(cfn, s3):
+    """Every module-level store must be cleared by reset() — /_ministack/reset is
+    what test isolation depends on, so an access point surviving it would leak
+    an alias into the next test."""
+    buckets = ["mrap-reset-us-east-1-app"]
+    cfn.create_stack(StackName="cfn-s3-mrap-reset",
+                     TemplateBody=_mrap_template("reset-mrap-app", buckets))
+    stack = _wait_stack(cfn, "cfn-s3-mrap-reset")
+    alias = {o["OutputKey"]: o["OutputValue"] for o in stack["Outputs"]}["Alias"]
+    s3.put_object(Bucket=buckets[0], Key="who.txt", Body=b"US BUCKET")
+    assert _mrap_get(alias, "who.txt") == (200, "US BUCKET")
+
+    _reset()
+
+    import urllib.error
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        _mrap_get(alias, "who.txt")
+    assert ei.value.code in (403, 404)

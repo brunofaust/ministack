@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """IAM policy evaluation engine.
 
 Implements the AWS IAM policy evaluation algorithm (single-account,
@@ -10,10 +12,13 @@ Evaluation order:
 """
 
 import datetime as _dt
+import hmac
 import ipaddress
 import json
 import logging
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +52,7 @@ class EvalContext:
     secure_transport: bool = False
     request_tags: dict[str, str] = field(default_factory=dict)
     tag_keys: list[str] = field(default_factory=list)
+    service_context: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -70,10 +76,6 @@ class AuthError:
     """Authentication failure (before policy evaluation)."""
     code: str  # "InvalidClientTokenId", "ExpiredTokenException", etc.
     message: str
-
-
-# Default access keys that are always treated as root (backwards compat)
-_ROOT_ACCESS_KEYS = frozenset({"test", ""})
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +179,8 @@ def _resolve_condition_key(key: str, ctx: EvalContext) -> Any:
         # role conditions its S3 grant on this key, so leaving it unresolved
         # denied every `cdk deploy` under AUTH=true.
         return _account_from_arn(ctx.resource_arn) or ctx.principal_account
+    if k in ctx.service_context:
+        return ctx.service_context[k]
     return None  # key not present
 
 
@@ -630,13 +634,245 @@ def _resolve_managed_policy_document(policy_arn: str,
     return None
 
 
+# ---------------------------------------------------------------------------
+# Access-key resolution — the credentials and principals MiniStack issued
+# ---------------------------------------------------------------------------
+
+_ACCOUNT_ID_RE = re.compile(r"^\d{12}$")
+_SESSION_TOKEN_NOT_CHECKED = object()
+
+
+@dataclass(frozen=True)
+class ResolvedCredential:
+    access_key_id: str
+    secret_access_key: str
+    account_id: str
+    principal_arn: str
+    principal_id: str
+    principal_type: str
+    principal_name: str = ""
+    session_token: str | None = None
+    expiration: float | None = None
+    source_access_key_id: str | None = None
+
+
+@dataclass(frozen=True)
+class CredentialResolutionError:
+    code: str
+    message: str
+
+
+class AmbiguousAccessKeyError(ValueError):
+    """Raised when more than one tenant owns the same IAM access key."""
+
+
+def is_root_access_key(access_key_id: str) -> bool:
+    """Return whether a key represents MiniStack's configured root caller."""
+    configured_key = os.environ.get("AWS_ACCESS_KEY_ID", "test")
+    return (
+        not access_key_id
+        or access_key_id == "test"
+        or access_key_id == configured_key
+        or bool(_ACCOUNT_ID_RE.fullmatch(access_key_id))
+    )
+
+
+def _unknown_access_key() -> CredentialResolutionError:
+    return CredentialResolutionError(
+        "UnrecognizedClientException",
+        "The security token included in the request is invalid.",
+    )
+
+
+def _invalid_session_token() -> CredentialResolutionError:
+    return CredentialResolutionError(
+        "InvalidToken",
+        "The provided token is malformed or otherwise invalid.",
+    )
+
+
+def _account_from_arn(arn: str) -> str | None:
+    parts = arn.split(":")
+    if len(parts) > 4 and _ACCOUNT_ID_RE.fullmatch(parts[4]):
+        return parts[4]
+    return None
+
+
+def _principal_type(arn: str, recorded_type: str) -> str:
+    if recorded_type:
+        return recorded_type
+    if ":assumed-role/" in arn:
+        return "AssumedRole"
+    if ":user/" in arn:
+        return "User"
+    if arn.endswith(":root"):
+        return "Root"
+    return ""
+
+
+def _validate_session_token(expected: str | None, supplied) -> CredentialResolutionError | None:
+    if supplied is _SESSION_TOKEN_NOT_CHECKED:
+        return None
+    supplied = supplied or ""
+    if expected is None:
+        return _invalid_session_token() if supplied else None
+    if not isinstance(expected, str) or not isinstance(supplied, str) or not hmac.compare_digest(
+        expected.encode("utf-8"), supplied.encode("utf-8")
+    ):
+        return _invalid_session_token()
+    return None
+
+
+def find_iam_access_key_account(access_key_id: str) -> str | None:
+    """Return the sole account that owns an IAM access key, if known.
+
+    AWS access key IDs are globally unique. Duplicate emulator records raise
+    instead of selecting either tenant.
+    """
+    if is_root_access_key(access_key_id):
+        return None
+
+    from ministack.services import sts as sts_svc
+
+    if access_key_id in sts_svc._sessions:
+        return None
+
+    from ministack.services import iam as iam_svc
+
+    accounts = {
+        account_id
+        for (account_id, stored_key) in iam_svc._access_keys.to_dict()
+        if stored_key == access_key_id
+    }
+    if len(accounts) > 1:
+        raise AmbiguousAccessKeyError(access_key_id)
+    if accounts:
+        return accounts.pop()
+    return None
+
+
+def resolve_credential(
+    access_key_id: str,
+    account_id: str | None = None,
+    session_token=_SESSION_TOKEN_NOT_CHECKED,
+) -> ResolvedCredential | CredentialResolutionError:
+    """Resolve a root, IAM, or STS key in an explicit account.
+
+    Passing ``session_token`` also validates whether the caller supplied the
+    exact token attached to temporary credentials. Omitting it leaves token
+    validation to the caller, which keeps policy-only identity lookups usable.
+    """
+    from ministack.core.responses import get_account_id
+
+    account_id = account_id or get_account_id()
+
+    if is_root_access_key(access_key_id):
+        if _ACCOUNT_ID_RE.fullmatch(access_key_id):
+            if account_id != access_key_id:
+                return _unknown_access_key()
+            account_id = access_key_id
+        configured_key = os.environ.get("AWS_ACCESS_KEY_ID", "test")
+        configured_token = os.environ.get("AWS_SESSION_TOKEN") or None
+        numeric_token_supplied = (
+            bool(_ACCOUNT_ID_RE.fullmatch(access_key_id))
+            and isinstance(session_token, str)
+            and bool(session_token)
+        )
+        expected_token = (
+            configured_token
+            if access_key_id == configured_key or numeric_token_supplied
+            else None
+        )
+        token_error = _validate_session_token(expected_token, session_token)
+        if token_error:
+            return token_error
+        return ResolvedCredential(
+            access_key_id=access_key_id,
+            secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+            session_token=expected_token,
+            account_id=account_id,
+            principal_arn=f"arn:aws:iam::{account_id}:root",
+            principal_id=account_id,
+            principal_type="Root",
+            source_access_key_id=access_key_id,
+        )
+
+    from ministack.services import sts as sts_svc
+
+    session = sts_svc._sessions.get(access_key_id)
+    if session is not None:
+        principal_arn = str(session.get("Arn", ""))
+        session_account = session.get("AccountId") or _account_from_arn(principal_arn)
+        if session_account and session_account != account_id:
+            return _unknown_access_key()
+        expiration = session.get("Expiration")
+        if isinstance(expiration, (int, float)) and time.time() > expiration:
+            return CredentialResolutionError(
+                "ExpiredTokenException",
+                "The security token included in the request is expired",
+            )
+        expected_token = session.get("SessionToken")
+        token_error = _validate_session_token(expected_token, session_token)
+        if token_error:
+            return token_error
+        secret = session.get("SecretAccessKey")
+        principal_type = _principal_type(principal_arn, session.get("PrincipalType", ""))
+        if not secret or not principal_type:
+            return _unknown_access_key()
+        principal_name = ""
+        if principal_type == "User" and ":user/" in principal_arn:
+            principal_name = str(session.get("PrincipalName") or "")
+            if not principal_name:
+                principal_name = principal_arn.rsplit("/", 1)[-1]
+        return ResolvedCredential(
+            access_key_id=access_key_id,
+            secret_access_key=secret,
+            session_token=expected_token,
+            expiration=expiration if isinstance(expiration, (int, float)) else None,
+            account_id=session_account or account_id,
+            principal_arn=principal_arn,
+            principal_id=str(session.get("UserId", "")),
+            principal_type=principal_type,
+            principal_name=principal_name,
+            source_access_key_id=session.get("SourceAccessKeyId"),
+        )
+
+    from ministack.services import iam as iam_svc
+
+    key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
+    if key_record is None:
+        return _unknown_access_key()
+    if key_record.get("Status") != "Active":
+        return CredentialResolutionError(
+            "InvalidClientTokenId",
+            "The security token included in the request is invalid.",
+        )
+    token_error = _validate_session_token(None, session_token)
+    if token_error:
+        return token_error
+    secret = key_record.get("SecretAccessKey")
+    if not secret:
+        return _unknown_access_key()
+    user_name = str(key_record.get("UserName", ""))
+    user = iam_svc._users.get_scoped(account_id, None, user_name) or {}
+    principal_arn = str(
+        user.get("Arn") or f"arn:aws:iam::{account_id}:user/{user_name}"
+    )
+    return ResolvedCredential(
+        access_key_id=access_key_id,
+        secret_access_key=secret,
+        account_id=account_id,
+        principal_arn=principal_arn,
+        principal_id=str(user.get("UserId", "")),
+        principal_type="User",
+        principal_name=user_name,
+        source_access_key_id=access_key_id,
+    )
+
+
 def _is_root_key(access_key_id: str) -> bool:
-    """Keys that are always treated as root: empty, 'test', 12-digit account IDs."""
-    if not access_key_id or access_key_id in _ROOT_ACCESS_KEYS:
-        return True
-    if re.match(r"^\d{12}$", access_key_id):
-        return True
-    return False
+    """Keys treated as root: empty, ``test``, configured, or account IDs."""
+    return is_root_access_key(access_key_id)
 
 
 def resolve_principal(access_key_id: str,
@@ -646,62 +882,30 @@ def resolve_principal(access_key_id: str,
     Returns a ``PrincipalInfo`` on success or an ``AuthError`` when
     authentication fails (unknown key, inactive key, expired session).
     """
-    import time
+    from ministack.core.responses import _account_from_sts_session
 
-    from ministack.services import iam as iam_svc
-    from ministack.services import sts as sts_svc
-
-    # Root / default keys — allow-all, no checks
-    if _is_root_key(access_key_id):
-        return PrincipalInfo(
-            arn=f"arn:aws:iam::{account_id}:root",
-            type="Root",
-            account=account_id,
-            policies=None,
+    account_id = _account_from_sts_session(access_key_id) or account_id
+    credential = resolve_credential(access_key_id, account_id)
+    if isinstance(credential, CredentialResolutionError):
+        return AuthError(credential.code, credential.message)
+    if credential.principal_type == "Root":
+        policies = None
+    elif credential.principal_type == "User":
+        policies = _gather_user_policies(credential.principal_name, account_id)
+    elif credential.principal_type == "AssumedRole":
+        policies = _gather_role_policies(
+            _role_name_from_assumed_arn(credential.principal_arn), account_id
         )
-
-    # Session credentials (AssumeRole) — ASIA prefix
-    if access_key_id in sts_svc._sessions:
-        session = sts_svc._sessions[access_key_id]
-        # Check expiry
-        expiration = session.get("Expiration")
-        if expiration is not None and time.time() > expiration:
-            return AuthError(
-                "ExpiredTokenException",
-                "The security token included in the request is expired",
-            )
-        assumed_arn = session.get("Arn", "")
-        role_name = _role_name_from_assumed_arn(assumed_arn)
-        policies = _gather_role_policies(role_name, account_id)
-        return PrincipalInfo(
-            arn=assumed_arn,
-            type="AssumedRole",
-            account=account_id,
-            policies=policies,
+    else:
+        return AuthError(
+            "UnrecognizedClientException",
+            "The security token included in the request is invalid.",
         )
-
-    # IAM user access key — AKIA prefix
-    key_record = iam_svc._access_keys.get_scoped(account_id, None, access_key_id)
-    if key_record is not None:
-        # Check key status
-        if key_record.get("Status") == "Inactive":
-            return AuthError(
-                "InvalidClientTokenId",
-                "The security token included in the request is invalid.",
-            )
-        user_name = key_record.get("UserName", "")
-        policies = _gather_user_policies(user_name, account_id)
-        return PrincipalInfo(
-            arn=f"arn:aws:iam::{account_id}:user/{user_name}",
-            type="User",
-            account=account_id,
-            policies=policies,
-        )
-
-    # Unknown access key — reject
-    return AuthError(
-        "UnrecognizedClientException",
-        "The security token included in the request is invalid.",
+    return PrincipalInfo(
+        arn=credential.principal_arn,
+        type=credential.principal_type,
+        account=credential.account_id,
+        policies=policies,
     )
 
 
@@ -774,7 +978,7 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
         return {
             "accessKey": access_key_id,
             "accountId": account_id,
-            "userArn": f"arn:aws:iam::{account_id}:user/{user_name}",
+            "userArn": user.get("Arn") or f"arn:aws:iam::{account_id}:user/{user_name}",
             "userId": user.get("UserId", ""),
             "principalOrgId": _principal_org_id(),
             "session": None,
@@ -783,7 +987,8 @@ def resolve_caller_identity(access_key_id: str) -> dict | None:
 
 
 def enforce(access_key_id: str, iam_action: str, service: str,
-            region: str, resource_arn: str = "*") -> EvalResult | AuthError | None:
+            region: str, resource_arn: str = "*",
+            service_context: dict[str, Any] | None = None) -> EvalResult | AuthError | None:
     """Check whether the request should be allowed.
 
     Returns ``None`` if allowed, an ``AuthError`` for authentication failures,
@@ -813,6 +1018,9 @@ def enforce(access_key_id: str, iam_action: str, service: str,
         action=iam_action,
         resource_arn=resource_arn,
         region=region,
+        service_context={
+            key.lower(): value for key, value in (service_context or {}).items()
+        },
     )
 
     result = evaluate(ctx, principal.policies)

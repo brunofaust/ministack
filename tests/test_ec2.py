@@ -118,6 +118,15 @@ def test_ec2_availability_zones_carry_group_and_opt_in(ec2):
     assert all(z["OptInStatus"] == "opt-in-not-required" for z in zones)
 
 
+def test_ec2_availability_zones_carry_zone_type(ec2):
+    """ZoneType is another optional member: a consumer that branches on it (the AWS
+    Load Balancer Controller's subnet locale resolution) gets an empty string, not
+    an error, when it's missing — and fails its own validation on that empty value.
+    Every zone ministack fabricates is a standard Availability Zone."""
+    zones = ec2.describe_availability_zones()["AvailabilityZones"]
+    assert all(z["ZoneType"] == "availability-zone" for z in zones)
+
+
 def test_ec2_describe_regions_returns_commercial_regions(ec2):
     """DescribeRegions must list at least the four legacy us-* regions
     with opt-in-not-required, and emit the shape AWS returns."""
@@ -662,6 +671,47 @@ def test_ec2_sg_authorize_revoke_ingress(ec2):
     assert not any(p.get("FromPort") == 80 for p in desc2["SecurityGroups"][0]["IpPermissions"])
 
     ec2.delete_security_group(GroupId=sg_id)
+
+
+def test_ec2_describe_security_groups_reports_every_range_family(ec2):
+    """DescribeSecurityGroups reports each family the permission carries.
+    IpPermission has ipRanges, ipv6Ranges and prefixListIds, and each range
+    carries its description; the read rendered the last two as empty
+    elements, so a configured IPv6 or prefix-list rule was invisible and
+    Terraform planned the same egress update on every run.
+    Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    sg_id = ec2.create_security_group(
+        GroupName=f"qa-ec2-sg-families-{suffix}", Description="families")["GroupId"]
+    try:
+        # The shape Terraform's egress block sends for a dual-stack allow-all.
+        ec2.revoke_security_group_egress(GroupId=sg_id, IpPermissions=[
+            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+        ec2.authorize_security_group_egress(GroupId=sg_id, IpPermissions=[{
+            "IpProtocol": "-1",
+            "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "all v4"}],
+            "Ipv6Ranges": [{"CidrIpv6": "::/0", "Description": "all v6"}],
+        }])
+        ec2.authorize_security_group_ingress(GroupId=sg_id, IpPermissions=[{
+            "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+            "Ipv6Ranges": [{"CidrIpv6": "2001:db8::/32"}],
+        }])
+
+        described = ec2.describe_security_groups(GroupIds=[sg_id])["SecurityGroups"][0]
+
+        egress = described["IpPermissionsEgress"]
+        assert len(egress) == 1, egress
+        assert egress[0]["IpRanges"] == [{"CidrIp": "0.0.0.0/0", "Description": "all v4"}]
+        assert egress[0]["Ipv6Ranges"] == [{"CidrIpv6": "::/0", "Description": "all v6"}]
+
+        ingress = described["IpPermissions"]
+        assert len(ingress) == 1, ingress
+        assert ingress[0]["Ipv6Ranges"] == [{"CidrIpv6": "2001:db8::/32"}]
+        assert ingress[0]["IpRanges"] == []
+    finally:
+        ec2.delete_security_group(GroupId=sg_id)
 
 
 def test_ec2_revoke_security_group_egress_returns_revoked_rules(ec2):
@@ -2645,6 +2695,56 @@ def test_ec2_launch_template_with_block_devices(ec2):
     ec2.delete_launch_template(LaunchTemplateId=lt_id)
 
 
+def test_ec2_launch_template_keeps_metadata_options_and_shutdown_behavior(ec2):
+    """A template's IMDS settings and shutdown behaviour survive the read.
+    RequestLaunchTemplateData carries MetadataOptions and
+    InstanceInitiatedShutdownBehavior, and the response shape reports both
+    (metadataOptions, instanceInitiatedShutdownBehavior); the parser dropped
+    them, so every Terraform refresh reported them as newly added.
+    Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    name = f"qa-lt-metadata-{_uuid.uuid4().hex[:8]}"
+    created = ec2.create_launch_template(
+        LaunchTemplateName=name,
+        LaunchTemplateData={
+            "InstanceInitiatedShutdownBehavior": "terminate",
+            "MetadataOptions": {
+                "HttpEndpoint": "enabled",
+                "HttpPutResponseHopLimit": 2,
+                "HttpTokens": "required",
+                "HttpProtocolIpv6": "enabled",
+                "InstanceMetadataTags": "disabled",
+            },
+        },
+    )["LaunchTemplate"]
+    try:
+        versions = ec2.describe_launch_template_versions(
+            LaunchTemplateId=created["LaunchTemplateId"])["LaunchTemplateVersions"]
+        data = versions[0]["LaunchTemplateData"]
+        assert data["InstanceInitiatedShutdownBehavior"] == "terminate"
+        options = data["MetadataOptions"]
+        assert options["HttpEndpoint"] == "enabled"
+        assert options["HttpPutResponseHopLimit"] == 2
+        assert options["HttpTokens"] == "required"
+        assert options["HttpProtocolIpv6"] == "enabled"
+        assert options["InstanceMetadataTags"] == "disabled"
+        # The response shape carries a State the request has no member for.
+        assert options["State"] == "applied"
+
+        # A new version keeps its own options, so a refresh of either is stable.
+        ec2.create_launch_template_version(
+            LaunchTemplateId=created["LaunchTemplateId"],
+            LaunchTemplateData={"MetadataOptions": {"HttpTokens": "optional"}})
+        latest = ec2.describe_launch_template_versions(
+            LaunchTemplateId=created["LaunchTemplateId"], Versions=["2"],
+        )["LaunchTemplateVersions"][0]["LaunchTemplateData"]
+        assert latest["MetadataOptions"]["HttpTokens"] == "optional"
+        assert "InstanceInitiatedShutdownBehavior" not in latest
+    finally:
+        ec2.delete_launch_template(LaunchTemplateId=created["LaunchTemplateId"])
+
+
 def test_ec2_launch_template_not_found(ec2):
     """Describe/delete a non-existent template should fail."""
     with pytest.raises(ClientError) as exc:
@@ -2670,6 +2770,76 @@ def test_ec2_default_subnets_three_azs(ec2):
     for s in subnets:
         assert s["DefaultForAz"] is True
         assert s["MapPublicIpOnLaunch"] is True
+
+
+def test_ec2_default_subnets_carry_availability_zone_id(ec2):
+    """Default VPC subnets must expose the same ZoneId DescribeAvailabilityZones reports."""
+    resp = ec2.describe_subnets(Filters=[{"Name": "vpc-id", "Values": ["vpc-00000001"]}])
+    by_az = {s["AvailabilityZone"]: s for s in resp["Subnets"]}
+    assert by_az["us-east-1a"]["AvailabilityZoneId"] == "use1-az1"
+    assert by_az["us-east-1b"]["AvailabilityZoneId"] == "use1-az2"
+    assert by_az["us-east-1c"]["AvailabilityZoneId"] == "use1-az3"
+
+
+def test_ec2_create_subnet_availability_zone_id(ec2):
+    """AvailabilityZoneId must never be null, and must always name the zone
+    AvailabilityZone names: on AWS the two are one mapping, and every
+    CreateSubnet example in the reference answers a consistent pair
+    (us-east-2a/use2-az1, us-west-2-lax-1a/usw2-lax1-az1). An id supplied on
+    its own resolves the zone name; a conflicting pair cannot be stored."""
+    vpc_id = ec2.create_vpc(CidrBlock="10.78.0.0/16")["Vpc"]["VpcId"]
+
+    derived = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.1.0/24",
+                                 AvailabilityZone="us-east-1c")["Subnet"]
+    assert derived["AvailabilityZoneId"] == "use1-az3"
+
+    desc = ec2.describe_subnets(SubnetIds=[derived["SubnetId"]])["Subnets"][0]
+    assert desc["AvailabilityZoneId"] == "use1-az3"
+
+    # AvailabilityZoneId alone resolves the zone name it belongs to, so both
+    # members agree the way a real response does.
+    by_id = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.2.0/24",
+                              AvailabilityZoneId="use1-az2")["Subnet"]
+    assert by_id["AvailabilityZoneId"] == "use1-az2"
+    assert by_id["AvailabilityZone"] == "us-east-1b"
+
+    # A conflicting pair never lands: the zone name drives the id, so the
+    # record stays one AWS could actually return.
+    conflicting = ec2.create_subnet(VpcId=vpc_id, CidrBlock="10.78.3.0/24",
+                                    AvailabilityZone="us-east-1a",
+                                    AvailabilityZoneId="use1-az2")["Subnet"]
+    assert conflicting["AvailabilityZone"] == "us-east-1a"
+    assert conflicting["AvailabilityZoneId"] == "use1-az1"
+
+    ec2.delete_subnet(SubnetId=derived["SubnetId"])
+    ec2.delete_subnet(SubnetId=by_id["SubnetId"])
+    ec2.delete_subnet(SubnetId=conflicting["SubnetId"])
+    ec2.delete_vpc(VpcId=vpc_id)
+
+
+def test_ec2_backfill_availability_zone_id_on_restore():
+    """A subnet persisted before AvailabilityZoneId existed must not KeyError on restore.
+
+    In-process against ministack.services.ec2 directly (like the AMI/instance tests
+    below): this exercises the module's own state, not whatever separate process is
+    serving the `ec2` fixture's HTTP requests.
+    """
+    import ministack.services.ec2 as ec2mod
+
+    legacy_subnet = {
+        "SubnetId": "subnet-legacy1", "VpcId": "vpc-legacy1", "CidrBlock": "10.9.0.0/24",
+        "AvailabilityZone": "us-east-1b", "AvailableIpAddressCount": 251,
+        "State": "available", "DefaultForAz": False, "MapPublicIpOnLaunch": False,
+        "OwnerId": "000000000000",
+    }
+    ec2mod._subnets["subnet-legacy1"] = legacy_subnet
+    try:
+        ec2mod._backfill_subnet_availability_zone_ids()
+
+        assert legacy_subnet["AvailabilityZoneId"] == "use1-az2"
+        assert "<availabilityZoneId>use1-az2</availabilityZoneId>" in ec2mod._subnet_fields_xml(legacy_subnet)
+    finally:
+        del ec2mod._subnets["subnet-legacy1"]
 
 
 def test_ec2_describe_subnets_tags_filters(ec2):
@@ -3433,6 +3603,94 @@ def test_create_fleet_distributes_across_configs_and_overrides(ec2):
     assert instance_types == ["t3.large", "t3.medium", "t3.small", "t3.xlarge"]
     total_ids = [iid for item in resp["Instances"] for iid in item["InstanceIds"]]
     assert len(total_ids) == 4
+
+
+def test_create_fleet_applies_launch_template_instance_tags(ec2):
+    """A launch template's instance TagSpecifications reach the instances the
+    fleet creates.
+
+    The EC2 model is explicit that this is the mechanism:
+    ``RequestLaunchTemplateData.TagSpecifications`` is "the tags to apply to the
+    resources that are created during instance launch", and
+    ``CreateFleetRequest.TagSpecifications`` says that for a ``maintain`` or
+    ``request`` fleet "you cannot specify a resource type of instance. To tag
+    instances at launch, specify the tags in a launch template."
+    """
+    uid = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"lt-tags-{uid}",
+        LaunchTemplateData={
+            "ImageId": "ami-12345678",
+            "InstanceType": "t3.micro",
+            "TagSpecifications": [
+                {"ResourceType": "instance",
+                 "Tags": [{"Key": "ProbeTag", "Value": "from-launch-template"},
+                          {"Key": "EnvironmentTag", "Value": "probe-environment"}]},
+                # A non-instance spec must not leak onto the instance.
+                {"ResourceType": "volume",
+                 "Tags": [{"Key": "VolumeOnly", "Value": "yes"}]},
+            ],
+        },
+    )
+    lt_id = lt["LaunchTemplate"]["LaunchTemplateId"]
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "1"},
+        }],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 1,
+            "DefaultTargetCapacityType": "on-demand",
+        },
+        Type="instant",
+    )
+    instance_id = resp["Instances"][0]["InstanceIds"][0]
+    inst = ec2.describe_instances(InstanceIds=[instance_id])[
+        "Reservations"][0]["Instances"][0]
+    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+    assert tags.get("ProbeTag") == "from-launch-template"
+    assert tags.get("EnvironmentTag") == "probe-environment"
+    assert "VolumeOnly" not in tags
+
+
+def test_create_fleet_merges_request_and_launch_template_instance_tags(ec2):
+    """An instant fleet may also carry its own instance TagSpecifications. Both
+    sets reach the instance; on a duplicate key the request wins (the merge
+    precedence is MiniStack's choice, not a measured AWS behaviour)."""
+    uid = _uuid_mod.uuid4().hex[:8]
+    lt = ec2.create_launch_template(
+        LaunchTemplateName=f"lt-merge-{uid}",
+        LaunchTemplateData={
+            "ImageId": "ami-12345678",
+            "InstanceType": "t3.micro",
+            "TagSpecifications": [
+                {"ResourceType": "instance",
+                 "Tags": [{"Key": "FromTemplate", "Value": "yes"},
+                          {"Key": "Shared", "Value": "template"}]},
+            ],
+        },
+    )
+    resp = ec2.create_fleet(
+        LaunchTemplateConfigs=[{
+            "LaunchTemplateSpecification": {
+                "LaunchTemplateId": lt["LaunchTemplate"]["LaunchTemplateId"],
+                "Version": "1"},
+        }],
+        TargetCapacitySpecification={
+            "TotalTargetCapacity": 1,
+            "DefaultTargetCapacityType": "on-demand",
+        },
+        Type="instant",
+        TagSpecifications=[{"ResourceType": "instance",
+                            "Tags": [{"Key": "FromRequest", "Value": "yes"},
+                                     {"Key": "Shared", "Value": "request"}]}],
+    )
+    instance_id = resp["Instances"][0]["InstanceIds"][0]
+    inst = ec2.describe_instances(InstanceIds=[instance_id])[
+        "Reservations"][0]["Instances"][0]
+    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+    assert tags.get("FromTemplate") == "yes"
+    assert tags.get("FromRequest") == "yes"
+    assert tags.get("Shared") == "request"
 
 
 def test_create_fleet_maintain_returns_fleetid_only(ec2):
@@ -4363,8 +4621,8 @@ def test_ec2_cross_account_ami_sharing():
     assert _consumer_sees() == []
 
     # The consumer never gains modify rights: the image is not in their scope.
-    from botocore.exceptions import ClientError
     import pytest as _pytest
+    from botocore.exceptions import ClientError
     with _pytest.raises(ClientError) as exc:
         consumer.modify_image_attribute(
             ImageId=ami, LaunchPermission={"Add": [{"Group": "all"}]})

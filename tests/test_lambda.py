@@ -3,12 +3,17 @@ import contextlib
 import io
 import json
 import os
+import socket
+import sys
+import threading
+import shutil
+import sys
 import time
 import urllib.error as _urlerr
 import urllib.request as _urlreq
 import uuid as _uuid_mod
 import zipfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from urllib.parse import urlparse
 
 import boto3
@@ -2710,6 +2715,37 @@ def test_lambda_add_remove_permission(lam):
     lam.remove_permission(FunctionName="qa-lam-policy", StatementId="allow-s3")
     policy2 = json.loads(lam.get_policy(FunctionName="qa-lam-policy")["Policy"])
     assert not any(s["Sid"] == "allow-s3" for s in policy2["Statement"])
+
+def test_lambda_add_permission_keeps_event_source_token_and_invoked_via_function_url(lam):
+    """EventSourceToken lands as a StringEquals on lambda:EventSourceToken and
+    InvokedViaFunctionUrl as a Bool on lambda:InvokedViaFunctionUrl with a
+    string value, the shape Lambda writes for function URL statements
+    (https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html)."""
+    fn = f"qa-lam-policy-cond-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/r",
+        Handler="index.handler",
+        Code={"ZipFile": _zip_lambda("def handler(e,c): return {}")},
+    )
+    try:
+        added = json.loads(lam.add_permission(
+            FunctionName=fn,
+            StatementId="alexa",
+            Action="lambda:InvokeFunction",
+            Principal="alexa-appkit.amazon.com",
+            EventSourceToken="amzn1.ask.skill.qa-lam-policy-cond",
+            InvokedViaFunctionUrl=True,
+        )["Statement"])
+        assert added["Condition"] == {
+            "StringEquals": {"lambda:EventSourceToken": "amzn1.ask.skill.qa-lam-policy-cond"},
+            "Bool": {"lambda:InvokedViaFunctionUrl": "true"},
+        }
+        policy = json.loads(lam.get_policy(FunctionName=fn)["Policy"])
+        assert [s["Condition"] for s in policy["Statement"]] == [added["Condition"]]
+    finally:
+        lam.delete_function(FunctionName=fn)
 
 def test_lambda_list_functions_pagination(lam):
     """ListFunctions pagination with Marker works correctly."""
@@ -6226,6 +6262,113 @@ def test_route_async_failure_to_sqs_dlq():
         set_request_region(original_region)
 
 
+@pytest.mark.parametrize("payload", [b'[1,2,3]', b'"a string"', b'42', b'{"k":"v"}'])
+def test_warm_worker_context_reaches_every_payload_shape(lam, payload):
+    """On AWS the per-invocation context is the execution environment and the
+    context object, not the event: `_X_AMZN_TRACE_ID` is a reserved variable
+    that "changes with each invocation" (configuration-envvars) and the payload
+    reaches the handler as sent, whatever its JSON type. The pooled worker
+    carries those values beside the payload, so a list or a bare string is
+    served exactly like an object."""
+    fname = f"warm-ctx-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "import os\n"
+        "def handler(event, context):\n"
+        "    return {'event': event,\n"
+        "            'trace': os.environ.get('_X_AMZN_TRACE_ID'),\n"
+        "            'req': context.aws_request_id}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+        Timeout=10, TracingConfig={"Mode": "Active"},
+    )
+    try:
+        body = json.loads(lam.invoke(FunctionName=fname, Payload=payload)["Payload"].read())
+        assert body["event"] == json.loads(payload)
+        assert body["trace"], "the trace header did not reach a non-dict payload"
+        assert body["req"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_nodejs_warm_context_object_is_populated(lam):
+    """The properties nodejs-context.html documents, on the warm pool: the
+    bootstrap read them off the event, where nothing ever set them, so every
+    one was empty and getRemainingTimeInMillis() was a constant."""
+    fname = f"warm-jsctx-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "exports.handler = async (event, context) => ({\n"
+        "  name: context.functionName, version: context.functionVersion,\n"
+        "  mem: context.memoryLimitInMB, arn: context.invokedFunctionArn,\n"
+        "  req: context.awsRequestId, group: context.logGroupName,\n"
+        "  stream: context.logStreamName, remaining: context.getRemainingTimeInMillis(),\n"
+        "  waits: context.callbackWaitsForEmptyEventLoop});\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="nodejs20.x", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip_js(code)},
+        Timeout=7, MemorySize=256,
+    )
+    try:
+        first = json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["name"] == fname
+        assert first["version"] == "$LATEST"
+        assert first["mem"] == "256"
+        assert first["arn"].endswith(f":function:{fname}")
+        assert first["group"] == f"/aws/lambda/{fname}"
+        assert first["stream"]
+        assert first["waits"] is True
+        # Counts down from the configured timeout rather than a constant.
+        assert 0 < first["remaining"] <= 7000
+        # The request id is per invocation; the log stream is per environment.
+        second = json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert second["req"] != first["req"]
+        assert second["stream"] == first["stream"]
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+def test_warm_invocation_leaves_the_caller_event_untouched(monkeypatch):
+    """The per-invocation values (trace header, invoke depth, durable context)
+    travel beside the payload, so the handler's event is the caller's and
+    nothing ministack-shaped survives the call — the async retry path hands
+    the very same object to `_route_async_failure`, which puts it in the DLQ
+    envelope as `requestPayload`."""
+    seen = {}
+    worker = Mock()
+
+    def _invoke(event, request_id, **ctx):
+        seen["event"] = event
+        seen["ctx"] = ctx
+        return {"status": "ok", "result": {"ok": True}, "log": ""}
+
+    worker.invoke.side_effect = _invoke
+    monkeypatch.setattr(lsvc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lsvc, "acquire_worker", Mock(return_value=(worker, "reuse")))
+    monkeypatch.setattr(lsvc, "release_worker", Mock())
+    monkeypatch.setattr(lsvc, "_emit_lambda_logs", Mock())
+    config = {
+        "FunctionName": "warm-carrier-copy",
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:warm-carrier-copy",
+        "Runtime": "python3.12", "Handler": "index.handler", "Timeout": 3,
+    }
+    event = {"input": "hi"}
+    token = lsvc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
+    try:
+        result = lsvc._execute_function_warm({"config": config, "code_zip": b"zip"}, event)
+    finally:
+        lsvc._durable_ctx.reset(token)
+
+    assert result["body"] == {"ok": True}
+    # The per-invocation values reached the worker beside the payload...
+    assert seen["ctx"]["depth"] is not None
+    assert seen["ctx"]["durable"]["AWS_LAMBDA_DURABLE_EXECUTION_ARN"] == "exec-arn"
+    # ...and the payload is the caller's, untouched.
+    assert seen["event"] == {"input": "hi"}
+    assert event == {"input": "hi"}
+
+
 def test_route_async_failure_to_sqs_does_not_tail_match_foreign_region():
     """A stale foreign-Region target ARN must not route to a same-named local queue."""
     import ministack.services.sqs as _sqs
@@ -7615,6 +7758,7 @@ const { OrganizationsClient, ListAccountsCommand } = require("@aws-sdk/client-or
 const { CodeBuildClient, ListProjectsCommand } = require("@aws-sdk/client-codebuild");
 const { CloudTrailClient, LookupEventsCommand } = require("@aws-sdk/client-cloudtrail");
 const { ServiceDiscoveryClient, ListServicesCommand } = require("@aws-sdk/client-servicediscovery");
+const { TranslateClient, StartTextTranslationJobCommand } = require("@aws-sdk/client-translate");
 exports.handler = async () => ({
   sqs:   typeof SQSClient === "function" && typeof SendMessageCommand === "function",
   kms:   typeof KMSClient === "function" && typeof EncryptCommand === "function",
@@ -7629,6 +7773,7 @@ exports.handler = async () => ({
   cb:    typeof CodeBuildClient === "function" && typeof ListProjectsCommand === "function",
   ct:    typeof CloudTrailClient === "function" && typeof LookupEventsCommand === "function",
   sd:    typeof ServiceDiscoveryClient === "function" && typeof ListServicesCommand === "function",
+  tr:    typeof TranslateClient === "function" && typeof StartTextTranslationJobCommand === "function",
 });
 """
     result = _run_nodejs_worker(handler_js)
@@ -7636,6 +7781,47 @@ exports.handler = async () => ({
     r = result["result"]
     for svc, ok in r.items():
         assert ok is True, f"Stub not resolved for service key: {svc!r}"
+
+
+def test_nodejs_worker_translate_stub_sends_shine_target():
+    """The Translate stub addresses the service by its real target prefix.
+
+    Translate's awsJson1.1 target prefix is AWSShineFrontendService_20170701,
+    which is what router.py matches on, so a handler that never bundles
+    @aws-sdk/client-translate still reaches the service module.
+    """
+    handler_js = """\
+const http = require("http");
+const srv = http.createServer((req, res) => {
+  const target = req.headers["x-amz-target"];
+  let body = "";
+  req.on("data", (c) => { body += c; });
+  req.on("end", () => {
+    res.writeHead(200, { "Content-Type": "application/x-amz-json-1.1" });
+    res.end(JSON.stringify({ JobId: "abc", JobStatus: "SUBMITTED", _target: target, _body: body }));
+  });
+});
+srv.listen(0, "127.0.0.1", () => {
+  process.env.AWS_ENDPOINT_URL = "http://127.0.0.1:" + srv.address().port;
+  const { TranslateClient, StartTextTranslationJobCommand } = require("@aws-sdk/client-translate");
+  new TranslateClient({})
+    .send(new StartTextTranslationJobCommand({ JobName: "job" }))
+    .then((out) => { srv.close(); exports._result = out; })
+    .catch((e) => { srv.close(); exports._result = { error: String(e) }; });
+});
+exports.handler = () => new Promise((res) => {
+  const wait = () => exports._result ? res(exports._result) : setTimeout(wait, 10);
+  wait();
+});
+"""
+    result = _run_nodejs_worker(handler_js)
+    assert result.get("status") == "ok", f"Invocation failed: {result}"
+    r = result["result"]
+    assert r.get("_target") == "AWSShineFrontendService_20170701.StartTextTranslationJob", (
+        f"X-Amz-Target was {r.get('_target')!r}"
+    )
+    assert json.loads(r["_body"]) == {"JobName": "job"}
+    assert r["JobId"] == "abc"
 
 
 def test_nodejs_worker_https_localhost_downgraded_to_http():
@@ -7980,6 +8166,112 @@ def test_lambda_durable_stop(lam):
         lam.delete_function(FunctionName=fname)
 
 
+def test_lambda_durable_invocation_completed_recorded(lam):
+    """Every handler invocation of a durable execution ends with an
+    InvocationCompleted history event (a real EventType on the model,
+    previously never emitted), carrying a RequestId and both timestamps."""
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        assert code == 200
+        completed = [e for e in body["Events"] if e["EventType"] == "InvocationCompleted"]
+        assert completed, [e["EventType"] for e in body["Events"]]
+        details = completed[0]["InvocationCompletedDetails"]
+        assert details["RequestId"]
+        assert details["EndTimestamp"] >= details["StartTimestamp"] - 1
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.serial
+def test_lambda_durable_execution_timeout_enforced(lam):
+    """DurableConfig.ExecutionTimeout (a real field, seconds) caps the whole
+    execution: it was stored and ignored, so a RUNNING execution could out-
+    live its cap forever. It now lands TIMED_OUT with an ExecutionTimedOut
+    event once the deadline passes. The wait below is the 1-second timeout
+    itself firing, not a contention budget."""
+    import base64 as _b64
+    fname = f"durable-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return {}")).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True, "ExecutionTimeout": 1},
+    })
+    try:
+        invoke_req = urllib.request.Request(
+            f"{_ms_endpoint()}/2015-03-31/functions/{fname}/invocations",
+            method="POST", data=b"{}", headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(invoke_req) as r:
+            arn_raw = r.headers.get("X-Amz-Durable-Execution-Arn")
+            r.read()
+        from urllib.parse import quote
+        arn = quote(arn_raw, safe="/:$")
+        deadline = time.time() + 10
+        status = None
+        while time.time() < deadline:
+            code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}")
+            status = body["Status"]
+            if status != "RUNNING":
+                break
+            time.sleep(0.2)
+        assert status == "TIMED_OUT", status
+        code, hist = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        assert any(e["EventType"] == "ExecutionTimedOut" for e in hist["Events"]), (
+            [e["EventType"] for e in hist["Events"]])
+    finally:
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.mark.serial
+def test_lambda_durable_stop_reaches_inflight_chained_invoke(lam):
+    """StopDurableExecution reaches an in-flight chained invoke: the op lands
+    STOPPED with a ChainedInvokeStopped event (a real EventType, previously
+    never emitted), and the child's late result is discarded instead of
+    appending ChainedInvokeSucceeded onto a stopped execution."""
+    import base64 as _b64
+    child = f"durable-stopchild-{_uuid_mod.uuid4().hex[:8]}"
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": child, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": _b64.b64encode(_make_zip(
+            "import time\ndef handler(e,c):\n    time.sleep(2)\n    return {'late': True}")).decode()},
+        "Timeout": 30,
+    })
+    fname, _, rec = _create_durable_execution_directly(lam)
+    try:
+        from urllib.parse import quote
+        arn = quote(rec["DurableExecutionArn"], safe="/:$")
+        code, _b = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/checkpoint", body={
+            "CheckpointToken": rec["CheckpointToken"],
+            "Updates": [{"Id": "chain-stop", "Type": "CHAINED_INVOKE",
+                         "Action": "START", "Name": "slow-child",
+                         "ChainedInvokeOptions": {"FunctionName": child}}],
+        })
+        assert code == 200
+        code, _b = _raw_durable("POST", f"/2025-12-01/durable-executions/{arn}/stop", body={
+            "ErrorMessage": "stopping with child in flight",
+        })
+        assert code == 200
+        code, hist = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        types = [e["EventType"] for e in hist["Events"]]
+        assert "ChainedInvokeStarted" in types, types
+        assert "ChainedInvokeStopped" in types, types
+        # Past the child's 2s sleep: its late result must not have been applied.
+        time.sleep(3)
+        code, hist = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}/history")
+        types = [e["EventType"] for e in hist["Events"]]
+        assert "ChainedInvokeSucceeded" not in types, types
+        code, body = _raw_durable("GET", f"/2025-12-01/durable-executions/{arn}")
+        assert body["Status"] == "STOPPED"
+    finally:
+        lam.delete_function(FunctionName=fname)
+        lam.delete_function(FunctionName=child)
+
+
 def test_lambda_durable_list_by_function(lam):
     fname, fn_arn, rec = _create_durable_execution_directly(lam)
     try:
@@ -8047,6 +8339,112 @@ def handler(event, context):
             pass
 
 
+def test_lambda_durable_invocation_reuses_the_warm_worker(lam):
+    """Durable invocations go through the warm pool like every other
+    python/nodejs invocation: the second call reuses the worker (module state
+    survives) and still gets its own execution ARN and checkpoint token."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-warm-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    # The counter lives in the module, so it only survives if the same worker
+    # process serves both invocations.
+    code = """
+import os
+_CALLS = 0
+def handler(event, context):
+    global _CALLS
+    _CALLS += 1
+    return {
+        "calls": _CALLS,
+        "arn": os.environ.get("AWS_LAMBDA_DURABLE_EXECUTION_ARN"),
+        "token": os.environ.get("AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN"),
+    }
+"""
+    zip_b64 = _b64.b64encode(_make_zip(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        # A one-shot subprocess pays interpreter start plus the botocore import
+        # inside this budget; a warm worker pays it once, before the invoke.
+        "Timeout": 1,
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        first = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        second = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["calls"] == 1
+        assert second["calls"] == 2, "durable invocation did not reuse the warm worker"
+        assert first["arn"] and second["arn"]
+        assert first["arn"] != second["arn"]
+        assert first["token"] != second["token"]
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
+def test_lambda_durable_context_is_dropped_when_the_next_invocation_is_not_durable(lam):
+    """A worker that served a durable invocation is reused for a non-durable one
+    of the same function, and the bootstrap deletes the three variables the
+    previous invocation set, so the handler cannot read a stale context."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-drop-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    code = """
+import os
+_CALLS = 0
+_NAMES = (
+    "AWS_LAMBDA_DURABLE_EXECUTION_ARN",
+    "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN",
+    "AWS_LAMBDA_DURABLE_EXECUTION_NAME",
+)
+def handler(event, context):
+    global _CALLS
+    _CALLS += 1
+    return {"calls": _CALLS, "env": {n: os.environ.get(n) for n in _NAMES}}
+"""
+    zip_b64 = _b64.b64encode(_make_zip(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "Timeout": 5,
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        first = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["calls"] == 1
+        assert all(first["env"].values()), first
+        # Switching the function off durable does not respawn its worker: the
+        # counter must keep counting in the same process.
+        code, body = _raw_durable("PUT", f"/2015-03-31/functions/{fname}/configuration",
+                                  body={"DurableConfig": {"Enabled": False}})
+        assert code == 200, body
+        second = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert second["calls"] == 2, "the non-durable invocation did not reuse the worker"
+        assert not any(second["env"].values()), second
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
+@pytest.mark.serial
 def test_lambda_durable_chained_invoke_runs_child(lam):
     """A CHAINED_INVOKE checkpoint update with Action=START actually spawns
     the child function and records the result back into the parent's
@@ -8102,14 +8500,26 @@ def test_lambda_durable_chained_invoke_runs_child(lam):
                 }],
             })
         assert code == 200
-        # The child runs in a daemon thread; give it a moment.
+        # ChainedInvokeStarted is recorded synchronously when the checkpoint
+        # accepts the START update, so it must already be on the log — no
+        # polling, no budget.
+        code, history = _raw_durable("GET",
+            f"/2025-12-01/durable-executions/{arn_enc}/history")
+        started = [e for e in history["Events"] if e["EventType"] == "ChainedInvokeStarted"]
+        assert started, [e["EventType"] for e in history["Events"]]
+        assert started[0]["ChainedInvokeStartedDetails"]["FunctionName"] == child
+        # The child completes in a background thread; serial keeps the box
+        # quiet so the short poll is honest. Breaking on Failed keeps a real
+        # child error visible instead of reading as a timeout.
         import time as _time
-        for _ in range(30):
-            _time.sleep(0.1)
+        deadline = _time.time() + 20
+        while _time.time() < deadline:
             code, history = _raw_durable("GET",
                 f"/2025-12-01/durable-executions/{arn_enc}/history")
-            if any(e["EventType"] == "ChainedInvokeSucceeded" for e in history.get("Events", [])):
+            if any(e["EventType"] in ("ChainedInvokeSucceeded", "ChainedInvokeFailed")
+                   for e in history.get("Events", [])):
                 break
+            _time.sleep(0.2)
         events = history["Events"]
         assert any(e["EventType"] == "ChainedInvokeSucceeded" for e in events), \
             f"expected ChainedInvokeSucceeded, got {[e['EventType'] for e in events]}"
@@ -8343,6 +8753,50 @@ def test_lambda_get_state_prunes_orphan_blobs(lambda_svc_isolated):
     assert not (blob_dir / f"{hashlib.sha256(old_code).hexdigest()}.zip").exists()
 
 
+def test_lambda_durable_invocation_reuses_the_warm_worker_nodejs(lam):
+    """The nodejs bootstrap takes the same durable context off the event: the
+    second call reuses the worker (module state survives) and still gets its
+    own execution ARN and checkpoint token."""
+    import base64 as _b64
+    import json as _json
+    fname = f"durable-warm-js-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        lam.delete_function(FunctionName=fname)
+    except Exception:
+        pass
+    code = """
+let calls = 0;
+exports.handler = async () => ({
+  calls: ++calls,
+  arn: process.env.AWS_LAMBDA_DURABLE_EXECUTION_ARN,
+  token: process.env.AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN,
+});
+"""
+    zip_b64 = _b64.b64encode(_make_zip_js(code)).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "nodejs20.x",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "Timeout": 3,
+        "DurableConfig": {"Enabled": True},
+    })
+    try:
+        first = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        second = _json.loads(lam.invoke(FunctionName=fname, Payload=b"{}")["Payload"].read())
+        assert first["calls"] == 1
+        assert second["calls"] == 2, "durable nodejs invocation did not reuse the warm worker"
+        assert first["arn"] and second["arn"]
+        assert first["arn"] != second["arn"]
+        assert first["token"] != second["token"]
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
+
+
 def test_lambda_durable_event_wrapped_with_sdk_fields(lam):
     """A durable invocation's event payload is wrapped with the fields the
     aws-durable-execution-sdk-python SDK reads from the Lambda event:
@@ -8375,6 +8829,9 @@ def handler(event, context):
         # SDK requires these three top-level keys.
         for key in ("DurableExecutionArn", "CheckpointToken", "InitialExecutionState"):
             assert key in body["keys"], f"missing {key} in {body['keys']}"
+        # The emulator's own carrier keys (durable context, depth, trace) are
+        # popped by the bootstrap before the handler sees the event.
+        assert not any(k.startswith("_ministack") for k in body["keys"]), body["keys"]
         ops = body["event"]["InitialExecutionState"]["Operations"]
         # AWS seeds the synthetic EXECUTION-type op with the input payload.
         assert len(ops) == 1 and ops[0]["Type"] == "EXECUTION"
@@ -8416,6 +8873,95 @@ def _start_callback(lam):
     cb_id = (op.get("CallbackDetails") or {}).get("CallbackId")
     assert cb_id, f"no CallbackId in {op}"
     return fname, rec["DurableExecutionArn"], cb_id, body["CheckpointToken"]
+
+
+def test_lambda_durable_concurrent_executions_get_their_own_callback(lam):
+    """Two executions of one function reach the same workflow position, so the
+    SDK checkpoints the same operation id for both. The CallbackId is the
+    emulator's to mint and must be unique per execution: completing the first
+    execution's callback must resolve that execution and leave the second one
+    waiting. Reported by @Nhollas."""
+    import base64 as _b64
+    from urllib.parse import quote
+
+    fname = f"durable-cb-iso-{_uuid_mod.uuid4().hex[:8]}"
+    zip_b64 = _b64.b64encode(_make_zip("def handler(e,c): return e")).decode()
+    _raw_durable("POST", "/2015-03-31/functions", body={
+        "FunctionName": fname,
+        "Runtime": "python3.12",
+        "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler",
+        "Code": {"ZipFile": zip_b64},
+        "DurableConfig": {"Enabled": True},
+    })
+    op_id = "cbsharedaaaaaaaaaaaaaaaaaaaaaa"
+
+    def start(payload):
+        """Invoke, then checkpoint a CALLBACK START under the shared op id."""
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2015-03-31/functions/{fname}/invocations",
+            method="POST", data=payload, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            arn = r.headers.get("X-Amz-Durable-Execution-Arn")
+            token = r.headers.get("X-Amz-Durable-Checkpoint-Token")
+            r.read()
+        code, body = _raw_durable(
+            "POST", f"/2025-12-01/durable-executions/{quote(arn, safe='/:$')}/checkpoint",
+            body={"CheckpointToken": token, "Updates": [{
+                "Id": op_id, "Type": "CALLBACK", "Action": "START", "Name": "answer",
+                "CallbackOptions": {"TimeoutSeconds": 120},
+            }]})
+        assert code == 200, body
+        op = next(o for o in body["NewExecutionState"]["Operations"] if o["Id"] == op_id)
+        return arn, (op.get("CallbackDetails") or {}).get("CallbackId")
+
+    try:
+        arn_a, cb_a = start(b'{"runId":"A"}')
+        arn_b, cb_b = start(b'{"runId":"B"}')
+        assert arn_a != arn_b
+        assert cb_a and cb_b
+        assert cb_a != cb_b, "two executions were handed the same CallbackId"
+
+        # Completing A's callback resolves A...
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/"
+            f"{quote(cb_a, safe='')}/succeed",
+            method="POST", data=b'{"answer":"A"}',
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+
+        def events(arn):
+            code, hist = _raw_durable(
+                "GET", f"/2025-12-01/durable-executions/{quote(arn, safe='/:$')}/history")
+            assert code == 200, hist
+            return hist["Events"]
+
+        succeeded_a = [e for e in events(arn_a) if e["EventType"] == "CallbackSucceeded"]
+        assert len(succeeded_a) == 1
+        assert succeeded_a[0]["CallbackSucceededDetails"]["Result"]["Payload"] == (
+            '{"answer":"A"}')
+        # ...and leaves B waiting: no CallbackSucceeded of A's answer on B.
+        assert not [e for e in events(arn_b) if e["EventType"] == "CallbackSucceeded"], (
+            "the second execution received the first execution's answer")
+
+        # B's own id still resolves B.
+        req = urllib.request.Request(
+            f"{_ms_endpoint()}/2025-12-01/durable-execution-callbacks/"
+            f"{quote(cb_b, safe='')}/succeed",
+            method="POST", data=b'{"answer":"B"}',
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            assert r.status == 200
+        succeeded_b = [e for e in events(arn_b) if e["EventType"] == "CallbackSucceeded"]
+        assert len(succeeded_b) == 1
+        assert succeeded_b[0]["CallbackSucceededDetails"]["Result"]["Payload"] == (
+            '{"answer":"B"}')
+    finally:
+        try:
+            lam.delete_function(FunctionName=fname)
+        except Exception:
+            pass
 
 
 def test_lambda_durable_send_callback_success_then_already_closed(lam):
@@ -11033,7 +11579,7 @@ def test_snapstart_rejected_with_large_ephemeral_storage(lam):
         lam.delete_function(FunctionName=fname)
 
 
-# ──────────────── docker executor: no extraction-dir leak ────────────────
+# ──────────── docker executor: shared extraction cache (issue #1600) ────────────
 
 
 _SPAWN_LEAK_CONFIG = {
@@ -11044,51 +11590,264 @@ _SPAWN_LEAK_CONFIG = {
 }
 
 
-def _capture_mkdtemp(monkeypatch):
-    import tempfile as _tf
-    created = []
-    real = _tf.mkdtemp
-
-    def _capture(*a, **kw):
-        d = real(*a, **kw)
-        created.append(d)
-        return d
-
-    monkeypatch.setattr(_tf, "mkdtemp", _capture)
-    return created
+def _fresh_extract_cache(monkeypatch, tmp_path):
+    """Point the extraction cache at an empty per-test root."""
+    monkeypatch.setattr(lsvc, "_DOCKER_EXTRACT_CACHE", str(tmp_path / "extract"))
+    monkeypatch.setattr(lsvc, "_docker_extract_dirs", {})
 
 
-def test_spawn_failure_on_corrupt_zip_leaves_no_tmpdir(monkeypatch):
-    """A corrupt code zip raises out of the extraction block; the tmpdir made
-    just before must not be orphaned (issue #1600)."""
+def _count_extractions(monkeypatch):
+    calls = []
+    real = lsvc._extract_zip_preserving_mode
+
+    def counting(zf, dest):
+        calls.append(dest)
+        return real(zf, dest)
+
+    monkeypatch.setattr(lsvc, "_extract_zip_preserving_mode", counting)
+    return calls
+
+
+def test_spawn_failure_on_corrupt_zip_leaves_no_extraction(monkeypatch, tmp_path):
+    """A corrupt code zip raises out of the cache build; no partial tree may
+    linger on disk and nothing may be registered in the cache (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: object())
-    created = _capture_mkdtemp(monkeypatch)
+    _fresh_extract_cache(monkeypatch, tmp_path)
 
     with pytest.raises(zipfile.BadZipFile):
         lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), b"this is not a zip")
 
-    assert created, "spawn never created an extraction dir"
-    assert not any(os.path.exists(d) for d in created)
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.exists(lsvc._DOCKER_EXTRACT_CACHE) or not os.listdir(
+        lsvc._DOCKER_EXTRACT_CACHE)
 
 
-def test_spawn_failure_on_docker_api_timeout_leaves_no_tmpdir(monkeypatch):
+def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     """images.get raising anything other than ImageNotFound (the reported
-    case: a socket read timeout) propagates after extraction; the tmpdir must
-    be removed on the way out (issue #1600)."""
+    case: a socket read timeout) propagates after extraction. The extracted
+    tree stays in the content-addressed cache — that is the point of it — and
+    the retry reuses it without a second unpack (issue #1600)."""
     monkeypatch.setattr(lsvc, "_docker_available", True)
     fake_client = MagicMock()
     fake_client.images.get.side_effect = TimeoutError("Read timed out.")
     monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
-    created = _capture_mkdtemp(monkeypatch)
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    extractions = _count_extractions(monkeypatch)
+    code = _make_zip("def handler(e, c): pass")
 
-    with pytest.raises(TimeoutError):
-        lsvc._spawn_lambda_container(
-            dict(_SPAWN_LEAK_CONFIG), _make_zip("def handler(e, c): pass"),
+    for _ in range(2):
+        with pytest.raises(TimeoutError):
+            lsvc._spawn_lambda_container(dict(_SPAWN_LEAK_CONFIG), code)
+
+    assert len(extractions) == 1, "second cold start must reuse the cached tree"
+    (key,) = lsvc._docker_extract_dirs
+    assert key.startswith("code-") and os.path.isdir(lsvc._docker_extract_dirs[key])
+
+
+def test_docker_extracted_dir_is_content_addressed(monkeypatch, tmp_path):
+    """Identical blobs share one tree; different blobs and kinds get their
+    own. The dirs are what every container of that code receives (read-only
+    bind mount or docker cp), so sharing is invisible from inside."""
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    extractions = _count_extractions(monkeypatch)
+    code_a = _make_zip("def handler(e, c): return 1")
+    code_b = _make_zip("def handler(e, c): return 2")
+
+    d1 = lsvc._docker_extracted_dir(code_a, "code")
+    d2 = lsvc._docker_extracted_dir(code_a, "code")
+    d3 = lsvc._docker_extracted_dir(code_b, "code")
+    d4 = lsvc._docker_extracted_dir(code_a, "layer")
+    assert d1 == d2 and len({d1, d3, d4}) == 3
+    assert len(extractions) == 3
+    assert os.path.exists(os.path.join(d1, "index.py"))
+
+
+def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
+    """On a shared cached code dir the shim file already exists from the first
+    cold start; recognizing our own content must return the shim handler
+    rather than silently running the container without the shim."""
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    first = lsvc._write_context_arn_shim(str(code_dir), "python3.12", "index.handler")
+    second = lsvc._write_context_arn_shim(str(code_dir), "python3.12", "index.handler")
+    assert first == second == "_msctx_shim.handler"
+    # A same-named file that came from the user's own zip is left alone.
+    (code_dir / "_msctx_shim.js").write_text("// user's own module")
+    assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_node_context_shim_downgrades_https_to_the_gateway(tmp_path):
+    """The response submitters the CDK bundles into its custom-resource
+    handlers build the ResponseURL PUT from the URL's hostname and path only
+    and hand it to https.request, so it goes out over TLS to port 443
+    whatever the URL says, and in the docker executor a Node custom resource
+    never signalled its stack. The shim the executor injects turns that into a plain
+    HTTP request on the gateway port for the gateway hosts, and only those."""
+    import http.server
+    import subprocess
+    import threading
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_PUT(self):
+            seen.append((self.command, self.path, self.headers.get("Host")))
+            self.send_response(200)
+            self.end_headers()
+
+        do_GET = do_PUT
+
+        def log_message(self, *args):
+            pass
+
+    # The advertised-host case below dials a second loopback address the shim
+    # does not know by default; Linux answers on all of 127/8, so bind wide
+    # there and stay on 127.0.0.1 elsewhere.
+    on_linux = sys.platform.startswith("linux")
+    server = http.server.HTTPServer(("0.0.0.0" if on_linux else "127.0.0.1", 0), Handler)
+    port = server.server_address[1]
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        code_dir = tmp_path / "task"
+        code_dir.mkdir()
+        (code_dir / "index.js").write_text(
+            "const https = require('https');\n"
+            "exports.handler = (event) => new Promise((resolve, reject) => {\n"
+            "  const done = (res) => resolve({status: res.statusCode});\n"
+            "  let req;\n"
+            "  if (event.form === 'string') {\n"
+            "    req = https.request('https://' + event.host + '/_ministack/cfn-response/tok', {method: 'PUT'}, done);\n"
+            "  } else if (event.form === 'get') {\n"
+            "    req = https.get({hostname: event.host, path: '/_ministack/cfn-response/tok'}, done);\n"
+            "  } else {\n"
+            "    const opts = {hostname: event.host, path: '/_ministack/cfn-response/tok', method: 'PUT'};\n"
+            "    if (event.port) opts.port = event.port;\n"
+            "    req = https.request(opts, done);\n"
+            "  }\n"
+            "  req.on('error', reject);\n"
+            "  if (event.form !== 'get') req.end('{}');\n"
+            "});\n"
+        )
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") == "_msctx_shim.handler"
+        env = {
+            **os.environ,
+            "LAMBDA_TASK_ROOT": str(code_dir),
+            "_MS_REAL_HANDLER": "index.handler",
+            "AWS_ENDPOINT_URL": f"http://127.0.0.1:{port}",
+            "_MS_GATEWAY_HOSTS": "127.0.0.2",
+        }
+        script = (
+            "const s = require(process.argv[1]);"
+            "const event = {host: process.argv[2], port: process.argv[3] ? Number(process.argv[3]) : undefined,"
+            "  form: process.argv[4] || 'options'};"
+            "s.handler(event, {}).then("
+            "  (r) => process.stdout.write(JSON.stringify(r)),"
+            "  (e) => process.stdout.write(JSON.stringify({error: e.code || String(e)})));"
         )
 
-    assert created, "spawn never created an extraction dir"
-    assert not any(os.path.exists(d) for d in created)
+        def run(host, hport=None, form="options"):
+            proc = subprocess.run(
+                ["node", "-e", script, str(code_dir / "_msctx_shim.js"), host, str(hport or ""), form],
+                env=env, capture_output=True, text=True, timeout=30,
+            )
+            assert proc.returncode == 0, proc.stderr
+            return json.loads(proc.stdout)
+
+        # The CDK shape: hostname and path only, https default port. The gateway
+        # host becomes http on the gateway port.
+        assert run("127.0.0.1") == {"status": 200}
+        assert seen[-1] == ("PUT", "/_ministack/cfn-response/tok", f"127.0.0.1:{port}")
+        # An explicit 443 is the same case; so is the advertised gateway host
+        # the container learns through _MS_GATEWAY_HOSTS.
+        assert run("127.0.0.1", 443) == {"status": 200}
+        if on_linux:
+            assert run("127.0.0.2") == {"status": 200}
+            assert seen[-1] == ("PUT", "/_ministack/cfn-response/tok", f"127.0.0.2:{port}")
+        # The string-URL and https.get forms take the same path.
+        assert run("127.0.0.1", form="string") == {"status": 200}
+        assert seen[-1][0] == "PUT"
+        assert run("127.0.0.1", form="get") == {"status": 200}
+        assert seen[-1][0] == "GET"
+        # An explicit other port on a gateway host keeps TLS: the request is
+        # not downgraded and finds no TLS listener there.
+        assert "error" in run("127.0.0.1", port + 1)
+        assert seen[-1][2] != f"127.0.0.1:{port + 1}"
+        # Every other host keeps real TLS on 443 (here: nothing listens).
+        assert "error" in run("localhost.invalid")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_extract_cache_sweep_is_reference_based(monkeypatch, tmp_path):
+    """The sweep drops extracted trees whose blob no longer backs any
+    function, version, or layer version — and only those. References are read
+    from stored CodeSha256 values (base64), never by re-hashing blobs."""
+    import base64 as _b64
+    import hashlib as _hashlib
+
+    from ministack.core.responses import AccountRegionScopedDict
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    code_a, code_b = _make_zip("def handler(e,c): return 1"), _make_zip("def handler(e,c): return 2")
+    layer_z = _make_zip("def handler(e,c): return 3")
+    d_a = lsvc._docker_extracted_dir(code_a, "code")
+    d_b = lsvc._docker_extracted_dir(code_b, "code")
+    d_l = lsvc._docker_extracted_dir(layer_z, "layer")
+
+    def b64(blob):
+        return _b64.b64encode(_hashlib.sha256(blob).digest()).decode()
+
+    funcs = AccountRegionScopedDict()
+    funcs["fn-a"] = {"config": {"CodeSha256": b64(code_a)},
+                     "versions": {"1": {"config": {"CodeSha256": b64(code_a)}}}}
+    layers = AccountRegionScopedDict()
+    layers["shared"] = {"versions": [{"Content": {"CodeSha256": b64(layer_z)}}]}
+    monkeypatch.setattr(lsvc, "_functions", funcs)
+    monkeypatch.setattr(lsvc, "_layers", layers)
+
+    lsvc._sweep_extract_cache()
+    assert os.path.isdir(d_a) and os.path.isdir(d_l)
+    assert not os.path.isdir(d_b), "unreferenced code tree must be evicted"
+    assert set(lsvc._docker_extract_dirs) == {f"code-{_hashlib.sha256(code_a).hexdigest()}",
+                                              f"layer-{_hashlib.sha256(layer_z).hexdigest()}"}
+
+    # Last references gone -> everything evicted.
+    del funcs["fn-a"]
+    layers["shared"]["versions"] = []
+    lsvc._sweep_extract_cache()
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.isdir(d_a) and not os.path.isdir(d_l)
+
+
+def test_delete_and_update_paths_trigger_the_sweep(lam, monkeypatch):
+    """DeleteFunction, UpdateFunctionCode and DeleteLayerVersion are the
+    moments references disappear; each must run the cache sweep."""
+    calls = []
+    monkeypatch.setattr(lsvc, "_sweep_extract_cache", lambda: calls.append(1))
+    import base64 as _b64
+    fname = f"sweep-hooks-{_uuid_mod.uuid4().hex[:8]}"
+    lsvc._create_function({"FunctionName": fname, "Runtime": "python3.12",
+                           "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+                           "Code": {"ZipFile": _b64.b64encode(
+                               _make_zip("def handler(e,c): return 1")).decode()}})
+    lsvc._update_code(fname, {"ZipFile": _b64.b64encode(
+        _make_zip("def handler(e,c): return 2")).decode()})
+    lsvc._delete_function(fname, {})
+    lsvc._publish_layer_version("sweep-layer", {"Content": {"ZipFile": _b64.b64encode(
+        _make_zip("x = 1")).decode()}})
+    lsvc._delete_layer_version("sweep-layer", 1)
+    assert len(calls) >= 3, calls
+
+
+def test_reset_clears_the_extraction_cache(monkeypatch, tmp_path):
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    lsvc._docker_extracted_dir(_make_zip("def handler(e, c): pass"), "code")
+    assert lsvc._docker_extract_dirs
+    lsvc.reset()
+    assert lsvc._docker_extract_dirs == {}
+    assert not os.path.exists(lsvc._DOCKER_EXTRACT_CACHE)
 
 
 def _make_zip_multi(files: dict) -> bytes:
@@ -11335,3 +12094,989 @@ def test_lambda_rie_sentinel_arn_resolves_in_caller_scope():
         lsvc._functions.pop_scoped(account_id, "eu-central-1", function_name, None)
         set_request_account_id(original_account)
         set_request_region(original_region)
+
+
+# ---------------------------------------------------------------------------
+# provided.* (custom runtime) local execution: warm environment and dispatch
+#
+# Every test drives a *real* bootstrap — a stdlib-only Python script that
+# speaks the Lambda Runtime API over ``AWS_LAMBDA_RUNTIME_API`` exactly as a Go
+# or Rust binary would. No Go toolchain, no Docker, no running MiniStack.
+# ---------------------------------------------------------------------------
+
+from ministack.core import lambda_runtime
+from ministack.services import lambda_svc
+
+# ---------------------------------------------------------------------------
+# Bootstrap fixtures (stdlib only, run by the host Python interpreter)
+# ---------------------------------------------------------------------------
+
+_PREAMBLE = '''#!{python}
+import json, os, sys, time, urllib.request, urllib.error
+
+API = os.environ["AWS_LAMBDA_RUNTIME_API"]
+PORT = int(API.rsplit(":", 1)[1])
+
+
+def _call(path, data=None, method=None):
+    url = "http://%s/2018-06-01%s" % (API, path)
+    req = urllib.request.Request(url, data=data, method=method)
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+        return resp.getcode(), resp.headers, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+def next_invocation():
+    code, headers, body = _call("/runtime/invocation/next")
+    if code != 200:
+        raise SystemExit(0)
+    return headers, json.loads(body or b"null")
+
+
+def post_response(rid, payload):
+    return _call("/runtime/invocation/%s/response" % rid,
+                 data=json.dumps(payload).encode(), method="POST")[0]
+
+
+def post_error(rid, payload):
+    return _call("/runtime/invocation/%s/error" % rid,
+                 data=json.dumps(payload).encode(), method="POST")[0]
+
+
+def post_init_error(payload):
+    return _call("/runtime/init/error",
+                 data=json.dumps(payload).encode(), method="POST")[0]
+'''
+
+
+def _bootstrap(body: str) -> bytes:
+    """Zip a bootstrap script whose body follows the Runtime API preamble."""
+    script = _PREAMBLE.format(python=sys.executable) + "\n" + body
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("bootstrap", script)
+    return buf.getvalue()
+
+
+ECHO_BOOTSTRAP = _bootstrap('''
+n = 0
+while True:
+    headers, event = next_invocation()
+    n += 1
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    post_response(rid, {
+        "pid": os.getpid(),
+        "n": n,
+        "port": PORT,
+        "event": event,
+        "request_id": rid,
+        "trace": headers.get("Lambda-Runtime-Trace-Id"),
+        "arn": headers.get("Lambda-Runtime-Invoked-Function-Arn"),
+        "deadline": headers.get("Lambda-Runtime-Deadline-Ms"),
+    })
+''')
+
+
+def _provided_worker_config(**overrides):
+    config = {
+        "Runtime": "provided.al2023",
+        "Handler": "bootstrap",
+        "FunctionName": "provided-fn",
+        "FunctionArn": "arn:aws:lambda:us-east-1:123456789012:function:provided-fn",
+        "Timeout": 10,
+        "MemorySize": 128,
+    }
+    config.update(overrides)
+    return config
+
+
+@pytest.fixture
+def isolated_runtime(monkeypatch, tmp_path):
+    """Pool isolation for the provided-runtime tests.
+
+    Requested explicitly rather than autouse: these tests now sit beside the
+    rest of the Lambda suite, which shares the warm pool with the live server.
+    """
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(lambda_runtime, "_workers", {})
+    monkeypatch.setattr(lambda_svc, "_PROVIDED_CODE_CACHE", str(tmp_path / "code"))
+    monkeypatch.setattr(lambda_svc, "_provided_code_dirs", {})
+    yield
+    lambda_runtime.reset()
+
+
+@pytest.fixture
+def worker_factory(isolated_runtime):
+    """Build ProvidedWorkers and guarantee they are torn down."""
+    built: list = []
+
+    def _make(code_zip: bytes, **config_overrides) -> lambda_runtime.ProvidedWorker:
+        worker = lambda_runtime.ProvidedWorker("provided-fn", _provided_worker_config(**config_overrides), code_zip)
+        built.append(worker)
+        return worker
+
+    yield _make
+    lambda_runtime.kill_workers(built)
+    lambda_runtime.reset()
+
+
+def _port_is_closed(port: int) -> bool:
+    for _ in range(50):
+        sock = socket.socket()
+        sock.settimeout(0.5)
+        try:
+            sock.connect(("127.0.0.1", port))
+        except OSError:
+            return True
+        finally:
+            sock.close()
+        time.sleep(0.05)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Reuse + per-invocation trace context
+# ---------------------------------------------------------------------------
+
+
+def test_environment_is_reused_and_trace_is_per_invocation(worker_factory):
+    """Second invocation lands on the same process, with its own trace ID."""
+    worker = worker_factory(ECHO_BOOTSTRAP)
+
+    first = worker.invoke({"k": 1}, "req-1", trace_id="Root=1-aaa;Sampled=1")
+    second = worker.invoke({"k": 2}, "req-2", trace_id="Root=1-bbb;Sampled=1")
+    third = worker.invoke({"k": 3}, "req-3")
+
+    assert first["status"] == "ok" and second["status"] == "ok"
+    assert first["cold_start"] is True
+    assert second["cold_start"] is False and third["cold_start"] is False
+
+    assert first["result"]["pid"] == second["result"]["pid"] == third["result"]["pid"]
+    assert [r["result"]["n"] for r in (first, second, third)] == [1, 2, 3]
+
+    # Request IDs and trace IDs are per invocation, never carried over.
+    assert first["result"]["request_id"] == "req-1"
+    assert second["result"]["request_id"] == "req-2"
+    assert first["result"]["trace"] == "Root=1-aaa;Sampled=1"
+    assert second["result"]["trace"] == "Root=1-bbb;Sampled=1"
+    assert third["result"]["trace"] is None
+    assert first["result"]["arn"] == worker.config["FunctionArn"]
+
+
+def test_trace_id_does_not_touch_the_event_payload(worker_factory):
+    """The event is the caller's; trace context rides the Runtime API header.
+
+    A user event that happens to contain the key the old implementation
+    reserved must reach the handler untouched.
+    """
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    event = {"_x_amzn_trace_id": "user-supplied", "hello": "world"}
+
+    result = worker.invoke(event, "req-1", trace_id="Root=1-ccc")
+
+    assert result["status"] == "ok"
+    # Delivered verbatim ...
+    assert result["result"]["event"] == {
+        "_x_amzn_trace_id": "user-supplied", "hello": "world"}
+    # ... and the header carries the real trace ID.
+    assert result["result"]["trace"] == "Root=1-ccc"
+    # The caller's dict was not mutated.
+    assert event == {"_x_amzn_trace_id": "user-supplied", "hello": "world"}
+
+
+# ---------------------------------------------------------------------------
+# Logs: both pipes drained continuously, buffer bounded
+# ---------------------------------------------------------------------------
+
+
+CHATTY_BOOTSTRAP = _bootstrap('''
+LINE = "x" * 120
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    count = event["lines"]
+    for i in range(count):
+        sys.stdout.write("OUT-%d %s\\n" % (i, LINE))
+        sys.stderr.write("ERR-%d %s\\n" % (i, LINE))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    time.sleep(0.2)
+    post_response(rid, {"logged": count})
+''')
+
+
+def test_large_log_volume_does_not_wedge_the_bootstrap(worker_factory):
+    """~500KB across both pipes: an undrained pipe would block the child.
+
+    stdout is drained as logs too — a custom runtime writes there — and both
+    streams are merged into one log buffer.
+    """
+    worker = worker_factory(CHATTY_BOOTSTRAP, Timeout=30)
+
+    result = worker.invoke({"lines": 2000}, "req-1")
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"logged": 2000}
+    log = result["log"]
+    assert "OUT-0 " in log and "ERR-0 " in log
+    assert "OUT-1999 " in log and "ERR-1999 " in log
+
+    # And the environment survives it.
+    again = worker.invoke({"lines": 1}, "req-2")
+    assert again["status"] == "ok"
+    assert again["cold_start"] is False
+
+
+def test_log_buffer_is_bounded_and_keeps_the_newest_lines(worker_factory, monkeypatch):
+    monkeypatch.setattr(lambda_runtime, "_PROVIDED_LOG_MAX_LINES", 50)
+    worker = worker_factory(CHATTY_BOOTSTRAP, Timeout=30)
+
+    result = worker.invoke({"lines": 400}, "req-1")
+
+    assert result["status"] == "ok"
+    lines = [line for line in result["log"].splitlines() if line]
+    assert len(lines) <= 50
+    # Oldest dropped, newest kept.
+    assert "OUT-0 " not in result["log"]
+    assert any(line.startswith("ERR-399 ") or line.startswith("OUT-399 ")
+               for line in lines)
+
+
+# ---------------------------------------------------------------------------
+# Crash / restart
+# ---------------------------------------------------------------------------
+
+
+CRASH_BOOTSTRAP = _bootstrap('''
+headers, event = next_invocation()
+rid = headers["Lambda-Runtime-Aws-Request-Id"]
+post_response(rid, {"pid": os.getpid(), "port": PORT})
+sys.stderr.write("bye\\n")
+sys.stderr.flush()
+os._exit(9)
+''')
+
+
+def test_crashed_bootstrap_is_replaced_without_leaking_its_server(worker_factory):
+    worker = worker_factory(CRASH_BOOTSTRAP)
+    threads_before = threading.active_count()
+
+    first = worker.invoke({}, "req-1")
+    assert first["status"] == "ok"
+    first_port = first["result"]["port"]
+    first_pid = first["result"]["pid"]
+
+    # The bootstrap exits right after responding; the next invocation gets a
+    # brand new environment, and the dead one's HTTP server is gone.
+    second = worker.invoke({}, "req-2")
+    assert second["status"] == "ok"
+    assert second["cold_start"] is True
+    assert second["result"]["pid"] != first_pid
+    assert second["result"]["port"] != first_port
+    assert _port_is_closed(first_port), "leaked Runtime API server from dead generation"
+
+    worker.kill()
+    assert _port_is_closed(second["result"]["port"])
+    # Two generations, no accumulated threads.
+    for _ in range(50):
+        if threading.active_count() <= threads_before + 1:
+            break
+        time.sleep(0.1)
+    assert threading.active_count() <= threads_before + 1
+
+
+# ---------------------------------------------------------------------------
+# Init failures are detected promptly
+# ---------------------------------------------------------------------------
+
+
+INIT_ERROR_BOOTSTRAP = _bootstrap('''
+sys.stderr.write("init blew up\\n")
+sys.stderr.flush()
+post_init_error({"errorMessage": "cannot load config", "errorType": "Init.Error"})
+sys.exit(1)
+''')
+
+INSTANT_EXIT_BOOTSTRAP = _bootstrap('''
+sys.stderr.write("missing shared library\\n")
+sys.stderr.flush()
+sys.exit(3)
+''')
+
+
+def test_init_error_fails_fast_and_leaves_nothing_running(worker_factory):
+    worker = worker_factory(INIT_ERROR_BOOTSTRAP)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="init error"):
+        worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < lambda_runtime._PROVIDED_INIT_TIMEOUT / 2
+    assert worker._proc is None
+    assert worker._server is None
+    assert worker._server_thread is None
+
+
+def test_bootstrap_that_exits_immediately_fails_fast(worker_factory):
+    worker = worker_factory(INSTANT_EXIT_BOOTSTRAP)
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="exited during init with code 3"):
+        worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < lambda_runtime._PROVIDED_INIT_TIMEOUT / 2
+    assert worker._proc is None and worker._server is None
+
+
+def test_init_overrun_reruns_init_under_the_function_timeout(worker_factory, monkeypatch):
+    """AWS does not fail the call when init overruns its budget: "Lambda
+    retries the Init phase at the time of the first function invocation with
+    the configured function timeout". Only the second overrun gives up."""
+    monkeypatch.setattr(lambda_runtime, "_PROVIDED_INIT_TIMEOUT", 0.5)
+    silent = _bootstrap('time.sleep(60)\n')
+    worker = worker_factory(silent, Timeout=2)
+
+    started = time.monotonic()
+    with pytest.raises(lambda_runtime.ProvidedInitTimeout,
+                       match="did not reach the Runtime API"):
+        worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    # Both budgets were spent: the 0.5s init, then a re-init under Timeout=2.
+    assert 2.5 <= elapsed < 10.0
+    assert worker._proc is None and worker._server is None
+
+
+def test_a_missing_bootstrap_is_runtime_invalid_entrypoint(worker_factory):
+    """"If the bootstrap file doesn't exist or isn't executable, your function
+    returns a Runtime.InvalidEntrypoint error upon invocation"."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        archive.writestr("not-bootstrap", "noop")
+    worker = worker_factory(buf.getvalue())
+
+    with pytest.raises(lambda_runtime.ProvidedRuntimeError) as excinfo:
+        worker.invoke({}, "req-1")
+    assert excinfo.value.error_type == "Runtime.InvalidEntrypoint"
+
+
+# ---------------------------------------------------------------------------
+# Timeout + recovery
+# ---------------------------------------------------------------------------
+
+
+SLOW_ONCE_BOOTSTRAP_TEMPLATE = '''
+MARKER = {marker!r}
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    if not os.path.exists(MARKER):
+        open(MARKER, "w").close()
+        sys.stderr.write("going to sleep\\n")
+        sys.stderr.flush()
+        time.sleep(30)
+    post_response(rid, {{"pid": os.getpid(), "port": PORT}})
+'''
+
+
+def test_timeout_kills_environment_and_next_invocation_recovers(worker_factory, tmp_path):
+    marker = str(tmp_path / "slept")
+    worker = worker_factory(
+        _bootstrap(SLOW_ONCE_BOOTSTRAP_TEMPLATE.format(marker=marker)),
+        Timeout=1,
+    )
+
+    started = time.monotonic()
+    timed_out = worker.invoke({}, "req-1")
+    elapsed = time.monotonic() - started
+
+    assert timed_out["status"] == "error"
+    assert timed_out["error"] == "Task timed out after 1.00 seconds"
+    assert "going to sleep" in timed_out["log"]
+    assert elapsed < 8.0
+    assert worker._proc is None and worker._server is None
+
+    # A fresh environment serves the next invocation, and the marker makes the
+    # replacement take the fast path.
+    recovered = worker.invoke({}, "req-2")
+    assert recovered["status"] == "ok"
+    assert recovered["cold_start"] is True
+
+
+# ---------------------------------------------------------------------------
+# Request-ID validation and stale-response isolation
+# ---------------------------------------------------------------------------
+
+
+BAD_REQUEST_ID_BOOTSTRAP = _bootstrap('''
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    codes = {
+        "bogus": post_response("not-a-real-request-id", {"stolen": True}),
+        "empty": post_error("", {"errorMessage": "nope"}),
+    }
+    codes["real"] = post_response(rid, {"codes": codes, "request_id": rid})
+    if codes["real"] != 202:
+        post_error(rid, {"errorMessage": "response rejected: %s" % codes})
+''')
+
+
+def test_unknown_request_ids_are_rejected_not_delivered(worker_factory):
+    worker = worker_factory(BAD_REQUEST_ID_BOOTSTRAP)
+
+    result = worker.invoke({}, "req-1")
+
+    assert result["status"] == "ok"
+    # The forged IDs got 400s; only the real one was accepted.
+    assert result["result"]["codes"] == {"bogus": 400, "empty": 404}
+    assert result["result"]["request_id"] == "req-1"
+
+
+DUPLICATE_RESPONSE_BOOTSTRAP = _bootstrap('''
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    first = post_response(rid, {"which": "first"})
+    second = post_response(rid, {"which": "second", "first_code": first})
+    sys.stderr.write("dup-code=%s\\n" % second)
+    sys.stderr.flush()
+''')
+
+
+def test_duplicate_response_for_same_request_id_is_rejected(worker_factory):
+    worker = worker_factory(DUPLICATE_RESPONSE_BOOTSTRAP)
+
+    first = worker.invoke({}, "req-1")
+    assert first["status"] == "ok"
+    assert first["result"] == {"which": "first"}
+
+    # The duplicate got a 400 and, crucially, did not become the *next*
+    # invocation's result.
+    second = worker.invoke({}, "req-2")
+    assert second["status"] == "ok"
+    assert second["result"] == {"which": "first"}
+    assert "dup-code=400" in "\n".join([first["log"], second["log"]])
+
+
+def test_results_from_a_dead_generation_are_ignored(isolated_runtime):
+    """A late POST from a torn-down environment cannot satisfy its successor."""
+    worker = lambda_runtime.ProvidedWorker("provided-fn", _provided_worker_config(), b"")
+    worker._generation = 7
+    worker._current_request_id = "req-live"
+
+    # Same request ID, previous generation.
+    assert worker._record_result(6, "req-live", "response", {"stale": True}) is False
+    assert worker._response_ready.is_set() is False
+    assert worker._result == {}
+
+    # Wrong request ID, current generation.
+    assert worker._record_result(7, "req-old", "response", {"stale": True}) is False
+    assert worker._response_ready.is_set() is False
+
+    # The live one is accepted exactly once.
+    assert worker._record_result(7, "req-live", "response", {"ok": True}) is True
+    assert worker._result == {"response": {"ok": True}}
+    assert worker._record_result(7, "req-live", "response", {"again": True}) is False
+    assert worker._result == {"response": {"ok": True}}
+
+
+def test_init_error_from_a_dead_generation_is_ignored(isolated_runtime):
+    worker = lambda_runtime.ProvidedWorker("provided-fn", _provided_worker_config(), b"")
+    worker._generation = 3
+
+    worker._record_init_error(2, {"errorMessage": "stale"})
+    assert worker._init_error is None
+    assert worker._init_settled.is_set() is False
+
+    worker._record_init_error(3, {"errorMessage": "live"})
+    assert worker._init_error == {"errorMessage": "live"}
+    assert worker._init_settled.is_set() is True
+
+
+# ---------------------------------------------------------------------------
+# Cleanup / pool contract
+# ---------------------------------------------------------------------------
+
+
+def test_kill_reaps_process_server_and_threads(worker_factory):
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    threads_before = threading.active_count()
+
+    result = worker.invoke({}, "req-1")
+    port = result["result"]["port"]
+    proc = worker._proc
+    log_thread = worker._log_thread
+    assert proc.poll() is None
+
+    worker.kill()
+
+    assert proc.poll() is not None, "bootstrap process not reaped"
+    assert worker._proc is None
+    assert worker._server is None and worker._server_thread is None
+    assert worker._log_thread is None
+    assert _port_is_closed(port), "Runtime API socket still listening after kill"
+    log_thread.join(timeout=2.0)
+    assert not log_thread.is_alive()
+    for _ in range(50):
+        if threading.active_count() <= threads_before:
+            break
+        time.sleep(0.1)
+    assert threading.active_count() <= threads_before
+
+
+def test_pool_contract_lease_reuse_and_reset(isolated_runtime):
+    """provided.* functions use the same acquire/release pool as the rest."""
+    config = _provided_worker_config()
+    try:
+        worker, reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        assert isinstance(worker, lambda_runtime.ProvidedWorker)
+        assert reason == "spawn"
+        assert worker.in_use is True
+
+        first = worker.invoke({}, "req-1")
+        assert first["status"] == "ok"
+        port = first["result"]["port"]
+
+        # A second lease while the first is held gets a *separate* environment.
+        other, other_reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        assert other is not worker and other_reason == "spawn"
+        lambda_runtime.release_worker(other)
+
+        lambda_runtime.release_worker(worker)
+        again, reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        assert reason == "reused"
+        assert again is worker
+        assert again.invoke({}, "req-2")["result"]["port"] == port
+        lambda_runtime.release_worker(again)
+    finally:
+        lambda_runtime.reset()
+
+    assert _port_is_closed(port)
+
+
+def test_concurrent_invocations_use_separate_leased_environments(isolated_runtime):
+    """Two leases run at the same time on two processes, results not crossed."""
+    config = _provided_worker_config()
+    barrier = threading.Barrier(2, timeout=30)
+    results: dict = {}
+
+    try:
+        workers = []
+        for _ in range(2):
+            worker, reason = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+            assert reason == "spawn"
+            workers.append(worker)
+
+        def _run(index, worker):
+            barrier.wait()
+            results[index] = worker.invoke({"i": index}, f"req-{index}",
+                                           trace_id=f"Root=1-{index}")
+
+        threads = [threading.Thread(target=_run, args=(i, w))
+                   for i, w in enumerate(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive()
+
+        assert set(results) == {0, 1}
+        assert all(r["status"] == "ok" for r in results.values())
+        assert results[0]["result"]["pid"] != results[1]["result"]["pid"]
+        for index, result in results.items():
+            assert result["result"]["event"] == {"i": index}
+            assert result["result"]["request_id"] == f"req-{index}"
+            assert result["result"]["trace"] == f"Root=1-{index}"
+        for worker in workers:
+            lambda_runtime.release_worker(worker)
+    finally:
+        lambda_runtime.reset()
+
+    for result in results.values():
+        assert _port_is_closed(result["result"]["port"])
+
+
+def test_idle_reaper_and_reset_release_provided_environments(isolated_runtime):
+    config = _provided_worker_config()
+    try:
+        first, _ = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        second, _ = lambda_runtime.acquire_worker("provided-fn", config, ECHO_BOOTSTRAP)
+        ports = [w.invoke({}, "req-1")["result"]["port"] for w in (first, second)]
+        procs = [first._proc, second._proc]
+        lambda_runtime.release_worker(first)
+        lambda_runtime.release_worker(second)
+
+        # ttl=0 reaps every surplus environment; the first per key stays warm.
+        assert lambda_runtime.reap_idle_workers(ttl=0) == 1
+        assert procs[1].poll() is not None
+        assert _port_is_closed(ports[1])
+        assert second._server is None
+        assert procs[0].poll() is None
+
+        lambda_runtime.reset()
+        assert procs[0].poll() is not None
+        assert _port_is_closed(ports[0])
+        assert first._server is None and first._log_thread is None
+    finally:
+        lambda_runtime.reset()
+
+
+def test_invoke_signature_keeps_trace_out_of_the_positional_contract(isolated_runtime):
+    """``trace_id`` is keyword-only, so no caller can pass it as the event."""
+    import inspect
+
+    sig = inspect.signature(lambda_runtime.ProvidedWorker.invoke)
+    assert list(sig.parameters) == ["self", "event", "request_id", "trace_id"]
+    assert sig.parameters["trace_id"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["trace_id"].default is None
+
+
+def test_json_only_bootstrap_output_is_not_parsed_as_protocol(worker_factory):
+    """stdout is logs, not a protocol channel: JSON there must not confuse us."""
+    noisy = _bootstrap('''
+while True:
+    headers, event = next_invocation()
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    sys.stdout.write(json.dumps({"status": "ok", "result": "from-stdout"}) + "\\n")
+    sys.stdout.flush()
+    post_response(rid, {"real": True})
+''')
+    worker = worker_factory(noisy)
+
+    result = worker.invoke({}, "req-1")
+
+    assert result["status"] == "ok"
+    assert result["result"] == {"real": True}
+    assert "from-stdout" in result["log"]
+
+
+def test_handler_error_does_not_poison_warm_environment(worker_factory):
+    code = _bootstrap('''
+n = 0
+while True:
+    headers, event = next_invocation()
+    n += 1
+    rid = headers["Lambda-Runtime-Aws-Request-Id"]
+    if event.get("fail"):
+        post_error(rid, {"errorMessage": "handler failed", "errorType": "Test.Error"})
+    else:
+        post_response(rid, {"n": n})
+''')
+    worker = worker_factory(code)
+    failed = worker.invoke({"fail": True}, "req-1")
+    assert failed["status"] == "error"
+    assert failed["error_payload"]["errorType"] == "Test.Error"
+    recovered = worker.invoke({}, "req-2")
+    assert recovered["status"] == "ok"
+    assert recovered["cold_start"] is False
+    assert recovered["result"] == {"n": 2}
+
+
+def test_exit_during_invocation_fails_without_waiting_for_timeout(worker_factory):
+    worker = worker_factory(_bootstrap('''
+next_invocation()
+sys.stderr.write("crashed during handler\\n")
+sys.stderr.flush()
+sys.exit(9)
+'''), Timeout=30)
+    started = time.monotonic()
+    result = worker.invoke({}, "req-1")
+    assert time.monotonic() - started < 8
+    assert result["status"] == "error"
+    assert result["error_payload"]["errorType"] == "Runtime.ExitError"
+    assert "crashed during handler" in result["log"]
+    assert worker._proc is None and worker._server is None
+
+
+def test_response_recorded_just_after_process_exit_is_preserved(worker_factory, monkeypatch):
+    from unittest.mock import Mock
+
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    proc = Mock()
+    statuses = iter([None, 0])
+    proc.poll.side_effect = lambda: next(statuses, 0)
+    worker._proc = proc
+    ready = Mock()
+    waits = iter([False, True])
+
+    def wait(timeout):
+        settled = next(waits)
+        if settled:
+            worker._result = {"response": {"ok": True}}
+        return settled
+
+    ready.wait.side_effect = wait
+    worker._response_ready = ready
+    monkeypatch.setattr(worker, "_drain_stderr_bounded", lambda: "")
+    result = worker.invoke({}, "req-1")
+    assert result["status"] == "ok"
+    assert result["result"] == {"ok": True}
+    assert ready.wait.call_count == 2
+    assert worker._proc is None
+
+
+def test_spawn_failure_closes_the_already_started_server(worker_factory, monkeypatch):
+    worker = worker_factory(ECHO_BOOTSTRAP)
+    resources = []
+
+    def failed_popen(*args, **kwargs):
+        resources.extend([worker._server, worker._server_thread])
+        raise OSError("cannot execute bootstrap")
+
+    monkeypatch.setattr(lambda_runtime.subprocess, "Popen", failed_popen)
+    # A bootstrap the host cannot exec is Runtime.InvalidEntrypoint on AWS, so
+    # the OSError is re-raised carrying that type rather than as itself.
+    with pytest.raises(lambda_runtime.ProvidedRuntimeError,
+                       match="cannot execute bootstrap") as excinfo:
+        worker.invoke({}, "req-1")
+    assert excinfo.value.error_type == "Runtime.InvalidEntrypoint"
+    server, thread = resources
+    assert server.fileno() == -1
+    assert not thread.is_alive()
+    assert worker._proc is None and worker._server is None
+
+
+def _provided_dispatch_config(account="111122223333", region="us-east-1", version="$LATEST"):
+    return {
+        "FunctionName": "provided-pool-test",
+        "FunctionArn": f"arn:aws:lambda:{region}:{account}:function:provided-pool-test",
+        "Runtime": "provided.al2023",
+        "Version": version,
+        "Timeout": 2,
+        "Handler": "bootstrap",
+    }
+
+
+@pytest.fixture
+def isolated_pool(monkeypatch):
+    monkeypatch.setattr(lambda_runtime, "_workers", {})
+    monkeypatch.setattr(lambda_svc, "_ensure_reaper_thread", lambda: None)
+    try:
+        yield
+    finally:
+        lambda_runtime.reset()
+
+
+@pytest.mark.parametrize("event", [
+    {"_x_amzn_trace_id": "user data", "value": 1}, [1, 2], "text", None,
+])
+def test_provided_metadata_does_not_mutate_payload(monkeypatch, event):
+    worker = Mock()
+    worker.invoke.return_value = {"status": "ok", "result": event, "log": "handler log"}
+    monkeypatch.setattr(lambda_svc, "_ensure_reaper_thread", lambda: None)
+    monkeypatch.setattr(lambda_svc, "acquire_worker", Mock(return_value=(worker, "spawn")))
+    release = Mock()
+    monkeypatch.setattr(lambda_svc, "release_worker", release)
+    monkeypatch.setattr(lambda_svc, "_xray_trace_id_for_invocation", lambda config: "trace-1")
+    result = lambda_svc._execute_function_provided_warm(
+        {"config": _provided_dispatch_config(), "code_zip": b"zip"}, event, "request-1",
+    )
+    worker.invoke.assert_called_once_with(event, "request-1", trace_id="trace-1")
+    release.assert_called_once_with(worker)
+    assert result == {"body": event, "log": "handler log"}
+    if isinstance(event, dict):
+        assert event["_x_amzn_trace_id"] == "user data"
+
+
+def test_provided_failure_is_scoped_and_not_retried(monkeypatch, isolated_pool):
+    config = _provided_dispatch_config()
+    failed, _ = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    lambda_runtime.release_worker(failed)
+    fail = Mock(side_effect=RuntimeError("bootstrap crashed"))
+    monkeypatch.setattr(failed, "invoke", fail)
+    unrelated = []
+    for account, region, version in [
+        ("999900001111", "us-east-1", "$LATEST"),
+        ("111122223333", "eu-west-1", "$LATEST"),
+        ("111122223333", "us-east-1", "1"),
+    ]:
+        other = _provided_dispatch_config(account, region, version)
+        worker, _ = lambda_runtime.acquire_worker(
+            other["FunctionName"], other, b"zip", qualifier=version,
+        )
+        unrelated.append(worker)
+    fallback = Mock()
+    monkeypatch.setattr(lambda_svc, "_execute_function_provided", fallback)
+    result = lambda_svc._execute_function_provided_warm({"config": config, "code_zip": b"zip"}, {})
+    assert result["error"] is True
+    assert result["body"]["errorMessage"] == "bootstrap crashed"
+    assert fail.call_count == 1
+    fallback.assert_not_called()
+    remaining = [w for entries in lambda_runtime._workers.values() for w in entries]
+    assert remaining == unrelated
+    assert all(w.in_use for w in unrelated)
+
+
+def test_provided_concurrent_leases_and_reuse(isolated_pool):
+    config = _provided_dispatch_config()
+    first, _ = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    second, _ = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    assert isinstance(first, lambda_runtime.ProvidedWorker)
+    assert isinstance(second, lambda_runtime.ProvidedWorker)
+    assert first is not second
+    lambda_runtime.release_worker(first)
+    reused, reason = lambda_runtime.acquire_worker(config["FunctionName"], config, b"zip")
+    assert reused is first
+    assert reason == "reused"
+    lambda_runtime.release_worker(reused)
+    lambda_runtime.release_worker(second)
+
+
+@pytest.mark.parametrize("mode,target", [
+    ("local", "_execute_function_provided_warm"),
+    ("durable", "_execute_function_provided"),
+    ("docker", "_execute_function_docker"),
+    ("strict", "_execute_function_docker"),
+    ("image", "_execute_function_docker"),
+    ("proxy", "_execute_function_proxy"),
+])
+def test_provided_dispatch_preserves_other_executors(monkeypatch, mode, target):
+    monkeypatch.setattr(lambda_svc, "LAMBDA_EXECUTOR", "docker" if mode == "docker" else "local")
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", mode == "strict")
+    monkeypatch.setattr(lambda_svc, "_proxy_url_for", lambda config: "http://proxy" if mode == "proxy" else None)
+    monkeypatch.setattr(lambda_svc, "_emit_lambda_logs", Mock())
+    names = ["_execute_function_provided_warm", "_execute_function_provided",
+             "_execute_function_docker", "_execute_function_proxy"]
+    executors = {name: Mock(return_value={"body": name}) for name in names}
+    for name, executor in executors.items():
+        monkeypatch.setattr(lambda_svc, name, executor)
+    config = _provided_dispatch_config()
+    if mode == "image":
+        config.update(PackageType="Image", ImageUri="example:latest")
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"test": True} if mode == "durable" else None)
+    try:
+        result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert result == {"body": target}
+    for name, executor in executors.items():
+        assert executor.call_count == (1 if name == target else 0)
+    if mode == "local":
+        executors[target].assert_called_once_with(func, {}, "request-1")
+
+
+@pytest.mark.parametrize("runtime", ["python3.12", "nodejs20.x"])
+@pytest.mark.parametrize("durable", [False, True])
+def test_python_and_nodejs_dispatch_to_the_warm_pool_durable_or_not(
+        monkeypatch, runtime, durable):
+    """The sibling of the provided.* routing above: python and nodejs reach
+    _execute_function_warm whether or not the invocation is durable, because
+    their per-call durable context rides in the event rather than in the
+    worker's spawn environment."""
+    monkeypatch.setattr(lambda_svc, "LAMBDA_EXECUTOR", "local")
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", False)
+    monkeypatch.setattr(lambda_svc, "_proxy_url_for", lambda config: None)
+    monkeypatch.setattr(lambda_svc, "_emit_lambda_logs", Mock())
+    names = ["_execute_function_warm", "_execute_function_local",
+             "_execute_function_provided", "_execute_function_provided_warm",
+             "_execute_function_docker", "_execute_function_proxy"]
+    executors = {name: Mock(return_value={"body": name}) for name in names}
+    for name, executor in executors.items():
+        monkeypatch.setattr(lambda_svc, name, executor)
+    config = _provided_dispatch_config()
+    config["Runtime"] = runtime
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"test": True} if durable else None)
+    try:
+        result = lambda_svc._execute_function_dispatch(func, config, {}, "request-1", time.time())
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert result == {"body": "_execute_function_warm"}
+    for name, executor in executors.items():
+        assert executor.call_count == (1 if name == "_execute_function_warm" else 0)
+
+
+@pytest.mark.parametrize("unavailable", ["sdk", "daemon"])
+def test_docker_unavailable_fallback_carries_the_durable_context(monkeypatch, unavailable):
+    """Both permissive Docker fallbacks send python and nodejs to the warm
+    pool, so the durable context reaches the handler there too. Before the
+    carrier moved into the event they invoked with the three variables unset."""
+    monkeypatch.setattr(lambda_svc, "_docker_available", unavailable != "sdk")
+    monkeypatch.setattr(lambda_svc, "_get_docker_client",
+                        lambda: None if unavailable == "daemon" else object())
+    monkeypatch.setattr(lambda_svc, "LAMBDA_STRICT", False)
+    warm = Mock(return_value={"body": "warm"})
+    one_shot = Mock(return_value={"body": "one-shot"})
+    monkeypatch.setattr(lambda_svc, "_execute_function_warm", warm)
+    monkeypatch.setattr(lambda_svc, "_execute_function_local", one_shot)
+    config = _provided_dispatch_config()
+    config["Runtime"] = "python3.12"
+    func = {"config": config, "code_zip": b"zip"}
+    token = lambda_svc._durable_ctx.set({"arn": "exec-arn", "token": "tok", "name": "exec"})
+    try:
+        assert lambda_svc._execute_function_docker(func, {}) == {"body": "warm"}
+        overlay = lambda_svc._durable_env_overlay()
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    warm.assert_called_once_with(func, {})
+    one_shot.assert_not_called()
+    assert overlay == {
+        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "exec-arn",
+        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": "tok",
+        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": "exec",
+    }
+
+
+def test_provided_env_keeps_function_vars_and_endpoint_precedence(monkeypatch):
+    config = _provided_dispatch_config()
+    config.update(MemorySize=256, Environment={"Variables": {
+        "CUSTOM": "value", "AWS_ENDPOINT_URL": "http://wrong:4566",
+    }})
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://ministack:4566")
+    monkeypatch.setattr(lambda_svc, "get_region", lambda: "us-east-1")
+    token = lambda_svc._durable_ctx.set(None)
+    try:
+        env = lambda_svc._provided_worker_env(config, "/code", 12345)
+    finally:
+        lambda_svc._durable_ctx.reset(token)
+    assert env["AWS_LAMBDA_RUNTIME_API"] == "127.0.0.1:12345"
+    assert env["AWS_LAMBDA_FUNCTION_NAME"] == config["FunctionName"]
+    assert env["AWS_LAMBDA_FUNCTION_MEMORY_SIZE"] == "256"
+    assert env["AWS_ACCESS_KEY_ID"] == "111122223333"
+    assert env["AWS_REGION"] == "us-east-1"
+    assert env["LAMBDA_TASK_ROOT"] == "/code"
+    assert env["CUSTOM"] == "value"
+    assert env["AWS_ENDPOINT_URL"] == "http://ministack:4566"
+
+
+def test_provided_env_uses_execution_role_credentials(monkeypatch):
+    config = _provided_dispatch_config()
+    credentials = {
+        "AWS_ACCESS_KEY_ID": "ASIATESTROLE",
+        "AWS_SECRET_ACCESS_KEY": "role-secret",
+        "AWS_SESSION_TOKEN": "role-session",
+    }
+    resolve = Mock(return_value=credentials)
+    monkeypatch.setattr(lambda_svc, "execution_credentials", resolve)
+    env = lambda_svc._provided_worker_env(config, "/code", 12345)
+    resolve.assert_called_once_with(config)
+    assert {key: env[key] for key in credentials} == credentials
+
+
+@pytest.mark.parametrize("operation", ["code", "configuration", "delete"])
+def test_function_changes_invalidate_provided_workers(monkeypatch, isolated_pool, operation):
+    config = _provided_dispatch_config()
+    name = config["FunctionName"]
+    monkeypatch.setattr(lambda_svc, "_functions", {name: {"config": config, "code_zip": b"zip"}})
+    monkeypatch.setattr(lambda_svc, "get_account_id", lambda: "111122223333")
+    monkeypatch.setattr(lambda_svc, "get_region", lambda: "us-east-1")
+    monkeypatch.setattr(lambda_svc, "_pool_kill_function", Mock())
+    monkeypatch.setattr(lambda_svc, "_sweep_extract_cache", Mock())
+    monkeypatch.setattr(lambda_svc, "_schedule_state_transition", Mock())
+    worker, _ = lambda_runtime.acquire_worker(name, config, b"zip")
+    lambda_runtime.release_worker(worker)
+    if operation == "code":
+        result = lambda_svc._update_code(name, {})
+    elif operation == "configuration":
+        result = lambda_svc._update_config(name, {"Environment": {"Variables": {"UPDATED": "yes"}}})
+    else:
+        result = lambda_svc._delete_function(name, {})
+    assert result[0] in (200, 204)
+    assert not lambda_runtime._workers

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation engine — pure functions for template parsing, parameter resolution,
 condition evaluation, intrinsic function resolution, and topological sorting.
@@ -6,6 +8,8 @@ condition evaluation, intrinsic function resolution, and topological sorting.
 import base64
 import copy
 import heapq
+import ipaddress
+import itertools
 import json
 import logging
 import os
@@ -15,6 +19,8 @@ from types import SimpleNamespace
 import yaml
 
 from ministack.core.responses import get_account_id, get_region
+
+logger = logging.getLogger("cloudformation")
 
 # Sentinel for AWS::NoValue
 _NO_VALUE = object()
@@ -109,6 +115,286 @@ def _parse_template(template_body: str) -> dict:
 
 
 # ===========================================================================
+# Template pre-flight
+# ===========================================================================
+
+_DYNAMIC_REFERENCE = re.compile(r"\{\{resolve:([a-z-]+):([^}]*)\}\}")
+_DYNAMIC_SERVICES = ("ssm", "ssm-secure", "secretsmanager")
+
+
+def _find_dynamic_references(value, found: set) -> None:
+    if isinstance(value, str):
+        for m in _DYNAMIC_REFERENCE.finditer(value):
+            found.add(m.group(0))
+    elif isinstance(value, dict):
+        for v in value.values():
+            _find_dynamic_references(v, found)
+    elif isinstance(value, list):
+        for v in value:
+            _find_dynamic_references(v, found)
+
+
+def _has_dynamic_references(template: dict) -> bool:
+    refs: set[str] = set()
+    _find_dynamic_references((template or {}).get("Resources"), refs)
+    return bool(refs)
+
+
+def _resolve_dynamic_reference(literal: str) -> str:
+    """Resolve one ``{{resolve:...}}`` literal against the in-process SSM /
+    Secrets Manager stores. Raises ``ValueError`` when it cannot be resolved,
+    which fails the resource the way an unresolvable reference does on AWS.
+    ``ssm`` / ``ssm-secure`` take ``name[:version]`` (no version = latest);
+    ``secretsmanager`` takes
+    ``secret-id[:SecretString[:json-key[:version-stage[:version-id]]]]``,
+    the secret id being a name or an ARN."""
+    from ministack.services import secretsmanager, ssm
+
+    m = _DYNAMIC_REFERENCE.fullmatch(literal)
+    service, body = m.group(1), m.group(2)
+    if service in ("ssm", "ssm-secure"):
+        name, _, version = body.partition(":")
+        value = ssm.resolve_parameter_value(name, version or None, decrypt=True)
+        if value is None:
+            raise ValueError(
+                f"Dynamic reference {literal} could not be resolved: parameter "
+                f"{name}" + (f" version {version}" if version else "") + " not found")
+        return value
+    if body.startswith("arn:"):
+        parts = body.split(":")
+        secret_id, rest = ":".join(parts[:7]), parts[7:]
+    else:
+        parts = body.split(":")
+        secret_id, rest = parts[0], parts[1:]
+    rest += [""] * (4 - len(rest))
+    secret_string, json_key, version_stage, version_id = rest[:4]
+    if secret_string and secret_string != "SecretString":
+        raise ValueError(
+            f"Dynamic reference {literal} is invalid: the secret-string segment "
+            "must be SecretString")
+    if version_stage and version_id:
+        raise ValueError(
+            f"Dynamic reference {literal} is invalid: specify either a version "
+            "stage or a version id, not both")
+    value = secretsmanager.resolve_secret_string(
+        secret_id, version_stage or "AWSCURRENT", version_id or None)
+    if value is None:
+        raise ValueError(
+            f"Dynamic reference {literal} could not be resolved: secret "
+            f"{secret_id} not found")
+    if json_key:
+        try:
+            value = json.loads(value)[json_key]
+        except (ValueError, KeyError, TypeError):
+            raise ValueError(
+                f"Dynamic reference {literal} could not be resolved: key "
+                f"{json_key} not found in the secret") from None
+        if not isinstance(value, str):
+            value = json.dumps(value)
+    return value
+
+
+def _resolve_dynamic_references(value, previous: dict | None = None,
+                                reuse_ssm: bool = False,
+                                reuse_secrets: bool = False):
+    """Substitute every ``{{resolve:...}}`` inside ``value`` (recursively).
+
+    Returns ``(resolved_value, {literal: value})``. ``previous`` is the map a
+    prior deployment of the same resource recorded; ``reuse_ssm`` /
+    ``reuse_secrets`` keep those values instead of resolving again, which is
+    how the two kinds differ on update: an ``ssm`` reference re-resolves
+    whenever the stack is updated with a changed template, a
+    ``secretsmanager`` reference only when the resource that carries it
+    changes.
+    """
+    previous = previous or {}
+    resolved: dict = {}
+
+    def one(literal):
+        if literal in resolved:
+            return resolved[literal]
+        service = _DYNAMIC_REFERENCE.fullmatch(literal).group(1)
+        reuse = reuse_secrets if service == "secretsmanager" else reuse_ssm
+        if reuse and literal in previous:
+            resolved[literal] = previous[literal]
+        else:
+            resolved[literal] = _resolve_dynamic_reference(literal)
+        return resolved[literal]
+
+    def walk(node):
+        if isinstance(node, str):
+            if "{{resolve:" not in node:
+                return node
+            return _DYNAMIC_REFERENCE.sub(lambda m: one(m.group(0)), node)
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if isinstance(node, dict):
+            return {k: walk(v) for k, v in node.items()}
+        return node
+
+    return walk(value), resolved
+
+
+def validate_template_support(template: dict, conditions: dict,
+                              params: dict | None = None) -> None:
+    """Reject up front what provisioning could only fail on halfway through.
+
+    Real CloudFormation validates resource types before it touches anything:
+    CreateStack, UpdateStack, CreateChangeSet and ValidateTemplate all answer
+    ``Template format error: Unrecognized resource types: [...]`` and no stack
+    record is created. Doing the same here means an unsupported type no longer
+    provisions its predecessors first and rolls them back. Condition-false
+    resources are exempt, as they are during provisioning.
+
+    Dynamic references are resolved at provisioning time (``ssm``,
+    ``ssm-secure`` and ``secretsmanager``); a reference to any other service
+    is refused here, as is a malformed one.
+
+    Raises ``ValueError`` with the message the caller wraps as a
+    ``ValidationError``.
+
+    A template that still declares a ``Transform`` is exempt from the type
+    check: a macro can rewrite any resource, so real CloudFormation cannot
+    (and does not) pre-validate types through one — ``sam validate`` sends
+    SAM templates with ``AWS::Serverless::*`` resources to ValidateTemplate
+    and they pass. CreateStack, UpdateStack and CreateChangeSet apply the SAM
+    transform before calling this, so their expanded templates are validated
+    as usual.
+
+    ``params`` (the resolved ``{name: {Value, NoEcho}}`` map) turns on the
+    ``Rules`` section: CreateStack, UpdateStack and CreateChangeSet pass it,
+    ValidateTemplate (no parameter values) does not.
+    """
+    from .provisioners import _RESOURCE_HANDLERS
+
+    if isinstance(template, _IncludeFailed):
+        raise ValueError(template.error)
+    _validate_template_limits(template)
+    unrecognized: set[str] = set()
+    if not template.get("Transform"):
+        for res in (template.get("Resources") or {}).values():
+            if not isinstance(res, dict):
+                continue
+            cond = res.get("Condition")
+            if cond and not conditions.get(cond, True):
+                continue
+            rtype = res.get("Type", "AWS::CloudFormation::CustomResource")
+            # The registered AWS::CloudFormation::* types (WaitCondition,
+            # WaitConditionHandle, Stack, CustomResource) pass like any other
+            # handler; an unregistered one (Macro, HookVersion, a typo) is
+            # unrecognized, not a silent placeholder.
+            if rtype in _RESOURCE_HANDLERS or rtype.startswith("Custom::"):
+                continue
+            unrecognized.add(rtype)
+    if unrecognized:
+        raise ValueError(
+            "Template format error: Unrecognized resource types: ["
+            + ", ".join(sorted(unrecognized)) + "]"
+        )
+    _validate_template_statics(template)
+
+    refs: set[str] = set()
+    _find_dynamic_references(template.get("Resources"), refs)
+    _find_dynamic_references(template.get("Outputs"), refs)
+    unsupported = sorted(
+        r for r in refs if _DYNAMIC_REFERENCE.fullmatch(r).group(1) not in _DYNAMIC_SERVICES)
+    if unsupported:
+        raise ValueError(
+            "Template format error: unsupported dynamic reference(s): "
+            + ", ".join(unsupported)
+            + " (supported: ssm, ssm-secure, secretsmanager)"
+        )
+    if params is not None:
+        _evaluate_rules(template, params, conditions)
+
+
+# ===========================================================================
+# Template and stack quotas
+# ===========================================================================
+
+# The CloudFormation quotas page (cloudformation-limits.html): section sizes,
+# name lengths, the template description and the parameter value.
+_SECTION_QUOTAS = (
+    ("Resources", "resources", "Resource", 500),
+    ("Parameters", "parameters", "Parameter", 200),
+    ("Outputs", "outputs", "Output", 200),
+    ("Mappings", "mappings", "Mapping", 200),
+)
+_MAPPING_ATTRIBUTES_MAX = 200
+_NAME_MAX_CHARS = 255
+_DESCRIPTION_MAX_BYTES = 1024
+_PARAMETER_VALUE_MAX_BYTES = 4096
+
+
+def _quota_error(noun: str, count: int, maximum: int) -> ValueError:
+    # The sentence a real account answers for too many resources ("Template
+    # format error: Number of resources, 536, is greater than maximum allowed,
+    # 500"); the other sections reuse it, unmeasured.
+    return ValueError(
+        f"Template format error: Number of {noun}, {count}, is greater than "
+        f"maximum allowed, {maximum}")
+
+
+def _validate_template_limits(template: dict) -> None:
+    """The template quotas that need nothing but the template: 500 resources,
+    200 parameters, outputs and mappings, 200 attributes per mapping, names
+    of 255 characters, a description of 1,024 bytes and a parameter default
+    of 4,096 bytes. Raises ``ValueError`` with the message the caller wraps
+    as a ``ValidationError``; the wordings other than the resource count and
+    the parameter default are unmeasured."""
+    for section, noun, singular, maximum in _SECTION_QUOTAS:
+        members = template.get(section) or {}
+        if not isinstance(members, dict):
+            continue
+        if len(members) > maximum:
+            raise _quota_error(noun, len(members), maximum)
+        for name in members:
+            if len(str(name)) > _NAME_MAX_CHARS:
+                raise ValueError(
+                    f"Template format error: {singular} name {str(name)[:32]}... may "
+                    f"not exceed {_NAME_MAX_CHARS} characters")
+    for name, mapping in (template.get("Mappings") or {}).items():
+        if not isinstance(mapping, dict):
+            continue
+        if len(mapping) > _MAPPING_ATTRIBUTES_MAX:
+            raise _quota_error(f"attributes in mapping {name}", len(mapping),
+                               _MAPPING_ATTRIBUTES_MAX)
+        for attribute in mapping:
+            if len(str(attribute)) > _NAME_MAX_CHARS:
+                raise ValueError(
+                    f"Template format error: Mapping attribute name {str(attribute)[:32]}"
+                    f"... of mapping {name} may not exceed {_NAME_MAX_CHARS} characters")
+    description = template.get("Description")
+    if isinstance(description, str) and len(description.encode("utf-8")) > _DESCRIPTION_MAX_BYTES:
+        raise ValueError(
+            f"Template format error: Template description may not exceed "
+            f"{_DESCRIPTION_MAX_BYTES} bytes in size")
+    for name, defn in (template.get("Parameters") or {}).items():
+        default = defn.get("Default") if isinstance(defn, dict) else None
+        if default is not None and len(str(default).encode("utf-8")) > _PARAMETER_VALUE_MAX_BYTES:
+            # Quoted from a report of the error ("Template format error:
+            # Parameter 'EnvironmentVariables' default value '[****]' length is
+            # greater than 4096.").
+            raise ValueError(
+                f"Template format error: Parameter '{name}' default value '{default}' "
+                f"length is greater than {_PARAMETER_VALUE_MAX_BYTES}.")
+
+
+def _check_provided_parameter_values(provided_params: list[dict]) -> None:
+    """The request-level constraint on a parameter value (4,096 bytes): the
+    message follows the API's parameter validation, with the 1-based member
+    index of the request; unmeasured."""
+    for index, entry in enumerate(provided_params, 1):
+        value = entry.get("Value", "")
+        if value is not None and len(str(value).encode("utf-8")) > _PARAMETER_VALUE_MAX_BYTES:
+            raise ValueError(
+                f"1 validation error detected: Value '{value}' at "
+                f"'parameters.{index}.member.parameterValue' failed to satisfy "
+                "constraint: Member must have length less than or equal to "
+                f"{_PARAMETER_VALUE_MAX_BYTES}")
+
+
+# ===========================================================================
 # Parameter Resolver
 # ===========================================================================
 
@@ -139,6 +425,47 @@ _AWS_SPECIFIC_TYPES = {
 _SSM_PARAMETER_VALUE_PREFIX = "AWS::SSM::Parameter::Value<"
 
 
+def _constraint_error(name: str, defn: dict, reason: str) -> ValueError:
+    """The ValidationError a violated parameter constraint raises: real
+    CloudFormation answers ``Parameter 'P' must match pattern ^[a-z]+$`` (measured),
+    and a ``ConstraintDescription`` replaces the generic reason."""
+    description = defn.get("ConstraintDescription")
+    return ValueError(f"Parameter '{name}' {description or reason}")
+
+
+def _check_parameter_constraints(name: str, defn: dict, ptype: str, value: str) -> None:
+    """Apply AllowedPattern, MinLength, MaxLength, MinValue and MaxValue the way
+    the Parameters reference defines them: the pattern matches the whole value
+    (each member of a CommaDelimitedList), the lengths apply to String types,
+    the bounds to Number types (each member of a List<Number>)."""
+    is_list = ptype in ("CommaDelimitedList", "List<Number>")
+    members = [m.strip() for m in value.split(",")] if is_list else [value]
+    pattern = defn.get("AllowedPattern")
+    if pattern is not None and ptype != "Number":
+        try:
+            compiled = re.compile(str(pattern))
+        except re.error as exc:
+            raise ValueError(
+                f"Parameter '{name}' has an invalid AllowedPattern: {exc}") from None
+        if not all(compiled.fullmatch(m) for m in members):
+            raise _constraint_error(name, defn, f"must match pattern {pattern}")
+    if ptype in ("Number", "List<Number>"):
+        numbers = [float(m) for m in members]
+        if "MinValue" in defn and any(n < float(defn["MinValue"]) for n in numbers):
+            raise _constraint_error(
+                name, defn, f"must be a number not less than {defn['MinValue']}")
+        if "MaxValue" in defn and any(n > float(defn["MaxValue"]) for n in numbers):
+            raise _constraint_error(
+                name, defn, f"must be a number not greater than {defn['MaxValue']}")
+    elif not is_list:
+        if "MinLength" in defn and len(value) < int(defn["MinLength"]):
+            raise _constraint_error(
+                name, defn, f"must contain at least {defn['MinLength']} characters")
+        if "MaxLength" in defn and len(value) > int(defn["MaxLength"]):
+            raise _constraint_error(
+                name, defn, f"must contain at most {defn['MaxLength']} characters")
+
+
 def _resolve_parameters(template: dict, provided_params: list[dict],
                         previous_params: dict | None = None) -> dict:
     """Resolve template parameters with provided values and defaults.
@@ -150,6 +477,7 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
 
     Returns dict of param_name -> {Value, NoEcho}.
     """
+    _check_provided_parameter_values(provided_params)
     param_defs = template.get("Parameters", {})
     provided_map = {p["Key"]: p for p in provided_params if "Key" in p}
     previous_params = previous_params or {}
@@ -232,10 +560,19 @@ def _resolve_parameters(template: dict, provided_params: list[dict],
                 float(value)
             except ValueError:
                 raise ValueError(f"Parameter '{name}' value '{value}' is not a valid Number")
+        elif ptype == "List<Number>":
+            for member in value.split(","):
+                try:
+                    float(member.strip())
+                except ValueError:
+                    raise ValueError(
+                        f"Parameter '{name}' value '{value}' is not a valid List<Number>")
         elif ptype == "CommaDelimitedList":
             # Keep as string; Fn::Select will split
             pass
         # AWS-specific types treated as String -- no extra validation
+
+        _check_parameter_constraints(name, defn, ptype, value)
 
         out = {"Value": value, "NoEcho": no_echo}
         if ssm_name is not None:
@@ -299,8 +636,387 @@ def _evaluate_conditions(template: dict, params: dict) -> dict:
 
 
 # ===========================================================================
+# Rules section
+# ===========================================================================
+
+# The functions the Rules section accepts (rules-section-structure.html lists
+# them; Ref may be nested in all but Fn::ValueOf and Fn::ValueOfAll).
+_RULE_FUNCTIONS = frozenset({
+    "Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals", "Fn::If", "Fn::Contains",
+    "Fn::EachMemberEquals", "Fn::EachMemberIn", "Fn::RefAll", "Fn::ValueOf",
+    "Fn::ValueOfAll", "Ref",
+})
+
+# Fn::RefAll / Fn::ValueOf / Fn::ValueOfAll read the account: the three
+# parameter types whose attributes the reference documents are served from the
+# in-process EC2 store, keyed by the attribute names the Rules reference lists.
+_RULE_ACCOUNT_TYPES = {
+    "AWS::EC2::VPC::Id": ("_vpcs", {"DefaultNetworkAcl": "DefaultNetworkAclId",
+                                     "DefaultSecurityGroup": "DefaultSecurityGroupId"}),
+    "AWS::EC2::Subnet::Id": ("_subnets", {"AvailabilityZone": "AvailabilityZone",
+                                           "VpcId": "VpcId"}),
+    "AWS::EC2::SecurityGroup::Id": ("_security_groups", {}),
+}
+
+
+class _RuleUnsupported(Exception):
+    """A rule needs an account lookup this emulator does not serve; the rule is
+    skipped with a warning instead of failing the stack operation."""
+
+
+# The argument list each rule function takes (intrinsic-function-reference-rules):
+# ``Fn::Not`` one condition, ``Fn::If`` a condition and two values, the rest
+# two elements; ``Fn::And`` / ``Fn::Or`` any list, ``Ref`` / ``Fn::RefAll`` a name.
+_RULE_ARITY = {
+    "Fn::Equals": 2, "Fn::Contains": 2, "Fn::EachMemberEquals": 2,
+    "Fn::EachMemberIn": 2, "Fn::ValueOf": 2, "Fn::ValueOfAll": 2,
+    "Fn::Not": 1, "Fn::If": 3,
+}
+
+
+def _check_rule_expression(node, rule: str) -> None:
+    """Arity and argument types of every rule function under ``rule``: a
+    malformed argument is a template format error (unmeasured wording), not
+    an evaluation crash. ``Fn::ValueOf`` and ``Fn::ValueOfAll`` take two
+    strings: the reference says no other function can be used within them."""
+    if isinstance(node, list):
+        for value in node:
+            _check_rule_expression(value, rule)
+        return
+    if not isinstance(node, dict):
+        return
+    for fn, args in node.items():
+        if fn in ("Ref", "Fn::RefAll"):
+            if not isinstance(args, str):
+                raise ValueError(
+                    f"Template format error: {fn} in rule {rule} must name a "
+                    + ("parameter" if fn == "Ref" else "parameter type"))
+            continue
+        if fn in ("Fn::And", "Fn::Or"):
+            if not isinstance(args, list) or not args:
+                raise ValueError(
+                    f"Template format error: {fn} in rule {rule} must be a list of "
+                    "conditions")
+        elif fn in _RULE_ARITY:
+            if not isinstance(args, list) or len(args) != _RULE_ARITY[fn]:
+                raise ValueError(
+                    f"Template format error: {fn} in rule {rule} must be a list of "
+                    f"{_RULE_ARITY[fn]} elements")
+            if fn in ("Fn::ValueOf", "Fn::ValueOfAll") and not all(
+                    isinstance(a, str) for a in args):
+                raise ValueError(
+                    f"Template format error: {fn} in rule {rule} takes two strings; "
+                    "no function can be used within it")
+        _check_rule_expression(args, rule)
+
+
+def _rule_functions_used(node, found: set) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key.startswith("Fn::") or key == "Ref":
+                found.add(key)
+            _rule_functions_used(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _rule_functions_used(value, found)
+
+
+def _check_rules_section(template: dict) -> None:
+    """The shape checks that need nothing but the template: every rule carries
+    an ``Assertions`` list, every assertion an ``Assert``, only the rule
+    functions appear, and every function has the arguments it takes. The
+    function message is measured (a real account answered ``Template format
+    error: Following functions are not supported in the Rules block of the
+    template: [Fn::If]``, cloudformation-coverage-roadmap issue 921, 2021;
+    the bracket holds the offending names sorted and comma-joined, the join
+    unmeasured); the shape messages are unmeasured."""
+    rules = template.get("Rules")
+    if rules is None:
+        return
+    if not isinstance(rules, dict):
+        raise ValueError("Template format error: Rules must be a map of rule name to rule")
+    for name, rule in rules.items():
+        if not isinstance(rule, dict) or not isinstance(rule.get("Assertions"), list):
+            raise ValueError(
+                f"Template format error: Rule {name} must contain an Assertions list")
+        for assertion in rule["Assertions"]:
+            if not isinstance(assertion, dict) or "Assert" not in assertion:
+                raise ValueError(
+                    f"Template format error: Every assertion of rule {name} must "
+                    "contain an Assert")
+    used: set[str] = set()
+    _rule_functions_used(rules, used)
+    unsupported = sorted(used - _RULE_FUNCTIONS)
+    if unsupported:
+        raise ValueError(
+            "Template format error: Following functions are not supported in the "
+            "Rules block of the template: [" + ", ".join(unsupported) + "]")
+    for name, rule in rules.items():
+        _check_rule_expression(rule.get("RuleCondition"), name)
+        for assertion in rule["Assertions"]:
+            _check_rule_expression(assertion["Assert"], name)
+
+
+def _rule_inner_type(ptype: str) -> tuple[str, bool]:
+    """The type a parameter's declared type wraps and whether it is a list:
+    the SSM ``Value<...>`` wrapper is stripped first, then ``List<...>``
+    (a ``CommaDelimitedList`` is a list of strings)."""
+    if ptype.startswith(_SSM_PARAMETER_VALUE_PREFIX) and ptype.endswith(">"):
+        ptype = ptype[len(_SSM_PARAMETER_VALUE_PREFIX):-1]
+    if ptype == "CommaDelimitedList":
+        return "String", True
+    if ptype.startswith("List<") and ptype.endswith(">"):
+        return ptype[len("List<"):-1], True
+    return ptype, False
+
+
+def _rule_param_value(name: str, defn: dict, params: dict):
+    """A parameter as ``Ref`` sees it inside Rules: list-typed parameters are
+    lists of their trimmed members, everything else the string value."""
+    value = params[name]["Value"]
+    _, is_list = _rule_inner_type(str(defn.get("Type", "String")))
+    if is_list:
+        return [m.strip() for m in str(value).split(",")] if value != "" else []
+    return str(value)
+
+
+def _rule_account_records(parameter_type: str):
+    """The EC2 records behind an AWS-specific parameter type, or
+    ``_RuleUnsupported`` for a type this emulator does not list."""
+    spec = _RULE_ACCOUNT_TYPES.get(parameter_type)
+    if spec is None:
+        raise _RuleUnsupported(
+            f"Fn::RefAll / Fn::ValueOfAll over {parameter_type} is not supported")
+    from ministack.services import ec2
+    store = getattr(ec2, spec[0])
+    return {rid: store[rid] for rid in list(store)}, spec[1]
+
+
+def _rule_attribute(parameter_type: str, resource_id: str, attribute: str) -> str:
+    """One attribute of one account resource, as ``Fn::ValueOf`` returns it;
+    a resource the store does not hold yields an empty string."""
+    from ministack.services import ec2
+    records, attributes = _rule_account_records(parameter_type)
+    record = records.get(resource_id) or {}
+    if attribute.startswith("Tags."):
+        key = attribute[len("Tags."):]
+        for tag in ec2._tags.get(resource_id, []) or []:
+            if tag.get("Key") == key:
+                return str(tag.get("Value", ""))
+        return ""
+    field = attributes.get(attribute)
+    if field is None:
+        raise _RuleUnsupported(
+            f"attribute {attribute} of {parameter_type} is not supported")
+    return str(record.get(field, ""))
+
+
+def _evaluate_rules(template: dict, params: dict, conditions: dict) -> None:
+    """Evaluate the ``Rules`` section against the resolved parameters.
+
+    The Rules reference: a rule's ``Assertions`` are checked when its
+    ``RuleCondition`` is absent or evaluates to true; every ``Assert`` must
+    evaluate to true or the stack is neither created nor updated, and the
+    ``AssertDescription`` is the message. ``Fn::RefAll``, ``Fn::ValueOf`` and
+    ``Fn::ValueOfAll`` are served for ``AWS::EC2::VPC::Id``,
+    ``AWS::EC2::Subnet::Id`` and ``AWS::EC2::SecurityGroup::Id`` from the
+    in-process EC2 store; a rule over any other type is skipped with a
+    warning. Raises ``ValueError`` with the message the caller wraps as a
+    ``ValidationError`` (the failure text is unmeasured).
+    """
+    rules = template.get("Rules")
+    if not rules:
+        return
+    param_defs = template.get("Parameters") or {}
+    pseudo = {
+        "AWS::Region": get_region(),
+        "AWS::AccountId": get_account_id(),
+        "AWS::URLSuffix": "amazonaws.com",
+        "AWS::Partition": "aws",
+    }
+
+    def as_list(value, fn):
+        if not isinstance(value, list):
+            raise ValueError(
+                f"Template error: {fn} expects a list as its first argument, got "
+                f"'{value}'")
+        return [str(v) for v in value]
+
+    def as_bool(value, fn):
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Template error: every argument of {fn} must evaluate to true or "
+                f"false, got '{value}'")
+        return value
+
+    def ev(node):
+        if not isinstance(node, dict) or len(node) != 1:
+            return [ev(v) for v in node] if isinstance(node, list) else node
+        fn, args = next(iter(node.items()))
+        if fn == "Ref":
+            if args in params:
+                return _rule_param_value(args, param_defs.get(args, {}), params)
+            if args in pseudo:
+                return pseudo[args]
+            raise ValueError(
+                f"Template format error: Unresolved resource dependencies [{args}] "
+                "in the Rules block of the template")
+        if fn == "Fn::Equals":
+            left, right = ev(args[0]), ev(args[1])
+            if isinstance(left, list) or isinstance(right, list):
+                return left == right
+            return str(left) == str(right)
+        if fn == "Fn::And":
+            return all(as_bool(ev(a), fn) for a in args)
+        if fn == "Fn::Or":
+            return any(as_bool(ev(a), fn) for a in args)
+        if fn == "Fn::Not":
+            return not as_bool(ev(args[0]), fn)
+        if fn == "Fn::If":
+            chosen = ev(args[0])
+            if isinstance(args[0], str):
+                if args[0] not in conditions:
+                    raise ValueError(
+                        f"Template error: Fn::If refers to condition {args[0]} "
+                        "which is not defined in the Conditions block")
+                chosen = conditions[args[0]]
+            return ev(args[1]) if as_bool(chosen, fn) else ev(args[2])
+        if fn == "Fn::Contains":
+            return str(ev(args[1])) in as_list(ev(args[0]), fn)
+        if fn == "Fn::EachMemberEquals":
+            wanted = str(ev(args[1]))
+            return all(m == wanted for m in as_list(ev(args[0]), fn))
+        if fn == "Fn::EachMemberIn":
+            allowed = as_list(ev(args[1]), fn)
+            return all(m in allowed for m in as_list(ev(args[0]), fn))
+        if fn == "Fn::RefAll":
+            records, _ = _rule_account_records(str(args))
+            return list(records)
+        if fn == "Fn::ValueOfAll":
+            ptype, attribute = str(args[0]), str(args[1])
+            records, _ = _rule_account_records(ptype)
+            return [_rule_attribute(ptype, rid, attribute) for rid in records]
+        if fn == "Fn::ValueOf":
+            pname, attribute = str(args[0]), str(args[1])
+            if pname not in params:
+                raise ValueError(
+                    f"Template format error: Unresolved resource dependencies "
+                    f"[{pname}] in the Rules block of the template")
+            base, _ = _rule_inner_type(str(param_defs.get(pname, {}).get("Type", "String")))
+            value = _rule_param_value(pname, param_defs.get(pname, {}), params)
+            if isinstance(value, list):
+                return [_rule_attribute(base, v, attribute) for v in value]
+            return _rule_attribute(base, value, attribute)
+        raise ValueError(
+            "Template format error: Following functions are not supported in the "
+            f"Rules block of the template: [{fn}]")
+
+    for name, rule in rules.items():
+        try:
+            condition = rule.get("RuleCondition")
+            if condition is not None:
+                chosen = ev(condition)
+                if not isinstance(chosen, bool):
+                    raise ValueError(
+                        f"Template error: the RuleCondition of rule {name} must "
+                        f"evaluate to true or false, got '{chosen}'")
+                if not chosen:
+                    continue
+            for index, assertion in enumerate(rule["Assertions"], 1):
+                result = ev(assertion["Assert"])
+                if not isinstance(result, bool):
+                    raise ValueError(
+                        f"Template error: assertion {index} of rule {name} must "
+                        f"evaluate to true or false, got '{result}'")
+                if not result:
+                    description = assertion.get("AssertDescription") \
+                        or f"assertion {index} evaluated to false"
+                    raise ValueError(f"Template error: rule {name} failed: {description}")
+        except _RuleUnsupported as exc:
+            logger.warning("Rules: skipping rule %s: %s", name, exc)
+        except (TypeError, IndexError, KeyError) as exc:
+            # The shape check above refuses what it knows; anything that still
+            # does not evaluate is a template error, never an internal one.
+            raise ValueError(
+                f"Template format error: rule {name} could not be evaluated: "
+                f"{exc}") from exc
+
+
+# ===========================================================================
 # Intrinsic Function Resolver
 # ===========================================================================
+
+def _cidr_blocks(ip_block: str, count: int, cidr_bits: int) -> list[str]:
+    """``Fn::Cidr``: ``count`` consecutive subnets of ``ip_block`` whose mask is
+    ``cidr_bits`` shorter than the address length (``cidrBits`` are subnet
+    bits: 8 on an IPv4 /16 gives /24 blocks — measured on AWS:
+    ``192.168.0.0/16, 2, 8`` is ``192.168.0.0/24,192.168.1.0/24``)."""
+    if not 1 <= count <= 256:
+        raise ValueError(
+            f"Template error: Fn::Cidr count must be between 1 and 256, got {count}")
+    try:
+        network = ipaddress.ip_network(ip_block, strict=False)
+    except ValueError:
+        raise ValueError(f"Template error: Fn::Cidr ipBlock {ip_block!r} is not a CIDR block") from None
+    new_prefix = network.max_prefixlen - cidr_bits
+    if not network.prefixlen < new_prefix <= network.max_prefixlen:
+        raise ValueError(
+            f"Template error: Fn::Cidr cannot split {ip_block} into /{new_prefix} blocks")
+    subnets = list(itertools.islice(network.subnets(new_prefix=new_prefix), count))
+    if len(subnets) < count:
+        raise ValueError(
+            f"Template error: Fn::Cidr {ip_block} holds only {len(subnets)} /{new_prefix} blocks, "
+            f"{count} requested")
+    return [str(subnet) for subnet in subnets]
+
+
+_CONDITION_FUNCTIONS = ("Fn::And", "Fn::Or", "Fn::Not", "Fn::Equals")
+
+
+def _validate_template_statics(template: dict) -> None:
+    """The template errors a real account raises before any stack exists and
+    that need nothing but the template: a condition function as an Output
+    value, and an Fn::FindInMap with literal keys that the Mappings section
+    does not hold (both measured)."""
+    for out in (template.get("Outputs") or {}).values():
+        val = out.get("Value") if isinstance(out, dict) else None
+        if isinstance(val, dict) and len(val) == 1 and next(iter(val)) in _CONDITION_FUNCTIONS:
+            raise ValueError("Template format error: The Value field of every "
+                             "Outputs member must evaluate to a String.")
+    mappings = template.get("Mappings") or {}
+
+    def walk(node):
+        if isinstance(node, dict):
+            if len(node) == 1 and "Fn::FindInMap" in node:
+                args = node["Fn::FindInMap"]
+                if (isinstance(args, list) and len(args) >= 3
+                        and all(isinstance(a, str) for a in args[:3])
+                        and not (len(args) > 3 and isinstance(args[3], dict)
+                                 and "DefaultValue" in args[3])):
+                    name, k1, k2 = args[:3]
+                    if k1 not in mappings.get(name, {}) or k2 not in mappings.get(name, {}).get(k1, {}):
+                        raise ValueError(
+                            f"Template error: Unable to get mapping for {name}::{k1}::{k2}")
+                for arg in args if isinstance(args, list) else []:
+                    walk(arg)
+                return
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    for section in ("Resources", "Outputs", "Conditions"):
+        walk(template.get(section) or {})
+    _check_rules_section(template)
+
+
+def _unknown_attribute_message(res: dict, logical_id: str, attr: str) -> str:
+    # Verbatim what CloudFormation reports in the stack event that starts the
+    # rollback (measured on a real account against AWS::SQS::Queue).
+    rtype = res.get("ResourceType") or logical_id
+    return f"Requested attribute {attr} does not exist in schema for {rtype}"
+
 
 def _resolve_refs(value, resources, params, conditions, mappings,
                   stack_name, stack_id):
@@ -356,8 +1072,14 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         attrs = res.get("Attributes", {})
         if attr in attrs:
             return attrs[attr]
-        # Fallback: try PhysicalResourceId
-        return res.get("PhysicalResourceId", "")
+        if "PhysicalResourceId" in res:
+            # The resource exists and does not expose the attribute. Real
+            # CloudFormation fails the operation here (the stack rolls back);
+            # returning the physical id instead handed callers a silently wrong
+            # value.
+            raise ValueError(_unknown_attribute_message(res, logical_id, attr))
+        # Not provisioned yet (change-set diff): nothing to resolve against.
+        return ""
 
     # --- Fn::Join ---
     if "Fn::Join" in value:
@@ -412,7 +1134,10 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                 attrs = res.get("Attributes", {})
                 if parts[1] in attrs:
                     return str(attrs[parts[1]])
-                return str(res.get("PhysicalResourceId", var))
+                if "PhysicalResourceId" in res:
+                    raise ValueError(
+                        _unknown_attribute_message(res, parts[0], parts[1]))
+                return var
             # Resource physical ID
             if var in resources and "PhysicalResourceId" in resources[var]:
                 return str(resources[var]["PhysicalResourceId"])
@@ -466,7 +1191,17 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                              mappings, stack_name, stack_id)
         key2 = _resolve_refs(args[2], resources, params, conditions,
                              mappings, stack_name, stack_id)
-        return mappings.get(str(map_name), {}).get(str(key1), {}).get(str(key2), "")
+        top = mappings.get(str(map_name), {})
+        if str(key1) in top and str(key2) in top[str(key1)]:
+            return top[str(key1)][str(key2)]
+        # The optional fourth argument is {"DefaultValue": ...}; without it a
+        # missing key is a template error, as on AWS (measured: "Template
+        # error: Unable to get mapping for M::x::y").
+        if len(args) > 3 and isinstance(args[3], dict) and "DefaultValue" in args[3]:
+            return _resolve_refs(args[3]["DefaultValue"], resources, params,
+                                 conditions, mappings, stack_name, stack_id)
+        raise ValueError(
+            f"Template error: Unable to get mapping for {map_name}::{key1}::{key2}")
 
     # --- Fn::ImportValue ---
     if "Fn::ImportValue" in value:
@@ -512,6 +1247,11 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                                conditions, mappings, stack_name, stack_id)
         if not region:
             region = get_region()
+        # The zones the emulator's EC2 DescribeAvailabilityZones reports for
+        # the stack's region. For any other region a real account answered an
+        # empty list (measured), not a fabricated a/b/c.
+        if str(region) != get_region():
+            return []
         return [f"{region}a", f"{region}b", f"{region}c"]
 
     # --- Fn::Cidr ---
@@ -523,8 +1263,7 @@ def _resolve_refs(value, resources, params, conditions, mappings,
                                   mappings, stack_name, stack_id))
         cidr_bits = int(_resolve_refs(args[2], resources, params, conditions,
                                       mappings, stack_name, stack_id))
-        # Simplified CIDR generation
-        return [f"10.0.{i}.0/{32 - cidr_bits}" for i in range(count)]
+        return _cidr_blocks(str(ip_block), count, cidr_bits)
 
     # --- Fn::Equals (condition-like in non-condition context) ---
     if "Fn::Equals" in value:
@@ -534,6 +1273,23 @@ def _resolve_refs(value, resources, params, conditions, mappings,
         right = _resolve_refs(args[1], resources, params, conditions,
                               mappings, stack_name, stack_id)
         return str(left) == str(right)
+    for fn in ("Fn::And", "Fn::Or", "Fn::Not"):
+        if fn in value:
+            # Condition functions belong in Conditions and Fn::If. In a value
+            # position they evaluate to a boolean here, like Fn::Equals above,
+            # instead of leaking the unresolved call through to the service.
+            # What AWS does with one in a property was not measured; as an
+            # Output value it is refused up front (see _validate_template_statics).
+            operands = [
+                _resolve_refs(arg, resources, params, conditions, mappings,
+                              stack_name, stack_id)
+                for arg in value[fn]
+            ]
+            if fn == "Fn::And":
+                return all(bool(o) for o in operands)
+            if fn == "Fn::Or":
+                return any(bool(o) for o in operands)
+            return not bool(operands[0]) if operands else True
 
     # --- Condition (reference) ---
     if "Condition" in value and len(value) == 1:
@@ -651,6 +1407,146 @@ def _topological_sort(resources: dict, conditions: dict) -> list:
 
 
 # ===========================================================================
+# AWS::Include transform
+# ===========================================================================
+
+_INCLUDE_TRANSFORM = "AWS::Include"
+_INCLUDE_ERROR = "Transform AWS::Include failed with: "
+# The reference: the transform may be used anywhere except the Parameters
+# section and the template version; the top-level Transform form is not
+# expanded here.
+_INCLUDE_SKIPPED_SECTIONS = ("Parameters", "AWSTemplateFormatVersion", "Transform")
+
+
+class _IncludeError(ValueError):
+    """An ``AWS::Include`` that could not be expanded; the message is what the
+    caller answers, unwrapped."""
+
+
+class _IncludeFailed(dict):
+    """The template as sent, carrying the message of an include that failed.
+
+    The handlers apply the transforms in one step and wrap everything that
+    step raises as ``Template format error: ...``; a real account answers
+    the include sentence bare (``Transform AWS::Include failed with: ...``),
+    so the failure travels with the template to ``validate_template_support``,
+    which raises it as is. UpdateStack with ``UsePreviousTemplate`` swaps in
+    the stored processed template before that point, so a snippet that went
+    missing since the deploy does not fail the update."""
+
+    def __init__(self, template: dict, error: str):
+        super().__init__(template)
+        self.error = error
+
+
+def _is_include(node) -> bool:
+    """True for a map that carries an ``Fn::Transform`` naming ``AWS::Include``."""
+    spec = node.get("Fn::Transform") if isinstance(node, dict) else None
+    return isinstance(spec, dict) and spec.get("Name") == _INCLUDE_TRANSFORM
+
+
+def _include_location(node: dict):
+    """The ``Location`` parameter of an include node, or None."""
+    parameters = node["Fn::Transform"].get("Parameters")
+    return parameters.get("Location") if isinstance(parameters, dict) else None
+
+
+def _parse_snippet(text: str):
+    """A snippet is JSON or plain YAML: the reference says shorthand
+    notations are not supported in snippets, and a real account answers the
+    sentence below for a ``!Ref`` inside one (re:Post, "Include Parameters
+    in an AWS Include file"), so the plain SafeLoader is used, not the
+    template loader with its tag constructors."""
+    text = text.strip()
+    try:
+        return json.loads(text) if text.startswith("{") \
+            else yaml.load(text, Loader=yaml.SafeLoader)
+    except Exception as exc:
+        raise _IncludeError(
+            _INCLUDE_ERROR + "The specified S3 object's content should be valid "
+            "Yaml/JSON") from exc
+
+
+def _fetch_include_snippet(location) -> dict:
+    """The key-value object behind an ``s3://bucket/key`` location. The
+    location sentence and the content sentence are the ones a real account
+    answers; the missing-object, key-value and nesting sentences are
+    unmeasured."""
+    if not isinstance(location, str) or not location.startswith("s3://"):
+        raise _IncludeError(_INCLUDE_ERROR + "The location parameter is not a valid S3 uri.")
+    bucket, _, key = location[len("s3://"):].partition("/")
+    if not bucket or not key:
+        raise _IncludeError(_INCLUDE_ERROR + "The location parameter is not a valid S3 uri.")
+    from ministack.services import s3 as _s3
+    data = _s3._get_object_data(bucket, key)
+    if data is None:
+        raise _IncludeError(_INCLUDE_ERROR + f"The S3 object {location} does not exist.")
+    snippet = _parse_snippet(data.decode("utf-8"))
+    if not isinstance(snippet, dict):
+        raise _IncludeError(_INCLUDE_ERROR + f"The snippet at {location} must be a "
+                            "key-value object.")
+    nested: list = []
+    _find_includes(snippet, nested)
+    if nested:
+        raise _IncludeError(_INCLUDE_ERROR + f"The snippet at {location} uses AWS::Include, "
+                            "which cannot be nested.")
+    return snippet
+
+
+def _find_includes(node, found: list) -> None:
+    if isinstance(node, dict):
+        if _is_include(node):
+            found.append(node)
+        for value in node.values():
+            _find_includes(value, found)
+    elif isinstance(node, list):
+        for value in node:
+            _find_includes(value, found)
+
+
+def _apply_include_transform(template: dict) -> dict:
+    """Replace every embedded ``Fn::Transform`` that names ``AWS::Include``
+    by the contents of the S3 object it points to, the way the transform
+    reference describes: the snippet is inserted at the location of the
+    transform. A node that holds nothing but the transform becomes the
+    snippet; a node with other keys (``Resources`` next to a sibling
+    resource, a ``Properties`` map) takes the snippet's keys, the snippet
+    winning a duplicate key (unmeasured). The ``Parameters`` section and the
+    template version are not walked. An include that cannot be expanded
+    returns the template as ``_IncludeFailed``, which the validation step
+    turns into the ``ValidationError``."""
+    found: list = []
+    for section, value in template.items():
+        if section not in _INCLUDE_SKIPPED_SECTIONS:
+            _find_includes(value, found)
+    if not found:
+        return template
+
+    def walk(node):
+        if isinstance(node, list):
+            return [walk(v) for v in node]
+        if not isinstance(node, dict):
+            return node
+        if _is_include(node):
+            snippet = _fetch_include_snippet(_include_location(node))
+            rest = {k: walk(v) for k, v in node.items() if k != "Fn::Transform"}
+            if not rest:
+                return snippet
+            rest.update(snippet)
+            return rest
+        return {k: walk(v) for k, v in node.items()}
+
+    expanded = dict(template)
+    try:
+        for section, value in template.items():
+            if section not in _INCLUDE_SKIPPED_SECTIONS:
+                expanded[section] = walk(value)
+    except _IncludeError as exc:
+        return _IncludeFailed(template, str(exc))
+    return expanded
+
+
+# ===========================================================================
 # SAM Transform
 # ===========================================================================
 
@@ -661,10 +1557,33 @@ logging.getLogger("samtranslator.feature_toggle.feature_toggle").setLevel(loggin
 
 _NO_IAM_POLICY_LOADER = SimpleNamespace(load=lambda: {})
 
-def _apply_sam_transform_if_applicable(template: dict) -> dict:
+def declared_transforms(template: dict) -> list[str]:
+    """The transform names a template declares at the top level, in every
+    form the section takes: a string, the macro object with a ``Name`` (the
+    shape the AWS::Include reference documents at the top level), or a list
+    of either. Anything else is dropped. ValidateTemplate reports this list
+    and the SAM transform is looked up in it, so the two cannot disagree
+    about what a template declares.
+    """
     declared = template.get("Transform")
-    transforms = declared if isinstance(declared, list) else [declared]
-    if _SAM_TRANSFORM not in transforms:
+    entries = declared if isinstance(declared, list) else [declared]
+    names = []
+    for entry in entries:
+        if isinstance(entry, str):
+            names.append(entry)
+        elif isinstance(entry, dict) and isinstance(entry.get("Name"), str):
+            names.append(entry["Name"])
+    return names
+
+
+def _apply_sam_transform_if_applicable(template: dict) -> dict:
+    """The transforms a stack operation applies before validation: every
+    embedded ``AWS::Include`` first, then the SAM transform when the template
+    declares it."""
+    template = _apply_include_transform(template)
+    if isinstance(template, _IncludeFailed):
+        return template
+    if _SAM_TRANSFORM not in declared_transforms(template):
         return template
 
     try:

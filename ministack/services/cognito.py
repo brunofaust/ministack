@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon Cognito Service Emulator.
 
@@ -2344,6 +2346,10 @@ def _update_user_pool(data):
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
         "UserAttributeUpdateSettings",
+        # Deletion protection is switched off through UpdateUserPool before a
+        # protected pool can be deleted (per the DeletionProtection property
+        # on the CloudFormation resource reference).
+        "DeletionProtection",
     }
     for k in updatable:
         if k in data:
@@ -4010,10 +4016,26 @@ def _sign_up(data):
         attr_dict["sub"] = new_uuid()
     attrs = _dict_to_attr_list(attr_dict)
 
-    # SignUp always creates UNCONFIRMED — ConfirmSignUp (or AdminConfirmSignUp) confirms the account.
-    # AutoVerifiedAttributes only auto-verifies those attributes (e.g. email), not the account itself.
-    # Auto-confirming accounts requires a pre-signup Lambda trigger, which we don't emulate.
+    # SignUp creates UNCONFIRMED unless the pool's PreSignUp Lambda trigger
+    # auto-confirms — invoked before the user is persisted, fail-closed, as on
+    # AWS (a rejecting or failing trigger blocks the sign-up with
+    # UserLambdaValidationException).
     status = "UNCONFIRMED"
+    try:
+        presignup = _apply_presignup_trigger(
+            pid, cid, username, dict(attr_dict),
+            trigger_source="PreSignUp_SignUp",
+        )
+    except _PreSignUpRejected as e:
+        logger.info("Cognito: PreSignUp Lambda rejected sign-up for %s: %s", username, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    if presignup["autoConfirmUser"]:
+        status = "CONFIRMED"
+    if presignup["autoVerifyEmail"] and "email" in attr_dict:
+        attr_dict["email_verified"] = "true"
+    if presignup["autoVerifyPhone"] and "phone_number" in attr_dict:
+        attr_dict["phone_number_verified"] = "true"
+    attrs = _dict_to_attr_list(attr_dict)
 
     user = {
         "Username": username,
@@ -4035,7 +4057,8 @@ def _sign_up(data):
         "UserConfirmed": status == "CONFIRMED",
         "UserSub": attr_dict["sub"],
     }
-    if "email" in attr_dict:
+    if "email" in attr_dict and status != "CONFIRMED":
+        # An auto-confirmed user has nothing to verify — no code is delivered.
         resp["CodeDeliveryDetails"] = {
             "Destination": attr_dict["email"],
             "DeliveryMedium": "EMAIL",
@@ -6512,6 +6535,7 @@ def _get_credentials_for_identity(data):
 
     access_key = f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}"
     secret_key = base64.b64encode(secrets.token_bytes(30)).decode()
+    session_token = base64.b64encode(secrets.token_bytes(64)).decode()
     role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
 
     # The cognito* identity fields API Gateway reports for IAM-authorized
@@ -6539,26 +6563,29 @@ def _get_credentials_for_identity(data):
             provider_parts.append(provider_name)
 
     from ministack.services import sts as sts_svc
-    sts_svc._sessions[access_key] = {
+    sts_svc.register_session(access_key, {
         "Arn": (f"arn:aws:sts::{get_account_id()}:assumed-role/"
                 f"{role_name}/CognitoIdentityCredentials"),
         "UserId": f"{role_id}:CognitoIdentityCredentials",
         "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
         "Expiration": now + 3600,
+        "AccountId": get_account_id(),
+        "PrincipalType": "AssumedRole",
         "_identity_id": identity_id,
         "_identity_pool_id": (pool or {}).get("IdentityPoolId", ""),
         "_logins": logins,
         "_cognito_auth_type": "authenticated" if logins else "unauthenticated",
         "_cognito_auth_provider": ",".join(provider_parts) or None,
         "_cognito_amr": amr,
-    }
+    })
 
     return json_response({
         "IdentityId": identity_id,
         "Credentials": {
             "AccessKeyId": access_key,
             "SecretKey": secret_key,
-            "SessionToken": base64.b64encode(secrets.token_bytes(64)).decode(),
+            "SessionToken": session_token,
             "Expiration": now + 3600,
         },
     })
@@ -6581,7 +6608,12 @@ def _set_identity_pool_roles(data):
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    # The call sets the whole configuration: RoleMappings is optional on the
+    # API reference and no call removes a mapping on its own, so an omitted
+    # member clears what was there. Reasoned from the API surface, not
+    # measured against a live account.
     pool["_roles"] = data.get("Roles", {})
+    pool["_role_mappings"] = data.get("RoleMappings", {})
     return json_response({})
 
 
@@ -6593,7 +6625,9 @@ def _get_identity_pool_roles(data):
     return json_response({
         "IdentityPoolId": iid,
         "Roles": pool.get("_roles", {}),
-        "RoleMappings": {},
+        # .get, not indexing: pools created before this field existed (and the
+        # ones the CloudFormation provisioner builds itself) carry no entry.
+        "RoleMappings": pool.get("_role_mappings", {}),
     })
 
 

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon Transcribe emulator.
 
@@ -8,8 +10,13 @@ Implemented:
   StartTranscriptionJob, GetTranscriptionJob, ListTranscriptionJobs,
   DeleteTranscriptionJob.
 
-Jobs run as a background task that walks QUEUED -> IN_PROGRESS -> COMPLETED
-over ``TRANSCRIBE_JOB_RUN_SECONDS`` (0 completes immediately), reads the media
+StartTranscriptionJob returns the job already IN_PROGRESS with StartTime set,
+as the documented AWS response does. QUEUED is reached on AWS only by a
+request that opted into job queueing (``JobExecutionSettings.AllowDeferredExecution``)
+while the account is at its concurrent job limit; neither the quota nor the
+opt-in is modelled here, so a job never queues. A background task
+walks the job to COMPLETED or FAILED over ``TRANSCRIBE_JOB_RUN_SECONDS``
+(0 completes immediately), reads the media
 object out of MiniStack's S3 store, and writes a transcript document back to
 S3 in the real Transcribe result format. Entering a terminal state publishes a
 ``Transcribe Job State Change`` event so EventBridge rules downstream of a
@@ -72,9 +79,9 @@ from ministack.core.responses import (
 
 logger = logging.getLogger("transcribe")
 
-# How long a job spends between QUEUED and COMPLETED. Same knob shape as
-# GLUE_CRAWLER_RUN_SECONDS: tests that assert on IN_PROGRESS need a non-zero
-# value, tests that just want a result set it to 0.
+# How long a job spends between IN_PROGRESS and COMPLETED. Same knob shape as
+# GLUE_CRAWLER_RUN_SECONDS: tests that want to observe a job mid-flight need a
+# non-zero value, tests that just want a result set it to 0.
 _JOB_RUN_SECONDS = float(os.environ.get("TRANSCRIBE_JOB_RUN_SECONDS", "2"))
 
 # Where transcripts land when the caller supplies no OutputBucketName. Real
@@ -219,7 +226,7 @@ def load_persisted_state(data):
 
 def _fail_orphaned_jobs():
     """A job that was mid-flight when the process stopped has no worker any
-    more. Leaving it QUEUED or IN_PROGRESS strands every caller polling
+    more. Leaving it in a non-terminal state strands every caller polling
     GetTranscriptionJob forever, so it is failed the way AWS fails a job it
     cannot finish."""
     for job in _jobs.all_values():
@@ -625,20 +632,10 @@ async def _run_job(job_name, run_id, account_id, region, netloc):
 
 
 async def _run_job_inner(job_name, run_id, netloc):
-    half = _JOB_RUN_SECONDS / 2 if _JOB_RUN_SECONDS > 0 else 0
-
-    if half:
-        await asyncio.sleep(half)
-
-    job = _live_job(job_name, run_id)
-    if job is None:
-        return
-
-    job["TranscriptionJobStatus"] = "IN_PROGRESS"
-    job["StartTime"] = time.time()
-
-    if half:
-        await asyncio.sleep(half)
+    # The job is already IN_PROGRESS with StartTime set: the start handler put
+    # it there, as the AWS response does. There is no queued phase to wait out.
+    if _JOB_RUN_SECONDS > 0:
+        await asyncio.sleep(_JOB_RUN_SECONDS)
 
     job = _live_job(job_name, run_id)
     if job is None:
@@ -817,16 +814,19 @@ def _start_transcription_job(data):
         location_type = "SERVICE_BUCKET"
 
     run_id = new_uuid()
+    # One timestamp for both members: a job that starts immediately has not
+    # started before it was created, and two time.time() calls can skew.
+    created = time.time()
     job = {
         "TranscriptionJobName": name,
-        "TranscriptionJobStatus": "QUEUED",
+        "TranscriptionJobStatus": "IN_PROGRESS",
         "LanguageCode": language_code,
         "MediaSampleRateHertz": data.get("MediaSampleRateHertz"),
         "MediaFormat": data.get("MediaFormat"),
         "Media": copy.deepcopy(media),
         "Transcript": None,
-        "StartTime": None,
-        "CreationTime": time.time(),
+        "StartTime": created,
+        "CreationTime": created,
         "CompletionTime": None,
         "FailureReason": None,
         "Settings": copy.deepcopy(data.get("Settings")) if data.get("Settings") else None,

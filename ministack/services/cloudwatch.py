@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudWatch Metrics Service Emulator.
 Supports legacy Query API (form-encoded), smithy-rpc-v2-cbor (botocore 1.42+),
@@ -914,7 +916,9 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": int(time.time()),
+            "StateUpdatedTimestamp": _alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+            if name in _alarms
+            else int(time.time()),
             "ActionsEnabled": cbor_data.get("ActionsEnabled", True),
             "AlarmActions": cbor_data.get("AlarmActions", []),
             "OKActions": cbor_data.get("OKActions", []),
@@ -979,7 +983,9 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": int(time.time()),
+            "StateUpdatedTimestamp": _alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+            if name in _alarms
+            else int(time.time()),
             "ActionsEnabled": _p(params, "ActionsEnabled") != "false",
             "AlarmActions": alarm_actions,
             "OKActions": ok_actions,
@@ -1945,6 +1951,15 @@ def cloudformation_put_metric_alarm(alarm: dict) -> None:
             "Unchecked: Initial alarm creation",
         )
     _evaluate_alarm(alarm)
+
+
+def cloudformation_set_metric_alarm_tags(name: str, tags: list) -> None:
+    """Replace the tag set of a metric alarm created from a template. PutMetricAlarm
+    ignores Tags on an existing alarm, so a template's Tags are applied the way
+    CloudFormation does it: the full set replaces what is there (TagResource for
+    what is declared, UntagResource for what was dropped)."""
+    arn = f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}"
+    _resource_tags[arn] = {t["Key"]: t.get("Value", "") for t in tags}
 
 
 def cloudformation_delete_metric_alarm(name: str) -> None:

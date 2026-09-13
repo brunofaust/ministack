@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 S3 Service Emulator – AWS-compatible.
 Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
@@ -28,12 +30,13 @@ import contextvars
 import copy
 import datetime as _dt
 import hashlib
-import hmac
 import json
 import logging
 import os
+import random
 import re
 import shutil
+import string
 import struct
 import threading
 import time
@@ -48,6 +51,12 @@ from xml.sax.saxutils import escape as _esc
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    resolve_credential,
+)
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
@@ -59,6 +68,13 @@ from ministack.core.responses import (
     now_iso,
     set_request_account_id,
     set_request_region,
+)
+from ministack.core.sigv4 import (
+    build_canonical_request,
+    build_string_to_sign,
+    calculate_signature,
+    presigned_request_is_expired,
+    signatures_match,
 )
 
 logger = logging.getLogger("s3")
@@ -79,6 +95,45 @@ _bucket_encryption = AccountScopedDict()
 _bucket_lifecycle = AccountScopedDict()
 _bucket_intelligent_tiering = AccountScopedDict()
 _bucket_cors = AccountScopedDict()
+# Multi-Region Access Points. Keyed by ALIAS rather than name, because the alias
+# is what the data plane is addressed by: `<alias>.mrap.accesspoint.s3-global.amazonaws.com`.
+_mraps = AccountScopedDict()  # Alias -> {Name, Alias, Regions: [bucket, ...], CreatedAt}
+
+
+def new_mrap_alias() -> str:
+    """The alias S3 mints for a Multi-Region Access Point: a letter followed
+    by twelve lowercase letters or digits, suffixed with ``.mrap`` (e.g.
+    ``mfzwi23gnjvgw.mrap``; the documented pattern is
+    ``^[a-z][a-z0-9]*[.]mrap$``). The suffix is part of the alias itself —
+    GetAtt/GetMultiRegionAccessPoint return it, and the hostname is
+    ``<alias>.accesspoint.s3-global.amazonaws.com``."""
+    alphabet = string.ascii_lowercase + string.digits
+    base = random.choice(string.ascii_lowercase) + "".join(random.choices(alphabet, k=12))
+    return base + ".mrap"
+
+
+def resolve_mrap_bucket(alias: str):
+    """The bucket an MRAP alias serves, or None.
+
+    A real MRAP routes to whichever member bucket is nearest the caller. Nearest
+    has no meaning in a single-process emulator, so the member whose *stored*
+    region (recorded at CreateBucket) matches the request region wins and the
+    first member is the fallback — deterministic, and it makes a single-region
+    MRAP (the common case in a local stack) resolve to the only bucket it has.
+    """
+    record = _mraps.get(alias)
+    if not record:
+        return None
+    buckets = record.get("Regions") or []
+    if not buckets:
+        return None
+    region = get_region()
+    if region:
+        for bucket in buckets:
+            meta = _buckets.get(bucket)
+            if meta is not None and meta.get("region") == region:
+                return bucket
+    return buckets[0]
 _bucket_acl = AccountScopedDict()
 _bucket_websites = AccountScopedDict()
 _bucket_logging_config = AccountScopedDict()
@@ -126,6 +181,10 @@ _PERSISTED_BUCKET_DICTS = {
     "bucket_request_payment_config": _bucket_request_payment_config,
     "bucket_object_lock": _bucket_object_lock,
     "bucket_replication": _bucket_replication,
+    # An access point outliving a restart matters more than most: its alias is
+    # baked into client configuration, so member buckets coming back without the
+    # alias fronting them fails where a missing bucket would not.
+    "mraps": _mraps,
 }
 
 
@@ -1454,58 +1513,14 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", in
 # ---------------------------------------------------------------------------
 
 
-_SIGV4_UNSIGNED_PAYLOAD = "UNSIGNED-PAYLOAD"
-
-
-def _uri_encode(value: str, encode_slash: bool = True) -> str:
-    """RFC3986 encoding per the SigV4 spec: unreserved chars (A-Za-z0-9-_.~)
-    stay literal, everything else is percent-encoded. ``/`` is preserved in
-    the canonical URI (path separators) and encoded everywhere else."""
-    safe = "-_.~" + ("" if encode_slash else "/")
-    return url_quote(value, safe=safe)
-
-
-def _sigv4_signing_key(secret: str, date_stamp: str, region: str, service: str) -> bytes:
-    def _h(key, msg):
-        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
-
-    k_date = _h(("AWS4" + secret).encode("utf-8"), date_stamp)
-    k_region = _h(k_date, region)
-    k_service = _h(k_region, service)
-    return _h(k_service, "aws4_request")
-
-
-def _resolve_presign_secret(access_key_id):
-    """The secret a presigned URL was signed with.
-
-    STS temporary credentials are signed with the unique secret STS issued (not
-    the server's static one), so a presigned URL from an AssumeRole / session
-    token would never recompute against ``AWS_SECRET_ACCESS_KEY``. STS records
-    each issued secret by access key id; resolve it here, falling back to the
-    static server secret for a long-term (non-session) credential.
-    """
-    try:
-        from ministack.services import sts
-
-        session = sts._sessions.get(access_key_id)
-        if session and session.get("SecretAccessKey"):
-            return session["SecretAccessKey"]
-    except Exception:
-        pass
-    return os.environ.get("AWS_SECRET_ACCESS_KEY", "test")
-
-
 def _verify_presigned_sigv4(method, path, headers, query_params):
     """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
     signature, or None when the request is not a SigV4 presigned URL (header-
     signed and anonymous requests are handled elsewhere / left lax).
 
-    MiniStack has no IAM secret store, so it verifies against its own secret
-    (``AWS_SECRET_ACCESS_KEY``, default ``test``) — the same credential the
-    server and its Lambda runtimes use. A URL signed with any other secret, or
-    one whose signed headers (content-type, content-length, ...) were tampered
-    with after signing, does not recompute to the same signature and is
-    rejected with 403 SignatureDoesNotMatch, matching real S3.
+    MiniStack resolves root, IAM-user, and STS credentials before recomputing
+    the signature. Temporary credentials must include the exact session token
+    STS issued.
     """
     signature = _qp(query_params, "X-Amz-Signature", "") or _qp(query_params, "x-amz-signature", "")
     if not signature:
@@ -1536,55 +1551,67 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     expires = _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", "")
     if expires:
         try:
-            signed_at = _dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=_dt.timezone.utc)
-            if _dt.datetime.now(_dt.timezone.utc) > signed_at + _dt.timedelta(seconds=int(expires)):
+            if presigned_request_is_expired(amz_date, expires):
                 return _error("AccessDenied", "Request has expired", 403, path)
         except (ValueError, TypeError):
             pass
 
-    # Canonical query string: every query param except X-Amz-Signature,
-    # RFC3986-encoded, sorted by encoded key then value.
-    pairs = []
-    for name, values in query_params.items():
-        if name.lower() == "x-amz-signature":
-            continue
-        vlist = values if isinstance(values, list) else [values]
-        for v in vlist:
-            pairs.append((_uri_encode(name), _uri_encode(v)))
-    pairs.sort()
-    canonical_qs = "&".join(f"{k}={v}" for k, v in pairs)
-
-    # Canonical headers: the signed headers, lowercased names, trimmed values.
-    canonical_headers = ""
-    for hname in (h for h in signed_headers.split(";") if h):
-        raw = headers.get(hname, headers.get(hname.lower(), ""))
-        canonical_headers += f"{hname.lower()}:{' '.join(str(raw).split())}\n"
-
-    canonical_request = "\n".join(
-        [
-            method,
-            _uri_encode(path, encode_slash=False),
-            canonical_qs,
-            canonical_headers,
-            signed_headers,
-            _SIGV4_UNSIGNED_PAYLOAD,
-        ]
+    canonical_request = build_canonical_request(
+        method,
+        path,
+        headers,
+        query_params,
+        signed_headers,
+    )
+    string_to_sign = build_string_to_sign(
+        amz_date,
+        date_stamp,
+        region,
+        service,
+        canonical_request,
     )
 
-    string_to_sign = "\n".join(
-        [
-            "AWS4-HMAC-SHA256",
-            amz_date,
-            f"{date_stamp}/{region}/{service}/aws4_request",
-            hashlib.sha256(canonical_request.encode("utf-8")).hexdigest(),
-        ]
+    session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
+        query_params, "x-amz-security-token", ""
+    )
+    # S3 presigned requests verify credentials even with AUTH disabled.
+    # Resolve their tenant here, without changing routing for other requests.
+    try:
+        owner = find_iam_access_key_account(_akid)
+    except AmbiguousAccessKeyError:
+        # Two tenants holding one key is an emulator-only state; S3 has no
+        # error for it, so it answers as it does for a key it cannot resolve.
+        return _error(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
+        )
+    if owner:
+        set_request_account_id(owner)
+    credential = resolve_credential(_akid, get_account_id(), session_token)
+    if isinstance(credential, CredentialResolutionError):
+        # S3's own error table: ExpiredToken and InvalidToken are 400, while
+        # InvalidAccessKeyId is 403.
+        if credential.code == "ExpiredTokenException":
+            return _error("ExpiredToken", "The provided token has expired.", 400, path)
+        if credential.code == "InvalidToken":
+            return _error("InvalidToken", credential.message, 400, path)
+        return _error(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
+        )
+    computed = calculate_signature(
+        credential.secret_access_key,
+        date_stamp,
+        region,
+        service,
+        string_to_sign,
     )
 
-    secret = _resolve_presign_secret(_akid)
-    signing_key = _sigv4_signing_key(secret, date_stamp, region, service)
-    computed = hmac.new(signing_key, string_to_sign.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    if not hmac.compare_digest(computed, signature):
+    if not signatures_match(computed, signature):
         return _bad_signature()
     return None
 
@@ -1601,6 +1628,24 @@ _PRESIGN_SIGNING_PARAMS = {
     "x-amz-security-token",
     "x-amz-content-sha256",
 }
+
+# A presigned URL's checksum *value* is signed but never read as a supplied
+# integrity value. Current SDKs (JS since v3.729.0) compute it over the *empty*
+# body at presign time, because whoever holds the URL picks the body later, so
+# the value cannot describe what gets uploaded. Real S3 signs the parameter —
+# rewriting it still yields 403 — and then ignores it, storing the body it was
+# sent. Hoisting it into the headers instead hands it to
+# `_resolve_object_checksums`, which rejects the upload with `BadDigest` for a
+# request AWS answers 200.
+#
+# Only the value parameters are excluded. `x-amz-checksum-algorithm` and
+# `x-amz-sdk-checksum-algorithm` name an algorithm for the server to compute
+# rather than carrying a value, so they cannot disagree with a body and are
+# never the reason a request is refused; CreateMultipartUpload is presigned
+# with either of them to choose the algorithm its parts are digested with.
+_PRESIGN_UNHOISTED_CHECKSUM_PARAMS = frozenset(
+    f"x-amz-checksum-{alg}" for alg in _S3_CHECKSUM_HEADERS
+)
 
 
 def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
@@ -1619,12 +1664,16 @@ def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
     metadata in its query string stored the object without any: the PUT
     succeeded and the metadata was silently dropped.
 
-    An explicitly sent header always wins over its hoisted twin.
+    An explicitly sent header always wins over its hoisted twin. The checksum
+    values in ``_PRESIGN_UNHOISTED_CHECKSUM_PARAMS`` are the exception AWS
+    itself makes and stay out of the headers.
     """
     hoisted = None
     for name, values in query_params.items():
         lname = name.lower()
         if not lname.startswith("x-amz-") or lname in _PRESIGN_SIGNING_PARAMS:
+            continue
+        if lname in _PRESIGN_UNHOISTED_CHECKSUM_PARAMS:
             continue
         if lname in headers:
             continue
@@ -2850,7 +2899,8 @@ def _put_bucket_notification(name: str, body: bytes):
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
     # delivered the message (also loses the caller's account contextvar across
-    # threads, which broke multi-tenant tests).
+    # threads, which broke multi-tenant tests). Queue and topic destinations only;
+    # AWS does not send the test event to Lambda targets.
     _fire_s3_test_event(name)
     return 200, {}, b""
 
@@ -3557,7 +3607,8 @@ def _fire_s3_event_async(
 
 
 def _fire_s3_test_event(bucket_name: str) -> None:
-    """Deliver an s3:TestEvent to every destination in the bucket notification config."""
+    """Deliver an s3:TestEvent to the SQS and SNS destinations in the bucket
+    notification config. AWS does not send it to Lambda targets."""
     try:
         configs = _parse_notification_config(bucket_name)
         if not configs:
@@ -3577,8 +3628,8 @@ def _fire_s3_test_event(bucket_name: str) -> None:
                     _deliver_event_to_sqs(cfg["arn"], payload, bucket_region)
                 elif cfg["type"] == "sns":
                     _deliver_event_to_sns(cfg["arn"], payload, bucket_region)
-                elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
+                # No lambda branch: AWS verifies Lambda destinations by checking the
+                # function's permissions, not by invoking them.
             except Exception:
                 logger.exception("S3 test-event delivery failed for config %s", cfg.get("id"))
     except Exception:
@@ -6768,6 +6819,7 @@ def reset():
         _object_retention,
         _object_legal_hold,
         _object_versions,
+        _mraps,
     ):
         d.clear()
 

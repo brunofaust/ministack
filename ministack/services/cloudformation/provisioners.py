@@ -1,8 +1,11 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation provisioners — resource create/delete handlers for each AWS resource type.
 """
 
 import base64
+import contextvars
 import copy
 import hashlib
 import io
@@ -111,6 +114,401 @@ def _physical_name(stack_name: str, logical_id: str, *,
     return base[:max_len]
 
 
+# ---------------------------------------------------------------------------
+# CloudFront policies, functions and origin access controls
+#
+# The CloudFront APIs for these five types are fully implemented; only their
+# CloudFormation provisioners were missing, so a CDK app that declares a cache
+# policy or a viewer function rolled back with "Unsupported resource type" while
+# the same objects could be created over the API.
+#
+# Rather than re-implement the property mapping (ResponseHeadersPolicyConfig
+# alone is CORS, six security headers, server-timing, custom and removed
+# headers), each provisioner converts its CFN property dict to the XML element
+# the service's own parser already accepts and calls that parser. The property
+# names are identical — both are generated from the same AWS model — so the only
+# real difference is how lists are wrapped, which `_cf_props_to_element` handles.
+# Validation, defaults and the stored record shape are then exactly what the API
+# produces.
+# ---------------------------------------------------------------------------
+
+# XML wraps every list as <Field><Quantity>n</Quantity><Items><Tag>..; the item
+# tag varies by field and JSON does not carry it.
+_CF_LIST_ITEM_TAGS = {
+    "Headers": "Name",
+    "Cookies": "Name",
+    "QueryStrings": "Name",
+    "AccessControlAllowOrigins": "Origin",
+    "AccessControlAllowHeaders": "Header",
+    "AccessControlExposeHeaders": "Header",
+    "AccessControlAllowMethods": "Method",
+    "KeyValueStoreAssociations": "KeyValueStoreAssociation",
+    # These two break the pattern at both ends: the CFN property carrying the
+    # list is the *Config wrapper rather than the bare field name, and
+    # `_parse_rhp_config` matches the fully qualified item tag. Getting either
+    # half wrong drops every custom and removed header silently.
+    "CustomHeadersConfig": "ResponseHeadersPolicyCustomHeader",
+    "RemoveHeadersConfig": "ResponseHeadersPolicyRemoveHeader",
+}
+
+
+def _cf_props_to_element(tag, value):
+    """Render a CloudFormation property dict as the XML element CloudFront parses."""
+    from xml.etree.ElementTree import Element, SubElement
+
+    el = Element(tag)
+
+    def fill(parent, data):
+        for key, item in (data or {}).items():
+            if item is None:
+                continue
+            # CFN writes a list either bare (`Headers: [..]`) or wrapped
+            # (`AccessControlAllowHeaders: {Items: [..]}`); XML wants both as a
+            # counted Items block.
+            listed = None
+            if isinstance(item, list):
+                listed = item
+            elif isinstance(item, dict) and set(item) <= {"Items", "Quantity"} and isinstance(item.get("Items"), list):
+                listed = item["Items"]
+
+            if listed is not None:
+                block = SubElement(parent, key)
+                SubElement(block, "Quantity").text = str(len(listed))
+                if listed:
+                    items_el = SubElement(block, "Items")
+                    item_tag = _CF_LIST_ITEM_TAGS.get(key, "Name")
+                    for entry in listed:
+                        child = SubElement(items_el, item_tag)
+                        if isinstance(entry, dict):
+                            fill(child, entry)
+                        else:
+                            child.text = str(entry)
+            elif isinstance(item, dict):
+                fill(SubElement(parent, key), item)
+            elif isinstance(item, bool):
+                SubElement(parent, key).text = "true" if item else "false"
+            else:
+                SubElement(parent, key).text = str(item)
+
+    fill(el, value)
+    return el
+
+
+def _cf_policy_create(store, parse, label, props, config_key, logical_id, stack_name):
+    """Create one of the three CloudFront policy families from CFN properties.
+
+    `parse` is the service's own config parser — the generic `_ORP_SPEC`/`_RHP_SPEC`
+    ones, or `_parse_cache_policy_config`, which predates that framework and has
+    no spec entry.
+    """
+    cfg_props = dict(props.get(config_key) or {})
+    cfg_props.setdefault("Name", _physical_name(stack_name, logical_id, max_len=128))
+    cfg, err = parse(_cf_props_to_element(config_key, cfg_props))
+    if err is not None:
+        # `parse` returns an HTTP error tuple; CFN needs an exception so the
+        # stack rolls back with the reason attached rather than half-created.
+        raise ValueError(f"{label}: {cfg_props.get('Name')} is not valid")
+    for existing in store.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return existing["Id"], {"Id": existing["Id"],
+                                    "LastModifiedTime": existing["LastModifiedTime"]}
+    pid = new_uuid()
+    record = {"Id": pid, "ETag": new_uuid(), "LastModifiedTime": now_iso(), "Config": cfg}
+    store[pid] = record
+    # Ref resolves to the Id for all three families, which is what a
+    # DistributionConfig references.
+    return pid, {"Id": pid, "LastModifiedTime": record["LastModifiedTime"]}
+
+
+def _cf_refuse_taken_name(store, physical_id, name, label, name_of):
+    """Refuse a rename onto a name another object of the store already holds.
+
+    The service refuses it (UpdateCachePolicy and its siblings answer
+    CachePolicyAlreadyExists and the like), so the update handler must as well,
+    or the store ends up with two objects under one name.
+    """
+    for existing in store.values():
+        if existing["Id"] != physical_id and name_of(existing) == name:
+            raise ValueError(f"{label}: {name} already exists")
+
+
+def _cf_policy_update(store, parse, label, create_fn, physical_id, new_props,
+                      config_key, logical_id, stack_name):
+    """Update one of the three CloudFront policy families in place.
+
+    Every property of all three types is "Update requires: No interruption" in
+    the resource references, the config's `Name` included, so there is no
+    replacement path here: the policy keeps its Id (which is its physical id,
+    and what `Ref` hands to a distribution) across every change.
+
+    The whole config is re-parsed from the template and swapped in, the way
+    UpdateCachePolicy replaces the config it is sent, so a property the
+    template drops falls back to the parser's create default rather than
+    lingering from the previous version.
+    """
+    record = store.get(physical_id)
+    if record is None:
+        # The policy is gone (deleted through the API between updates); create
+        # it again so the stack converges on what the template asks for.
+        return create_fn(logical_id or physical_id, new_props, stack_name)
+    cfg_props = dict(new_props.get(config_key) or {})
+    cfg_props.setdefault("Name", _physical_name(stack_name, logical_id or physical_id,
+                                                max_len=128))
+    cfg, err = parse(_cf_props_to_element(config_key, cfg_props))
+    if err is not None:
+        raise ValueError(f"{label}: {cfg_props.get('Name')} is not valid")
+    _cf_refuse_taken_name(store, physical_id, cfg["Name"], label,
+                          lambda existing: existing["Config"]["Name"])
+    record["Config"] = cfg
+    record["ETag"] = new_uuid()
+    record["LastModifiedTime"] = now_iso()
+    return physical_id, {"Id": physical_id,
+                         "LastModifiedTime": record["LastModifiedTime"]}
+
+
+def _cf_cache_policy_create(logical_id, props, stack_name):
+    return _cf_policy_create(_cf._cache_policies, _cf._parse_cache_policy_config,
+                             "AWS::CloudFront::CachePolicy", props,
+                             "CachePolicyConfig", logical_id, stack_name)
+
+
+def _cf_cache_policy_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    return _cf_policy_update(_cf._cache_policies, _cf._parse_cache_policy_config,
+                             "AWS::CloudFront::CachePolicy", _cf_cache_policy_create,
+                             physical_id, new_props, "CachePolicyConfig",
+                             logical_id, stack_name)
+
+
+def _cf_cache_policy_delete(physical_id, props):
+    _cf._cache_policies.pop(physical_id, None)
+
+
+def _cf_origin_request_policy_create(logical_id, props, stack_name):
+    return _cf_policy_create(_cf._origin_request_policies, _cf._ORP_SPEC["parse"],
+                             "AWS::CloudFront::OriginRequestPolicy", props,
+                             "OriginRequestPolicyConfig", logical_id, stack_name)
+
+
+def _cf_origin_request_policy_update(physical_id, old_props, new_props, stack_name,
+                                     logical_id=None):
+    return _cf_policy_update(_cf._origin_request_policies, _cf._ORP_SPEC["parse"],
+                             "AWS::CloudFront::OriginRequestPolicy",
+                             _cf_origin_request_policy_create,
+                             physical_id, new_props, "OriginRequestPolicyConfig",
+                             logical_id, stack_name)
+
+
+def _cf_origin_request_policy_delete(physical_id, props):
+    _cf._origin_request_policies.pop(physical_id, None)
+
+
+def _cf_response_headers_policy_create(logical_id, props, stack_name):
+    return _cf_policy_create(_cf._response_headers_policies, _cf._RHP_SPEC["parse"],
+                             "AWS::CloudFront::ResponseHeadersPolicy", props,
+                             "ResponseHeadersPolicyConfig", logical_id, stack_name)
+
+
+def _cf_response_headers_policy_update(physical_id, old_props, new_props, stack_name,
+                                       logical_id=None):
+    return _cf_policy_update(_cf._response_headers_policies, _cf._RHP_SPEC["parse"],
+                             "AWS::CloudFront::ResponseHeadersPolicy",
+                             _cf_response_headers_policy_create,
+                             physical_id, new_props, "ResponseHeadersPolicyConfig",
+                             logical_id, stack_name)
+
+
+def _cf_response_headers_policy_delete(physical_id, props):
+    _cf._response_headers_policies.pop(physical_id, None)
+
+
+def _cf_oac_record_fields(cfg, name):
+    """The OAC record fields an OriginAccessControlConfig carries.
+
+    The reference marks every field but Description "Required: Yes"; the
+    fallbacks here are MiniStack's own, for a template that leaves one out.
+    They live in one place so that a create and an update of the same template
+    cannot come to disagree about what an absent field means.
+    """
+    return {
+        "Name": name,
+        "Description": cfg.get("Description", ""),
+        "OriginAccessControlOriginType": cfg.get("OriginAccessControlOriginType", "s3"),
+        "SigningBehavior": cfg.get("SigningBehavior", "always"),
+        "SigningProtocol": cfg.get("SigningProtocol", "sigv4"),
+    }
+
+
+def _cf_oac_create(logical_id, props, stack_name):
+    cfg = dict(props.get("OriginAccessControlConfig") or {})
+    name = cfg.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    for existing in _cf._oacs.values():
+        if existing.get("Name") == name:
+            return existing["Id"], {"Id": existing["Id"]}
+    oac_id = _cf._dist_id()
+    _cf._oacs[oac_id] = {
+        "Id": oac_id,
+        **_cf_oac_record_fields(cfg, name),
+        "ETag": new_uuid(),
+    }
+    return oac_id, {"Id": oac_id}
+
+
+def _cf_oac_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an origin access control in place.
+
+    The reference marks OriginAccessControlConfig and all five fields under it
+    "Update requires: No interruption" — `Name` included, which UpdateOriginAccessControl
+    also accepts — so the OAC keeps the Id a distribution's origin refers to.
+    The record is rebuilt through the same `_cf_oac_record_fields` the create
+    handler uses, so a property the template drops reverts to its create default.
+    """
+    record = _cf._oacs.get(physical_id)
+    if record is None:
+        # Deleted through the API between updates; converge by creating it again.
+        return _cf_oac_create(logical_id or physical_id, new_props, stack_name)
+    cfg = dict(new_props.get("OriginAccessControlConfig") or {})
+    name = cfg.get("Name") or _physical_name(stack_name, logical_id or physical_id,
+                                             max_len=64)
+    _cf_refuse_taken_name(_cf._oacs, physical_id, name,
+                          "AWS::CloudFront::OriginAccessControl",
+                          lambda existing: existing.get("Name"))
+    record.update(_cf_oac_record_fields(cfg, name))
+    record["ETag"] = new_uuid()
+    return physical_id, {"Id": physical_id}
+
+
+def _cf_oac_delete(physical_id, props):
+    _cf._oacs.pop(physical_id, None)
+
+
+def _cf_function_live_body(cfg, code):
+    """The snapshot PublishFunction freezes for the LIVE stage."""
+    return {
+        "comment": cfg["comment"],
+        "runtime": cfg["runtime"],
+        "kvs_arns": list(cfg["kvs_arns"]),
+        "code": code,
+    }
+
+
+def _cf_function_tags(name, props):
+    """`Tags` on the type is an array of Tag and is "No interruption" on an
+    update, so the template's list replaces whatever the function carried."""
+    tags = [
+        {"Key": str(t.get("Key", "")), "Value": str(t.get("Value", ""))}
+        for t in (props.get("Tags") or [])
+        if isinstance(t, dict) and t.get("Key")
+    ]
+    arn = _cf._func_arn(name)
+    if tags:
+        _cf._tags[arn] = tags
+    else:
+        _cf._tags.pop(arn, None)
+
+
+def _cf_function_body(name, props):
+    """The FunctionConfig, source and AutoPublish flag a template carries."""
+    cfg_el = _cf_props_to_element("FunctionConfig", props.get("FunctionConfig") or {})
+    cfg, err = _cf._cf_parse_function_config(cfg_el)
+    if err is not None:
+        raise ValueError(f"AWS::CloudFront::Function {name}: FunctionConfig is not valid")
+
+    # CFN carries the source verbatim; the API takes it base64-encoded.
+    code = props.get("FunctionCode") or ""
+    if isinstance(code, str):
+        code = code.encode("utf-8")
+
+    # "By default, when you create a function, it's in the DEVELOPMENT stage"
+    # (AWS::CloudFront::Function reference) — publishing to LIVE happens only
+    # when the template sets AutoPublish to true, which CDK emits explicitly.
+    auto_publish = props.get("AutoPublish", False)
+    if isinstance(auto_publish, str):
+        auto_publish = auto_publish.lower() == "true"
+    return cfg, code, auto_publish
+
+
+def _cf_function_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
+    if name in _cf._functions:
+        # CreateFunction answers FunctionAlreadyExists; a stack must not write
+        # over a function it does not own, on a create or on a rename.
+        raise ValueError(f"AWS::CloudFront::Function: {name} already exists")
+    cfg, code, auto_publish = _cf_function_body(name, props)
+
+    now = now_iso()
+    dev_etag = new_uuid()
+
+    _cf._functions[name] = {
+        "name": name,
+        "arn": _cf._func_arn(name),
+        "comment": cfg["comment"],
+        "runtime": cfg["runtime"],
+        "kvs_arns": cfg["kvs_arns"],
+        "code": code,
+        "created": now,
+        "last_modified_dev": now,
+        "last_modified_live": now if auto_publish else None,
+        "dev_etag": dev_etag,
+        "live_etag": new_uuid() if auto_publish else None,
+        "live_body": _cf_function_live_body(cfg, code) if auto_publish else None,
+    }
+    _cf_function_tags(name, props)
+    # The reference lists only FunctionARN and FunctionMetadata.FunctionARN as
+    # GetAtt attributes — no Stage.
+    arn = _cf._func_arn(name)
+    return name, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
+
+
+def _cf_function_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a CloudFront function in place.
+
+    `Name` is the type's one "Update requires: Replacement" property; AutoPublish,
+    FunctionCode, FunctionConfig, FunctionMetadata and Tags are "No interruption".
+    A renamed function is therefore created under the new name and the old one
+    removed, while everything else keeps the physical id — the function name,
+    which is what its ARN is built from — and its creation time.
+
+    The new source lands in DEVELOPMENT and the published body keeps serving
+    LIVE, as UpdateFunction does ("The changes are made only to the version of
+    the function that is in the DEVELOPMENT stage"). `AutoPublish: true`
+    republishes right after, which is what the reference means by "updating the
+    AWS::CloudFront::Function resource with the AutoPublish property set to
+    true".
+    """
+    name = new_props.get("Name") or _physical_name(stack_name,
+                                                   logical_id or physical_id, max_len=64)
+    record = _cf._functions.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, record.get("name") if record else None,
+        _cf_function_create, _cf_function_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    cfg, code, auto_publish = _cf_function_body(name, new_props)
+    now = now_iso()
+    record["comment"] = cfg["comment"]
+    record["runtime"] = cfg["runtime"]
+    record["kvs_arns"] = cfg["kvs_arns"]
+    record["code"] = code
+    record["last_modified_dev"] = now
+    record["dev_etag"] = new_uuid()
+    if auto_publish:
+        record["last_modified_live"] = now
+        record["live_etag"] = new_uuid()
+        record["live_body"] = _cf_function_live_body(cfg, code)
+    _cf_function_tags(name, new_props)
+    arn = _cf._func_arn(name)
+    return physical_id, {"FunctionARN": arn, "FunctionMetadata.FunctionARN": arn}
+
+
+def _cf_function_delete(physical_id, props):
+    _cf._functions.pop(physical_id, None)
+    _cf._tags.pop(_cf._func_arn(physical_id), None)
+
+
 # ===========================================================================
 # Resource Provisioner Framework
 # ===========================================================================
@@ -126,7 +524,9 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
         return _custom_resource_create(logical_id, props, stack_name, resource_type)
     # CloudFormation internal types are no-ops
     if resource_type.startswith("AWS::CloudFormation::"):
-        logger.info("CloudFormation internal type %s for %s -- noop", resource_type, logical_id)
+        logger.warning(
+            "CloudFormation type %s (%s) has no provisioner -- recorded as a "
+            "no-op placeholder, nothing is created", resource_type, logical_id)
         noop_id = f"{stack_name}-{logical_id}-noop-{new_uuid()[:8]}"
         return noop_id, {}
     raise ValueError(f"Unsupported resource type: {resource_type}")
@@ -137,7 +537,10 @@ def _delete_resource(resource_type: str, physical_id: str, props: dict,
     """Delete a provisioned resource."""
     handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "delete" in handler:
-        handler["delete"](physical_id, props)
+        if handler.get("delete_with_logical_id"):
+            handler["delete"](physical_id, props, logical_id)
+        else:
+            handler["delete"](physical_id, props)
         return
     # Custom resource types
     if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
@@ -178,6 +581,31 @@ def _requires_replacement_dynamodb(old_props, new_props):
     return False
 
 
+def _requires_replacement_sfn(old_props, new_props):
+    """AWS::StepFunctions::StateMachine requires replacement when
+    StateMachineType changes (the resource reference marks the property
+    "Update requires: Replacement")."""
+    return (old_props.get("StateMachineType", "STANDARD")
+            != new_props.get("StateMachineType", "STANDARD"))
+
+
+def _requires_replacement_cognito_user_pool_group(old_props, new_props):
+    """AWS::Cognito::UserPoolGroup requires replacement when UserPoolId
+    changes (the resource reference marks the property "Update requires:
+    Replacement")."""
+    return old_props.get("UserPoolId") != new_props.get("UserPoolId")
+
+
+def _requires_replacement_cognito_resource_server(old_props, new_props):
+    """AWS::Cognito::UserPoolResourceServer requires replacement when
+    UserPoolId changes (the resource reference marks the property "Update
+    requires: Replacement"). Identifier is "Replacement" as well, but it is
+    also the physical name, so a change to it is a replacement under a new
+    name, which the custom-name guard does not block; only the pool move is
+    a replacement under an unchanged name."""
+    return old_props.get("UserPoolId") != new_props.get("UserPoolId")
+
+
 # Resource types that carry a user-supplied physical name AND can require
 # replacement. Real CloudFormation refuses an update that would replace a
 # custom-named resource (you must rename it first), so MiniStack must fail the
@@ -187,6 +615,33 @@ _CUSTOM_NAME_REPLACEMENT = {
     "AWS::DynamoDB::Table": {
         "name": "TableName",
         "requires_replacement": _requires_replacement_dynamodb,
+    },
+    "AWS::StepFunctions::StateMachine": {
+        "name": "StateMachineName",
+        "requires_replacement": _requires_replacement_sfn,
+    },
+    "AWS::Cognito::UserPoolGroup": {
+        "name": "GroupName",
+        "requires_replacement": _requires_replacement_cognito_user_pool_group,
+    },
+    "AWS::Cognito::UserPoolResourceServer": {
+        # Identifier is the physical id of the resource server and the prefix
+        # of every scope string it vends, so it is always a custom name.
+        "name": "Identifier",
+        "requires_replacement": _requires_replacement_cognito_resource_server,
+    },
+    "AWS::IoT::ThingGroup": {
+        "name": "ThingGroupName",
+        "requires_replacement": lambda old, new: old.get("ParentGroupName") != new.get("ParentGroupName"),
+    },
+    # KmsKeyId is "Update requires: Replacement" in the resource reference.
+    "AWS::Location::Tracker": {
+        "name": "TrackerName",
+        "requires_replacement": lambda old, new: old.get("KmsKeyId") != new.get("KmsKeyId"),
+    },
+    "AWS::IAM::InstanceProfile": {
+        "name": "InstanceProfileName",
+        "requires_replacement": lambda old, new: old.get("Path", "/") != new.get("Path", "/"),
     },
 }
 
@@ -214,20 +669,64 @@ def _custom_named_replacement_error(resource_type, old_props, new_props):
     return None
 
 
+# Set by the stack engine around an update whose resource carries
+# ``UpdateReplacePolicy: Retain`` (or ``RetainExceptOnCreate``): a handler that
+# replaces the resource must then leave the predecessor in place; the engine
+# records the DELETE_SKIPPED event.
+_RETAIN_REPLACED = contextvars.ContextVar("cfn_retain_replaced", default=False)
+# The DeletionPolicy / UpdateReplacePolicy values that keep a resource; the
+# engine reads the same tuple for the cleanup phase and the stack delete.
+# Snapshot is not among them: the emulator takes no snapshots, so a Snapshot
+# resource is deleted like a Delete one.
+_RETAINING_POLICIES = ("Retain", "RetainExceptOnCreate")
+
+
 def _rename_replacement(physical_id, old_props, new_props, stack_name, logical_id,
-                        declared_name, current_name, create_fn, delete_fn):
+                        declared_name, current_name, create_fn, delete_fn,
+                        delete_when_id_unchanged=False):
     """Shared prologue for the name-keyed update handlers: when the resource
     record is gone (current_name is None) or its create-only name property
     changed, the update is a replacement — create the new resource first, then
-    delete the old one, in CloudFormation's replacement order. Returns the
-    create result, or None when the update can proceed in place.
+    delete the old one, in CloudFormation's replacement order (unless the
+    resource's UpdateReplacePolicy retains it). Returns the create result, or
+    None when the update can proceed in place.
+
+    The predecessor is normally left alone when the create returns the same
+    physical id, because then it IS the predecessor. A type whose physical id
+    does not carry its whole identity (a subscription filter keyed by group
+    and name, a resource server keyed by pool and identifier) replaces under
+    an unchanged id and has to delete the old record itself: those pass
+    ``delete_when_id_unchanged``.
     """
     if current_name is not None and declared_name == current_name:
         return None
     created = create_fn(logical_id or physical_id, new_props, stack_name)
-    if current_name is not None and created[0] != physical_id:
-        delete_fn(physical_id, old_props)
+    replaced = created[0] != physical_id or delete_when_id_unchanged
+    if current_name is not None and replaced:
+        # Through the shared helper, so the retaining policy has one reader:
+        # a second copy of the check here is the drift _delete_predecessor
+        # exists to prevent.
+        _delete_predecessor(delete_fn, physical_id, old_props)
     return created
+
+
+def _delete_predecessor(delete_fn, *args, **kwargs):
+    """Delete the resource a handler-side replacement has just superseded,
+    unless the template retains it (an UpdateReplacePolicy in the engine's
+    retaining set): the engine then records the DELETE_SKIPPED event and the
+    predecessor stays, as on AWS. Every update handler that creates the
+    replacement itself removes the old resource through this, so the policy
+    cannot be forgotten at one site, with three exceptions. Two have a
+    deterministic generated name (the DynamoDB table and the Location
+    tracker): the replacement takes the name back, so there is nothing left
+    to retain. The third is the Lambda permission's degenerate ``Id`` branch,
+    which removes and re-puts one statement under a Sid that cannot change:
+    the physical id is kept, nothing is replaced, and the policy does not
+    apply.
+    """
+    if _RETAIN_REPLACED.get():
+        return
+    delete_fn(*args, **kwargs)
 
 
 def _update_resource(resource_type: str, physical_id: str, old_props: dict,
@@ -253,12 +752,24 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
         # still referencing it via Ref/Fn::GetAtt would then pick up the
         # instant it was reprocessed later in the same update.
         return physical_id, old_attrs or {}
+    handler = _RESOURCE_HANDLERS.get(resource_type)
+    tag_spec = _STACK_TAG_PROPERTY.get(resource_type)
+    if tag_spec and not (handler and "update" in handler):
+        # Only the tag property differs (a stack-tag change reaches every
+        # tagged resource): without an update handler the fallback below
+        # would re-create the resource under a new physical id. The tags
+        # stay as they are rather than that.
+        tag_prop = tag_spec[0]
+        if ({k: v for k, v in old_props.items() if k != tag_prop}
+                == {k: v for k, v in new_props.items() if k != tag_prop}):
+            logger.debug("Tag-only change on %s %s ignored: no update handler",
+                         resource_type, physical_id)
+            return physical_id, old_attrs or {}
     replacement_error = _custom_named_replacement_error(
         resource_type, old_props, new_props
     )
     if replacement_error:
         raise ValueError(replacement_error)
-    handler = _RESOURCE_HANDLERS.get(resource_type)
     if handler and "update" in handler:
         if handler.get("update_with_logical_id"):
             return handler["update"](
@@ -279,6 +790,138 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     # resource types make their create idempotent on that stable name;
     # real CloudFormation never presents a fresh physical id this way.
     return _provision_resource(resource_type, logical_id or physical_id, new_props, stack_name)
+
+
+# ---------------------------------------------------------------------------
+# Tags
+# ---------------------------------------------------------------------------
+
+def _tag_map(tags) -> dict:
+    """The ``{Key: Value}`` view of a CloudFormation ``Tags`` property; a map
+    (the shape SSM and API Gateway v2 use) passes through."""
+    if isinstance(tags, dict):
+        return {str(k): str(v) for k, v in tags.items()}
+    return {
+        str(t["Key"]): str(t.get("Value", ""))
+        for t in (tags or [])
+        if isinstance(t, dict) and "Key" in t
+    }
+
+
+def _reconcile_tag_map(store: dict, old_props: dict, new_props: dict,
+                       prop: str = "Tags") -> None:
+    """Apply a tag property change to a service's ``{key: value}`` tag
+    store: keys the template dropped are removed, the rest set. Tags added
+    through the service's own tagging API stay untouched, as on AWS."""
+    old_tags = _tag_map(old_props.get(prop))
+    new_tags = _tag_map(new_props.get(prop))
+    if old_tags == new_tags:
+        return
+    for key in old_tags.keys() - new_tags.keys():
+        store.pop(key, None)
+    store.update(new_tags)
+
+
+def _reconcile_tag_list(store: list, old_props: dict, new_props: dict,
+                        key: str = "Key", value: str = "Value") -> None:
+    """The list-store twin of ``_reconcile_tag_map``: entries the template
+    dropped are removed, the new ones set, entries from elsewhere kept. The
+    list is changed in place; ``key``/``value`` name the entry fields."""
+    old_tags = _tag_map(old_props.get("Tags"))
+    new_tags = _tag_map(new_props.get("Tags"))
+    if old_tags == new_tags:
+        return
+    store[:] = [
+        t for t in store
+        if t.get(key) not in old_tags and t.get(key) not in new_tags
+    ] + [{key: k, value: v} for k, v in new_tags.items()]
+
+
+# The types whose provisioner stores a tag property, with that property's name
+# and shape. Stack-level tags and the three ``aws:cloudformation:`` tags are
+# merged into the property before the resource is created or updated; a type
+# outside this table has no tag store to merge them into.
+_STACK_TAG_PROPERTY: dict[str, tuple[str, str]] = {
+    "AWS::ApiGateway::ApiKey": ("Tags", "list"),
+    "AWS::ApiGateway::DomainName": ("Tags", "list"),
+    "AWS::ApiGateway::RestApi": ("Tags", "list"),
+    "AWS::ApiGateway::Stage": ("Tags", "list"),
+    "AWS::ApiGateway::UsagePlan": ("Tags", "list"),
+    "AWS::ApiGatewayV2::Api": ("Tags", "map"),
+    "AWS::ApiGatewayV2::Stage": ("Tags", "map"),
+    "AWS::AppConfig::Application": ("Tags", "list"),
+    "AWS::AppConfig::ConfigurationProfile": ("Tags", "list"),
+    "AWS::AppConfig::Deployment": ("Tags", "list"),
+    "AWS::AppConfig::DeploymentStrategy": ("Tags", "list"),
+    "AWS::AppConfig::Environment": ("Tags", "list"),
+    "AWS::AutoScaling::AutoScalingGroup": ("Tags", "list"),
+    "AWS::Backup::BackupPlan": ("BackupPlanTags", "map"),
+    "AWS::Backup::BackupVault": ("BackupVaultTags", "map"),
+    "AWS::CertificateManager::Certificate": ("Tags", "list"),
+    "AWS::CloudFormation::Stack": ("Tags", "list"),
+    "AWS::CloudFront::Distribution": ("Tags", "list"),
+    "AWS::CloudWatch::Alarm": ("Tags", "list"),
+    "AWS::CodeBuild::Project": ("Tags", "list"),
+    "AWS::Cognito::IdentityPool": ("IdentityPoolTags", "map"),
+    "AWS::Cognito::UserPool": ("UserPoolTags", "map"),
+    "AWS::DynamoDB::Table": ("Tags", "list"),
+    "AWS::EC2::VPCEndpoint": ("Tags", "list"),
+    "AWS::ECS::Cluster": ("Tags", "list"),
+    "AWS::ECS::Service": ("Tags", "list"),
+    "AWS::EKS::Cluster": ("Tags", "list"),
+    "AWS::EKS::Nodegroup": ("Tags", "map"),
+    "AWS::ElasticLoadBalancingV2::Listener": ("Tags", "list"),
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": ("Tags", "list"),
+    "AWS::ElasticLoadBalancingV2::TargetGroup": ("Tags", "list"),
+    "AWS::Events::EventBus": ("Tags", "list"),
+    "AWS::IAM::Role": ("Tags", "list"),
+    "AWS::KMS::Key": ("Tags", "list"),
+    "AWS::Kinesis::Stream": ("Tags", "list"),
+    "AWS::Lambda::Function": ("Tags", "list"),
+    "AWS::Location::Tracker": ("Tags", "list"),
+    "AWS::Logs::LogGroup": ("Tags", "list"),
+    "AWS::OpenSearchService::Domain": ("Tags", "list"),
+    "AWS::RDS::DBInstance": ("Tags", "list"),
+    "AWS::SNS::Topic": ("Tags", "list"),
+    "AWS::SQS::Queue": ("Tags", "list"),
+    "AWS::SSM::Parameter": ("Tags", "map"),
+    "AWS::Scheduler::ScheduleGroup": ("Tags", "list"),
+    "AWS::SecretsManager::Secret": ("Tags", "list"),
+    "AWS::StepFunctions::StateMachine": ("Tags", "list"),
+}
+
+
+def _with_stack_tags(resource_type: str, props: dict, stack_tags: list,
+                     stack_name: str, stack_id: str, logical_id: str) -> dict:
+    """The properties a resource is provisioned with: the template's own tag
+    property plus the stack-level tags and the three ``aws:cloudformation:``
+    tags CloudFormation adds, for the types in ``_STACK_TAG_PROPERTY``. A key
+    the template sets wins over the stack-level tag of the same name. Returns
+    ``props`` itself for every other type, and a copy otherwise: the stack
+    record keeps the template's properties."""
+    spec = _STACK_TAG_PROPERTY.get(resource_type)
+    if spec is None:
+        return props
+    prop, shape = spec
+    extra = _tag_map(stack_tags)
+    extra["aws:cloudformation:stack-name"] = stack_name
+    extra["aws:cloudformation:stack-id"] = stack_id
+    extra["aws:cloudformation:logical-id"] = logical_id
+    own = props.get(prop)
+    if shape == "map":
+        merged = {**extra, **(own if isinstance(own, dict) else _tag_map(own))}
+    else:
+        if isinstance(own, dict):
+            own = [{"Key": key, "Value": value} for key, value in own.items()]
+        own_list = [t for t in (own or []) if isinstance(t, dict) and "Key" in t]
+        present = {t["Key"] for t in own_list}
+        merged = own_list + [
+            {"Key": key, "Value": value}
+            for key, value in extra.items() if key not in present
+        ]
+    out = dict(props)
+    out[prop] = merged
+    return out
 
 
 # ===========================================================================
@@ -379,7 +1022,7 @@ def _opensearch_domain_update(physical_id, old_props, new_props, stack_name,
             replacement_logical_id, new_props, stack_name
         )
         try:
-            _opensearch.delete_domain_record(physical_id, missing_ok=True)
+            _delete_predecessor(_opensearch.delete_domain_record, physical_id, missing_ok=True)
         except Exception:
             _opensearch.delete_domain_record(new_id, missing_ok=True)
             raise
@@ -465,6 +1108,54 @@ def _s3_apply_notification(name, notif):
         )
 
 
+# ---------------------------------------------------------------------------
+# S3 Multi-Region Access Point
+# ---------------------------------------------------------------------------
+
+def _s3_mrap_create(logical_id, props, stack_name):
+    """Provision an AWS::S3::MultiRegionAccessPoint.
+
+    On AWS this is asynchronous — `CreateMultiRegionAccessPoint` returns a
+    request token you poll — but CloudFormation hides that behind the resource,
+    and every attribute a template can read (`Alias`, `CreatedAt`) is known the
+    moment the access point exists. So it is created synchronously here.
+
+    `Regions` is a list of `{Bucket}`; the member names are kept so the data
+    plane can resolve the alias to one of them.
+    """
+    name = props.get("Name") or _physical_name(stack_name, logical_id, lowercase=True, max_len=50)
+    buckets = [
+        r.get("Bucket") for r in (props.get("Regions") or [])
+        if isinstance(r, dict) and r.get("Bucket")
+    ]
+
+    for existing in _s3._mraps.values():
+        if existing.get("Name") == name:
+            return existing["Alias"], {"Alias": existing["Alias"],
+                                       "CreatedAt": existing["CreatedAt"]}
+
+    alias = _s3.new_mrap_alias()
+    created_at = now_iso()
+    _s3._mraps[alias] = {
+        "Name": name,
+        "Alias": alias,
+        "Regions": buckets,
+        "CreatedAt": created_at,
+        "PublicAccessBlockConfiguration": props.get("PublicAccessBlockConfiguration") or {},
+    }
+    logger.info("Created MultiRegionAccessPoint %s alias=%s over %d bucket(s)",
+                name, alias, len(buckets))
+    # The physical id is the NAME (what DeleteMultiRegionAccessPoint takes);
+    # `Alias` is the attribute a distribution origin is built from.
+    return name, {"Alias": alias, "CreatedAt": created_at}
+
+
+def _s3_mrap_delete(physical_id, props):
+    for alias, record in list(_s3._mraps.items()):
+        if record.get("Name") == physical_id:
+            _s3._mraps.pop(alias, None)
+
+
 def _s3_create(logical_id, props, stack_name):
     name = props.get("BucketName") or _physical_name(stack_name, logical_id, lowercase=True, max_len=63)
     _s3._buckets.setdefault(name, {
@@ -519,10 +1210,8 @@ def _s3_update(physical_id, old_props, new_props, stack_name):
 
 def _s3_bucket_policy_create(logical_id, props, stack_name):
     bucket = props.get("Bucket", "")
-    policy = props.get("PolicyDocument")
-    if bucket and policy:
-        import json
-        _s3._bucket_policies[bucket] = json.dumps(policy) if isinstance(policy, dict) else policy
+    if bucket and props.get("PolicyDocument"):
+        _s3._bucket_policies[bucket] = _policy_document_json(props)
     return f"{bucket}-policy", {}
 
 
@@ -531,7 +1220,7 @@ def _s3_bucket_policy_update(physical_id, old_props, new_props, stack_name):
         # Bucket is create-only on AWS — the policy is replaced onto the new
         # bucket and removed from the old one.
         result = _s3_bucket_policy_create(physical_id, new_props, stack_name)
-        _s3_bucket_policy_delete(physical_id, old_props)
+        _delete_predecessor(_s3_bucket_policy_delete, physical_id, old_props)
         return result
     return _s3_bucket_policy_create(physical_id, new_props, stack_name)
 
@@ -583,7 +1272,7 @@ def _sqs_create(logical_id, props, stack_name):
         "is_fifo": is_fifo,
         "attributes": attributes,
         "messages": [],
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "dedup_cache": {},
         "fifo_seq": 0,
     }
@@ -625,6 +1314,7 @@ def _sqs_update(physical_id, old_props, new_props, stack_name, logical_id=None):
             ).lower()
         else:
             attributes.pop("ContentBasedDeduplication", None)
+    _reconcile_tag_map(queue.setdefault("tags", {}), old_props, new_props)
     attributes["LastModifiedTimestamp"] = str(int(time.time()))
     arn = attributes["QueueArn"]
     return physical_id, {"Arn": arn, "QueueName": name, "QueueUrl": physical_id}
@@ -675,7 +1365,7 @@ def _sns_create(logical_id, props, stack_name):
         },
         "subscriptions": [],
         "messages": [],
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
     }
 
     # Handle Subscription property. The private _cfn_inline marker is what
@@ -719,6 +1409,7 @@ def _sns_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     if replaced is not None:
         return replaced
     topic["attributes"]["DisplayName"] = new_props.get("DisplayName", name)
+    _reconcile_tag_map(topic.setdefault("tags", {}), old_props, new_props)
     # Reconcile the template-inline subscriptions by (Protocol, Endpoint).
     # Only records carrying the _cfn_inline marker are eligible for removal:
     # a standalone AWS::SNS::Subscription resource (or a plain Subscribe call)
@@ -760,6 +1451,42 @@ def _sns_delete(physical_id, props):
 
 # --- SNS Subscription (standalone) ---
 
+# The properties of the type that are subscription attributes, with the value
+# the create stores when the template leaves the property out. They are the
+# No-interruption properties of the resource reference
+# (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-sns-subscription.html),
+# minus ReplayPolicy, which the service does not store.
+_SNS_SUBSCRIPTION_ATTRIBUTE_DEFAULTS = {
+    "DeliveryPolicy": "",
+    "FilterPolicy": "",
+    "FilterPolicyScope": "MessageAttributes",
+    "RawMessageDelivery": False,
+    "RedrivePolicy": "",
+    "SubscriptionRoleArn": "",
+}
+
+# The properties whose change replaces the subscription (Update requires:
+# Replacement on the resource reference).
+_SNS_SUBSCRIPTION_IDENTITY = ("TopicArn", "Protocol", "Endpoint")
+
+
+def _sns_sub_attributes(props):
+    """The subscription attributes ``props`` declares, as the strings the
+    service stores: a JSON property rendered, RawMessageDelivery normalised
+    to ``true``/``false``."""
+    attrs = {}
+    for name in _SNS_SUBSCRIPTION_ATTRIBUTE_DEFAULTS:
+        if name not in props:
+            continue
+        value = props[name]
+        if name == "RawMessageDelivery":
+            value = "true" if (value is True or str(value).lower() == "true") else "false"
+        elif isinstance(value, (dict, list)):
+            value = json.dumps(value)
+        attrs[name] = "" if value is None else str(value)
+    return attrs
+
+
 def _sns_sub_create(logical_id, props, stack_name):
     topic_arn = props.get("TopicArn", "")
     protocol = props.get("Protocol", "")
@@ -770,8 +1497,12 @@ def _sns_sub_create(logical_id, props, stack_name):
         return sub_arn, {"SubscriptionArn": sub_arn}
 
     sub_arn = f"{topic_arn}:{new_uuid()}"
-    raw = props.get("RawMessageDelivery", False)
-    raw_str = "true" if (raw is True or str(raw).lower() == "true") else "false"
+    attributes = {
+        "FilterPolicyScope": "MessageAttributes",
+        "FilterPolicy": "",
+        "RawMessageDelivery": "false",
+    }
+    attributes.update(_sns_sub_attributes(props))
     sub = {
         "arn": sub_arn,
         "topic_arn": topic_arn,
@@ -779,19 +1510,46 @@ def _sns_sub_create(logical_id, props, stack_name):
         "endpoint": endpoint,
         "confirmed": protocol not in ("http", "https"),
         "owner": get_account_id(),
-        "attributes": {
-            "FilterPolicyScope": props.get("FilterPolicyScope", "MessageAttributes"),
-            "FilterPolicy": (
-                json.dumps(props.get("FilterPolicy"))
-                if isinstance(props.get("FilterPolicy"), (dict, list))
-                else (props.get("FilterPolicy", "") or "")
-            ),
-            "RawMessageDelivery": raw_str,
-        },
+        "attributes": attributes,
     }
     topic["subscriptions"].append(sub)
     _sns._sub_arn_to_topic[sub_arn] = topic_arn
     return sub_arn, {"SubscriptionArn": sub_arn}
+
+
+def _sns_sub_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a subscription in place through SetSubscriptionAttributes,
+    keeping its ARN, for the No-interruption properties of the resource
+    reference (DeliveryPolicy, FilterPolicy, FilterPolicyScope,
+    RawMessageDelivery, RedrivePolicy, SubscriptionRoleArn). A property the
+    template drops reverts to what the create stores without it. TopicArn,
+    Protocol and Endpoint require replacement: the new subscription is
+    created before the old one is removed, so the ARN changes there, as on
+    AWS. Region (Some interruptions) and ReplayPolicy are not stored by the
+    service and are ignored."""
+    topic_arn = _sns._sub_arn_to_topic.get(physical_id, "")
+    sub = _sns._find_subscription(topic_arn, physical_id) if topic_arn else None
+    identity = tuple(new_props.get(key, "") for key in _SNS_SUBSCRIPTION_IDENTITY)
+    current = (sub["topic_arn"], sub["protocol"], sub["endpoint"]) if sub else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        identity, current, _sns_sub_create, _sns_sub_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    attributes = _sns_sub_attributes(
+        _declared_or_default(old_props, new_props, _SNS_SUBSCRIPTION_ATTRIBUTE_DEFAULTS)
+    )
+    for name, value in attributes.items():
+        resp = _sns._set_subscription_attributes({
+            "SubscriptionArn": physical_id,
+            "AttributeName": name,
+            "AttributeValue": value,
+        })
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::SNS::Subscription update failed: {resp[2]!r}")
+    return physical_id, {"SubscriptionArn": physical_id}
 
 
 def _sns_sub_delete(physical_id, props):
@@ -859,6 +1617,10 @@ def _ddb_create(logical_id, props, stack_name):
         "Tags": [],
     }
     _dynamodb._tables[name] = table
+    if props.get("Tags"):
+        _dynamodb._tags[arn] = [
+            {"Key": k, "Value": v} for k, v in _tag_map(props["Tags"]).items()
+        ]
 
     attrs = {"Arn": arn}
     if stream_arn:
@@ -906,8 +1668,17 @@ def _ddb_update(physical_id, old_props, new_props, stack_name, logical_id=None):
                 f"resource requires replacing. Rename {name} and update the "
                 "stack again."
             )
+        # Not routed through _delete_predecessor: the emulator's generated
+        # name is deterministic, so the table comes back under the same name
+        # and the old one is lost even under UpdateReplacePolicy Retain (AWS
+        # would mint a new name and keep the old table). AWS::Location::Tracker
+        # is the other type with that shape and is left alone for the same
+        # reason.
         _ddb_delete(physical_id, old_props)
         return _ddb_create(logical_id or physical_id, new_props, stack_name)
+
+    _reconcile_tag_list(
+        _dynamodb._tags.setdefault(table["TableArn"], []), old_props, new_props)
 
     data = {"TableName": name}
     old_billing = old_props.get("BillingMode", "PROVISIONED")
@@ -1093,7 +1864,7 @@ def _lambda_create(logical_id, props, stack_name):
         "code_s3_object_version": code.get("S3ObjectVersion"),
         "versions": {},
         "next_version": 1,
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
         "event_invoke_config": None,
         "event_invoke_configs": {},
@@ -1201,6 +1972,7 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     resp = _lambda_svc._update_config(name, config_data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::Lambda::Function configuration update failed: {resp[2]!r}")
+    _reconcile_tag_map(func.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": func["config"]["FunctionArn"]}
 
 
@@ -1253,7 +2025,7 @@ def _lambda_url_update(physical_id, old_props, new_props, stack_name):
         for key in ("TargetFunctionArn", "Qualifier")
     ):
         new_id, attrs = _lambda_url_create(physical_id, new_props, stack_name)
-        _lambda_url_delete(physical_id, old_props)
+        _delete_predecessor(_lambda_url_delete, physical_id, old_props)
         return new_id, attrs
 
     _func, func_name, qualifier = _lambda_url_target(new_props)
@@ -1414,10 +2186,16 @@ def _attach_policy_to_entities(arn, props):
                 _iam.attach_managed_policy(entity, arn)
 
 
+def _iam_policy_arn(props, name):
+    """The ARN MiniStack keys an AWS::IAM::Policy record by. Derived from the
+    name, so create and rename must agree on it."""
+    return f"arn:aws:iam::{get_account_id()}:policy{props.get('Path', '/')}{name}"
+
+
 def _iam_policy_create(logical_id, props, stack_name):
     name = props.get("PolicyName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = f"arn:aws:iam::{get_account_id()}:policy{path}{name}"
+    arn = _iam_policy_arn(props, name)
     pol_doc = props.get("PolicyDocument", {})
     if isinstance(pol_doc, dict):
         pol_doc = json.dumps(pol_doc)
@@ -1433,43 +2211,161 @@ def _iam_policy_create(logical_id, props, stack_name):
     return name, {"Id": record["PolicyId"]}
 
 
-def _iam_policy_delete(physical_id, props):
-    # The physical id is the policy name (what Ref returns), so find the record
-    # by name. Older stacks stored the ARN as the physical id; popping that
-    # first keeps them deletable.
-    if _iam._policies.pop(physical_id, None) is not None:
-        return
-    for arn, policy in list(_iam._policies.items()):
+def _iam_policy_record(physical_id):
+    """Find the record behind an AWS::IAM::Policy physical id. The physical id
+    is the policy name (what Ref returns); older stacks stored the ARN."""
+    record = _iam._policies.get(physical_id)
+    if record is not None:
+        return physical_id, record
+    for arn, policy in _iam._policies.items():
         if policy.get("PolicyName") == physical_id:
-            _iam._policies.pop(arn, None)
-            return
+            return arn, policy
+    return None, None
+
+
+def _iam_policy_set_document(arn, record, document, resource_type):
+    """A new PolicyDocument becomes a new default policy version through the
+    IAM module's own CreatePolicyVersion (pruning the oldest non-default
+    version at the five-version cap first, like the CFN handler), so the
+    policy id, the creation date and the attachments stay. Shared by the
+    inline and the managed policy handlers."""
+    versions = record["Versions"]
+    surplus = len(versions) - _IAM_POLICY_VERSION_LIMIT + 1
+    if surplus > 0:
+        prunable = sorted(
+            (v["VersionId"] for v in versions.values() if not v["IsDefaultVersion"]),
+            key=lambda vid: int(vid.lstrip("v")),
+        )
+        for version_id in prunable[:surplus]:
+            _iam._delete_policy_version({"PolicyArn": arn, "VersionId": version_id})
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    resp = _iam._create_policy_version({
+        "PolicyArn": arn,
+        "PolicyDocument": document,
+        "SetAsDefault": "true",
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"{resource_type} update failed: {resp[2]!r}")
+
+
+def _iam_policy_reconcile_entities(arn, old_props, new_props):
+    """Attach the policy to the Roles / Users / Groups the new template names
+    and detach it from the ones the old template named, through the IAM
+    helpers so AttachmentCount stays in step. Shared by the inline and the
+    managed policy handlers."""
+    for prop, store in (("Roles", _iam._roles),
+                        ("Users", _iam._users),
+                        ("Groups", _iam._groups)):
+        old_names = set(old_props.get(prop, []) or [])
+        new_names = set(new_props.get(prop, []) or [])
+        for entity_name in sorted(old_names - new_names):
+            entity = store.get(entity_name)
+            if entity is not None:
+                _iam.detach_managed_policy(entity, arn)
+        for entity_name in sorted(new_names - old_names):
+            entity = store.get(entity_name)
+            if entity is not None:
+                _iam.attach_managed_policy(entity, arn)
+
+
+def _iam_policy_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an inline policy in place, as PutRolePolicy / PutUserPolicy /
+    PutGroupPolicy do on AWS: every property of AWS::IAM::Policy, PolicyName
+    included, updates with no interruption
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-policy.html).
+    A new PolicyDocument becomes the default version under the same policy
+    id, the Roles / Users / Groups lists reconcile through attach/detach,
+    and a new PolicyName re-keys the record (MiniStack keys it by an ARN
+    derived from the name) with its id, versions and attachments intact;
+    Ref follows the new name, as it does on AWS.
+    """
+    name = new_props.get("PolicyName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128
+    )
+    arn, record = _iam_policy_record(physical_id)
+    if record is None:
+        return _iam_policy_create(logical_id or physical_id, new_props, stack_name)
+
+    new_arn = _iam_policy_arn(new_props, name)
+    if new_arn != arn or name != record.get("PolicyName"):
+        _iam.rename_policy(arn, new_arn, name)
+        arn = new_arn
+
+    if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
+        _iam_policy_set_document(
+            arn, record, new_props.get("PolicyDocument", {}), "AWS::IAM::Policy"
+        )
+    _iam_policy_reconcile_entities(arn, old_props, new_props)
+    return name, {"Id": record["PolicyId"]}
+
+
+def _iam_policy_remove(arn, props):
+    """Detach the policy from every Role / User / Group the template named,
+    through the IAM helpers so AttachmentCount follows, then drop the
+    record. Shared by the inline and the managed policy delete handlers."""
+    _iam_policy_reconcile_entities(arn, props, {})
+    _iam._policies.pop(arn, None)
+
+
+def _iam_policy_delete(physical_id, props):
+    arn, _record = _iam_policy_record(physical_id)
+    if arn is not None:
+        _iam_policy_remove(arn, props)
 
 
 # --- IAM InstanceProfile ---
 
+def _iam_ip_roles(props):
+    """The role names of the Roles property that exist, the shape the
+    service keeps on the record (its XML resolves them against the role
+    store); a role the template names that does not exist is skipped."""
+    return [rname for rname in props.get("Roles", []) if rname in _iam._roles]
+
+
 def _iam_ip_create(logical_id, props, stack_name):
     name = props.get("InstanceProfileName") or _physical_name(stack_name, logical_id, max_len=128)
     path = props.get("Path", "/")
-    arn = f"arn:aws:iam::{get_account_id()}:instance-profile{path}{name}"
-    ip_id = new_uuid().replace("-", "")[:21].upper()
+    # A generated name is the emulator's deterministic one, so a replacement
+    # lands under the same name (AWS would mint a new one) and must not be
+    # refused; a custom name goes through CreateInstanceProfile as it is, and
+    # its EntityAlreadyExists keeps one stack from writing over a profile
+    # another stack or the API owns.
+    if not props.get("InstanceProfileName"):
+        _iam._instance_profiles.pop(name, None)
+    resp = _iam._create_instance_profile({"InstanceProfileName": [name], "Path": [path]})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IAM::InstanceProfile create failed: {resp[2]!r}")
+    profile = _iam._instance_profiles[name]
+    profile["Roles"] = _iam_ip_roles(props)
+    return profile["Arn"], {"Arn": profile["Arn"]}
 
-    roles = []
-    for rname in props.get("Roles", []):
-        role = _iam._roles.get(rname)
-        if role:
-            roles.append(role)
 
-    profile = {
-        "InstanceProfileName": name,
-        "InstanceProfileId": ip_id,
-        "Arn": arn,
-        "Path": path,
-        "Roles": roles,
-        "CreateDate": now_iso(),
-        "Tags": [],
-    }
-    _iam._instance_profiles[name] = profile
-    return arn, {"Arn": arn}
+def _iam_ip_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an instance profile in place: Roles is No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iam-instanceprofile.html),
+    so the role list is replaced on the record, which keeps its ARN, id,
+    creation date and the tags set through TagInstanceProfile (the create
+    rebuilt the record with no tags). InstanceProfileName and Path require
+    replacement: the profile under the new ARN is created before the old
+    one is removed; a custom-named profile whose Path changes was already
+    refused by _custom_named_replacement_error, as CloudFormation refuses
+    to replace a custom-named resource."""
+    name = new_props.get("InstanceProfileName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128)
+    profile = next(
+        (ip for ip in _iam._instance_profiles.values() if ip.get("Arn") == physical_id), None)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _iam.instance_profile_arn(name, new_props.get("Path", "/")),
+        profile["Arn"] if profile else None,
+        _iam_ip_create, _iam_ip_delete,
+    )
+    if replaced is not None:
+        return replaced
+    profile["Roles"] = _iam_ip_roles(new_props)
+    return physical_id, {"Arn": physical_id}
 
 
 def _iam_ip_delete(physical_id, props):
@@ -1548,16 +2444,22 @@ def _ssm_update(physical_id, old_props, new_props, stack_name):
             raise ValueError(f"AWS::SSM::Parameter replace failed: {body!r}")
         # Drop the old parameter through the SSM path so its history and tags go
         # with it (a bare store pop orphaned both).
-        _ssm._delete_parameter({"Name": physical_id})
+        _delete_predecessor(_ssm._delete_parameter, {"Name": physical_id})
         return new_name, _ssm_attrs(new_name, data)
     # Every other property is No interruption: overwrite in place through
     # PutParameter, so Version increments and history grows (a bare store write
     # pinned Version at 1 forever).
     data = _ssm_put_data(physical_id, new_props)
     data["Overwrite"] = True
+    # PutParameter replaces the parameter's tag set; reconcile it instead so
+    # tags added through AddTagsToResource stay.
+    data.pop("Tags", None)
     status, _headers, body = _ssm._put_parameter(data)
     if status >= 400:
         raise ValueError(f"AWS::SSM::Parameter update failed: {body!r}")
+    _reconcile_tag_map(
+        _ssm._tags.setdefault(_ssm._param_arn(physical_id), {}), old_props, new_props
+    )
     return physical_id, _ssm_attrs(physical_id, data)
 
 
@@ -1824,7 +2726,11 @@ def _cwlogs_create(logical_id, props, stack_name):
         "arn": arn,
         "creationTime": int(time.time() * 1000),
         "retentionInDays": int(retention) if retention else None,
-        "tags": {},
+        # DescribeLogGroups reports the class on every group; the API's
+        # default when the template names none is STANDARD.
+        "logGroupClass": props.get("LogGroupClass") or "STANDARD",
+        "kmsKeyId": props.get("KmsKeyId") or None,
+        "tags": _tag_map(props.get("Tags")),
         "streams": {},
         "subscriptionFilters": {},
     }
@@ -1846,6 +2752,11 @@ def _cwlogs_update(physical_id, old_props, new_props, stack_name, logical_id=Non
         return replaced
     retention = new_props.get("RetentionInDays")
     group["retentionInDays"] = int(retention) if retention else None
+    # LogGroupClass and KmsKeyId are Mutable on the resource reference; the
+    # API refuses a class change after creation, so the record keeps the one
+    # it was created with and only the key moves.
+    group["kmsKeyId"] = new_props.get("KmsKeyId") or None
+    _reconcile_tag_map(group.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": group["arn"]}
 
 
@@ -1874,6 +2785,20 @@ def _cwlogs_resource_policy_delete(physical_id, props):
 
 # --- CloudWatch Logs SubscriptionFilter (#896) ---
 
+def _cwlogs_subfilter_payload(group, filter_name, props):
+    """The PutSubscriptionFilter request a template's properties describe.
+    PutSubscriptionFilter creates or updates, so the create and the
+    in-place update send the same mapping through the same service call."""
+    return {
+        "logGroupName": group,
+        "filterName": filter_name,
+        "filterPattern": props.get("FilterPattern", ""),
+        "destinationArn": props.get("DestinationArn", ""),
+        "roleArn": props.get("RoleArn", ""),
+        "distribution": props.get("Distribution", "ByLogStream"),
+    }
+
+
 def _cwlogs_subfilter_create(logical_id, props, stack_name):
     group = props.get("LogGroupName")
     if not group:
@@ -1892,16 +2817,53 @@ def _cwlogs_subfilter_create(logical_id, props, stack_name):
             "streams": {},
             "subscriptionFilters": {},
         }
-    grp.setdefault("subscriptionFilters", {})[filter_name] = {
-        "filterName": filter_name,
-        "logGroupName": group,
-        "filterPattern": props.get("FilterPattern", ""),
-        "destinationArn": props.get("DestinationArn", ""),
-        "roleArn": props.get("RoleArn", ""),
-        "distribution": props.get("Distribution", "ByLogStream"),
-        "creationTime": int(time.time() * 1000),
-    }
+    resp = _cw_logs._put_subscription_filter(_cwlogs_subfilter_payload(group, filter_name, props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::SubscriptionFilter create failed: {resp[2]!r}")
     return filter_name, {}
+
+
+def _cwlogs_subfilter_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a subscription filter in place through PutSubscriptionFilter,
+    keeping its name (what Ref returns), for the No-interruption properties
+    of the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-logs-subscriptionfilter.html):
+    FilterPattern, DestinationArn, RoleArn and Distribution. The record is
+    put whole, so a property the template drops reverts to what the create
+    stores without it (empty pattern and role, ByLogStream). FilterName and
+    LogGroupName require replacement: the new filter is created before the
+    old one is removed.
+
+    The replacement is spelled out rather than going through
+    _rename_replacement, because a filter is keyed by (group, name): a move
+    to another group under the same name keeps the physical id, so the
+    engine records no replacement and the helper would see none either,
+    leaving the old filter behind in the old group. ApplyOnTransformedLogs,
+    EmitSystemFields and FieldSelectionCriteria are not stored by the
+    service and are ignored.
+    """
+    old_group = old_props.get("LogGroupName")
+    new_group = new_props.get("LogGroupName")
+    if not new_group:
+        raise ValueError("AWS::Logs::SubscriptionFilter requires LogGroupName")
+    filter_name = new_props.get("FilterName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=512)
+    grp = _cw_logs._log_groups.get(old_group)
+    current = grp.get("subscriptionFilters", {}).get(physical_id) if grp else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_group, filter_name), (old_group, physical_id) if current else None,
+        _cwlogs_subfilter_create, _cwlogs_subfilter_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
+
+    resp = _cw_logs._put_subscription_filter(
+        _cwlogs_subfilter_payload(new_group, physical_id, new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Logs::SubscriptionFilter update failed: {resp[2]!r}")
+    return physical_id, {}
 
 
 def _cwlogs_subfilter_delete(physical_id, props):
@@ -1916,7 +2878,8 @@ def _eb_rule_create(logical_id, props, stack_name):
     name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=64)
     bus = props.get("EventBusName", "default")
     key = _eb._rule_key(name, bus)
-    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:rule/{bus}/{name}"
+    # The service's own ARN shape: a default-bus rule has no bus segment.
+    arn = _eb._rule_arn(name, bus)
 
     _eb._rules[key] = {
         "Name": name,
@@ -1934,14 +2897,100 @@ def _eb_rule_create(logical_id, props, stack_name):
     for t in targets:
         _eb._targets[key].append(t)
 
-    return name, {"Arn": arn}
+    _eb_rule_apply_tags(arn, [], props.get("Tags") or [])
+    return name, {"Arn": arn, "RuleName": name}
+
+
+def _eb_rule_apply_tags(arn, old_tags, new_tags):
+    """Reconcile the template's tags on a rule through TagResource /
+    UntagResource: a key the template dropped is removed, the declared ones
+    are written, and a tag added outside the stack is left alone.
+    """
+    declared = {t["Key"] for t in new_tags}
+    dropped = sorted({t["Key"] for t in old_tags} - declared)
+    if dropped:
+        _eb._untag_resource({"ResourceARN": arn, "TagKeys": dropped})
+    if new_tags:
+        resp = _eb._tag_resource({"ResourceARN": arn, "Tags": new_tags})
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::Events::Rule TagResource failed: {resp[2]!r}")
+
+
+def _eb_rule_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a rule in place through PutRule / PutTargets / RemoveTargets, so
+    the rule keeps its name and ARN and any target added outside the
+    template survives. Name is the one create-only property
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-events-rule.html):
+    a rename is a replacement, the new rule created before the old one is
+    removed. EventBusName updates with "some interruptions": the rule moves
+    to the other bus under the same name, carrying its targets and tags
+    along. Tags update without interruption: the template's tag set is
+    reconciled the same way the targets are.
+    """
+    name = new_props.get("Name") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=64
+    )
+    old_bus = old_props.get("EventBusName", "default")
+    new_bus = new_props.get("EventBusName", "default")
+    old_key = _eb._rule_key(physical_id, old_bus)
+    rule = _eb._rules.get(old_key)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, rule.get("Name") if rule else None, _eb_rule_create, _eb_rule_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    _eb._ensure_default_bus()
+    pattern = new_props.get("EventPattern", "")
+    resp = _eb._put_rule({
+        "Name": name,
+        "EventBusName": new_bus,
+        "State": new_props.get("State", "ENABLED"),
+        "Description": new_props.get("Description", ""),
+        "ScheduleExpression": new_props.get("ScheduleExpression", ""),
+        "EventPattern": json.dumps(pattern) if isinstance(pattern, dict) else pattern,
+        "RoleArn": new_props.get("RoleArn", ""),
+    })
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Events::Rule update failed: {resp[2]!r}")
+    new_key = _eb._rule_key(name, new_bus)
+    if new_bus != old_bus:
+        # PutRule accepted the new bus, so the rule exists there now: the
+        # old record goes, and its targets (the template's and any added
+        # outside the stack, reconciled below) and tags move over. A move
+        # onto a bus that does not exist fails above, leaving the rule as
+        # it was.
+        old_rule = _eb._rules.pop(old_key, None) or {}
+        _eb._targets[new_key] = list(_eb._targets.pop(old_key, []))
+        if old_rule.get("Arn") in _eb._tags:
+            _eb._tags[_eb._rules[new_key]["Arn"]] = _eb._tags.pop(old_rule["Arn"])
+
+    old_ids = {t.get("Id") for t in old_props.get("Targets", []) or []}
+    new_targets = new_props.get("Targets", []) or []
+    new_ids = {t.get("Id") for t in new_targets}
+    if old_ids - new_ids:
+        _eb._remove_targets({
+            "Rule": name, "EventBusName": new_bus, "Ids": sorted(old_ids - new_ids),
+        })
+    if new_targets:
+        resp = _eb._put_targets({
+            "Rule": name, "EventBusName": new_bus, "Targets": new_targets,
+        })
+        if resp[0] >= 400:
+            raise ValueError(f"AWS::Events::Rule PutTargets failed: {resp[2]!r}")
+    arn = _eb._rules[new_key]["Arn"]
+    _eb_rule_apply_tags(arn, old_props.get("Tags") or [], new_props.get("Tags") or [])
+    return name, {"Arn": arn, "RuleName": name}
 
 
 def _eb_rule_delete(physical_id, props):
     bus = props.get("EventBusName", "default")
     key = _eb._rule_key(physical_id, bus)
-    _eb._rules.pop(key, None)
+    rule = _eb._rules.pop(key, None)
     _eb._targets.pop(key, None)
+    if rule:
+        _eb._tags.pop(rule["Arn"], None)
 
 
 # --- IoT Topic Rule (AWS::IoT::TopicRule) ---
@@ -2086,7 +3135,7 @@ def _eks_nodegroup_create(logical_id, props, stack_name):
         "amiType": props.get("AmiType", "AL2_x86_64"),
         "diskSize": props.get("DiskSize", 20),
         "labels": props.get("Labels", {}),
-        "tags": {t["Key"]: t["Value"] for t in props.get("Tags", [])},
+        "tags": _tag_map(props.get("Tags")),
     }
     _eks._create_nodegroup(cluster_name, body)
     key = f"{cluster_name}/{ng_name}"
@@ -2153,7 +3202,7 @@ def _kinesis_stream_create(logical_id, props, stack_name):
         "StreamModeDetails": {"StreamMode": stream_mode},
         "RetentionPeriodHours": retention,
         "shards": _kinesis._build_shards(shard_count),
-        "tags": {},
+        "tags": _tag_map(props.get("Tags")),
         "CreationTimestamp": int(time.time()),
         "EncryptionType": "NONE",
     }
@@ -2195,31 +3244,101 @@ def _lambda_function_for_cfn_ref(function_ref: str) -> tuple[dict | None, str, s
     return func, name, resource_arn, qualifier
 
 
+# Every property of the type, all create-only
+# (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html),
+# forwarded to AddPermission under the same names.
+_LAMBDA_PERMISSION_PROPERTIES = (
+    "Action",
+    "Principal",
+    "SourceArn",
+    "SourceAccount",
+    "PrincipalOrgID",
+    "FunctionUrlAuthType",
+    "InvokedViaFunctionUrl",
+    "EventSourceToken",
+)
+
+
+def _lambda_permission_sids(props, logical_id, physical_id):
+    """The candidate Sids a permission resource may have written.
+
+    An explicit ``Id`` (ministack-legacy property, not on the AWS reference)
+    is the Sid verbatim. Otherwise the Sid is the generated physical id, the
+    shape real CloudFormation mints (``<stack>-<LogicalId>-XXXXXXXX``); the
+    bare logical id is kept as a fallback candidate so stacks persisted by
+    earlier releases (whose default Sid was the logical id) still delete
+    their statement.
+    """
+    if props.get("Id"):
+        return [props["Id"]]
+    return [sid for sid in (physical_id, logical_id) if sid]
+
+
 def _lambda_permission_create(logical_id, props, stack_name):
-    func, _func_name, resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
-    if func:
-        stmt = {
-            "Sid": props.get("Id") or logical_id,
-            "Effect": "Allow",
-            "Principal": props.get("Principal", "*"),
-            "Action": props.get("Action", "lambda:InvokeFunction"),
-            "Resource": resource_arn,
-        }
-        source_arn = props.get("SourceArn")
-        if source_arn:
-            stmt["Condition"] = {"ArnLike": {"AWS:SourceArn": source_arn}}
-        func["policy"]["Statement"].append(stmt)
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    func, func_name, _resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
+    if func:
+        # Real CloudFormation generates the statement id — it is the
+        # resource's physical id, unique per instance, which is what lets a
+        # replacement's predecessor be deleted by Sid without touching the
+        # successor. ``Id`` overrides it for templates written against
+        # earlier MiniStack releases.
+        data = {"StatementId": props.get("Id") or pid, "Principal": "*"}
+        data.update({key: props[key] for key in _LAMBDA_PERMISSION_PROPERTIES if props.get(key) is not None})
+        status, _headers, body = _lambda_svc._add_permission(func_name, data, path_qualifier=qualifier)
+        if status >= 400:
+            raise ValueError(
+                f"AWS::Lambda::Permission AddPermission failed: {body.decode() if isinstance(body, bytes) else body}"
+            )
     return pid, {}
 
 
-def _lambda_permission_delete(physical_id, props):
-    func, _func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
+def _lambda_permission_remove_statement(props, sids):
+    func, func_name, _resource_arn, qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     if func:
-        sid = props.get("Id") or ""
-        func["policy"]["Statement"] = [
-            s for s in func["policy"]["Statement"] if s.get("Sid") != sid
-        ]
+        # A statement already gone (removed by hand, or the function policy
+        # rewritten) is nothing to fail a stack delete over.
+        for sid in sids:
+            _lambda_svc._remove_permission(func_name, sid, {}, path_qualifier=qualifier)
+
+
+def _lambda_permission_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Every AWS::Lambda::Permission property requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-permission.html),
+    so any change is AddPermission under a fresh physical id followed by
+    RemovePermission of the old statement, the order CloudFormation replaces
+    in, unless the template retains the old one. The fresh generated Sid is
+    what keeps the engine's predecessor cleanup (which deletes by the OLD
+    resource's Sid) and the rollback of a failed later resource (which
+    deletes by the NEW one) on their own statements.
+
+    The one degenerate case is an explicit legacy ``Id`` that names the Sid
+    the old resource wrote: the Sid then cannot change, AddPermission would
+    refuse the duplicate, so the statement is removed and re-put under it and
+    the physical id is kept (not a replacement). That is the FIRST candidate
+    only, the Sid the old resource actually used; the second is the
+    persisted-by-an-earlier-release fallback, and a new ``Id`` naming it is a
+    real Sid change and so a real replacement.
+    """
+    old_sids = _lambda_permission_sids(old_props, logical_id, physical_id)
+    if new_props.get("Id") and old_sids and new_props["Id"] == old_sids[0]:
+        # The Sid cannot change, so the statement is re-put under it and the
+        # physical id is kept: not a replacement.
+        _lambda_permission_remove_statement(old_props, old_sids)
+        _new_pid, attrs = _lambda_permission_create(logical_id or physical_id, new_props, stack_name)
+        return physical_id, attrs
+    new_pid, attrs = _lambda_permission_create(logical_id or physical_id, new_props, stack_name)
+    _delete_predecessor(_lambda_permission_remove_statement, old_props, old_sids)
+    return new_pid, attrs
+
+
+def _lambda_permission_delete(physical_id, props, logical_id=None):
+    # The Sid candidates mirror create exactly (explicit Id, the generated
+    # physical id, or the pre-upgrade logical-id default), so the statement
+    # this resource added is removed — on stack delete, on the engine's
+    # predecessor cleanup after a replacement, and on the rollback of one.
+    _lambda_permission_remove_statement(
+        props, _lambda_permission_sids(props, logical_id, physical_id))
 
 
 # --- Lambda Version ---
@@ -2263,19 +3382,86 @@ def _lambda_version_delete(physical_id, props):
         func["versions"].pop(version, None)
 
 
-# --- CloudFormation WaitCondition / WaitConditionHandle (no-ops) ---
+# --- CloudFormation WaitCondition / WaitConditionHandle ---
+
+def _cfn_wait_condition_definition(stack_name: str, logical_id: str) -> dict:
+    """The resource definition as the running operation sees it: the stack
+    record's ``_template_body`` is the template being deployed (create,
+    update and change-set execution set it before the run starts)."""
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation.engine import _parse_template
+    stack = _stacks.get(stack_name) or {}
+    template = None
+    body = stack.get("_template_body")
+    if body:
+        try:
+            template = _parse_template(body)
+        except Exception:
+            template = None
+    if not isinstance(template, dict):
+        template = stack.get("_template") or {}
+    res_def = (template.get("Resources") or {}).get(logical_id) or {}
+    return res_def if isinstance(res_def, dict) else {}
+
 
 def _cfn_wait_condition_create(logical_id, props, stack_name):
-    """WaitCondition — no-op, return immediately (no real signalling in local emulation)."""
+    """WaitCondition: block the stack until ``Count`` SUCCESS signals arrived,
+    a FAILURE signal arrived, or the timeout passed. With a ``CreationPolicy``
+    the signals come through SignalResource only; otherwise through the
+    handle's URL (and SignalResource). Runs on a worker thread (see
+    ``_is_custom_resource`` in stacks.py)."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    stack_id = _cr_stack_id(stack_name)
+    res_def = _cfn_wait_condition_definition(stack_name, logical_id)
+    if "CreationPolicy" in res_def:
+        creation_policy = res_def.get("CreationPolicy")
+        if not isinstance(creation_policy, dict):
+            raise ValueError(f"WaitCondition {logical_id!r}: CreationPolicy must be an object")
+        signal = creation_policy.get("ResourceSignal")
+        if signal is None:
+            signal = {}
+        if not isinstance(signal, dict):
+            raise ValueError(f"WaitCondition {logical_id!r}: CreationPolicy ResourceSignal must be an object")
+        count = _wc.validate_count(signal.get("Count"), logical_id)
+        timeout_s = _wc.validate_resource_signal_timeout(signal.get("Timeout"), logical_id)
+        token = _wc.register_slot(stack_id)
+    else:
+        token = _wc.token_from_url(props.get("Handle"))
+        if token is None or _wc.handle_owner(token) != stack_id:
+            raise ValueError(
+                f"WaitCondition {logical_id!r}: Handle must be the Ref of an "
+                "AWS::CloudFormation::WaitConditionHandle of this stack"
+            )
+        if props.get("Timeout") in (None, ""):
+            raise ValueError(f"WaitCondition {logical_id!r}: Timeout is required")
+        count = _wc.validate_count(props.get("Count"), logical_id)
+        timeout_s = _wc.validate_timeout_seconds(props.get("Timeout"), logical_id)
+    data = _wc.wait_for(token, stack_id, stack_name, logical_id,
+                        "AWS::CloudFormation::WaitCondition", count, timeout_s)
     pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {"Data": "{}"}
+    attrs = {"Data": json.dumps(data), "Id": pid}
+    _wc.remember_result(pid, attrs)
+    return pid, attrs
+
+
+def _cfn_wait_condition_update(physical_id, old_props, new_props, stack_name):
+    """Updates are not supported on AWS; the resource keeps its id and data."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    return physical_id, _wc.recall_result(physical_id) or {"Data": "{}", "Id": physical_id}
 
 
 def _cfn_wait_condition_handle_create(logical_id, props, stack_name):
-    """WaitConditionHandle — no-op, return a presigned-style URL."""
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    url = f"https://cloudformation-waitcondition-{get_region()}.s3.amazonaws.com/{pid}"
-    return pid, {"Ref": url}
+    """WaitConditionHandle: the physical id (and ``Ref``) is the URL a signal
+    is PUT to, served under ``/_ministack/cfn-signal/``; ``Id`` is its token."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    url, token = _wc.register_handle(_cr_stack_id(stack_name))
+    return url, {"Ref": url, "Id": token}
+
+
+def _cfn_wait_condition_handle_delete(physical_id, props):
+    """Forget the handle: a later PUT to its URL is a 404."""
+    from ministack.services.cloudformation import wait_conditions as _wc
+    _wc.discard_handle(physical_id)
 
 
 def _cfn_noop_delete(physical_id, props):
@@ -2285,6 +3471,46 @@ def _cfn_noop_delete(physical_id, props):
 
 
 # --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
+
+def _check_nested_stack_capabilities(parent_stack_name, template):
+    """Refuse a nested stack's template whose IAM resources the parent did
+    not acknowledge. AWS asks for the capabilities on the parent ("For nested
+    stacks that contain IAM resources, you must acknowledge IAM capabilities",
+    using-cfn-nested-stacks), so the set the parent stored covers the child
+    and, through the child's own record, every level below it. Like the
+    parent's check this runs under AUTH=true only, and it reads the IAM
+    rule alone: whether a child template's own Transform needs
+    CAPABILITY_AUTO_EXPAND on the parent is not modelled here.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return
+    from ministack.services.cloudformation.handlers import (
+        _insufficient_capabilities_message,
+        _missing_capabilities,
+        _required_iam_capabilities,
+    )
+    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)),
+                                    _required_iam_capabilities(template))
+    if missing:
+        raise ValueError(_insufficient_capabilities_message(missing))
+
+
+def _parent_capabilities(parent_stack_name):
+    """The capabilities the parent stack acknowledged on its last operation."""
+    from ministack.services.cloudformation import _stacks
+    return list((_stacks.get(parent_stack_name) or {}).get("Capabilities", []))
+
+
+def _inherited_capabilities(parent_stack_name):
+    """What a child stack's record carries, which is the parent's set under
+    AUTH=true and nothing without it. The set exists to be read by the check
+    on the level below, so recording it where no check runs would only change
+    what DescribeStacks reports on a child.
+    """
+    from ministack.app import AUTH
+    return _parent_capabilities(parent_stack_name) if AUTH else []
+
 
 def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                              previous_physical_id=None, previous_props=None):
@@ -2314,7 +3540,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         _topological_sort,
     )
     from ministack.services.cloudformation.helpers import _resolve_template
-    from ministack.services.cloudformation.stacks import _add_event
+    from ministack.services.cloudformation.stacks import _add_event, _resource_policy
 
     template_url = props.get("TemplateURL")
     if not template_url:
@@ -2330,6 +3556,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         raise ValueError(f"Nested-stack template empty at {template_url}")
 
     template = _parse_template(template_body)
+    _check_nested_stack_capabilities(parent_stack_name, template)
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
@@ -2369,7 +3596,11 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
             {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
             for k, v in param_values.items()
         ],
-        "Tags": [],
+        "Tags": [
+            {"Key": key, "Value": value}
+            for key, value in _tag_map(props.get("Tags")).items()
+            if not key.startswith("aws:")
+        ],
         "Outputs": [],
         "DisableRollback": True,
         "_resources": (previous_stack_snapshot.get("_resources", {})
@@ -2381,6 +3612,11 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         "_parent_stack_name": parent_stack_name,
         "RootId": _cr_stack_id(parent_stack_name),
         "ParentId": _cr_stack_id(parent_stack_name),
+        # The parent's acknowledgement covers every level of nesting, so a
+        # child of this child reads the same set. Only the check needs it, so
+        # it is recorded only where the check runs: without AUTH a child's
+        # DescribeStacks reports what it reported before, nothing.
+        "Capabilities": _inherited_capabilities(parent_stack_name),
     }
     _stacks[child_name] = child_stack
     _stack_events.setdefault(child_stack_id, [])
@@ -2427,15 +3663,31 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                    f"{status_prefix}_IN_PROGRESS")
         try:
             prev = prev_resources.get(child_logical_id)
+            new_tagged = _with_stack_tags(
+                resource_type, resolved_props, child_stack["Tags"],
+                child_name, child_stack_id, child_logical_id)
             if prev:
-                physical_id, attrs = _update_resource(
-                    resource_type, prev.get("PhysicalResourceId", child_logical_id),
-                    prev.get("Properties", {}), resolved_props, child_name,
-                    child_logical_id,
-                )
+                old_tagged = _with_stack_tags(
+                    resource_type, prev.get("Properties", {}),
+                    (previous_stack_snapshot or {}).get("Tags") or [],
+                    child_name, child_stack_id, child_logical_id)
+                # The child's own UpdateReplacePolicy decides whether a
+                # handler-side replacement keeps the predecessor; without
+                # this the parent's policy leaked into the child's handlers.
+                token = _RETAIN_REPLACED.set(_resource_policy(
+                    res_def, "UpdateReplacePolicy", provisioned, param_values,
+                    conditions, mappings, child_name, child_stack_id,
+                ) in _RETAINING_POLICIES)
+                try:
+                    physical_id, attrs = _update_resource(
+                        resource_type, prev.get("PhysicalResourceId", child_logical_id),
+                        old_tagged, new_tagged, child_name, child_logical_id,
+                    )
+                finally:
+                    _RETAIN_REPLACED.reset(token)
             else:
                 physical_id, attrs = _provision_resource(
-                    resource_type, child_logical_id, resolved_props, child_name,
+                    resource_type, child_logical_id, new_tagged, child_name,
                 )
         except Exception as exc:
             child_stack["StackStatus"] = f"{status_prefix}_FAILED"
@@ -2467,8 +3719,14 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                                  old.get("Properties", {}),
                                  child_name, stale_id)
             except Exception as exc:
-                logger.warning("Nested-stack %s: failed to delete pruned %s: %s",
-                               child_name, stale_id, exc)
+                # As for a top-level stack: the resource stays in the child
+                # stack as DELETE_FAILED so a later delete retries it.
+                logger.error("Nested-stack %s: failed to delete pruned %s: %s",
+                             child_name, stale_id, exc)
+                stale = provisioned.setdefault(stale_id, dict(old))
+                stale["ResourceStatus"] = "DELETE_FAILED"
+                stale["ResourceStatusReason"] = str(exc)
+                stale["Timestamp"] = now_iso()
 
     resolved_outputs = []
     output_attrs: dict[str, str] = {}
@@ -2660,7 +3918,7 @@ def _apigw_rest_api_update(physical_id, old_props, new_props, stack_name, logica
     to the dependent resources as the same update reprocesses them)."""
     if new_props.get("Body") != old_props.get("Body"):
         created = _apigw_rest_api_create(logical_id or physical_id, new_props, stack_name)
-        _apigw_rest_api_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_rest_api_delete, physical_id, old_props)
         return created
 
     patch_ops = []
@@ -2727,7 +3985,7 @@ def _apigw_resource_update(physical_id, old_props, new_props, stack_name):
     # All three properties (RestApiId, ParentId, PathPart) are create-only on
     # AWS — any change is a replacement.
     created = _apigw_resource_create(physical_id, new_props, stack_name)
-    _apigw_resource_delete(physical_id, old_props)
+    _delete_predecessor(_apigw_resource_delete, physical_id, old_props)
     return created
 
 
@@ -2745,12 +4003,27 @@ def _apigw_method_create(logical_id, props, stack_name):
     data = {
         "authorizationType": props.get("AuthorizationType", "NONE"),
         "authorizerId": props.get("AuthorizerId"),
+        "authorizationScopes": props.get("AuthorizationScopes", []),
         "apiKeyRequired": props.get("ApiKeyRequired", False),
         "operationName": props.get("OperationName", ""),
         "requestParameters": props.get("RequestParameters", {}),
         "requestModels": props.get("RequestModels", {}),
     }
     _apigw_v1._put_method(api_id, resource_id, http_method, data)
+
+    # apigateway_v1 stores these in dicts keyed by the status code as a string,
+    # and a template may legitimately carry StatusCode as an integer.
+    for method_response in props.get("MethodResponses", []) or []:
+        _apigw_v1._put_method_response(
+            api_id,
+            resource_id,
+            http_method,
+            str(method_response.get("StatusCode", "200")),
+            {
+                "responseParameters": method_response.get("ResponseParameters", {}),
+                "responseModels": method_response.get("ResponseModels", {}),
+            },
+        )
 
     # Also set Integration if provided
     integration = props.get("Integration")
@@ -2769,6 +4042,20 @@ def _apigw_method_create(logical_id, props, stack_name):
         }
         _apigw_v1._put_integration(api_id, resource_id, http_method, int_data)
 
+        for integration_response in integration.get("IntegrationResponses", []) or []:
+            _apigw_v1._put_integration_response(
+                api_id,
+                resource_id,
+                http_method,
+                str(integration_response.get("StatusCode", "200")),
+                {
+                    "selectionPattern": integration_response.get("SelectionPattern", ""),
+                    "responseParameters": integration_response.get("ResponseParameters", {}),
+                    "responseTemplates": integration_response.get("ResponseTemplates", {}),
+                    "contentHandling": integration_response.get("ContentHandling"),
+                },
+            )
+
     pid = f"{api_id}-{resource_id}-{http_method}"
     return pid, {}
 
@@ -2782,7 +4069,7 @@ def _apigw_method_update(physical_id, old_props, new_props, stack_name):
         for key in ("RestApiId", "ResourceId", "HttpMethod")
     ):
         created = _apigw_method_create(physical_id, new_props, stack_name)
-        _apigw_method_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_method_delete, physical_id, old_props)
         return created
     if old_props.get("Integration") and not new_props.get("Integration"):
         _apigw_v1._delete_integration(
@@ -2839,8 +4126,13 @@ def _apigw_model_update(physical_id, old_props, new_props, stack_name):
     # changes. The stack engine delegates that replacement lifecycle here.
     if (old_api_id != new_api_id or physical_id != new_name
             or old_content_type != new_content_type):
-        _apigw_v1._delete_model(old_api_id, physical_id)
-        return _apigw_model_create(physical_id, new_props, stack_name)
+        # The replacement is created first; the emulator's CreateModel path
+        # overwrites a model of the same name on the same API, so the
+        # predecessor is deleted only when its (api, name) key differs.
+        created = _apigw_model_create(physical_id, new_props, stack_name)
+        if (old_api_id, physical_id) != (new_api_id, created[0]):
+            _delete_predecessor(_apigw_v1._delete_model, old_api_id, physical_id)
+        return created
 
     patch_operations = []
     old_description = old_props.get("Description", "")
@@ -2872,34 +4164,75 @@ def _apigw_model_delete(physical_id, props):
 
 # --- API Gateway Authorizer ---
 
-def _apigw_authorizer_create(logical_id, props, stack_name):
-    """Provision an AWS::ApiGateway::Authorizer.
+# (CFN property, authorizer field, value the create fills in when the template
+# omits the property — the defaults of the resource reference: a 300 s result
+# TTL and the Authorization header as identity source). Name is required on
+# AWS and defaults to the logical id here; RestApiId is the one property that
+# requires replacement.
+_APIGW_AUTHORIZER_PROPERTIES = (
+    ("Type", "type", "TOKEN"),
+    ("AuthorizerUri", "authorizerUri", ""),
+    ("AuthorizerCredentials", "authorizerCredentials", None),
+    ("IdentitySource", "identitySource", "method.request.header.Authorization"),
+    ("IdentityValidationExpression", "identityValidationExpression", ""),
+    ("AuthorizerResultTtlInSeconds", "authorizerResultTtlInSeconds", 300),
+    ("ProviderARNs", "providerARNs", []),
+    ("AuthType", "authType", None),
+)
 
-    Maps CFN properties to the existing apigateway_v1 authorizer store:
-    Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS), AuthorizerUri,
-    AuthorizerCredentials, IdentitySource, IdentityValidationExpression,
-    AuthorizerResultTtlInSeconds, ProviderARNs, RestApiId. ``AuthType`` is
-    documented in the AWS CFN spec as informational only; the underlying
-    apigateway_v1._create_authorizer record does not currently expose it,
-    so the field is dropped here.
-    """
+
+def _apigw_authorizer_create(logical_id, props, stack_name):
+    """Provision an AWS::ApiGateway::Authorizer through the apigateway_v1
+    authorizer store: Name, Type (TOKEN / REQUEST / COGNITO_USER_POOLS),
+    AuthorizerUri, AuthorizerCredentials, IdentitySource,
+    IdentityValidationExpression, AuthorizerResultTtlInSeconds, ProviderARNs,
+    AuthType (informational, kept as GetAuthorizer reports it), RestApiId."""
     api_id = props.get("RestApiId", "")
-    data = {
-        "name": props.get("Name", logical_id),
-        "type": props.get("Type", "TOKEN"),
-        "authorizerUri": props.get("AuthorizerUri", ""),
-        "authorizerCredentials": props.get("AuthorizerCredentials"),
-        "identitySource": props.get("IdentitySource", "method.request.header.Authorization"),
-        "identityValidationExpression": props.get("IdentityValidationExpression", ""),
-        "authorizerResultTtlInSeconds": props.get("AuthorizerResultTtlInSeconds", 300),
-        "providerARNs": props.get("ProviderARNs", []),
-    }
-    status, headers, body = _apigw_v1._create_authorizer(api_id, data)
+    data = {"name": props.get("Name", logical_id)}
+    for prop, field, default in _APIGW_AUTHORIZER_PROPERTIES:
+        value = props.get(prop, default)
+        if prop == "AuthType" and value is None:
+            continue
+        data[field] = value
+    status, _headers, body = _apigw_v1._create_authorizer(api_id, data)
     if status >= 400:
         raise ValueError(f"AWS::ApiGateway::Authorizer create failed: {body!r}")
-    authorizer = json.loads(body) if isinstance(body, (bytes, bytearray)) else json.loads(body)
-    authorizer_id = authorizer.get("id", "")
+    authorizer_id = json.loads(body).get("id", "")
     return authorizer_id, {"AuthorizerId": authorizer_id}
+
+
+def _apigw_authorizer_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an authorizer in place through UpdateAuthorizer, keeping its id
+    (what Ref and AuthorizerId return): every property but RestApiId is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-authorizer.html).
+    A property the new template drops reverts to the value the create fills
+    in. A changed RestApiId, or an authorizer deleted behind the stack's back,
+    is a replacement: the new authorizer is created and the engine removes
+    the old one."""
+    api_id = new_props.get("RestApiId", "")
+    record = _apigw_v1._authorizers_v1.get(api_id, {}).get(physical_id)
+    if record is None or new_props.get("RestApiId") != old_props.get("RestApiId"):
+        return _apigw_authorizer_create(logical_id or physical_id, new_props, stack_name)
+    default_name = logical_id or physical_id
+    patch_ops = []
+    if new_props.get("Name", default_name) != old_props.get("Name", default_name):
+        patch_ops.append({"op": "replace", "path": "/name",
+                          "value": new_props.get("Name", default_name)})
+    for prop, field, default in _APIGW_AUTHORIZER_PROPERTIES:
+        value = new_props.get(prop, default)
+        if value == old_props.get(prop, default):
+            continue
+        if prop == "AuthType" and value is None:
+            patch_ops.append({"op": "remove", "path": f"/{field}"})
+        else:
+            patch_ops.append({"op": "replace", "path": f"/{field}", "value": value})
+    if patch_ops:
+        status, _headers, body = _apigw_v1._update_authorizer(
+            api_id, physical_id, {"patchOperations": patch_ops})
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::Authorizer update failed: {body!r}")
+    return physical_id, {"AuthorizerId": physical_id}
 
 
 def _apigw_authorizer_delete(physical_id, props):
@@ -2910,17 +4243,66 @@ def _apigw_authorizer_delete(physical_id, props):
 
 # --- API Gateway Deployment ---
 
+def _apigw_deployment_stage(props):
+    """The stage a deployment declares: StageName plus the StageDescription
+    object's Description and Variables (a plain string is taken as the
+    description, for templates written against earlier releases)."""
+    stage_description = props.get("StageDescription") or {}
+    if isinstance(stage_description, dict):
+        description = stage_description.get("Description", "")
+        variables = stage_description.get("Variables") or {}
+    else:
+        description, variables = str(stage_description), {}
+    return props.get("StageName"), description, variables
+
+
 def _apigw_deployment_create(logical_id, props, stack_name):
     api_id = props.get("RestApiId", "")
+    stage_name, stage_description, variables = _apigw_deployment_stage(props)
     data = {
         "description": props.get("Description", ""),
-        "stageName": props.get("StageName"),
-        "stageDescription": props.get("StageDescription", ""),
+        "stageName": stage_name,
+        "stageDescription": stage_description,
+        "variables": variables,
     }
-    status, headers, body = _apigw_v1._create_deployment(api_id, data)
-    deployment = json.loads(body) if isinstance(body, bytes) else json.loads(body)
-    deployment_id = deployment.get("id", "")
+    status, _headers, body = _apigw_v1._create_deployment(api_id, data)
+    if status >= 400:
+        raise ValueError(f"AWS::ApiGateway::Deployment create failed: {body!r}")
+    deployment_id = json.loads(body).get("id", "")
     return deployment_id, {"DeploymentId": deployment_id}
+
+
+def _apigw_deployment_update(physical_id, old_props, new_props, stack_name):
+    """Update a deployment in place, keeping its id (what Ref and DeploymentId
+    return): Description, StageName and StageDescription are No interruption
+    on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigateway-deployment.html),
+    so a changed description patches the deployment and a changed stage name
+    or stage description deploys the same deployment to that stage, as the
+    create does. RestApiId and DeploymentCanarySettings require replacement:
+    a new deployment is created and the engine removes the old one. A stage
+    the template stops naming is left standing, as on AWS.
+
+    Not modelled: DeploymentCanarySettings is accepted without effect (the
+    create does not store it; a change still replaces), and of the
+    StageDescription object only Description and Variables reach the stage."""
+    api_id = new_props.get("RestApiId", "")
+    record = _apigw_v1._deployments_v1.get(api_id, {}).get(physical_id)
+    if record is None or any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("RestApiId", "DeploymentCanarySettings")
+    ):
+        return _apigw_deployment_create(physical_id, new_props, stack_name)
+    if new_props.get("Description", "") != old_props.get("Description", ""):
+        status, _headers, body = _apigw_v1._update_deployment(api_id, physical_id, {
+            "patchOperations": [{"op": "replace", "path": "/description",
+                                 "value": new_props.get("Description", "")}]})
+        if status >= 400:
+            raise ValueError(f"AWS::ApiGateway::Deployment update failed: {body!r}")
+    stage = _apigw_deployment_stage(new_props)
+    if stage[0] and stage != _apigw_deployment_stage(old_props):
+        _apigw_v1._deploy_to_stage(api_id, physical_id, *stage)
+    return physical_id, {"DeploymentId": physical_id}
 
 
 def _apigw_deployment_delete(physical_id, props):
@@ -2956,7 +4338,7 @@ def _apigw_stage_update(physical_id, old_props, new_props, stack_name):
         for key in ("RestApiId", "StageName")
     ):
         created = _apigw_stage_create(physical_id, new_props, stack_name)
-        _apigw_stage_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_stage_delete, physical_id, old_props)
         return created
     api_id = new_props.get("RestApiId", "")
     stage_name = new_props.get("StageName", "")
@@ -2991,13 +4373,6 @@ def _apigw_stage_delete(physical_id, props):
 
 
 # --- API Gateway ApiKey / UsagePlan (v1) ---
-
-def _apigw_tag_map(raw):
-    """Normalize CFN ``Tags`` (a map, or a list of {Key, Value}) to a dict."""
-    if isinstance(raw, dict):
-        return dict(raw)
-    return {t["Key"]: t["Value"] for t in raw or []}
-
 
 def _apigw_throttle(raw):
     """Map a CFN ThrottleSettings block to the API Gateway wire shape."""
@@ -3038,7 +4413,7 @@ def _apigw_api_key_create(logical_id, props, stack_name):
             {"restApiId": sk.get("RestApiId", ""), "stageName": sk.get("StageName", "")}
             for sk in props.get("StageKeys", [])
         ],
-        "tags": _apigw_tag_map(props.get("Tags")),
+        "tags": _tag_map(props.get("Tags")),
     }
     status, _headers, body = _apigw_v1._create_api_key(data)
     if status >= 400:
@@ -3063,8 +4438,9 @@ def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
     # replaces the key. Everything else updates the existing record in place.
     if (old_props.get("Value") != new_props.get("Value")
             or old_props.get("Name") != new_props.get("Name")):
-        _apigw_v1._delete_api_key(physical_id)
-        return _apigw_api_key_create(physical_id, new_props, stack_name)
+        created = _apigw_api_key_create(physical_id, new_props, stack_name)
+        _delete_predecessor(_apigw_v1._delete_api_key, physical_id)
+        return created
     key = _apigw_v1._api_keys.get(physical_id)
     if key is None:
         return _apigw_api_key_create(physical_id, new_props, stack_name)
@@ -3072,6 +4448,7 @@ def _apigw_api_key_update(physical_id, old_props, new_props, stack_name):
     key["enabled"] = new_props.get("Enabled", True)
     key["customerId"] = new_props.get("CustomerId", key.get("customerId", ""))
     key["lastUpdatedDate"] = _apigw_v1._now_unix()
+    _reconcile_tag_map(key.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"APIKeyId": physical_id}
 
 
@@ -3094,7 +4471,7 @@ def _apigw_usage_plan_body(props):
         ],
         "throttle": _apigw_throttle(props.get("Throttle")),
         "quota": _apigw_quota(props.get("Quota")),
-        "tags": _apigw_tag_map(props.get("Tags")),
+        "tags": _tag_map(props.get("Tags")),
     }
 
 
@@ -3119,7 +4496,10 @@ def _apigw_usage_plan_update(physical_id, old_props, new_props, stack_name):
         return _apigw_usage_plan_create(physical_id, new_props, stack_name)
     if new_props.get("UsagePlanName"):
         plan["name"] = new_props["UsagePlanName"]
-    plan.update(_apigw_usage_plan_body(new_props))
+    body = _apigw_usage_plan_body(new_props)
+    body["tags"] = dict(plan.get("tags") or {})
+    _reconcile_tag_map(body["tags"], old_props, new_props)
+    plan.update(body)
     return physical_id, {"Id": physical_id}
 
 
@@ -3178,7 +4558,7 @@ def _apigw_base_path_mapping_update(physical_id, old_props, new_props, stack_nam
     # same atomic create-before-delete behavior here.
     new_id, attrs = _apigw_base_path_mapping_create(physical_id, new_props, stack_name)
     if (new_domain, new_base_path) != (old_domain, old_base_path):
-        _apigw_v1._delete_base_path_mapping(old_domain, old_base_path)
+        _delete_predecessor(_apigw_v1._delete_base_path_mapping, old_domain, old_base_path)
     return new_id, attrs
 
 
@@ -3269,7 +4649,7 @@ def _apigw_domain_name_update(physical_id, old_props, new_props, stack_name):
     new_domain_name = new_props.get("DomainName", "")
     new_id, attrs = _apigw_domain_name_create(physical_id, new_props, stack_name)
     if new_domain_name != physical_id:
-        _apigw_domain_name_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_domain_name_delete, physical_id, old_props)
     elif existing_mappings is not None:
         # The native create helper initializes this collection. Preserve
         # dependent mappings while mutable domain properties update in place.
@@ -3311,7 +4691,7 @@ def _apigw_gateway_response_update(physical_id, old_props, new_props, stack_name
     # customization so a failed create cannot destroy the working resource.
     if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "ResponseType")):
         new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
-        _apigw_gateway_response_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_gateway_response_delete, physical_id, old_props)
         return new_id, attrs
 
     _new_id, attrs = _apigw_gateway_response_create(physical_id, new_props, stack_name)
@@ -3364,7 +4744,7 @@ def _apigw_documentation_part_update(physical_id, old_props, new_props, stack_na
     # specification; Properties is mutable in place.
     if any(new_props.get(key) != old_props.get(key) for key in ("RestApiId", "Location")):
         new_id, attrs = _apigw_documentation_part_create(physical_id, new_props, stack_name)
-        _apigw_documentation_part_delete(physical_id, old_props)
+        _delete_predecessor(_apigw_documentation_part_delete, physical_id, old_props)
         return new_id, attrs
 
     if new_props.get("Properties") != old_props.get("Properties"):
@@ -3500,8 +4880,7 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
     for immutable in ("EventSourceArn", "StartingPosition", "StartingPositionTimestamp"):
         if new_props.get(immutable) != old_props.get(immutable):
             new_id, attrs = _lambda_esm_create(physical_id, new_props, stack_name)
-            _lambda_svc._esms.pop(physical_id, None)
-            _lambda_svc._release_esm_poll_state(physical_id)
+            _delete_predecessor(_lambda_esm_delete, physical_id, old_props)
             return new_id, attrs
     for key in (
         "BatchSize",
@@ -3570,7 +4949,10 @@ def _lambda_event_invoke_config_update(physical_id, old_props, new_props, stack_
         physical_id, new_props, stack_name
     )
     if replacement:
-        _lambda_event_invoke_config_delete(physical_id, old_props)
+        # FunctionName written in another form (name vs ARN) resolves to the
+        # same config; deleting the predecessor would delete the new one.
+        if new_id != physical_id:
+            _delete_predecessor(_lambda_event_invoke_config_delete, physical_id, old_props)
         return new_id, attrs
     return physical_id, attrs
 
@@ -3622,12 +5004,55 @@ def _pipes_pipe_delete(physical_id, props):
 
 # --- Lambda Alias ---
 
+def _lambda_alias_routing_config(props):
+    """The template's RoutingConfig in the shape the API stores: the
+    AliasRoutingConfiguration property type lists AdditionalVersionWeights
+    as ``{FunctionVersion, FunctionWeight}`` entries, the API keeps a
+    ``{version: weight}`` map, which is what GetAlias returns. None when
+    the template declares no routing."""
+    rc = props.get("RoutingConfig")
+    if not rc:
+        return None
+    weights = rc.get("AdditionalVersionWeights") or {}
+    if isinstance(weights, list):
+        try:
+            weights = {str(w["FunctionVersion"]): float(w["FunctionWeight"]) for w in weights}
+        except (KeyError, TypeError, ValueError):
+            raise ValueError(
+                "AWS::Lambda::Alias: every AdditionalVersionWeights entry needs a "
+                "FunctionVersion and a numeric FunctionWeight") from None
+    return {"AdditionalVersionWeights": weights}
+
+
+def _lambda_alias_provisioned_concurrency(func_name, alias_name, old_props, new_props):
+    """Apply the ProvisionedConcurrencyConfig property to the alias
+    qualifier through the service's put and delete: declared, it is put;
+    dropped since the previous template, it is deleted; never declared,
+    a configuration set through the API is left alone."""
+    payload = _declared_or_default(old_props, new_props, {"ProvisionedConcurrencyConfig": None})
+    if "ProvisionedConcurrencyConfig" not in payload:
+        return
+    config = payload["ProvisionedConcurrencyConfig"]
+    if config:
+        resp = _lambda_svc._put_provisioned_concurrency(func_name, alias_name, {
+            "ProvisionedConcurrentExecutions": int(config.get("ProvisionedConcurrentExecutions", 0)),
+        })
+    else:
+        resp = _lambda_svc._delete_provisioned_concurrency(func_name, alias_name)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Lambda::Alias ProvisionedConcurrencyConfig failed: {resp[2]!r}")
+
+
 def _lambda_alias_create(logical_id, props, stack_name):
     func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(props.get("FunctionName", ""))
     alias_name = props.get("Name", "")
     func_version = props.get("FunctionVersion", "$LATEST")
 
     if func:
+        if alias_name in func.get("aliases", {}):
+            # CreateAlias answers ResourceConflictException; a stack must not
+            # write over an alias it does not own, on a create or on a rename.
+            raise ValueError(f"AWS::Lambda::Alias: {func_name}:{alias_name} already exists")
         alias = {
             "AliasArn": f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}",
             "Name": alias_name,
@@ -3635,14 +5060,50 @@ def _lambda_alias_create(logical_id, props, stack_name):
             "Description": props.get("Description", ""),
             "RevisionId": new_uuid(),
         }
-        rc = props.get("RoutingConfig")
-        if rc:
+        rc = _lambda_alias_routing_config(props)
+        if rc and rc["AdditionalVersionWeights"]:
             alias["RoutingConfig"] = rc
         func["aliases"][alias_name] = alias
+        _lambda_alias_provisioned_concurrency(func_name, alias_name, {}, props)
         return alias["AliasArn"], {"AliasArn": alias["AliasArn"]}
 
     alias_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}:{alias_name}"
     return alias_arn, {"AliasArn": alias_arn}
+
+
+def _lambda_alias_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an alias in place through UpdateAlias, keeping its ARN, for
+    the No-interruption properties of the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lambda-alias.html):
+    FunctionVersion, Description, RoutingConfig and
+    ProvisionedConcurrencyConfig. A dropped Description empties, a dropped
+    RoutingConfig or ProvisionedConcurrencyConfig is removed. Name and
+    FunctionName require replacement: the new alias is created before the
+    old one is removed."""
+    func, func_name, _resource_arn, _qualifier = _lambda_function_for_cfn_ref(
+        old_props.get("FunctionName", ""))
+    _new_func, new_func_name, _new_arn, _new_qualifier = _lambda_function_for_cfn_ref(
+        new_props.get("FunctionName", ""))
+    alias_name = old_props.get("Name", "")
+    current = (func_name, alias_name) if func and alias_name in func["aliases"] else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_func_name, new_props.get("Name", "")), current,
+        _lambda_alias_create, _lambda_alias_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    data = _declared_or_default(old_props, new_props, {
+        "FunctionVersion": "$LATEST", "Description": "", "RoutingConfig": None,
+    })
+    if "RoutingConfig" in data:
+        data["RoutingConfig"] = _lambda_alias_routing_config(new_props)
+    resp = _lambda_svc._update_alias(func_name, alias_name, data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Lambda::Alias update failed: {resp[2]!r}")
+    _lambda_alias_provisioned_concurrency(func_name, alias_name, old_props, new_props)
+    return physical_id, {"AliasArn": physical_id}
 
 
 def _lambda_alias_delete(physical_id, props):
@@ -3650,53 +5111,92 @@ def _lambda_alias_delete(physical_id, props):
     alias_name = props.get("Name", "")
     if func:
         func["aliases"].pop(alias_name, None)
+        # The alias qualifier's provisioned concurrency goes with the alias.
+        func.get("provisioned_concurrency", {}).pop(alias_name, None)
+
+
+# --- Resource policy attachments (SQS QueuePolicy, SNS TopicPolicy) ---
+
+def _policy_document_json(props):
+    """The PolicyDocument of a policy-attachment resource as the JSON string
+    the service stores under the ``Policy`` attribute."""
+    policy_doc = props.get("PolicyDocument", {})
+    if isinstance(policy_doc, dict):
+        policy_doc = json.dumps(policy_doc)
+    return policy_doc
+
+
+def _policy_attachment_update(physical_id, old_props, new_props, members, store):
+    """Shared update for the two policy-attachment types, AWS::SQS::QueuePolicy
+    and AWS::SNS::TopicPolicy: PolicyDocument and the member list (Queues,
+    Topics) are both No interruption on the resource references, so the
+    physical id is kept, the new document is written on every member the
+    new template names, and it is removed from a member the old template
+    named and the new one dropped. ``store`` is the service's record map,
+    keyed the way the member list refers to it (queue URL, topic ARN).
+    A member dropped from the list loses its policy even when another resource
+    put it there: last writer wins, as on AWS.
+    """
+    policy_doc = _policy_document_json(new_props)
+    new_members = new_props.get(members, [])
+    for member in old_props.get(members, []):
+        record = store.get(member)
+        if record and member not in new_members:
+            record["attributes"].pop("Policy", None)
+    for member in new_members:
+        record = store.get(member)
+        if record:
+            record["attributes"]["Policy"] = policy_doc
+    return physical_id, {}
+
+
+def _policy_attachment_create(logical_id, props, stack_name, members, store):
+    """Shared create for the two policy-attachment types: the document is
+    written on every member the template names, and the physical id is the
+    generated one CloudFormation mints for a type with no name of its own."""
+    policy_doc = _policy_document_json(props)
+    for member in props.get(members, []):
+        record = store.get(member)
+        if record:
+            record["attributes"]["Policy"] = policy_doc
+    return f"{stack_name}-{logical_id}-{new_uuid()[:8]}", {}
+
+
+def _policy_attachment_delete(props, members, store):
+    """Shared delete for the two policy-attachment types: the member goes
+    back to the service's default, which is no Policy attribute at all."""
+    for member in props.get(members, []):
+        record = store.get(member)
+        if record:
+            record["attributes"].pop("Policy", None)
 
 
 # --- SQS QueuePolicy ---
 
 def _sqs_queue_policy_create(logical_id, props, stack_name):
-    policy_doc = props.get("PolicyDocument", {})
-    if isinstance(policy_doc, dict):
-        policy_doc = json.dumps(policy_doc)
-    queues = props.get("Queues", [])
-    for queue_url in queues:
-        queue = _sqs._queues.get(queue_url)
-        if queue:
-            queue["attributes"]["Policy"] = policy_doc
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {}
+    return _policy_attachment_create(logical_id, props, stack_name, "Queues", _sqs._queues)
+
+
+def _sqs_queue_policy_update(physical_id, old_props, new_props, stack_name):
+    return _policy_attachment_update(physical_id, old_props, new_props, "Queues", _sqs._queues)
 
 
 def _sqs_queue_policy_delete(physical_id, props):
-    queues = props.get("Queues", [])
-    for queue_url in queues:
-        queue = _sqs._queues.get(queue_url)
-        if queue:
-            queue["attributes"].pop("Policy", None)
+    _policy_attachment_delete(props, "Queues", _sqs._queues)
 
 
 # --- SNS TopicPolicy ---
 
 def _sns_topic_policy_create(logical_id, props, stack_name):
-    policy_doc = props.get("PolicyDocument", {})
-    if isinstance(policy_doc, dict):
-        policy_doc = json.dumps(policy_doc)
-    topics = props.get("Topics", [])
-    for topic_arn in topics:
-        topic = _sns._topics.get(topic_arn)
-        if topic:
-            topic["attributes"]["Policy"] = policy_doc
-    pid = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
-    return pid, {}
+    return _policy_attachment_create(logical_id, props, stack_name, "Topics", _sns._topics)
+
+
+def _sns_topic_policy_update(physical_id, old_props, new_props, stack_name):
+    return _policy_attachment_update(physical_id, old_props, new_props, "Topics", _sns._topics)
 
 
 def _sns_topic_policy_delete(physical_id, props):
-    topics = props.get("Topics", [])
-    for topic_arn in topics:
-        topic = _sns._topics.get(topic_arn)
-        if topic:
-            # Restore default policy
-            topic["attributes"].pop("Policy", None)
+    _policy_attachment_delete(props, "Topics", _sns._topics)
 
 
 # --- AppSync resource provisioners ---
@@ -3861,9 +5361,10 @@ def _appsync_apikey_delete(physical_id, props):
 
 # --- SecretsManager resource provisioners ---
 
-def _sm_secret_create(logical_id, props, stack_name):
+def _sm_secret_string(props):
+    """The secret value a template declares: SecretString verbatim, or one
+    generated from GenerateSecretString."""
     import string as _string
-    name = props.get("Name") or _physical_name(stack_name, logical_id)
     secret_string = props.get("SecretString", "")
     gen = props.get("GenerateSecretString")
     if gen and not secret_string:
@@ -3876,7 +5377,6 @@ def _sm_secret_create(logical_id, props, stack_name):
         template = gen.get("SecretStringTemplate")
         gen_key = gen.get("GenerateStringKey", "password")
         if template:
-            import json
             try:
                 obj = json.loads(template)
                 obj[gen_key] = generated
@@ -3885,6 +5385,12 @@ def _sm_secret_create(logical_id, props, stack_name):
                 secret_string = generated
         else:
             secret_string = generated
+    return secret_string
+
+
+def _sm_secret_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id)
+    secret_string = _sm_secret_string(props)
 
     arn = f"arn:aws:secretsmanager:{get_region()}:{get_account_id()}:secret:{name}-{new_uuid()[:6]}"
     import time as _time
@@ -3905,64 +5411,258 @@ def _sm_secret_create(logical_id, props, stack_name):
             }
         },
     }
+    if props.get("ReplicaRegions"):
+        _sm_secret_replicate(name, props["ReplicaRegions"])
     return name, {"Arn": arn}
 
 
+def _sm_secret_replicate(secret_id, regions):
+    """Replicate a secret to the regions a template declares, through the
+    service's ReplicateSecretToRegions: a region already replicated keeps its
+    replica (the KmsKeyId is refreshed), a new one gets a copy of the secret.
+    The template's ReplicaRegion entries carry Region and KmsKeyId, the shape
+    AddReplicaRegions expects, so they are passed through as they are."""
+    resp = _sm._replicate_secret_to_regions({"SecretId": secret_id, "AddReplicaRegions": list(regions)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::SecretsManager::Secret replication failed: {resp[2]!r}")
+
+
+def _sm_secret_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a secret in place through UpdateSecret, keeping its ARN and every
+    stored version. Name is the one create-only property
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-secretsmanager-secret.html):
+    a rename is a replacement, the new secret created before the old one is
+    removed. A changed SecretString or GenerateSecretString publishes a new
+    AWSCURRENT version, as the reference documents; the previous version
+    stays behind as AWSPREVIOUS. ReplicaRegions is applied through
+    ReplicateSecretToRegions. Type is not stored by the service and is
+    ignored.
+    """
+    name = new_props.get("Name") or _physical_name(stack_name, logical_id or physical_id)
+    secret = _sm._secrets.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, secret.get("Name") if secret else None, _sm_secret_create, _sm_secret_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    data = {"SecretId": physical_id}
+    # Sent only when the template speaks to the property: declared, or
+    # dropped since the previous template, which clears it as
+    # CloudFormation does. A value set outside the stack on a property
+    # the template never declared is left alone.
+    data.update(_declared_or_default(old_props, new_props, {"Description": "", "KmsKeyId": None}))
+    if (new_props.get("SecretString") != old_props.get("SecretString")
+            or new_props.get("GenerateSecretString") != old_props.get("GenerateSecretString")):
+        data["SecretString"] = _sm_secret_string(new_props)
+    resp = _sm._update_secret(data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::SecretsManager::Secret update failed: {resp[2]!r}")
+    # Keys the template dropped go, the rest are set; tags applied through
+    # TagResource are not the stack's to clear.
+    _reconcile_tag_list(secret.setdefault("Tags", []), old_props, new_props)
+    if new_props.get("ReplicaRegions") and new_props["ReplicaRegions"] != old_props.get("ReplicaRegions"):
+        # Regions added or re-keyed since the previous template are applied;
+        # a region dropped from the template keeps its replica, the service
+        # has no RemoveRegionsFromReplication to take it down with.
+        _sm_secret_replicate(physical_id, new_props["ReplicaRegions"])
+    return physical_id, {"Arn": secret["ARN"]}
+
+
 def _sm_secret_delete(physical_id, props):
-    _sm._secrets.pop(physical_id, None)
+    secret = _sm._secrets.get(physical_id)
+    if secret is not None:
+        # Takes the replicas and the resource policy down with the secret.
+        _sm._purge_secret(physical_id, secret)
 
 
 # --- Cognito UserPool ---
 
-def _cognito_user_pool_create(logical_id, props, stack_name):
-    name = props.get("PoolName") or _physical_name(stack_name, logical_id, max_len=128)
-    pid = _cognito._pool_id()
-    now = _cognito._now_epoch()
-    pool = {
-        "Id": pid,
-        "Name": name,
+def _cognito_user_pool_name(props, stack_name, logical_id):
+    # UserPoolName is the CloudFormation property; PoolName (the API's name for
+    # it) stays accepted because earlier templates written against MiniStack
+    # used it.
+    return (props.get("UserPoolName") or props.get("PoolName")
+            or _physical_name(stack_name, logical_id, max_len=128))
+
+
+# UpdateUserPool's parameters, with the value CloudFormation applies when the
+# template drops the property. The resource reference says "If you don't
+# specify a value for a parameter, Amazon Cognito sets it to a default value",
+# and the defaults here are what the service's CreateUserPool fills in, so a
+# dropped property ends up as it would on a pool created without it. A
+# property absent from both templates is never touched.
+_COGNITO_USER_POOL_UPDATABLE = {
+    "Policies": {
+        "PasswordPolicy": {
+            "MinimumLength": 8,
+            "RequireUppercase": True,
+            "RequireLowercase": True,
+            "RequireNumbers": True,
+            "RequireSymbols": True,
+            "TemporaryPasswordValidityDays": 7,
+        }
+    },
+    "DeletionProtection": "INACTIVE",
+    "AutoVerifiedAttributes": [],
+    "SmsVerificationMessage": "",
+    "EmailVerificationMessage": "",
+    "EmailVerificationSubject": "",
+    "SmsAuthenticationMessage": "",
+    "MfaConfiguration": "OFF",
+    "DeviceConfiguration": {},
+    "EmailConfiguration": {},
+    "SmsConfiguration": {},
+    "UserPoolTags": {},
+    "AdminCreateUserConfig": {
+        "AllowAdminCreateUserOnly": False,
+        "UnusedAccountValidityDays": 7,
+    },
+    "UserPoolAddOns": {},
+    "VerificationMessageTemplate": {},
+    "AccountRecoverySetting": {},
+    "LambdaConfig": {},
+    "UserAttributeUpdateSettings": {},
+}
+
+# Properties CreateUserPool takes that no later API call changes: the sign-in
+# attributes are fixed at creation, and the resource reference says of
+# UsernameConfiguration "This configuration is immutable after you set it".
+# Schema is create-time too, but AddCustomAttributes can grow it afterwards.
+_COGNITO_USER_POOL_CREATE_ONLY = ("Schema", "AliasAttributes", "UsernameAttributes",
+                                  "UsernameConfiguration")
+
+# The rest of the AWS::Cognito::UserPool reference (UserPoolTier, the
+# EmailAuthentication* and WebAuthn* properties, IssuerConfiguration,
+# KeyConfiguration) has no field on the service's record and is not
+# modelled: it is accepted and ignored on create and on update alike.
+
+
+def _cognito_user_pool_attributes(pid):
+    return {
         "Arn": _cognito._pool_arn(pid),
-        "CreationDate": now,
-        "LastModifiedDate": now,
-        "Policies": props.get("Policies", {
-            "PasswordPolicy": {
-                "MinimumLength": 8,
-                "RequireUppercase": True,
-                "RequireLowercase": True,
-                "RequireNumbers": True,
-                "RequireSymbols": True,
-                "TemporaryPasswordValidityDays": 7,
-            }
-        }),
-        "SchemaAttributes": _cognito._build_schema_attributes(props.get("Schema")),
-        "AutoVerifiedAttributes": props.get("AutoVerifiedAttributes", []),
-        "AliasAttributes": props.get("AliasAttributes", []),
-        "UsernameAttributes": props.get("UsernameAttributes", []),
-        "MfaConfiguration": props.get("MfaConfiguration", "OFF"),
-        # EnabledMfas (what CDK emits for mfaSecondFactor) maps onto the per
-        # method config blocks GetUserPoolMfaConfig reports. Only the software
-        # token block carries an Enabled flag in the API model; SMS and email
-        # configs are message/role shapes that come from their own properties,
-        # so a bare SMS_MFA/EMAIL_OTP entry has nothing faithful to invent.
-        **({"SoftwareTokenMfaConfiguration": {"Enabled": True}}
-           if "SOFTWARE_TOKEN_MFA" in (props.get("EnabledMfas") or []) else {}),
-        "EstimatedNumberOfUsers": 0,
-        "UserPoolTags": props.get("UserPoolTags", {}),
-        "AdminCreateUserConfig": props.get("AdminCreateUserConfig", {
-            "AllowAdminCreateUserOnly": False,
-            "UnusedAccountValidityDays": 7,
-        }),
-        "LambdaConfig": props.get("LambdaConfig", {}),
-        "Domain": None,
-        "_clients": {},
-        "_users": {},
-        "_groups": {},
-        "_resource_servers": {},
+        "ProviderName": f"cognito-idp.{get_region()}.amazonaws.com/{pid}",
+        "UserPoolId": pid,
     }
-    _cognito._user_pools[pid] = pool
-    arn = _cognito._pool_arn(pid)
-    provider_name = f"cognito-idp.{get_region()}.amazonaws.com/{pid}"
-    return pid, {"Arn": arn, "ProviderName": provider_name}
+
+
+def _cognito_user_pool_create(logical_id, props, stack_name):
+    """Create the pool through the service's CreateUserPool so the record
+    carries every property the API stores, the same set
+    _cognito_user_pool_update applies later."""
+    payload = {
+        key: props[key]
+        for key in (*_COGNITO_USER_POOL_CREATE_ONLY, *_COGNITO_USER_POOL_UPDATABLE)
+        if key in props
+    }
+    payload["PoolName"] = _cognito_user_pool_name(props, stack_name, logical_id)
+    status, _, body = _cognito._create_user_pool(payload)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPool create failed: {body!r}")
+    pid = json.loads(body)["UserPool"]["Id"]
+    _cognito_user_pool_software_token_mfa(pid, {}, props)
+    return pid, _cognito_user_pool_attributes(pid)
+
+
+def _cognito_user_pool_software_token_mfa(pid, old_props, new_props):
+    """Apply an EnabledMfas change through SetUserPoolMfaConfig. EnabledMfas
+    (what CDK emits for mfaSecondFactor) maps onto the per method config
+    blocks GetUserPoolMfaConfig reports. Only the software token block
+    carries an Enabled flag in the API model; SMS and email configs are
+    message/role shapes that come from their own properties, so a bare
+    SMS_MFA/EMAIL_OTP entry has nothing faithful to invent. SOFTWARE_TOKEN_MFA
+    arriving switches the block on, its removal (or the property being
+    dropped) switches it off; a pool that never listed it is left without
+    the block, since a disabled block nobody asked for reads as drift to a
+    client that diffs the config.
+    """
+    was = "SOFTWARE_TOKEN_MFA" in (old_props.get("EnabledMfas") or [])
+    now = "SOFTWARE_TOKEN_MFA" in (new_props.get("EnabledMfas") or [])
+    if was == now:
+        return
+    status, _, body = _cognito._set_user_pool_mfa_config({
+        "UserPoolId": pid, "SoftwareTokenMfaConfiguration": {"Enabled": now},
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPool EnabledMfas update failed: {body!r}")
+
+
+def _declared_or_default(old_props, new_props, defaults):
+    """The API payload for a set of updatable properties: each one the new
+    template declares, plus the default for each one the old template
+    declared and the new one dropped."""
+    payload = {}
+    for key, default in defaults.items():
+        if key in new_props:
+            payload[key] = new_props[key]
+        elif key in old_props:
+            payload[key] = copy.deepcopy(default)
+    return payload
+
+
+def _cognito_user_pool_add_attributes(physical_id, pool, schema):
+    """Send the Schema entries the pool does not carry yet through
+    AddCustomAttributes, the one API call that changes a pool's schema after
+    CreateUserPool. It adds and never removes or redefines, so an entry the
+    pool already has (a standard attribute, or a custom one from an earlier
+    template) is left as it is, and it takes at most 25 attributes per call,
+    so a larger addition goes in batches. The service validates the rest: a
+    Required custom attribute, or more than the pool's custom-attribute
+    limit, fails the update.
+    """
+    known = {a["Name"] for a in _cognito._ensure_schema_attributes(pool)["SchemaAttributes"]}
+    additions = [
+        raw for raw in schema or []
+        if isinstance(raw, dict) and _cognito._schema_attribute_name(raw) not in known
+    ]
+    for start in range(0, len(additions), 25):
+        status, _, body = _cognito._add_custom_attributes({
+            "UserPoolId": physical_id, "CustomAttributes": additions[start:start + 25],
+        })
+        if status >= 400:
+            raise ValueError(f"AWS::Cognito::UserPool Schema update failed: {body!r}")
+
+
+def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name,
+                              logical_id=None):
+    """Update a user pool in place: no AWS::Cognito::UserPool property
+    requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpool.html),
+    so the pool keeps its generated id, its ARN and its users, clients and
+    groups. What UpdateUserPool accepts goes through that path; the name,
+    create-only on the API but not in CloudFormation, is applied to the
+    record directly. AliasAttributes, UsernameAttributes and
+    UsernameConfiguration are fixed at CreateUserPool and no API call
+    changes them afterwards, so a change fails the update with a message
+    naming the property rather than altering the record behind the
+    service's back. A Schema change can only add attributes, through
+    AddCustomAttributes.
+    """
+    pool = _cognito._user_pools.get(physical_id)
+    if pool is None:
+        raise ValueError(f"AWS::Cognito::UserPool {physical_id} no longer exists")
+    for prop in _COGNITO_USER_POOL_CREATE_ONLY[1:]:
+        if new_props.get(prop) != old_props.get(prop) and (new_props.get(prop) or old_props.get(prop)):
+            raise ValueError(
+                f"AWS::Cognito::UserPool {prop} is set at CreateUserPool and no "
+                f"API call changes it afterwards, so MiniStack fails the update "
+                f"for pool {physical_id} instead of altering the record; declare "
+                "a new UserPool resource instead."
+            )
+    payload = _declared_or_default(old_props, new_props, _COGNITO_USER_POOL_UPDATABLE)
+    if payload:
+        payload["UserPoolId"] = physical_id
+        status, _, body = _cognito._update_user_pool(payload)
+        if status >= 400:
+            raise ValueError(f"AWS::Cognito::UserPool update failed: {body!r}")
+
+    _cognito_user_pool_software_token_mfa(physical_id, old_props, new_props)
+    pool["Name"] = _cognito_user_pool_name(new_props, stack_name, logical_id or physical_id)
+    if new_props.get("Schema") != old_props.get("Schema"):
+        _cognito_user_pool_add_attributes(physical_id, pool, new_props.get("Schema"))
+    pool["LastModifiedDate"] = _cognito._now_epoch()
+    return physical_id, _cognito_user_pool_attributes(physical_id)
 
 
 def _cognito_user_pool_delete(physical_id, props):
@@ -3973,30 +5673,98 @@ def _cognito_user_pool_delete(physical_id, props):
 
 # --- Cognito UserPoolClient ---
 
-def _cognito_user_pool_client_create(logical_id, props, stack_name):
-    pid = props.get("UserPoolId", "")
-    pool = _cognito._user_pools.get(pid)
-    if not pool:
-        raise ValueError(f"UserPool {pid} not found for UserPoolClient")
+# UpdateUserPoolClient's parameters, with the value a dropped property
+# reverts to: what the service's CreateUserPoolClient fills in when the
+# request omits it, since the resource reference says a parameter without a
+# value is set to its default. None clears AnalyticsConfiguration, which the
+# client record omits on read. RefreshTokenRotation has no field on the
+# record and is not modelled.
+_COGNITO_USER_POOL_CLIENT_UPDATABLE = {
+    "ClientName": "",
+    "RefreshTokenValidity": 30,
+    "AccessTokenValidity": 60,
+    "IdTokenValidity": 60,
+    "TokenValidityUnits": {},
+    "ReadAttributes": [],
+    "WriteAttributes": [],
+    "ExplicitAuthFlows": [],
+    "SupportedIdentityProviders": [],
+    "CallbackURLs": [],
+    "LogoutURLs": [],
+    "DefaultRedirectURI": "",
+    "AllowedOAuthFlows": [],
+    "AllowedOAuthScopes": [],
+    "AllowedOAuthFlowsUserPoolClient": False,
+    "AnalyticsConfiguration": None,
+    "PreventUserExistenceErrors": "LEGACY",
+    "EnableTokenRevocation": True,
+    "EnablePropagateAdditionalUserContextData": False,
+    "AuthSessionValidity": 3,
+}
 
-    cid = _cognito._client_id()
-    now = _cognito._now_epoch()
-    client = {
-        "UserPoolId": pid,
-        "ClientName": props.get("ClientName", ""),
-        "ClientId": cid,
-        "ClientSecret": props.get("GenerateSecret", False) and _cognito._client_secret() or None,
-        "CreationDate": now,
-        "LastModifiedDate": now,
-        "ExplicitAuthFlows": props.get("ExplicitAuthFlows", []),
-        "AllowedOAuthFlows": props.get("AllowedOAuthFlows", []),
-        "AllowedOAuthScopes": props.get("AllowedOAuthScopes", []),
-        "CallbackURLs": props.get("CallbackURLs", []),
-        "LogoutURLs": props.get("LogoutURLs", []),
-        "SupportedIdentityProviders": props.get("SupportedIdentityProviders", []),
+
+def _cognito_user_pool_client_create(logical_id, props, stack_name):
+    """Create the app client through the service's CreateUserPoolClient so
+    the record carries every property UpdateUserPoolClient can change
+    later, and a replacement (UserPoolId or GenerateSecret changed) carries
+    the whole template over."""
+    payload = {key: props[key] for key in _COGNITO_USER_POOL_CLIENT_UPDATABLE if key in props}
+    payload["UserPoolId"] = props.get("UserPoolId", "")
+    payload["GenerateSecret"] = bool(props.get("GenerateSecret", False))
+    status, _, body = _cognito._create_user_pool_client(payload)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolClient create failed: {body!r}")
+    client = json.loads(body)["UserPoolClient"]
+    return client["ClientId"], _cognito_user_pool_client_attributes(client)
+
+
+def _cognito_user_pool_client_attributes(client):
+    """The attributes the type reports: ClientId, ClientSecret and Name.
+    ClientSecret is a documented Fn::GetAtt attribute of the type and a
+    template that reads it (Serverless Framework emits one) failed the stack
+    with "does not exist in schema" while the value was right there on the
+    record. A client created without GenerateSecret has none, and the
+    attribute reads empty rather than failing the template.
+    """
+    return {
+        "ClientId": client.get("ClientId", ""),
+        "ClientSecret": client.get("ClientSecret") or "",
+        "Name": client.get("ClientName", ""),
     }
-    pool["_clients"][cid] = client
-    return cid, {}
+
+
+def _cognito_user_pool_client_update(physical_id, old_props, new_props, stack_name,
+                                     logical_id=None):
+    """Update an app client in place through UpdateUserPoolClient, keeping
+    its ClientId (what Ref returns) and its secret. UserPoolId and
+    GenerateSecret require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolclient.html):
+    the client id is generated, so the new client is created before the old
+    one is removed and Ref moves to the new id, as on AWS.
+
+    The replacement prologue is spelled out here rather than going through
+    _rename_replacement because that helper keys on a create-only name
+    property, and the two properties that replace a client are not its
+    name: ClientName changes in place, while UserPoolId and GenerateSecret
+    replace.
+    """
+    if (new_props.get("UserPoolId") != old_props.get("UserPoolId")
+            or bool(new_props.get("GenerateSecret")) != bool(old_props.get("GenerateSecret"))):
+        created = _cognito_user_pool_client_create(logical_id or physical_id, new_props, stack_name)
+        _delete_predecessor(_cognito_user_pool_client_delete, physical_id, old_props)
+        return created
+    payload = _declared_or_default(
+        old_props, new_props, _COGNITO_USER_POOL_CLIENT_UPDATABLE
+    )
+    if payload:
+        payload["UserPoolId"] = new_props.get("UserPoolId", "")
+        payload["ClientId"] = physical_id
+        status, _, body = _cognito._update_user_pool_client(payload)
+        if status >= 400:
+            raise ValueError(f"AWS::Cognito::UserPoolClient update failed: {body!r}")
+    pool = _cognito._user_pools.get(new_props.get("UserPoolId", "")) or {}
+    client = (pool.get("_clients") or {}).get(physical_id) or {"ClientId": physical_id}
+    return physical_id, _cognito_user_pool_client_attributes(client)
 
 
 def _cognito_user_pool_client_delete(physical_id, props):
@@ -4024,6 +5792,57 @@ def _cognito_user_pool_resource_server_create(logical_id, props, stack_name):
     return identifier, {}
 
 
+def _cognito_user_pool_resource_server_update(physical_id, old_props, new_props,
+                                              stack_name, logical_id=None):
+    """Update a resource server in place, keeping its Identifier (what Ref
+    returns). Name and Scopes are "Update requires: No interruption" on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolresourceserver.html)
+    and go through UpdateResourceServer; a dropped Scopes goes back to the
+    empty list the call defaults it to ("If you don't provide a value for an
+    attribute, it is set to the default value"). Name is "Required: Yes" on
+    the reference; a template that leaves it off gets the Identifier as
+    MiniStack's own fallback. Identifier and UserPoolId require replacement,
+    and the new resource server is created before the old one is removed.
+
+    A resource server is keyed by (pool, identifier) while its physical id is
+    the identifier alone, so a move to another pool keeps the id and the
+    engine's cleanup never sees the replacement: the handler passes the pair
+    as the identity and asks the shared helper to delete under an unchanged
+    id. Under a declared Identifier the move is refused before we get here
+    (_custom_named_replacement_error, the way CloudFormation refuses to
+    replace a custom-named resource); this branch carries the case where the
+    template leaves the Identifier off. A resource server the template
+    retains on replacement is left where it is, since the engine's own
+    cleanup does not see a replacement it can skip when the identifier
+    stayed the same.
+    """
+    identifier = new_props.get("Identifier", "")
+    old_pid = old_props.get("UserPoolId", "")
+    new_pid = new_props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(old_pid)
+    server = _cognito._pool_resource_servers(pool).get(physical_id) if pool else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_pid, identifier), (old_pid, physical_id) if server else None,
+        _cognito_user_pool_resource_server_create,
+        _cognito_user_pool_resource_server_delete,
+        delete_when_id_unchanged=True,
+    )
+    if replaced is not None:
+        return replaced
+
+    status, _, body = _cognito._update_resource_server({
+        "UserPoolId": new_pid,
+        "Identifier": identifier,
+        "Name": new_props.get("Name", identifier),
+        "Scopes": new_props.get("Scopes", []),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::UserPoolResourceServer update failed: {body!r}")
+    return identifier, {}
+
+
 def _cognito_user_pool_resource_server_delete(physical_id, props):
     pid = props.get("UserPoolId", "")
     pool = _cognito._user_pools.get(pid)
@@ -4046,14 +5865,61 @@ def _cognito_user_pool_group_create(logical_id, props, stack_name):
         "UserPoolId": pid,
         "Description": props.get("Description", ""),
         "RoleArn": props.get("RoleArn", ""),
-        "Precedence": props.get("Precedence", 0),
         "CreationDate": now,
         "LastModifiedDate": now,
         "_members": [],
     }
+    # "The default Precedence value is null" on the resource reference, so a
+    # template that does not set it gets a group without one.
+    if "Precedence" in props:
+        group["Precedence"] = props["Precedence"]
     pool["_groups"][name] = group
     # Ref on this resource type returns the GroupName (matches real AWS —
     # see https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html#aws-resource-cognito-userpoolgroup-return-values).
+    return name, {}
+
+
+def _cognito_user_pool_group_update(physical_id, old_props, new_props, stack_name,
+                                    logical_id=None):
+    """Update a group in place, keeping its name (what Ref returns) and its
+    members. GroupName and UserPoolId require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-userpoolgroup.html):
+    a rename, or a move to another pool, creates the new group before the
+    old one is removed; a move that keeps an explicit GroupName was already
+    refused by _custom_named_replacement_error, the way CloudFormation
+    refuses to replace a custom-named resource. Description, Precedence and
+    RoleArn are what UpdateGroup takes, applied to the record directly since
+    the service has no UpdateGroup handler.
+
+    The replacement prologue is spelled out here rather than going through
+    _rename_replacement because a group is keyed by (pool, name), and the
+    helper only compares names: a move to another pool under a generated
+    name keeps the same name, so the helper would see no replacement and
+    the old group would stay stranded in the old pool. The pool has to be
+    part of the replacement test.
+    """
+    name = new_props.get("GroupName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=128
+    )
+    old_pid = old_props.get("UserPoolId", "")
+    new_pid = new_props.get("UserPoolId", "")
+    pool = _cognito._user_pools.get(old_pid)
+    group = pool["_groups"].get(physical_id) if pool else None
+    if group is None or name != physical_id or new_pid != old_pid:
+        created = _cognito_user_pool_group_create(
+            logical_id or physical_id, new_props, stack_name
+        )
+        if group is not None:
+            _delete_predecessor(_cognito_user_pool_group_delete, physical_id, old_props)
+        return created
+
+    group["Description"] = new_props.get("Description", "")
+    group["RoleArn"] = new_props.get("RoleArn", "")
+    if "Precedence" in new_props:
+        group["Precedence"] = new_props["Precedence"]
+    else:
+        group.pop("Precedence", None)
+    group["LastModifiedDate"] = _cognito._now_epoch()
     return name, {}
 
 
@@ -4073,8 +5939,12 @@ def _cognito_user_pool_group_delete(physical_id, props):
 
 # --- Cognito IdentityPool ---
 
+def _cognito_identity_pool_name(props, stack_name, logical_id):
+    return props.get("IdentityPoolName") or _physical_name(stack_name, logical_id, max_len=128)
+
+
 def _cognito_identity_pool_create(logical_id, props, stack_name):
-    name = props.get("IdentityPoolName") or _physical_name(stack_name, logical_id, max_len=128)
+    name = _cognito_identity_pool_name(props, stack_name, logical_id)
     iid = _cognito._identity_pool_id()
     pool = {
         "IdentityPoolId": iid,
@@ -4091,7 +5961,49 @@ def _cognito_identity_pool_create(logical_id, props, stack_name):
         "_identities": {},
     }
     _cognito._identity_pools[iid] = pool
-    return iid, {}
+    # ListTagsForResource reads the pool's tag store, not the record.
+    _cognito._identity_tags[iid] = _tag_map(props.get("IdentityPoolTags"))
+    # The one Fn::GetAtt the resource reference lists is Name.
+    return iid, {"Name": name}
+
+
+# UpdateIdentityPool's parameters, with the value a dropped property reverts
+# to (the create handler's defaults). CognitoEvents, CognitoStreams and
+# PushSync have no field on the record and are not modelled.
+_COGNITO_IDENTITY_POOL_UPDATABLE = {
+    "AllowUnauthenticatedIdentities": False,
+    "AllowClassicFlow": False,
+    "SupportedLoginProviders": {},
+    "DeveloperProviderName": "",
+    "OpenIdConnectProviderARNs": [],
+    "CognitoIdentityProviders": [],
+    "SamlProviderARNs": [],
+    "IdentityPoolTags": {},
+}
+
+
+def _cognito_identity_pool_update(physical_id, old_props, new_props, stack_name,
+                                  logical_id=None):
+    """Update an identity pool in place through UpdateIdentityPool: no
+    AWS::Cognito::IdentityPool property requires replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-identitypool.html),
+    so the pool keeps its generated id, its role mapping, its principal-tag
+    mappings and its identities.
+    """
+    if physical_id not in _cognito._identity_pools:
+        raise ValueError(f"AWS::Cognito::IdentityPool {physical_id} no longer exists")
+    payload = _declared_or_default(
+        old_props, new_props, _COGNITO_IDENTITY_POOL_UPDATABLE
+    )
+    name = _cognito_identity_pool_name(new_props, stack_name, logical_id or physical_id)
+    payload["IdentityPoolId"] = physical_id
+    payload["IdentityPoolName"] = name
+    status, _, body = _cognito._update_identity_pool(payload)
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::IdentityPool update failed: {body!r}")
+    _reconcile_tag_map(_cognito._identity_tags.setdefault(physical_id, {}),
+                       old_props, new_props, prop="IdentityPoolTags")
+    return physical_id, {"Name": name}
 
 
 def _cognito_identity_pool_delete(physical_id, props):
@@ -4238,41 +6150,10 @@ def _iam_managed_policy_update(physical_id, old_props, new_props, stack_name, lo
         return _iam_managed_policy_create(logical_id or physical_id, new_props, stack_name)
 
     if new_props.get("PolicyDocument") != old_props.get("PolicyDocument"):
-        versions = record["Versions"]
-        surplus = len(versions) - _IAM_POLICY_VERSION_LIMIT + 1
-        if surplus > 0:
-            prunable = sorted(
-                (v["VersionId"] for v in versions.values() if not v["IsDefaultVersion"]),
-                key=lambda vid: int(vid.lstrip("v")),
-            )
-            for version_id in prunable[:surplus]:
-                _iam._delete_policy_version(
-                    {"PolicyArn": physical_id, "VersionId": version_id}
-                )
-        document = new_props.get("PolicyDocument", {})
-        if not isinstance(document, str):
-            document = json.dumps(document)
-        resp = _iam._create_policy_version({
-            "PolicyArn": physical_id,
-            "PolicyDocument": document,
-            "SetAsDefault": "true",
-        })
-        if resp[0] >= 400:
-            raise ValueError(f"AWS::IAM::ManagedPolicy update failed: {resp[2]!r}")
-
-    for prop, store in (("Roles", _iam._roles),
-                        ("Users", _iam._users),
-                        ("Groups", _iam._groups)):
-        old_names = set(old_props.get(prop, []) or [])
-        new_names = set(new_props.get(prop, []) or [])
-        for entity_name in sorted(old_names - new_names):
-            entity = store.get(entity_name)
-            if entity is not None:
-                _iam.detach_managed_policy(entity, physical_id)
-        for entity_name in sorted(new_names - old_names):
-            entity = store.get(entity_name)
-            if entity is not None:
-                _iam.attach_managed_policy(entity, physical_id)
+        _iam_policy_set_document(
+            physical_id, record, new_props.get("PolicyDocument", {}), "AWS::IAM::ManagedPolicy"
+        )
+    _iam_policy_reconcile_entities(physical_id, old_props, new_props)
 
     return physical_id, {
         "PolicyArn": physical_id,
@@ -4287,7 +6168,7 @@ def _iam_managed_policy_update(physical_id, old_props, new_props, stack_name, lo
 
 
 def _iam_managed_policy_delete(physical_id, props):
-    _iam._policies.pop(physical_id, None)
+    _iam_policy_remove(physical_id, props)
 
 
 # --- KMS resource provisioners ---
@@ -4407,13 +6288,55 @@ def _kms_key_delete(physical_id, props):
         })
 
 
-def _kms_alias_create(logical_id, props, stack_name):
-    alias_name = props.get("AliasName", f"alias/{stack_name}-{logical_id}")
-    target_key = props.get("TargetKeyId", "")
+_KMS_ALIAS_NAME = re.compile(r"^alias/[a-zA-Z0-9:/_-]{1,250}$")
+
+
+def _kms_alias_target(target_key):
     rec = _kms._resolve_key(target_key)
-    alias_arn = _kms._alias_arn(alias_name)
-    _kms._aliases[alias_arn] = rec["KeyId"] if rec else target_key
+    return rec["KeyId"] if rec else target_key
+
+
+def _kms_alias_name(props, stack_name, logical_id):
+    return props.get("AliasName") or f"alias/{stack_name}-{logical_id}"
+
+
+def _kms_alias_create(logical_id, props, stack_name):
+    alias_name = _kms_alias_name(props, stack_name, logical_id)
+    if not _KMS_ALIAS_NAME.match(alias_name) or alias_name.startswith("alias/aws/"):
+        # The constraints the resource reference states: the alias/ prefix,
+        # alphanumerics plus :/_- up to 256 characters, and alias/aws/
+        # reserved for AWS managed keys.
+        raise ValueError(
+            f"AWS::KMS::Alias AliasName {alias_name!r} must begin with alias/, "
+            "contain only alphanumerics, :, /, _ and -, and must not begin "
+            "with the reserved alias/aws/ prefix")
+    target_key = props.get("TargetKeyId", "")
+    if not target_key:
+        raise ValueError("AWS::KMS::Alias requires TargetKeyId")
+    _kms._aliases[_kms._alias_arn(alias_name)] = _kms_alias_target(target_key)
     return alias_name, {}
+
+
+def _kms_alias_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an alias in place: TargetKeyId is No interruption on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-kms-alias.html),
+    so a changed target re-points the alias under its name (what Ref
+    returns), as UpdateAlias does. AliasName requires replacement: the new
+    alias is created before the old one is removed."""
+    current = physical_id if _kms._alias_arn(physical_id) in _kms._aliases else None
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        _kms_alias_name(new_props, stack_name, logical_id or physical_id), current,
+        _kms_alias_create, _kms_alias_delete,
+    )
+    if replaced is not None:
+        return replaced
+    target_key = new_props.get("TargetKeyId", "")
+    if not target_key:
+        raise ValueError("AWS::KMS::Alias requires TargetKeyId")
+    _kms._aliases[_kms._alias_arn(physical_id)] = _kms_alias_target(target_key)
+    return physical_id, {}
 
 
 def _kms_alias_delete(physical_id, props):
@@ -4547,6 +6470,7 @@ def _ec2_subnet_create(logical_id, props, stack_name):
         "VpcId": vpc_id,
         "CidrBlock": cidr,
         "AvailabilityZone": az,
+        "AvailabilityZoneId": _ec2._az_id_for_zone_name(az),
         "State": "available",
         "AvailableIpAddressCount": 251,
         "DefaultForAz": False,
@@ -5157,9 +7081,10 @@ def _lambda_layer_version_permission_delete(physical_id, props):
 # StepFunctions StateMachine
 # ---------------------------------------------------------------------------
 
-def _sfn_state_machine_create(logical_id, props, stack_name):
-    name = props.get("StateMachineName") or _physical_name(stack_name, logical_id, max_len=80)
-    role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+def _sfn_definition(props):
+    """The Amazon States Language definition a template declares, resolved
+    from whichever of the three sources it uses, with DefinitionSubstitutions
+    applied."""
     import json as _json
 
     # Real CFN accepts three mutually-exclusive definition shapes:
@@ -5201,11 +7126,38 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
     if subs:
         for k, v in subs.items():
             definition = definition.replace("${" + str(k) + "}", str(v))
+    return definition
 
+
+def _sfn_tags(props):
+    """CloudFormation ``Tags`` ([{Key, Value}]) in the shape the Step
+    Functions tag store keeps ([{key, value}])."""
+    return [{"key": t.get("Key", ""), "value": t.get("Value", "")} for t in props.get("Tags") or []]
+
+
+def _sfn_attrs(arn, name):
+    """Ref is the ARN; Fn::GetAtt serves Arn, Name and StateMachineRevisionId,
+    the revision the record carries (rotated by every create and update)."""
+    attrs = {"Arn": arn, "Name": name}
+    sm = _sfn._state_machines.get(arn)
+    if sm and sm.get("revisionId"):
+        attrs["StateMachineRevisionId"] = sm["revisionId"]
+    return attrs
+
+
+def _sfn_state_machine_create(logical_id, props, stack_name):
+    name = props.get("StateMachineName") or _physical_name(stack_name, logical_id, max_len=80)
+    role_arn = props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+    definition = _sfn_definition(props)
     sm_type = props.get("StateMachineType", "STANDARD")
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     ts = now_iso()
+    # The record mirrors what CreateStateMachine writes, revision id and
+    # version counter included, so versions published later behave the same
+    # for a template-created machine. TracingConfiguration and
+    # EncryptionConfiguration have no field in the store and are accepted
+    # without effect.
     _sfn._state_machines[arn] = {
         "stateMachineArn": arn,
         "name": name,
@@ -5215,12 +7167,87 @@ def _sfn_state_machine_create(logical_id, props, stack_name):
         "creationDate": ts,
         "status": "ACTIVE",
         "loggingConfiguration": props.get("LoggingConfiguration", {"level": "OFF", "includeExecutionData": False}),
+        "revisionId": new_uuid(),
+        "lastVersionNumber": 0,
     }
-    return arn, {"Arn": arn, "Name": name}
+    tags = _sfn_tags(props)
+    if tags:
+        _sfn._tag_resource({"resourceArn": arn, "tags": tags})
+    return arn, _sfn_attrs(arn, name)
+
+
+def _sfn_state_machine_update(physical_id, old_props, new_props, stack_name,
+                              logical_id=None):
+    """Update a state machine in place through UpdateStateMachine, keeping
+    its ARN (what Ref returns), its executions and its published versions.
+    StateMachineName and StateMachineType require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-stepfunctions-statemachine.html):
+    a rename creates the new machine before the old one is removed; a type
+    change under an unchanged name is refused — for a custom name by
+    _custom_named_replacement_error, as CloudFormation refuses it, and here
+    for a generated name, whose deterministic derivation cannot yield a
+    fresh identity. Definition, DefinitionSubstitutions, RoleArn,
+    LoggingConfiguration and Tags update without interruption;
+    TracingConfiguration and EncryptionConfiguration are accepted without
+    effect, the store has no field for them.
+    """
+    name = new_props.get("StateMachineName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=80
+    )
+    sm = _sfn._state_machines.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, sm.get("name") if sm else None,
+        _sfn_state_machine_create, _sfn_state_machine_delete,
+    )
+    if replaced is not None:
+        return replaced
+
+    old_type = old_props.get("StateMachineType", "STANDARD")
+    new_type = new_props.get("StateMachineType", "STANDARD")
+    if new_type != old_type:
+        raise ValueError(
+            f"AWS::StepFunctions::StateMachine StateMachineType ({old_type} -> "
+            f"{new_type}) requires replacement, which MiniStack does not perform "
+            f"for {name}; set a StateMachineName to create the replacement."
+        )
+
+    data = {
+        "stateMachineArn": physical_id,
+        "definition": _sfn_definition(new_props),
+        "roleArn": new_props.get(
+            "RoleArn", f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole"
+        ),
+    }
+    # Sent only when the template speaks to the property: declared, or
+    # dropped since the previous template, which reverts it to the default
+    # the create applies. A logging configuration set outside the stack on a
+    # machine whose template never declared one is left alone.
+    logging = _declared_or_default(old_props, new_props, {
+        "LoggingConfiguration": {"level": "OFF", "includeExecutionData": False}})
+    if logging:
+        data["loggingConfiguration"] = logging["LoggingConfiguration"]
+    resp = _sfn._update_state_machine(data)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::StepFunctions::StateMachine update failed: {resp[2]!r}")
+
+    # Tags reconcile through TagResource / UntagResource as on AWS: keys the
+    # template dropped are removed, the rest are written in place.
+    old_tags = {t["key"]: t["value"] for t in _sfn_tags(old_props)}
+    new_tags = {t["key"]: t["value"] for t in _sfn_tags(new_props)}
+    if old_tags != new_tags:
+        dropped = sorted(old_tags.keys() - new_tags.keys())
+        if dropped:
+            _sfn._untag_resource({"resourceArn": physical_id, "tagKeys": dropped})
+        changed = [t for t in _sfn_tags(new_props) if old_tags.get(t["key"]) != t["value"]]
+        if changed:
+            _sfn._tag_resource({"resourceArn": physical_id, "tags": changed})
+    return physical_id, _sfn_attrs(physical_id, name)
 
 
 def _sfn_state_machine_delete(physical_id, props):
     _sfn._state_machines.pop(physical_id, None)
+    _sfn._tags.pop(physical_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -5558,13 +7585,15 @@ def _r53_record_set_delete(physical_id, props):
 # ---------------------------------------------------------------------------
 
 
-def _cw_metric_alarm_create(logical_id, props, stack_name):
+def _cw_metric_alarm_record(name, props):
+    """The PutMetricAlarm-shaped record for a template's alarm properties.
+    An existing alarm of that name keeps its state: CloudFormation leaves
+    the state untouched on update and only rewrites the configuration."""
     if props.get("Metrics"):
         raise ValueError(
             "AWS::CloudWatch::Alarm Properties.Metrics (metric math) is not supported; "
             "use MetricName and Namespace."
         )
-    name = props.get("AlarmName") or _physical_name(stack_name, logical_id, max_len=255)
     metric_name = props.get("MetricName")
     namespace = props.get("Namespace")
     if not metric_name or not namespace:
@@ -5625,7 +7654,9 @@ def _cw_metric_alarm_create(logical_id, props, stack_name):
         "StateReason": _cw._alarms[name]["StateReason"]
         if name in _cw._alarms
         else "Unchecked: Initial alarm creation",
-        "StateUpdatedTimestamp": int(time.time()),
+        "StateUpdatedTimestamp": _cw._alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+        if name in _cw._alarms
+        else int(time.time()),
         "ActionsEnabled": ae,
         "AlarmActions": alarm_actions,
         "OKActions": ok_actions,
@@ -5634,9 +7665,50 @@ def _cw_metric_alarm_create(logical_id, props, stack_name):
         "Unit": props.get("Unit"),
         "AlarmConfigurationUpdatedTimestamp": int(time.time()),
     }
+    return alarm
+
+
+def _cw_metric_alarm_put(name, props):
+    """Create or overwrite the alarm and apply the template's Tags. Every
+    property but AlarmName is "No interruption", so create and update run the
+    same path; Tags go through the tag store because PutMetricAlarm ignores
+    Tags on an existing alarm (its reference: "To change the tags of an
+    existing alarm, use TagResource or UntagResource")."""
+    alarm = _cw_metric_alarm_record(name, props)
     _cw.cloudformation_put_metric_alarm(alarm)
-    arn = alarm["AlarmArn"]
-    return name, {"Arn": arn}
+    tags = props.get("Tags") or []
+    _cw.cloudformation_set_metric_alarm_tags(
+        name, [t for t in tags if isinstance(t, dict) and t.get("Key")]
+    )
+    return name, {"Arn": alarm["AlarmArn"]}
+
+
+def _cw_metric_alarm_create(logical_id, props, stack_name):
+    name = props.get("AlarmName") or _physical_name(stack_name, logical_id, max_len=255)
+    return _cw_metric_alarm_put(name, props)
+
+
+def _cw_metric_alarm_update(physical_id, old_props, new_props, stack_name,
+                            logical_id=None):
+    """Update an alarm in place as PutMetricAlarm does: the configuration is
+    rewritten under the same name (what Ref returns) and the alarm state and
+    history stay. AlarmName is the one property with "Update requires:
+    Replacement"
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cloudwatch-alarm.html):
+    a rename creates the new alarm before the old one is removed. An alarm
+    deleted behind CloudFormation's back is recreated the same way.
+    """
+    name = new_props.get("AlarmName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=255
+    )
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, physical_id if physical_id in _cw._alarms else None,
+        _cw_metric_alarm_create, _cw_metric_alarm_delete,
+    )
+    if replaced is not None:
+        return replaced
+    return _cw_metric_alarm_put(name, new_props)
 
 
 def _cw_metric_alarm_delete(physical_id, props):
@@ -5679,7 +7751,7 @@ def _cw_dashboard_update(physical_id, old_props, new_props, stack_name):
         raise ValueError("DashboardName must be between 1 and 255 characters")
     _cw.cloudformation_put_dashboard(name, _cw_dashboard_body(new_props))
     if name != physical_id:
-        _cw.cloudformation_delete_dashboard(physical_id)
+        _delete_predecessor(_cw.cloudformation_delete_dashboard, physical_id)
     return name, {}
 
 
@@ -5691,22 +7763,36 @@ def _cw_dashboard_delete(physical_id, props):
 # ApiGatewayV2 Api
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_api_create(logical_id, props, stack_name):
-    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
-    protocol = props.get("ProtocolType", "HTTP")
-    api = {
-        "apiId": api_id,
-        "name": name,
-        "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
-        "createdDate": now_iso(),
-        "routeSelectionExpression": props.get("RouteSelectionExpression", "$request.method $request.path"),
+def _apigw_v2_api_props(props, stack_name, logical_id):
+    """The mutable part of an API record from its template properties, with
+    the create's defaults: what the create stores and what an update writes
+    over the existing record."""
+    # The HTTP default is the documented one; AWS requires the expression
+    # for a WebSocket API, and "$request.body.action" is the emulator's own
+    # fallback, the one its CreateApi uses.
+    default_rse = ("$request.body.action" if props.get("ProtocolType") == "WEBSOCKET"
+                   else "$request.method $request.path")
+    return {
+        "name": props.get("Name") or _physical_name(stack_name, logical_id, max_len=128),
+        "routeSelectionExpression": props.get("RouteSelectionExpression", default_rse),
         "apiKeySelectionExpression": props.get("ApiKeySelectionExpression", "$request.header.x-api-key"),
-        "tags": props.get("Tags", {}),
         "disableSchemaValidation": props.get("DisableSchemaValidation", False),
         "disableExecuteApiEndpoint": props.get("DisableExecuteApiEndpoint", False),
         "version": props.get("Version", ""),
+        "description": props.get("Description", ""),
+    }
+
+
+def _apigw_v2_api_create(logical_id, props, stack_name):
+    api_id = _apigw_v2._resolve_custom_api_id(props.get("Tags", {}), _apigw_v2._apis) or new_uuid()[:8]
+    protocol = props.get("ProtocolType", "HTTP")
+    api = {
+        "apiId": api_id,
+        "protocolType": protocol,
+        "apiEndpoint": f"http://{api_id}.execute-api.{_MINISTACK_HOST}:{os.environ.get('GATEWAY_PORT', '4566')}",
+        "createdDate": now_iso(),
+        "tags": dict(props.get("Tags") or {}),
+        **_apigw_v2_api_props(props, stack_name, logical_id),
     }
     if props.get("CorsConfiguration"):
         api["corsConfiguration"] = props["CorsConfiguration"]
@@ -5716,6 +7802,44 @@ def _apigw_v2_api_create(logical_id, props, stack_name):
     _apigw_v2._stages[api_id] = {}
     _apigw_v2._deployments[api_id] = {}
     return api_id, {"ApiId": api_id, "ApiEndpoint": api["apiEndpoint"]}
+
+
+def _apigw_v2_api_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an API in place: every property but ProtocolType is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-api.html),
+    so the update goes through the service's own UpdateApi and the record
+    keeps its apiId, its apiEndpoint and the routes, integrations and
+    stages stored under the id. The
+    create fallback minted a new id on every change, which re-created every
+    child that Refs the API, and with an ms-custom-id tag its second
+    _resolve_custom_api_id call refused the pinned id as already in use and
+    rolled the stack back. A property the template drops reverts to the
+    create's default. ProtocolType requires replacement: the new API is
+    created before the old one is removed (a pinned id cannot be replaced,
+    and the create's own refusal fails the update)."""
+    api = _apigw_v2._apis.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ProtocolType", "HTTP"), api["protocolType"] if api else None,
+        _apigw_v2_api_create, _apigw_v2_api_delete,
+    )
+    if replaced is not None:
+        return replaced
+    payload = _apigw_v2_api_props(new_props, stack_name, logical_id or physical_id)
+    if new_props.get("CorsConfiguration"):
+        payload["corsConfiguration"] = new_props["CorsConfiguration"]
+    resp = _apigw_v2._update_api(physical_id, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Api update failed: {resp[2]!r}")
+    if not new_props.get("CorsConfiguration"):
+        # A dropped property reverts to the create's default, which for CORS
+        # is no configuration at all. UpdateApi replaces a configuration and
+        # cannot clear one — DeleteCorsConfiguration is the call that removes
+        # it — so the removal happens here rather than inside UpdateApi.
+        _apigw_v2._delete_cors_configuration(physical_id)
+    _reconcile_tag_map(api.setdefault("tags", {}), old_props, new_props)
+    return physical_id, {"ApiId": physical_id, "ApiEndpoint": api["apiEndpoint"]}
 
 
 def _apigw_v2_api_delete(physical_id, props):
@@ -5730,22 +7854,59 @@ def _apigw_v2_api_delete(physical_id, props):
 # ApiGatewayV2 Stage
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_stage_create(logical_id, props, stack_name):
-    api_id = props.get("ApiId", "")
-    stage_name = props.get("StageName", "$default")
-    stage = {
-        "stageName": stage_name,
+def _apigw_v2_stage_props(props):
+    """The mutable part of a stage record from its template properties,
+    with the create's defaults: what the create stores and what an update
+    writes over the existing record."""
+    return {
         "autoDeploy": props.get("AutoDeploy", False),
-        "createdDate": now_iso(),
         "lastUpdatedDate": now_iso(),
         "stageVariables": props.get("StageVariables", {}),
         "description": props.get("Description", ""),
         "defaultRouteSettings": props.get("DefaultRouteSettings", {}),
         "routeSettings": props.get("RouteSettings", {}),
-        "tags": props.get("Tags", {}),
+    }
+
+
+def _apigw_v2_stage_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    stage_name = props.get("StageName", "$default")
+    stage = {
+        "stageName": stage_name,
+        "createdDate": now_iso(),
+        "tags": dict(props.get("Tags") or {}),
+        **_apigw_v2_stage_props(props),
     }
     _apigw_v2._stages.setdefault(api_id, {})[stage_name] = stage
     physical_id = f"{api_id}/{stage_name}"
+    return physical_id, {"StageName": stage_name}
+
+
+def _apigw_v2_stage_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a stage in place: every property but ApiId and StageName is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-stage.html),
+    so the update goes through the service's own UpdateStage, which keeps
+    the name and the creation date and refreshes lastUpdatedDate. The
+    create fallback rebuilt the
+    record under the same name, which reset createdDate and the tags set
+    through the service's own API. A property the template drops reverts to
+    the create's default. ApiId and StageName require replacement: the new
+    stage is created before the old one is removed."""
+    api_id, _, stage_name = physical_id.partition("/")
+    stage = _apigw_v2._stages.get(api_id, {}).get(stage_name)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        (new_props.get("ApiId", ""), new_props.get("StageName", "$default")),
+        (api_id, stage_name) if stage else None,
+        _apigw_v2_stage_create, _apigw_v2_stage_delete,
+    )
+    if replaced is not None:
+        return replaced
+    resp = _apigw_v2._update_stage(api_id, stage_name, _apigw_v2_stage_props(new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Stage update failed: {resp[2]!r}")
+    _reconcile_tag_map(stage.setdefault("tags", {}), old_props, new_props)
     return physical_id, {"StageName": stage_name}
 
 
@@ -5761,11 +7922,11 @@ def _apigw_v2_stage_delete(physical_id, props):
 # ApiGatewayV2 Integration
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_integration_create(logical_id, props, stack_name):
-    api_id = props.get("ApiId", "")
-    int_id = new_uuid()[:8]
-    integration = {
-        "integrationId": int_id,
+def _apigw_v2_integration_props(props):
+    """The mutable part of an integration record from its template
+    properties, with the create's defaults: what the create stores and what
+    an update writes over the existing record."""
+    return {
         "integrationType": props.get("IntegrationType", "AWS_PROXY"),
         "integrationUri": props.get("IntegrationUri", ""),
         "integrationMethod": props.get("IntegrationMethod", "POST"),
@@ -5779,10 +7940,44 @@ def _apigw_v2_integration_create(logical_id, props, stack_name):
         "responseParameters": props.get("ResponseParameters", {}),
         "contentHandlingStrategy": props.get("ContentHandlingStrategy"),
     }
+
+
+def _apigw_v2_integration_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    int_id = new_uuid()[:8]
+    integration = {"integrationId": int_id, **_apigw_v2_integration_props(props)}
     _apigw_v2._integrations.setdefault(api_id, {})[int_id] = integration
     # AWS returns just the integration ID as the physical ID (Ref).
     # Store apiId in outputs so delete can find the right API.
     return int_id, {"IntegrationId": int_id, "ApiId": api_id}
+
+
+def _apigw_v2_integration_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update an integration in place: every property but ApiId is No
+    interruption on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-integration.html),
+    so the update goes through the service's own UpdateIntegration and the
+    record keeps its integrationId, which every Route's Target names. The
+    create fallback minted a new id
+    on every change and left the old integration on the API. A property the
+    template drops reverts to the create's default. ApiId requires
+    replacement: the integration is created on the new API before the old
+    one is removed."""
+    old_api_id = old_props.get("ApiId", "")
+    int_id = physical_id.split("/", 1)[1] if "/" in physical_id else physical_id
+    integration = _apigw_v2._integrations.get(old_api_id, {}).get(int_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ApiId", ""), old_api_id if integration else None,
+        _apigw_v2_integration_create, _apigw_v2_integration_delete,
+    )
+    if replaced is not None:
+        return replaced
+    resp = _apigw_v2._update_integration(old_api_id, int_id,
+                                         _apigw_v2_integration_props(new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Integration update failed: {resp[2]!r}")
+    return physical_id, {"IntegrationId": int_id, "ApiId": old_api_id}
 
 
 def _apigw_v2_integration_delete(physical_id, props):
@@ -5801,11 +7996,11 @@ def _apigw_v2_integration_delete(physical_id, props):
 # ApiGatewayV2 Route
 # ---------------------------------------------------------------------------
 
-def _apigw_v2_route_create(logical_id, props, stack_name):
-    api_id = props.get("ApiId", "")
-    route_id = new_uuid()[:8]
-    route = {
-        "routeId": route_id,
+def _apigw_v2_route_props(props):
+    """The mutable part of a route record from its template properties,
+    with the create's defaults: what the create stores and what an update
+    writes over the existing record."""
+    return {
         "routeKey": props.get("RouteKey", "$default"),
         "target": props.get("Target", ""),
         "authorizationType": props.get("AuthorizationType", "NONE"),
@@ -5816,8 +8011,39 @@ def _apigw_v2_route_create(logical_id, props, stack_name):
         "requestModels": props.get("RequestModels", {}),
         "requestParameters": props.get("RequestParameters", {}),
     }
+
+
+def _apigw_v2_route_create(logical_id, props, stack_name):
+    api_id = props.get("ApiId", "")
+    route_id = new_uuid()[:8]
+    route = {"routeId": route_id, **_apigw_v2_route_props(props)}
     _apigw_v2._routes.setdefault(api_id, {})[route_id] = route
     physical_id = f"{api_id}/{route_id}"
+    return physical_id, {"RouteId": route_id}
+
+
+def _apigw_v2_route_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a route in place: every property but ApiId is No interruption
+    on the resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-apigatewayv2-route.html),
+    so the update goes through the service's own UpdateRoute and the record
+    keeps its routeId. The create fallback
+    minted a new id on every change and left the old route on the API,
+    where its route key kept matching requests. A property the template
+    drops reverts to the create's default. ApiId requires replacement: the
+    route is created on the new API before the old one is removed."""
+    api_id, _, route_id = physical_id.partition("/")
+    route = _apigw_v2._routes.get(api_id, {}).get(route_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        new_props.get("ApiId", ""), api_id if route else None,
+        _apigw_v2_route_create, _apigw_v2_route_delete,
+    )
+    if replaced is not None:
+        return replaced
+    resp = _apigw_v2._update_route(api_id, route_id, _apigw_v2_route_props(new_props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::ApiGatewayV2::Route update failed: {resp[2]!r}")
     return physical_id, {"RouteId": route_id}
 
 
@@ -6024,31 +8250,69 @@ def _cf_oai_delete(physical_id, props):
 # CloudFront Distribution
 # ---------------------------------------------------------------------------
 
+def _cf_distribution_config(props, caller_reference):
+    """The DistributionConfig element the service stores, rendered from the
+    template's JSON with the CallerReference the record carries."""
+    # DistributionConfig is Required: Yes on the resource reference; a
+    # template without it renders an empty configuration rather than the
+    # resource's other properties (Tags) as if they were one.
+    dist_config = props.get("DistributionConfig") or {}
+    return _cf._distribution_config_xml({"CallerReference": caller_reference, **dist_config})
+
+
 def _cf_distribution_create(logical_id, props, stack_name):
-    dist_config = props.get("DistributionConfig", props)
     dist_id = _cf._dist_id()
     arn = f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}"
-
-    origins = dist_config.get("Origins", [])
-    default_cache = dist_config.get("DefaultCacheBehavior", {})
-
+    # The API's DistributionConfig carries a CallerReference and a template
+    # has none; without one GetDistributionConfig would answer a config
+    # missing a member the SDKs expect. The update keeps it.
+    caller_reference = new_uuid()
+    config_el = _cf_distribution_config(props, caller_reference)
     _cf._distributions[dist_id] = {
         "Id": dist_id,
         "ARN": arn,
         "Status": "Deployed",
         "DomainName": f"{dist_id}.cloudfront.net",
-        "LastModifiedTime": now_iso(),
+        "LastModifiedTime": _cf._now_iso(),
         "ETag": new_uuid(),
-        "config_xml": "",
-        "enabled": dist_config.get("Enabled", True),
+        "CallerReference": caller_reference,
+        "config_xml": _cf.tostring(config_el, encoding="unicode"),
+        "enabled": _cf._get_enabled(config_el),
     }
     _cf._invalidations[dist_id] = []
+    _cf._tags[arn] = [{"Key": k, "Value": v} for k, v in _tag_map(props.get("Tags")).items()]
     return dist_id, {"Arn": arn, "DomainName": f"{dist_id}.cloudfront.net", "Id": dist_id}
 
 
+def _cf_distribution_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a distribution in place: DistributionConfig and Tags, the two
+    properties of the type, are both No interruption on the resource
+    reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cloudfront-distribution.html),
+    so there is no replacement path at all. The record keeps its Id, ARN
+    and DomainName and its invalidation history; the configuration is
+    stored anew, the ETag rolls and LastModifiedTime moves, as
+    UpdateDistribution does. The create fallback minted a new id and domain
+    name on every change and the engine then deleted the old distribution."""
+    dist = _cf._distributions.get(physical_id)
+    if dist is None:
+        return _cf_distribution_create(logical_id or physical_id, new_props, stack_name)
+    config_el = _cf_distribution_config(new_props, dist.get("CallerReference") or new_uuid())
+    dist["config_xml"] = _cf.tostring(config_el, encoding="unicode")
+    dist["enabled"] = _cf._get_enabled(config_el)
+    dist["ETag"] = new_uuid()
+    dist["LastModifiedTime"] = _cf._now_iso()
+    _reconcile_tag_list(_cf._tags.setdefault(dist["ARN"], []), old_props, new_props)
+    return physical_id, {"Arn": dist["ARN"], "DomainName": dist["DomainName"], "Id": physical_id}
+
+
 def _cf_distribution_delete(physical_id, props):
-    _cf._distributions.pop(physical_id, None)
+    dist = _cf._distributions.pop(physical_id, None)
     _cf._invalidations.pop(physical_id, None)
+    if dist:
+        # The tagging API reads the store as it is, so a deleted
+        # distribution would keep answering GetResources.
+        _cf._tags.pop(dist["ARN"], None)
 
 
 # ---------------------------------------------------------------------------
@@ -6582,7 +8846,7 @@ def _firehose_delivery_stream_update(physical_id, old_props, new_props, stack_na
         new_id, attrs = _firehose_delivery_stream_create(
             physical_id, new_props, stack_name
         )
-        _firehose_delivery_stream_delete(physical_id, old_props)
+        _delete_predecessor(_firehose_delivery_stream_delete, physical_id, old_props)
         return new_id, attrs
     stream = _firehose._streams.get(physical_id)
     if stream is None:
@@ -6623,6 +8887,72 @@ def _iot_thing_type_create(logical_id, props, stack_name):
 
 def _iot_thing_type_delete(physical_id, props):
     _iot._thing_types.pop(physical_id, None)
+
+
+# --- IoT ThingGroup ---
+# Ref is the thing group id (the resource reference), so the physical id is
+# the id and the handlers find the record by it.
+
+def _iot_thing_group_record(physical_id):
+    return next((g for g in _iot._thing_groups.values()
+                 if g.get("thingGroupId") == physical_id), None)
+
+
+def _iot_thing_group_properties(props):
+    """The ThingGroupProperties payload, with a dropped property at the
+    value the service stores for an omitted one (no description, no
+    attributes), so an update that removes a property clears it."""
+    declared = _pascal_to_camel(props.get("ThingGroupProperties") or {})
+    attributes = (declared.get("attributePayload") or {}).get("attributes") or {}
+    return {
+        "thingGroupDescription": declared.get("thingGroupDescription"),
+        "attributePayload": {"attributes": dict(attributes)},
+    }
+
+
+def _iot_thing_group_create(logical_id, props, stack_name):
+    name = props.get("ThingGroupName") or _physical_name(stack_name, logical_id)
+    payload = {"thingGroupProperties": _iot_thing_group_properties(props)}
+    if props.get("ParentGroupName"):
+        payload["parentGroupName"] = props["ParentGroupName"]
+    resp = _iot._create_thing_group(name, payload)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingGroup create failed: {resp[2]!r}")
+    rec = _iot._thing_groups.get(name) or {}
+    return rec.get("thingGroupId", name), {
+        "Arn": rec.get("thingGroupArn", _iot._thing_group_arn(name)),
+        "Id": rec.get("thingGroupId", ""),
+    }
+
+
+def _iot_thing_group_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    """Update a thing group in place through UpdateThingGroup: ThingGroupProperties
+    is the one property the reference marks No interruption that the service
+    stores. ThingGroupName and ParentGroupName require replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-iot-thinggroup.html):
+    the new group is created before the old one is removed, as CloudFormation
+    orders a replacement, and Ref follows the new id. QueryString and Tags are
+    accepted without effect — the service has no dynamic groups and no tag
+    store for thing groups."""
+    rec = _iot_thing_group_record(physical_id)
+    replacement = rec is None or any(
+        new_props.get(key) != old_props.get(key)
+        for key in ("ThingGroupName", "ParentGroupName")
+    )
+    if replacement:
+        return _iot_thing_group_create(logical_id or physical_id, new_props, stack_name)
+    name = rec["thingGroupName"]
+    resp = _iot._update_thing_group(
+        name, {"thingGroupProperties": _iot_thing_group_properties(new_props)})
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::IoT::ThingGroup update failed: {resp[2]!r}")
+    return physical_id, {"Arn": rec["thingGroupArn"], "Id": physical_id}
+
+
+def _iot_thing_group_delete(physical_id, props):
+    rec = _iot_thing_group_record(physical_id)
+    if rec is not None:
+        _iot._delete_thing_group(rec["thingGroupName"])
 
 
 def _iot_policy_document(props):
@@ -6677,7 +9007,7 @@ def _iot_policy_update(physical_id, old_props, new_props, stack_name, logical_id
     )
     if name != physical_id:
         created = _iot_policy_create(logical_id or physical_id, new_props, stack_name)
-        _iot_policy_delete(physical_id, old_props)
+        _delete_predecessor(_iot_policy_delete, physical_id, old_props)
         return created
     _iot_policy_prune_versions(name)
     resp = _iot._create_policy_version(
@@ -6765,7 +9095,7 @@ def _iot_provisioning_template_update(physical_id, old_props, new_props, stack_n
         created = _iot_provisioning_template_create(
             logical_id or physical_id, new_props, stack_name
         )
-        _iot_provisioning_template_delete(physical_id, old_props)
+        _delete_predecessor(_iot_provisioning_template_delete, physical_id, old_props)
         return created
     payload = _iot_provisioning_template_payload(name, new_props)
     payload.pop("templateName", None)
@@ -6906,20 +9236,57 @@ def _iot_ca_certificate_delete(physical_id, props):
     _iot._handle_ca_certificate("DELETE", f"/cacertificate/{physical_id}", b"", {})
 
 
-def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
+def _cognito_identity_pool_role_attachment_apply(props):
+    """Push Roles and RoleMappings onto the identity pool through
+    SetIdentityPoolRoles, which takes the whole configuration: a property the
+    template drops is cleared, its create default."""
     iid = props.get("IdentityPoolId")
     if not iid:
         raise ValueError("AWS::Cognito::IdentityPoolRoleAttachment requires IdentityPoolId")
-    resp = _cognito._set_identity_pool_roles({"IdentityPoolId": iid, "Roles": props.get("Roles", {})})
+    resp = _cognito._set_identity_pool_roles({
+        "IdentityPoolId": iid,
+        "Roles": props.get("Roles", {}),
+        "RoleMappings": props.get("RoleMappings", {}),
+    })
     if resp[0] >= 400:
-        raise ValueError(f"AWS::Cognito::IdentityPoolRoleAttachment create failed: {resp[2]!r}")
+        raise ValueError(
+            f"AWS::Cognito::IdentityPoolRoleAttachment: SetIdentityPoolRoles failed: {resp[2]!r}")
+    # Ref returns the IdentityPoolId (resource reference); Fn::GetAtt Id is
+    # documented as "the resource ID" only, and here that is the same value,
+    # because the pool id is the physical id of the attachment.
     return iid, {"Id": iid}
+
+
+def _cognito_identity_pool_role_attachment_create(logical_id, props, stack_name):
+    return _cognito_identity_pool_role_attachment_apply(props)
+
+
+def _cognito_identity_pool_role_attachment_update(physical_id, old_props, new_props,
+                                                  stack_name):
+    """Roles and RoleMappings are "Update requires: No interruption" on the
+    resource reference
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-cognito-identitypoolroleattachment.html),
+    so both are re-applied to the pool the attachment already sits on.
+    IdentityPoolId requires replacement: the new pool is configured first and
+    the old pool's configuration cleared afterwards, CloudFormation's
+    replacement order, which without this handler happened only because the
+    physical id of this type is the pool id itself."""
+    replacement = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, None,
+        new_props.get("IdentityPoolId"), physical_id,
+        _cognito_identity_pool_role_attachment_create,
+        _cognito_identity_pool_role_attachment_delete,
+    )
+    if replacement is not None:
+        return replacement
+    return _cognito_identity_pool_role_attachment_apply(new_props)
 
 
 def _cognito_identity_pool_role_attachment_delete(physical_id, props):
     pool = _cognito._identity_pools.get(physical_id)
     if pool is not None:
         pool["_roles"] = {}
+        pool["_role_mappings"] = {}
 
 
 def _cognito_identity_pool_principal_tag_apply(props):
@@ -6955,7 +9322,7 @@ def _cognito_identity_pool_principal_tag_update(physical_id, old_props, new_prop
     # either is a replacement, and the mapping left on the old pair would
     # otherwise keep tagging principals after the template stopped declaring it.
     if (old_props.get("IdentityPoolId"), old_props.get("IdentityProviderName")) != (iid, provider):
-        _cognito_identity_pool_principal_tag_delete(physical_id, old_props)
+        _delete_predecessor(_cognito_identity_pool_principal_tag_delete, physical_id, old_props)
     return f"{iid}|{provider}", {}
 
 
@@ -6966,6 +9333,226 @@ def _cognito_identity_pool_principal_tag_delete(physical_id, props):
         pool.get("_principal_tags", {}).pop(provider, None)
 
 
+
+# ---------------------------------------------------------------------------
+# In-place update handlers for the types whose create-fallback destroyed data
+# (generated identities, wiped children) or failed loudly. Each mutates the
+# existing service record; a genuinely create-only property returns the
+# resource to the engine as a replacement (new physical id), whose predecessor
+# the engine now deletes in its cleanup phase.
+# ---------------------------------------------------------------------------
+
+
+
+def _kinesis_stream_update(physical_id, old_props, new_props, stack_name):
+    stream = _kinesis._streams.get(physical_id)
+    new_name = new_props.get("Name")
+    if stream is None or (new_name and new_name != physical_id):
+        return _kinesis_stream_create(physical_id, new_props, stack_name)
+    if "RetentionPeriodHours" in new_props:
+        stream["RetentionPeriodHours"] = max(24, min(8760, int(new_props["RetentionPeriodHours"])))
+    smd = new_props.get("StreamModeDetails")
+    if isinstance(smd, dict) and smd.get("StreamMode"):
+        stream["StreamModeDetails"] = {"StreamMode": smd["StreamMode"]}
+    _reconcile_tag_map(stream.setdefault("tags", {}), old_props, new_props)
+    # ShardCount changes keep the existing shards — records live in them.
+    return physical_id, {"Arn": stream["StreamARN"]}
+
+
+def _ecr_repo_update(physical_id, old_props, new_props, stack_name):
+    repo = _ecr._repositories.get(physical_id)
+    new_name = new_props.get("RepositoryName")
+    if repo is None or (new_name and new_name != physical_id):
+        return _ecr_repo_create(physical_id, new_props, stack_name)
+    for prop, key in (("ImageTagMutability", "imageTagMutability"),
+                      ("ImageScanningConfiguration", "imageScanningConfiguration")):
+        if prop in new_props:
+            repo[key] = new_props[prop]
+    return physical_id, {"Arn": repo["repositoryArn"], "RepositoryUri": repo["repositoryUri"]}
+
+
+def _ddb_global_table_update(physical_id, old_props, new_props, stack_name):
+    # Same property translation as create, then the Table update handler —
+    # the create-fallback rebuilt the table record and dropped every item.
+    translated = dict(new_props)
+    for prop in ("Replicas", "MultiRegionConsistency", "GlobalTableWitnesses",
+                 "GlobalTableSourceArn", "WarmThroughput",
+                 "WriteOnDemandThroughputSettings", "ReadOnDemandThroughputSettings",
+                 "WriteProvisionedThroughputSettings", "ReadProvisionedThroughputSettings"):
+        translated.pop(prop, None)
+    return _ddb_update(physical_id, old_props, translated, stack_name)
+
+
+def _eb_event_bus_update(physical_id, old_props, new_props, stack_name):
+    new_name = new_props.get("Name")
+    if new_name and new_name != physical_id:
+        # Name is create-only: replacement (the fallback used to fail the
+        # stack with "EventBus already exists" on ANY property change).
+        return _eb_event_bus_create(physical_id, new_props, stack_name)
+    bus = _eb._event_buses.get(physical_id)
+    if bus is not None and isinstance(bus, dict):
+        if "Description" in new_props:
+            bus["Description"] = new_props["Description"]
+    arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{physical_id}"
+    _reconcile_tag_map(_eb._tags.setdefault(arn, {}), old_props, new_props)
+    return physical_id, {"Arn": arn, "Name": physical_id}
+
+
+def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
+    project = _codebuild._projects.get(physical_id)
+    new_name = new_props.get("Name")
+    if project is None or (new_name and new_name != physical_id):
+        return _codebuild_project_create(physical_id, new_props, stack_name)
+    for prop, key in (("Description", "description"), ("Source", "source"),
+                      ("SourceVersion", "sourceVersion"), ("Artifacts", "artifacts"),
+                      ("Environment", "environment"), ("ServiceRole", "serviceRole")):
+        if prop in new_props:
+            project[key] = new_props[prop]
+    if "TimeoutInMinutes" in new_props:
+        project["timeoutInMinutes"] = int(new_props["TimeoutInMinutes"])
+    _reconcile_tag_list(project.setdefault("tags", []), old_props, new_props,
+                        key="key", value="value")
+    return physical_id, {"Arn": _codebuild._project_arn(physical_id)}
+
+
+def _r53_record_set_update(physical_id, old_props, new_props, stack_name):
+    # Same name+type: the values update in place (the fallback raised
+    # "record already exists", so EVERY record edit rolled the stack back).
+    zone_id = _r53_resolve_hosted_zone_id(new_props)
+    new_rs = _r53_record_set_build_rs(new_props)
+    old_zone_id = _r53_resolve_hosted_zone_id(old_props)
+    old_rs = _r53_record_set_build_rs(old_props)
+    if zone_id != old_zone_id or _r53._rs_key(new_rs) != _r53._rs_key(old_rs):
+        # Different record identity: create the new one; the engine deletes
+        # the predecessor through the delete handler.
+        return _r53_record_set_create(physical_id, new_props, stack_name)
+    with _r53._lock:
+        records = list(_r53._records.get(zone_id, []))
+        key = _r53._rs_key(new_rs)
+        records = [r for r in records if _r53._rs_key(r) != key]
+        records.append(new_rs)
+        _r53._records[zone_id] = records
+    return new_rs["Name"], {"Name": new_rs["Name"]}
+
+
+def _scheduler_schedule_update(physical_id, old_props, new_props, stack_name):
+    import ministack.services.scheduler as _sched
+    new_name = new_props.get("Name")
+    if new_name and new_name != physical_id:
+        return _scheduler_schedule_create(physical_id, new_props, stack_name)
+    group = new_props.get("GroupName", old_props.get("GroupName", "default"))
+    key = f"{group}/{physical_id}"
+    schedule = _sched._schedules.get(key)
+    if schedule is None:
+        return _scheduler_schedule_create(physical_id, new_props, stack_name)
+    for prop in ("ScheduleExpression", "FlexibleTimeWindow", "Target",
+                 "State", "Description"):
+        if prop in new_props:
+            schedule[prop] = new_props[prop]
+    return physical_id, {"Arn": _sched._schedule_arn(group, physical_id)}
+
+
+# --- Amazon Location (AWS::Location::Tracker) ---
+
+# The properties the resource reference marks "No interruption", applied
+# through UpdateTracker, with the value a property reverts to when the
+# template drops it: the service's CreateTracker defaults, or None for a
+# member a fresh create leaves absent (it is removed from the record).
+# TrackerName and KmsKeyId require replacement; Tags are reconciled on the
+# tracker record.
+_LOCATION_TRACKER_UPDATABLE = {
+    "Description": "",
+    "PositionFiltering": "TimeBased",
+    "EventBridgeEnabled": False,
+    "KmsKeyEnableGeospatialQueries": None,
+}
+
+
+def _location_tracker_body(name, props):
+    """The CreateTracker request for a template's properties: both sides are
+    PascalCase, only Tags changes shape (CloudFormation's Key/Value list, the
+    API's map)."""
+    body = {"TrackerName": name}
+    for prop in ("Description", "PositionFiltering", "EventBridgeEnabled",
+                 "KmsKeyId", "KmsKeyEnableGeospatialQueries"):
+        if prop in props:
+            body[prop] = props[prop]
+    if "Tags" in props:
+        body["Tags"] = _tag_map(props["Tags"])
+    return body
+
+
+def _location_tracker_attrs(rec):
+    import ministack.services.location as _location
+    return {
+        "Arn": rec["TrackerArn"],
+        "TrackerArn": rec["TrackerArn"],
+        "CreateTime": _location._iso(rec["CreateTime"]),
+        "UpdateTime": _location._iso(rec["UpdateTime"]),
+    }
+
+
+def _location_tracker_create(logical_id, props, stack_name):
+    import ministack.services.location as _location
+    name = props.get("TrackerName") or _physical_name(stack_name, logical_id, max_len=100)
+    resp = _location._create_tracker(_location_tracker_body(name, props))
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Location::Tracker create failed: {resp[2]!r}")
+    return name, _location_tracker_attrs(_location._trackers[name])
+
+
+def _location_tracker_update(physical_id, old_props, new_props, stack_name,
+                             logical_id=None):
+    """Description, PositionFiltering, EventBridgeEnabled and
+    KmsKeyEnableGeospatialQueries update in place through UpdateTracker and a
+    Tags change is reconciled on the record. TrackerName and KmsKeyId require
+    replacement
+    (https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-location-tracker.html):
+    a renamed tracker is created before the old one, with its device
+    positions, is removed; a KmsKeyId change re-creates an auto-named
+    tracker under its deterministic physical name (the name is reused, so
+    the predecessor cannot be retained, as for a DynamoDB table), and with
+    an explicit, unchanged TrackerName it is refused by the
+    _CUSTOM_NAME_REPLACEMENT rule."""
+    import ministack.services.location as _location
+    name = new_props.get("TrackerName") or _physical_name(
+        stack_name, logical_id or physical_id, max_len=100
+    )
+    rec = _location._trackers.get(physical_id)
+    replaced = _rename_replacement(
+        physical_id, old_props, new_props, stack_name, logical_id,
+        name, physical_id if rec is not None else None,
+        _location_tracker_create, _location_tracker_delete,
+    )
+    if replaced is not None:
+        return replaced
+    if old_props.get("KmsKeyId") != new_props.get("KmsKeyId"):
+        # Not routed through _delete_predecessor, like the DynamoDB key-schema
+        # branch: the auto-generated name is deterministic, so the replacement
+        # takes it back and retaining the predecessor is not possible here.
+        _location_tracker_delete(physical_id, old_props)
+        return _location_tracker_create(logical_id or physical_id, new_props, stack_name)
+    changes = {}
+    for prop, default in _LOCATION_TRACKER_UPDATABLE.items():
+        if prop in new_props:
+            changes[prop] = new_props[prop]
+        elif prop in old_props:
+            if default is None:
+                rec.pop(prop, None)
+            else:
+                changes[prop] = default
+    resp = _location._update_tracker(name, changes)
+    if resp[0] >= 400:
+        raise ValueError(f"AWS::Location::Tracker update failed: {resp[2]!r}")
+    _reconcile_tag_map(rec.setdefault("Tags", {}), old_props, new_props)
+    return name, _location_tracker_attrs(rec)
+
+
+def _location_tracker_delete(physical_id, props):
+    import ministack.services.location as _location
+    _location._delete_tracker(physical_id)
+
+
 _RESOURCE_HANDLERS = {
     "AWS::OpenSearchService::Domain": {
         "create": _opensearch_domain_create,
@@ -6974,6 +9561,7 @@ _RESOURCE_HANDLERS = {
         "delete": _opensearch_domain_delete,
     },
     "AWS::S3::Bucket": {"create": _s3_create, "update": _s3_update, "delete": _s3_delete},
+    "AWS::S3::MultiRegionAccessPoint": {"create": _s3_mrap_create, "delete": _s3_mrap_delete},
     "AWS::S3::BucketPolicy": {
         "create": _s3_bucket_policy_create,
         "update": _s3_bucket_policy_update,
@@ -6994,7 +9582,12 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _sns_delete,
     },
-    "AWS::SNS::Subscription": {"create": _sns_sub_create, "delete": _sns_sub_delete},
+    "AWS::SNS::Subscription": {
+        "create": _sns_sub_create,
+        "update": _sns_sub_update,
+        "update_with_logical_id": True,
+        "delete": _sns_sub_delete,
+    },
     "AWS::DynamoDB::Table": {
         "create": _ddb_create,
         "update": _ddb_update,
@@ -7006,7 +9599,7 @@ _RESOURCE_HANDLERS = {
     # comes from WriteProvisionedThroughputSettings; Replicas is required and
     # ignored locally), so it gets a dedicated provisioner that translates
     # before delegating to the Table engine.
-    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
+    "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "update": _ddb_global_table_update, "delete": _ddb_global_table_delete},
     "AWS::Lambda::Function": {
         "create": _lambda_create,
         "update": _lambda_update,
@@ -7024,8 +9617,18 @@ _RESOURCE_HANDLERS = {
         "update_with_logical_id": True,
         "delete": _iam_role_delete,
     },
-    "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
-    "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
+    "AWS::IAM::Policy": {
+        "create": _iam_policy_create,
+        "update": _iam_policy_update,
+        "update_with_logical_id": True,
+        "delete": _iam_policy_delete,
+    },
+    "AWS::IAM::InstanceProfile": {
+        "create": _iam_ip_create,
+        "update": _iam_ip_update,
+        "update_with_logical_id": True,
+        "delete": _iam_ip_delete,
+    },
     "AWS::SSM::Parameter": {"create": _ssm_create, "update": _ssm_update, "delete": _ssm_delete},
     "AWS::AppConfig::Application": {
         "create": _appconfig_application_create,
@@ -7062,19 +9665,35 @@ _RESOURCE_HANDLERS = {
         "update": _cwlogs_resource_policy_update,
         "delete": _cwlogs_resource_policy_delete,
     },
-    "AWS::Logs::SubscriptionFilter": {"create": _cwlogs_subfilter_create, "delete": _cwlogs_subfilter_delete},
-    "AWS::Events::Rule": {"create": _eb_rule_create, "delete": _eb_rule_delete},
-    "AWS::Events::EventBus": {"create": _eb_event_bus_create, "delete": _eb_event_bus_delete},
-    "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "delete": _kinesis_stream_delete},
+    "AWS::Logs::SubscriptionFilter": {
+        "create": _cwlogs_subfilter_create,
+        "update": _cwlogs_subfilter_update,
+        "update_with_logical_id": True,
+        "delete": _cwlogs_subfilter_delete,
+    },
+    "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
+    "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},
+    "AWS::Events::Rule": {
+        "create": _eb_rule_create,
+        "update": _eb_rule_update,
+        "update_with_logical_id": True,
+        "delete": _eb_rule_delete,
+    },
     "AWS::KinesisFirehose::DeliveryStream": {
         "create": _firehose_delivery_stream_create,
         "update": _firehose_delivery_stream_update,
         "delete": _firehose_delivery_stream_delete,
     },
-    "AWS::Lambda::Permission": {"create": _lambda_permission_create, "delete": _lambda_permission_delete},
+    "AWS::Lambda::Permission": {
+        "create": _lambda_permission_create,
+        "update": _lambda_permission_update,
+        "update_with_logical_id": True,
+        "delete": _lambda_permission_delete,
+        "delete_with_logical_id": True,
+    },
     "AWS::Lambda::Version": {"create": _lambda_version_create, "delete": _lambda_version_delete},
-    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "delete": _cfn_noop_delete},
-    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update, "delete": _cfn_noop_delete},
+    "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,
         "update": _cfn_nested_stack_update,
@@ -7106,10 +9725,17 @@ _RESOURCE_HANDLERS = {
         "update": _apigw_model_update,
         "delete": _apigw_model_delete,
     },
-    "AWS::ApiGateway::Authorizer": {"create": _apigw_authorizer_create, "delete": _apigw_authorizer_delete},
-    # Deployment stays create-only: AWS treats a deployment as an immutable
-    # snapshot — an update is a new deployment (CFN replaces the resource).
-    "AWS::ApiGateway::Deployment": {"create": _apigw_deployment_create, "delete": _apigw_deployment_delete},
+    "AWS::ApiGateway::Authorizer": {
+        "create": _apigw_authorizer_create,
+        "update": _apigw_authorizer_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_authorizer_delete,
+    },
+    "AWS::ApiGateway::Deployment": {
+        "create": _apigw_deployment_create,
+        "update": _apigw_deployment_update,
+        "delete": _apigw_deployment_delete,
+    },
     "AWS::ApiGateway::Stage": {
         "create": _apigw_stage_create,
         "update": _apigw_stage_update,
@@ -7167,9 +9793,22 @@ _RESOURCE_HANDLERS = {
         "delete": _lambda_event_invoke_config_delete,
     },
     "AWS::Pipes::Pipe": {"create": _pipes_pipe_create, "delete": _pipes_pipe_delete},
-    "AWS::Lambda::Alias": {"create": _lambda_alias_create, "delete": _lambda_alias_delete},
-    "AWS::SQS::QueuePolicy": {"create": _sqs_queue_policy_create, "delete": _sqs_queue_policy_delete},
-    "AWS::SNS::TopicPolicy": {"create": _sns_topic_policy_create, "delete": _sns_topic_policy_delete},
+    "AWS::Lambda::Alias": {
+        "create": _lambda_alias_create,
+        "update": _lambda_alias_update,
+        "update_with_logical_id": True,
+        "delete": _lambda_alias_delete,
+    },
+    "AWS::SQS::QueuePolicy": {
+        "create": _sqs_queue_policy_create,
+        "update": _sqs_queue_policy_update,
+        "delete": _sqs_queue_policy_delete,
+    },
+    "AWS::SNS::TopicPolicy": {
+        "create": _sns_topic_policy_create,
+        "update": _sns_topic_policy_update,
+        "delete": _sns_topic_policy_delete,
+    },
     "AWS::AppSync::GraphQLApi": {"create": _appsync_api_create, "delete": _appsync_api_delete},
     "AWS::AppSync::DataSource": {"create": _appsync_ds_create, "delete": _appsync_ds_delete},
     "AWS::AppSync::FunctionConfiguration": {
@@ -7180,18 +9819,48 @@ _RESOURCE_HANDLERS = {
     "AWS::AppSync::Resolver": {"create": _appsync_resolver_create, "delete": _appsync_resolver_delete},
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create, "delete": _appsync_schema_delete},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
-    "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
-    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
-    "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
-    "AWS::Cognito::UserPoolResourceServer": {"create": _cognito_user_pool_resource_server_create, "delete": _cognito_user_pool_resource_server_delete},
-    "AWS::Cognito::UserPoolGroup": {"create": _cognito_user_pool_group_create, "delete": _cognito_user_pool_group_delete},
-    "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
+    "AWS::SecretsManager::Secret": {
+        "create": _sm_secret_create,
+        "update": _sm_secret_update,
+        "update_with_logical_id": True,
+        "delete": _sm_secret_delete,
+    },
+    "AWS::Cognito::UserPool": {
+        "create": _cognito_user_pool_create,
+        "update": _cognito_user_pool_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_delete,
+    },
+    "AWS::Cognito::UserPoolClient": {
+        "create": _cognito_user_pool_client_create,
+        "update": _cognito_user_pool_client_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_client_delete,
+    },
+    "AWS::Cognito::UserPoolResourceServer": {
+        "create": _cognito_user_pool_resource_server_create,
+        "update": _cognito_user_pool_resource_server_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_resource_server_delete,
+    },
+    "AWS::Cognito::UserPoolGroup": {
+        "create": _cognito_user_pool_group_create,
+        "update": _cognito_user_pool_group_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_user_pool_group_delete,
+    },
+    "AWS::Cognito::IdentityPool": {
+        "create": _cognito_identity_pool_create,
+        "update": _cognito_identity_pool_update,
+        "update_with_logical_id": True,
+        "delete": _cognito_identity_pool_delete,
+    },
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
-    "AWS::ECR::Repository": {"create": _ecr_repo_create, "delete": _ecr_repo_delete},
+    "AWS::ECR::Repository": {"create": _ecr_repo_create, "update": _ecr_repo_update, "delete": _ecr_repo_delete},
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
     "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
     "AWS::ElasticLoadBalancingV2::ListenerRule": {"create": _elbv2_listener_rule_create, "delete": _elbv2_listener_rule_delete},
-    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "delete": _codebuild_project_delete},
+    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "update": _codebuild_project_update, "delete": _codebuild_project_delete},
     "AWS::IAM::ManagedPolicy": {
         "create": _iam_managed_policy_create,
         "update": _iam_managed_policy_update,
@@ -7203,7 +9872,12 @@ _RESOURCE_HANDLERS = {
         "update": _kms_key_update,
         "delete": _kms_key_delete,
     },
-    "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},
+    "AWS::KMS::Alias": {
+        "create": _kms_alias_create,
+        "update": _kms_alias_update,
+        "update_with_logical_id": True,
+        "delete": _kms_alias_delete,
+    },
     "AWS::EC2::VPC": {"create": _ec2_vpc_create, "delete": _ec2_vpc_delete},
     "AWS::EC2::VPCEndpoint": {
         "create": _ec2_vpc_endpoint_create,
@@ -7228,13 +9902,38 @@ _RESOURCE_HANDLERS = {
         "create": _lambda_layer_version_permission_create,
         "delete": _lambda_layer_version_permission_delete,
     },
-    "AWS::StepFunctions::StateMachine": {"create": _sfn_state_machine_create, "delete": _sfn_state_machine_delete},
+    "AWS::StepFunctions::StateMachine": {
+        "create": _sfn_state_machine_create,
+        "update": _sfn_state_machine_update,
+        "update_with_logical_id": True,
+        "delete": _sfn_state_machine_delete,
+    },
     "AWS::Route53::HostedZone": {"create": _r53_hosted_zone_create, "delete": _r53_hosted_zone_delete},
-    "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "delete": _r53_record_set_delete},
-    "AWS::ApiGatewayV2::Api": {"create": _apigw_v2_api_create, "delete": _apigw_v2_api_delete},
-    "AWS::ApiGatewayV2::Stage": {"create": _apigw_v2_stage_create, "delete": _apigw_v2_stage_delete},
-    "AWS::ApiGatewayV2::Integration": {"create": _apigw_v2_integration_create, "delete": _apigw_v2_integration_delete},
-    "AWS::ApiGatewayV2::Route": {"create": _apigw_v2_route_create, "delete": _apigw_v2_route_delete},
+    "AWS::Route53::RecordSet": {"create": _r53_record_set_create, "update": _r53_record_set_update, "delete": _r53_record_set_delete},
+    "AWS::ApiGatewayV2::Api": {
+        "create": _apigw_v2_api_create,
+        "update": _apigw_v2_api_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_api_delete,
+    },
+    "AWS::ApiGatewayV2::Stage": {
+        "create": _apigw_v2_stage_create,
+        "update": _apigw_v2_stage_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_stage_delete,
+    },
+    "AWS::ApiGatewayV2::Integration": {
+        "create": _apigw_v2_integration_create,
+        "update": _apigw_v2_integration_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_integration_delete,
+    },
+    "AWS::ApiGatewayV2::Route": {
+        "create": _apigw_v2_route_create,
+        "update": _apigw_v2_route_update,
+        "update_with_logical_id": True,
+        "delete": _apigw_v2_route_delete,
+    },
     "AWS::ApiGatewayV2::Authorizer": {"create": _apigw_v2_authorizer_create, "update": _apigw_v2_authorizer_update, "delete": _apigw_v2_authorizer_delete},
     "AWS::SES::EmailIdentity": {"create": _ses_email_identity_create, "delete": _ses_email_identity_delete},
     "AWS::SES::ConfigurationSet": {"create": _ses_configuration_set_create, "delete": _ses_configuration_set_delete},
@@ -7245,9 +9944,49 @@ _RESOURCE_HANDLERS = {
         "update": _cf_oai_update,
         "delete": _cf_oai_delete,
     },
-    "AWS::CloudFront::Distribution": {"create": _cf_distribution_create, "delete": _cf_distribution_delete},
+    "AWS::CloudFront::Distribution": {
+        "create": _cf_distribution_create,
+        "update": _cf_distribution_update,
+        "update_with_logical_id": True,
+        "delete": _cf_distribution_delete,
+    },
     "AWS::CloudFront::KeyValueStore": {"create": _cf_kvs_create, "update": _cf_kvs_update, "delete": _cf_kvs_delete},
-    "AWS::CloudWatch::Alarm": {"create": _cw_metric_alarm_create, "delete": _cw_metric_alarm_delete},
+    "AWS::CloudFront::CachePolicy": {
+        "create": _cf_cache_policy_create,
+        "update": _cf_cache_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_cache_policy_delete,
+    },
+    "AWS::CloudFront::OriginRequestPolicy": {
+        "create": _cf_origin_request_policy_create,
+        "update": _cf_origin_request_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_origin_request_policy_delete,
+    },
+    "AWS::CloudFront::ResponseHeadersPolicy": {
+        "create": _cf_response_headers_policy_create,
+        "update": _cf_response_headers_policy_update,
+        "update_with_logical_id": True,
+        "delete": _cf_response_headers_policy_delete,
+    },
+    "AWS::CloudFront::OriginAccessControl": {
+        "create": _cf_oac_create,
+        "update": _cf_oac_update,
+        "update_with_logical_id": True,
+        "delete": _cf_oac_delete,
+    },
+    "AWS::CloudFront::Function": {
+        "create": _cf_function_create,
+        "update": _cf_function_update,
+        "update_with_logical_id": True,
+        "delete": _cf_function_delete,
+    },
+    "AWS::CloudWatch::Alarm": {
+        "create": _cw_metric_alarm_create,
+        "update": _cw_metric_alarm_update,
+        "update_with_logical_id": True,
+        "delete": _cw_metric_alarm_delete,
+    },
     "AWS::CloudWatch::Dashboard": {
         "create": _cw_dashboard_create,
         "update": _cw_dashboard_update,
@@ -7262,6 +10001,12 @@ _RESOURCE_HANDLERS = {
         "delete": _iot_topic_rule_delete,
     },
     "AWS::IoT::ThingType": {"create": _iot_thing_type_create, "delete": _iot_thing_type_delete},
+    "AWS::IoT::ThingGroup": {
+        "create": _iot_thing_group_create,
+        "update": _iot_thing_group_update,
+        "update_with_logical_id": True,
+        "delete": _iot_thing_group_delete,
+    },
     "AWS::IoT::Policy": {
         "create": _iot_policy_create,
         "update": _iot_policy_update,
@@ -7281,6 +10026,7 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::Cognito::IdentityPoolRoleAttachment": {
         "create": _cognito_identity_pool_role_attachment_create,
+        "update": _cognito_identity_pool_role_attachment_update,
         "delete": _cognito_identity_pool_role_attachment_delete,
     },
     "AWS::Cognito::IdentityPoolPrincipalTag": {
@@ -7289,8 +10035,15 @@ _RESOURCE_HANDLERS = {
         "delete": _cognito_identity_pool_principal_tag_delete,
     },
     # EventBridge Scheduler
-    "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "delete": _scheduler_schedule_delete},
+    "AWS::Scheduler::Schedule": {"create": _scheduler_schedule_create, "update": _scheduler_schedule_update, "delete": _scheduler_schedule_delete},
     "AWS::Scheduler::ScheduleGroup": {"create": _scheduler_group_create, "delete": _scheduler_group_delete},
+    # Amazon Location
+    "AWS::Location::Tracker": {
+        "create": _location_tracker_create,
+        "update": _location_tracker_update,
+        "update_with_logical_id": True,
+        "delete": _location_tracker_delete,
+    },
     # EKS
     "AWS::EKS::Cluster": {"create": _eks_cluster_create, "delete": _eks_cluster_delete},
     "AWS::EKS::Nodegroup": {"create": _eks_nodegroup_create, "delete": _eks_nodegroup_delete},

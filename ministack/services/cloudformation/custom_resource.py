@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation Custom Resource — ResponseURL intercept and Lambda invocation.
 """
@@ -8,7 +10,8 @@ import threading
 logger = logging.getLogger("cloudformation")
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
-_PORT = os.environ.get("GATEWAY_PORT", "4566")
+# The gateway port as the app resolves it: GATEWAY_PORT > EDGE_PORT > 4566.
+_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 _lock = threading.Lock()
 # token → {"event": threading.Event, "result": dict | None}

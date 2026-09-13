@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Glue Service Emulator.
 JSON-based API via X-Amz-Target (AWSGlue).
@@ -658,6 +660,23 @@ def _iceberg_rest_create_table(namespace, body):
     ]
     location = body.get("location") or f"s3://{_GLUE_WAREHOUSE_BUCKET}/{namespace}/{table_name}"
     metadata = _s3t._initial_iceberg_metadata(table_name, schema_fields, location)
+    # ``format-version`` is a reserved table property: a client creating with
+    # it (Spark's .tableProperty("format-version", "3")) expects it lifted
+    # into the top-level metadata field, not kept in the properties map.
+    props = dict(body.get("properties") or {})
+    fmt_ver = props.pop("format-version", None) or body.get("format-version")
+    if fmt_ver is not None:
+        try:
+            requested = int(str(fmt_ver))
+        except (TypeError, ValueError):
+            return _iceberg_error(f"Invalid format-version: {fmt_ver!r}", "BadRequestException", 400)
+        if requested > 3:
+            return _iceberg_error(
+                f"Cannot create table with unsupported format version: v{requested} (supported: v3)",
+                "BadRequestException", 400)
+        metadata["format-version"] = requested
+    if props:
+        metadata["properties"] = props
     if schema:
         metadata["schemas"] = [schema]
     partition_spec = body.get("partition-spec")
@@ -702,7 +721,12 @@ def _iceberg_rest_commit_table(namespace, table_name, body):
         return _iceberg_error(f"Table does not exist: {namespace}.{table_name}", "NoSuchTableException", 404)
     meta_loc = table["Parameters"]["metadata_location"]
     metadata = _iceberg_fetch_metadata(meta_loc) or {}
-    _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    try:
+        _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    except ValueError as exc:
+        # A refused update (an illegal format-version change) commits
+        # nothing: the stored metadata_location is only advanced below.
+        return _iceberg_error(str(exc), "BadRequestException", 400)
     version = _metadata_version_from_location(meta_loc) + 1
     new_loc = _iceberg_write_metadata(namespace, table_name, version, metadata)
     table["Parameters"]["metadata_location"] = new_loc

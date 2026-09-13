@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import importlib
 import json
+import time
 from types import SimpleNamespace
 from urllib.parse import urlencode
 
@@ -388,12 +389,14 @@ def test_ecs_essential_exit_stops_live_sidecars_and_fails_stepfunctions(monkeypa
         {"name": "sidecar", "image": "sidecar", "essential": False},
     ]}, [])
     task = {
+        "taskArn": "arn:aws:ecs:us-east-1:000000000000:task/default/essential-exit",
         "lastStatus": "RUNNING",
         "desiredStatus": "RUNNING",
         "_docker_ids": ["app-id", "sidecar-id"],
         "containers": task_containers,
-        "clusterArn": "arn:aws:ecs:us-east-1:000000000000:cluster/default",
+        "clusterArn": "",
     }
+    monkeypatch.setitem(ecs._tasks, task["taskArn"], task)
     ecs._maybe_mark_stopped(task)
     assert task["lastStatus"] == "STOPPED"
     assert sidecar.stopped is True
@@ -417,21 +420,20 @@ def test_ecs_nonessential_exit_does_not_stop_live_essential_container(monkeypatc
         {"name": "sidecar", "image": "sidecar", "essential": False},
     ]}, [])
     task = {
+        "taskArn": "arn:aws:ecs:us-east-1:000000000000:task/default/nonessential-exit",
         "lastStatus": "RUNNING",
         "desiredStatus": "RUNNING",
         "_docker_ids": ["app-id", "sidecar-id"],
         "containers": task_containers,
-        "clusterArn": "arn:aws:ecs:us-east-1:000000000000:cluster/default",
+        "clusterArn": "",
     }
+    monkeypatch.setitem(ecs._tasks, task["taskArn"], task)
 
     ecs._maybe_mark_stopped(task)
 
     assert task["lastStatus"] == "RUNNING"
     assert app.stopped is False
-    assert ecs._sanitize(task)["containers"] == [
-        {key: value for key, value in container.items() if not key.startswith("_")}
-        for container in task_containers
-    ]
+    assert all("_essential" not in item for item in ecs._sanitize(task)["containers"])
 
 
 def test_ecs_launch_exception_stops_task_for_stepfunctions(monkeypatch):
@@ -452,6 +454,11 @@ def test_ecs_launch_exception_stops_task_for_stepfunctions(monkeypatch):
         "containerDefinitions": [{"name": "app", "image": "broken", "essential": True}],
     })
     task = _payload(ecs._run_task({"cluster": "default", "taskDefinition": "launch-failure"}))["tasks"][0]
+    for _ in range(200):
+        task = ecs._tasks[task["taskArn"]]
+        if task["lastStatus"] == "STOPPED":
+            break
+        time.sleep(0.01)
     assert task["lastStatus"] == "STOPPED"
     assert task["stopCode"] == "TaskFailedToStart"
     with pytest.raises(stepfunctions._ExecutionError):

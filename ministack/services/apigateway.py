@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 API Gateway HTTP API v2 Emulator.
 
@@ -388,6 +390,10 @@ async def handle_request(method, path, headers, body, query_params):
                 return _delete_api(api_id)
             if method == "PATCH":
                 return _update_api(api_id, data)
+
+        # /v2/apis/{apiId}/cors
+        if api_id and sub == "cors" and method == "DELETE":
+            return _delete_cors_configuration(api_id)
 
         # /v2/apis/{apiId}/routes[/{routeId}[/routeresponses[/{routeResponseId}]]]
         if api_id and sub == "routes":
@@ -1836,11 +1842,27 @@ def _update_api(api_id, data):
     api = _apis.get(api_id)
     if not api:
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
-    for k in ("name", "corsConfiguration", "routeSelectionExpression",
-              "disableSchemaValidation", "disableExecuteApiEndpoint", "version"):
+    for k in ("name", "routeSelectionExpression", "apiKeySelectionExpression",
+              "disableSchemaValidation", "disableExecuteApiEndpoint", "version",
+              "description"):
         if k in data:
             api[k] = data[k]
+    # A CORS configuration is replaced wholesale, never removed here: the API
+    # has DeleteCorsConfiguration for that, so an empty one is nothing to
+    # apply. A caller that means to remove it deletes it.
+    if data.get("corsConfiguration"):
+        api["corsConfiguration"] = data["corsConfiguration"]
     return _apigw_response(api)
+
+
+def _delete_cors_configuration(api_id):
+    """DeleteCorsConfiguration: the operation that removes an HTTP API's CORS
+    configuration (UpdateApi replaces it, it cannot clear it)."""
+    api = _apis.get(api_id)
+    if not api:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    api.pop("corsConfiguration", None)
+    return 204, {}, b""
 
 
 # ---- Control plane: Routes ----

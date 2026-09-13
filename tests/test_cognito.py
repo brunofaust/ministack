@@ -926,6 +926,35 @@ def test_cognito_identity_pool_roles(cognito_identity):
     assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
     assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
 
+def test_cognito_identity_pool_role_mappings_round_trip(cognito_identity):
+    """SetIdentityPoolRoles keeps the RoleMappings it is given and
+    GetIdentityPoolRoles serves them back; a later call without RoleMappings
+    clears them, since the call sets the whole configuration."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="RoleMappingsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example:client"
+    mapping = {"Type": "Token", "AmbiguousRoleResolution": "AuthenticatedRole"}
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthRole"},
+        RoleMappings={provider: mapping},
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"] == {"authenticated": "arn:aws:iam::000000000000:role/AuthRole"}
+    assert roles["RoleMappings"] == {provider: mapping}
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthRole"},
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"] == {"authenticated": "arn:aws:iam::000000000000:role/AuthRole"}
+    assert roles.get("RoleMappings", {}) == {}
+
+
 def test_cognito_identity_pool_principal_tags(cognito_identity):
     """SetPrincipalTagAttributeMap stores a provider's attribute mapping and
     GetPrincipalTagAttributeMap reports it back."""
@@ -8249,3 +8278,56 @@ def test_cognito_identity_pool_credentials_are_sts_sessions(cognito_identity):
     assert ident["Arn"] == (
         "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
     assert ident["UserId"].endswith(":CognitoIdentityCredentials")
+
+
+def test_cognito_presignup_trigger_fires_on_plain_signup(cognito_idp, lam):
+    """A pool's PreSignUp Lambda runs on ordinary SignUp: autoConfirmUser
+    confirms the account (no code delivery), and a rejecting trigger blocks
+    the sign-up with UserLambdaValidationException, as on AWS."""
+    import io
+    import zipfile
+
+    fname = f"presignup-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    if event['userName'].startswith('deny'):\n"
+        "        raise Exception('no room for you')\n"
+        "    event['response']['autoConfirmUser'] = True\n"
+        "    event['response']['autoVerifyEmail'] = True\n"
+        "    return event\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+    fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fname}"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"presignup-{fname}",
+        LambdaConfig={"PreSignUp": fn_arn},
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+
+    resp = cognito_idp.sign_up(
+        ClientId=cid, Username="alice", Password="Passw0rd!x",
+        UserAttributes=[{"Name": "email", "Value": "alice@example.com"}])
+    assert resp["UserConfirmed"] is True
+    assert "CodeDeliveryDetails" not in resp
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice")
+    assert user["UserStatus"] == "CONFIRMED"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs.get("email_verified") == "true"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(ClientId=cid, Username="deny-bob", Password="Passw0rd!x")
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="deny-bob")
+
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    lam.delete_function(FunctionName=fname)
