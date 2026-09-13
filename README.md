@@ -8,7 +8,6 @@
 
 <p align="center">
   <a href="https://github.com/ministackorg/ministack/releases"><img src="https://img.shields.io/github/v/release/ministackorg/ministack" alt="GitHub release"></a>
-  <a href="https://github.com/ministackorg/ministack/actions"><img src="https://img.shields.io/github/actions/workflow/status/ministackorg/ministack/ci.yml?branch=main" alt="Build"></a>
   <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/pulls/ministackorg/ministack" alt="Docker Pulls"></a>
   <a href="https://hub.docker.com/r/ministackorg/ministack"><img src="https://img.shields.io/docker/image-size/ministackorg/ministack/latest" alt="Docker Image Size"></a>
   <a href="https://github.com/ministackorg/ministack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/ministackorg/ministack" alt="License"></a>
