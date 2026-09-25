@@ -716,6 +716,9 @@ class TestExtractS3VhostBucket:
         # NoSuchBucket for `busydone/dev/terraform.tfstate.tflock`).
         import ministack.app as app_mod
 
+        assert app_mod._MINISTACK_HOST in app_mod._S3_VHOST_BASE_HOSTS
+        assert "localhost" in app_mod._S3_VHOST_BASE_HOSTS
+        assert "localhost.localstack.cloud" in app_mod._S3_VHOST_BASE_HOSTS
         monkeypatch.setattr(app_mod, "_S3_VHOST_BASE_HOSTS", frozenset({"ministack", "localhost", "localhost.localstack.cloud"}))
         assert _extract_s3_vhost_bucket("busydone-terraform-state.localhost:41080") == "busydone-terraform-state"
         assert _extract_s3_vhost_bucket("mybucket.localhost.localstack.cloud:4566") == "mybucket"

@@ -27,6 +27,18 @@ import uuid
 from urllib.parse import parse_qs, unquote
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
+# Host-side clients address a published container port through localhost, while
+# in-network clients use MINISTACK_HOST. Both can send virtual-hosted S3 requests.
+_S3_VHOST_BASE_HOSTS = frozenset(
+    host.strip().lower()
+    for host in (
+        _MINISTACK_HOST,
+        "localhost",
+        "localhost.localstack.cloud",
+        *os.environ.get("MINISTACK_EXTRA_HOSTS", "").split(","),
+    )
+    if host.strip()
+)
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
 AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
@@ -139,7 +151,7 @@ def _extract_s3_vhost_bucket(host: str):
         return None
     if ".." in candidate or _IPV4_RE.match(candidate):
         return None
-    if tail == _MINISTACK_HOST or tail.endswith("." + _MINISTACK_HOST):
+    if any(tail == base or tail.endswith("." + base) for base in _S3_VHOST_BASE_HOSTS):
         return candidate
     first_tail_segment = tail.split(".", 1)[0]
     if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
