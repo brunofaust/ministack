@@ -1354,6 +1354,17 @@ def _container_override_for(container_overrides, container_name):
     return {}
 
 
+def _ecs_docker_flags():
+    """Parse ECS_DOCKER_FLAGS into environment overrides and Docker kwargs."""
+    flags = os.environ.get("ECS_DOCKER_FLAGS", "").strip()
+    if not flags:
+        return {}, {}
+    from ministack.services.lambda_svc import _parse_docker_flags
+
+    kwargs = _parse_docker_flags(flags)
+    return kwargs.pop("environment", {}), kwargs
+
+
 def _build_run_kwargs(cdef, td, env, port_bindings, ecs_network,
                       host_mode, task_id, task_arn, ministack_net_ip,
                       cluster_arn):
@@ -1814,6 +1825,11 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             task_arn, cluster_arn, td, cdef, launch_type, env,
             host_mode, ministack_net_ip,
         )
+        # Apply explicit local overrides after ECS metadata injection: callers
+        # may supply environment credentials so botocore never queries a
+        # container-credentials URI that is not a recognized metadata host.
+        flags_env, flags_kwargs = _ecs_docker_flags()
+        env.update(flags_env)
         with resource_lock("ecs-task", task_arn):
             active = _task_is_active(task_arn, task)
             if active:
@@ -1827,6 +1843,11 @@ def _start_task_worker(task, td, container_overrides, docker_client):
             effective_cdef, td, env, port_bindings, ecs_network,
             host_mode, task_id, task_arn, ministack_net_ip, cluster_arn,
         )
+        if flags_kwargs.get("mounts"):
+            run_kwargs["mounts"] = [
+                *run_kwargs.get("mounts", []), *flags_kwargs.pop("mounts")
+            ]
+        run_kwargs.update(flags_kwargs)
 
         with resource_lock("ecs-task", task_arn):
             active = _task_is_active(task_arn, task)

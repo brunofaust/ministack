@@ -3,6 +3,8 @@
 import threading
 from types import SimpleNamespace
 
+from botocore.credentials import EnvProvider
+
 import ministack.services.ecs as ecs_mod
 
 
@@ -51,7 +53,8 @@ def test_flags_reach_the_async_task_worker(monkeypatch):
     )
     monkeypatch.setenv(
         "ECS_DOCKER_FLAGS",
-        "-e FORK_ENDPOINT=http://mocks --network fork-net --add-host mocks:10.0.0.9",
+        "-e FORK_ENDPOINT=http://mocks -e AWS_ACCESS_KEY_ID=test "
+        "-e AWS_SECRET_ACCESS_KEY=test --network fork-net --add-host mocks:10.0.0.9",
     )
     ecs_mod._register_task_definition({
         "family": "docker-flags-worker",
@@ -70,5 +73,15 @@ def test_flags_reach_the_async_task_worker(monkeypatch):
     assert started.wait(timeout=2)
     _image, kwargs = calls[0]
     assert kwargs["environment"]["FORK_ENDPOINT"] == "http://mocks"
+    assert kwargs["environment"]["AWS_CONTAINER_CREDENTIALS_FULL_URI"].startswith(
+        "http://"
+    )
+    # Botocore resolves static environment credentials before considering the
+    # injected container-credentials URI (whose bridge IP it rejects).
+    credentials = EnvProvider(environ=kwargs["environment"]).load()
+    assert credentials is not None
+    assert credentials.method == "env"
+    assert credentials.access_key == "test"
+    assert credentials.secret_key == "test"
     assert kwargs["network"] == "fork-net"
     assert kwargs["extra_hosts"] == {"mocks": "10.0.0.9"}
