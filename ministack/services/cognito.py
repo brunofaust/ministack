@@ -1156,7 +1156,13 @@ def _build_presignup_event(pool_id: str, client_id: str, username: str,
     }
 
 
-def _user_from_token(token: str, pool: dict, pool_id: str, token_use: str = "access"):
+def _user_from_token(
+    token: str,
+    pool: dict,
+    pool_id: str,
+    token_use: str = "access",
+    expected_client_id: str | None = None,
+):
     """Validate a signed Cognito token and return its matching enabled user."""
     if not isinstance(token, str):
         return None
@@ -1199,6 +1205,7 @@ def _user_from_token(token: str, pool: dict, pool_id: str, token_use: str = "acc
             or expires_at <= time.time()
             or not isinstance(client_id, str)
             or client_id not in pool.get("_clients", {})
+            or (expected_client_id is not None and client_id != expected_client_id)
         ):
             return None
         sub = payload.get("sub", "")
@@ -3497,7 +3504,7 @@ def _admin_initiate_auth(data):
         # Decode stub token to find the correct user by sub. A token this pool
         # never issued is rejected like real Cognito does; the old fallback to
         # the first pool user minted a session for whoever was created first.
-        user = _user_from_token(refresh_token, pool, pid, "refresh")
+        user = _user_from_token(refresh_token, pool, pid, "refresh", cid)
         if not user:
             return error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
         secret_err = _verify_secret_hash(
@@ -3750,7 +3757,7 @@ def _refresh_auth_result(pool, pid, cid, refresh_token, secret_hash_data=None):
     # Decode stub token to find the correct user by sub; a token this pool never
     # issued is rejected (real Cognito does the same, and the previous fallback to
     # the first pool user minted a session for an arbitrary account).
-    user = _user_from_token(refresh_token, pool, pid, "refresh")
+    user = _user_from_token(refresh_token, pool, pid, "refresh", cid)
     if not user:
         return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
     if secret_hash_data is not None:

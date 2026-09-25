@@ -290,6 +290,40 @@ def test_bd_1438_confidential_refresh_auth_requires_secret_hash(admin):
     assert _payload(response)["__type"] == "NotAuthorizedException"
 
 
+@pytest.mark.parametrize("path", ("public", "admin", "api"))
+def test_bd_1439_refresh_token_is_bound_to_its_issuing_client(path):
+    """BD-1439: a refresh token cannot mint tokens through another app client."""
+    cognito, pool_id, confidential_client, user = _confidential_cognito_user()
+    public_client = _payload(cognito._create_user_pool_client({
+        "UserPoolId": pool_id,
+        "ClientName": "busy-public-client",
+        "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH"],
+    }))["UserPoolClient"]
+    confidential_client_id = confidential_client["ClientId"]
+    refresh_token = cognito._build_auth_result(pool_id, confidential_client_id, user)["RefreshToken"]
+    public_client_id = public_client["ClientId"]
+
+    if path == "public":
+        response = cognito._initiate_auth({
+            "ClientId": public_client_id,
+            "AuthFlow": "REFRESH_TOKEN_AUTH",
+            "AuthParameters": {"REFRESH_TOKEN": refresh_token},
+        })
+    elif path == "admin":
+        response = cognito._admin_initiate_auth({
+            "UserPoolId": pool_id,
+            "ClientId": public_client_id,
+            "AuthFlow": "REFRESH_TOKEN_AUTH",
+            "AuthParameters": {"REFRESH_TOKEN": refresh_token},
+        })
+    else:
+        response = cognito._get_tokens_from_refresh_token({
+            "ClientId": public_client_id,
+            "RefreshToken": refresh_token,
+        })
+    assert _payload(response)["__type"] == "NotAuthorizedException"
+
+
 
 @pytest.mark.parametrize("grant_type", ("authorization_code", "refresh_token"))
 @pytest.mark.parametrize("client_secret", ("", "wrong-secret"), ids=("omitted", "wrong"))
