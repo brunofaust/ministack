@@ -1,7 +1,4 @@
-# Non-release builds intentionally use the maintainer-requested fallback of the latest
-# published full image. Release builds override this in docker-publish.yml with the
-# same-release full-image digest; plugin-source PRs build and consume a head-matched
-# full-preview digest in docker-publish-on-pr.yml.
+# Non-release builds use the maintainer-requested latest published full image.
 ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
 
 # glibc base (not Alpine): DuckDB ships no musl wheel, and the Athena emulator
