@@ -60,6 +60,10 @@ def get_state() -> dict:
     })
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data: dict):
     _restore_regional_store(_identities, data.get("_identities", {}))
     _restore_regional_store(_config_sets, data.get("_config_sets", {}))
@@ -280,8 +284,12 @@ def _local_ses_v2_resource_arn(arn):
 
 
 async def handle_request(method, path, headers, body, query_params):
-    # Strip /v2/email prefix
-    sub = path[len("/v2/email"):]
+    # The SES dispatcher also accepts unprefixed REST paths when selected by
+    # a SESv2 target header. Preserve those paths and trailing-slash handling
+    # from its former inline v2 implementation.
+    sub = path.rstrip("/")
+    if sub.startswith("/v2/email"):
+        sub = sub[len("/v2/email"):]
 
     try:
         data = json.loads(body) if body else {}
@@ -312,7 +320,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # POST /v2/email/outbound-emails  (SendEmail)
     if sub == "/outbound-emails" and method == "POST":
-        msg_id = f"ministack-{new_uuid()}"
+        msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
@@ -415,7 +423,7 @@ async def handle_request(method, path, headers, body, query_params):
             subj = rendered.get("Subject", "")
             body_text = rendered.get("Text", "")
             body_html = rendered.get("Html", "")
-            msg_id = f"ministack-{new_uuid()}"
+            msg_id = f"{new_uuid()}@email.amazonses.com"
 
             all_addrs = to_addrs + cc_addrs + bcc_addrs
             if source and all_addrs:

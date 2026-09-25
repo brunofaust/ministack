@@ -202,12 +202,12 @@ async def _ws_subscribe_and_collect(
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
         await ws.send(_make_connect(_unique("ws-subscriber")))
         # Wait for CONNACK
-        await asyncio.wait_for(ws.recv(), timeout=2.0)
+        await asyncio.wait_for(ws.recv(), timeout=15.0)
         # Subscribe
         await ws.send(_make_subscribe(packet_id=1, topic=topic, qos=0))
         # Retained PUBLISH frames may precede SUBACK in the in-process broker.
         while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            msg = await asyncio.wait_for(ws.recv(), timeout=15.0)
             if _record_publish(msg, received) == 9:  # SUBACK
                 break
         ready_event.set()

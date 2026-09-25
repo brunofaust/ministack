@@ -140,10 +140,9 @@ def test_cognito_rejects_invalid_refresh_token():
     assert result is None
     assert _payload(error)["__type"] == "NotAuthorizedException"
 
-    oauth = cognito.handle_oauth2_token(
-        "POST",
-        "/oauth2/token",
-        {"content-type": "application/x-www-form-urlencoded"},
+    oauth = cognito._oauth2_token(
+        {},
+        {},
         urlencode({"grant_type": "refresh_token", "refresh_token": "garbage"}).encode(),
         {},
     )
@@ -155,10 +154,9 @@ def test_bd_1135_cognito_rejects_unknown_oauth_grant_from_raw_form():
     """BD-1135: a nonempty unknown raw-form grant is unsupported."""
     from ministack.services import cognito
 
-    oauth = cognito.handle_oauth2_token(
-        "POST",
-        "/oauth2/token",
-        {"content-type": "application/x-www-form-urlencoded"},
+    oauth = cognito._oauth2_token(
+        {},
+        {},
         urlencode({"grant_type": "made-up"}).encode(),
         {},
     )
@@ -171,10 +169,9 @@ def test_bd_1135_cognito_rejects_absent_oauth_grant_from_raw_form(form):
     """BD-1135: a missing or blank raw-form grant is an invalid request."""
     from ministack.services import cognito
 
-    oauth = cognito.handle_oauth2_token(
-        "POST",
-        "/oauth2/token",
-        {"content-type": "application/x-www-form-urlencoded"},
+    oauth = cognito._oauth2_token(
+        {},
+        {},
         urlencode(form).encode(),
         {},
     )

@@ -94,6 +94,10 @@ def restore_state(data):
     _vectors.update(data.get("vectors", {}))
 
 
+def load_persisted_state(data):
+    restore_state(data)
+
+
 def reset():
     _vector_buckets.clear()
     _bucket_policies.clear()

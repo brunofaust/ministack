@@ -501,7 +501,15 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
         if seg.startswith("{") and seg.endswith("+}"):
             regex_parts.append(".+")
         elif seg.startswith("{") and seg.endswith("}"):
-            regex_parts.append("[^/]+")
+            # Lazy, not single-segment. A botocore label is non-greedy because
+            # the SDK percent-encodes any "/" the value carries, so it stays one
+            # segment on the wire; we match the decoded path, where those are
+            # separators again. Every ARN-valued label is in this position, as
+            # is an MQTT topic, so "[^/]+" resolves no action at all and the
+            # request authorizes against "*". The pattern is anchored and the
+            # literal segments around a label still bound it, and a route with
+            # more literals outscores one with fewer.
+            regex_parts.append(".+?")
         else:
             regex_parts.append(re.escape(seg))
             specificity += 1
@@ -787,7 +795,12 @@ def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
                          account_id: str) -> str:
-    """Construct the resource ARN for the request, or '*' if unknown."""
+    """Construct the resource ARN for the request, or '*' if unknown.
+
+    ``query_params`` is the router's params dict, which for a query-protocol
+    POST carries the form-encoded body merged underneath the query string
+    (``app._routing_params``). The branches below read it directly.
+    """
 
     if service == "s3":
         parts = [p for p in path.split("/") if p]
@@ -1397,8 +1410,20 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     # --- IoT (REST path-based, multiple resource types) ---
 
-    if service == "iot":
+    # Both data planes carry iot: actions on iot: ARNs, and their paths are the
+    # ones the map below already names: a publish is /topics/{topic}, a shadow
+    # and a job execution are /things/{thingName}/... . Routed by credential
+    # scope, they arrive here as their own service keys.
+    if service in ("iot", "iot-data", "iot-jobs-data"):
         parts = [p for p in path.split("/") if p]
+        # Publish and the retained-message calls take everything after the
+        # prefix as the topic, and a topic is multi-level: the ARN is
+        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
+        # percent-encoded from the SDK, which is why iot_data._publish unquotes
+        # as well.
+        if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
+            topic = unquote("/".join(parts[1:]))
+            return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1406,15 +1431,14 @@ def extract_resource_arn(service: str, method: str, path: str,
             "policies": "policy",
             "certificates": "cert",
             "rules": "rule",
+            "jobs": "job",
+            "provisioning-templates": "provisioningtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
                 si = parts.index(segment)
                 if si + 1 < len(parts):
-                    name = parts[si + 1]
-                    if rtype == "cert":
-                        return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
-                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
+                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{parts[si + 1]}"
         return "*"
 
     # --- API Gateway (REST path-based) ---

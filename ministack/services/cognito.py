@@ -548,6 +548,7 @@ _challenge_sessions = AccountScopedDict()
 
 _CHALLENGE_SESSION_TTL = 3600  # fallback only — see _create_challenge_session for TTL from client config
 _MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 answered rounds
+_SIGNUP_CODE_TTL = 86400
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -583,6 +584,10 @@ def get_state():
         "auth_codes": copy.deepcopy(_auth_codes),
         "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -693,6 +698,30 @@ def _client_id() -> str:
 
 def _client_secret() -> str:
     return base64.b64encode(secrets.token_bytes(48)).decode()
+
+
+def _verify_secret_hash(client, client_id: str, username: str, data):
+    """Return an authorization error when a confidential client hash is invalid."""
+    client_secret = (client or {}).get("ClientSecret")
+    if not client_secret:
+        return None
+    provided = data.get("SecretHash", "")
+    expected = base64.b64encode(
+        hmac.new(
+            client_secret.encode(), f"{username}{client_id}".encode(), hashlib.sha256
+        ).digest()
+    )
+    try:
+        provided_bytes = provided.encode("ascii")
+    except (AttributeError, UnicodeEncodeError):
+        provided_bytes = b""
+    if not provided_bytes or not hmac.compare_digest(provided_bytes, expected):
+        return error_response_json(
+            "NotAuthorizedException",
+            f"Unable to verify secret hash for client {client_id}",
+            400,
+        )
+    return None
 
 
 def _identity_pool_id() -> str:
@@ -1893,11 +1922,20 @@ def _find_pool_by_client_id(client_id: str):
 
 
 def _cleanup_expired_relay_codes():
-    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL."""
+    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL.
+
+    `/saml2/idpresponse` and `/oauth2/idpresponse` run reentrantly, so this can
+    run on multiple threads at once while another thread concurrently inserts
+    or pops from `_auth_codes` — iterating the live dict view would raise
+    "dictionary changed size during iteration". Snapshot with `list(...)`
+    first, and `pop(..., None)` rather than `del` since a key collected into
+    `expired` may already have been consumed by another thread by the time
+    this one gets to remove it.
+    """
     now = time.time()
-    expired = [k for k, v in _auth_codes.items() if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
+    expired = [k for k, v in list(_auth_codes.items()) if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
     for k in expired:
-        del _auth_codes[k]
+        _auth_codes.pop(k, None)
 
 
 def _authenticate_client(headers: dict, form: dict):
@@ -1923,10 +1961,21 @@ def _generate_auth_code() -> str:
 
 
 def _cleanup_expired_codes():
+    """Remove expired managed-login authorization codes.
+
+    `/oauth2/token` runs reentrantly, so this can run on multiple threads at
+    once while `_issue_auth_code_redirect` (from `/login`, on the event loop)
+    or another `/oauth2/token` call concurrently inserts or pops from
+    `_authorization_codes` — iterating the live dict view would raise
+    "dictionary changed size during iteration". Snapshot with `list(...)`
+    first, and `pop(..., None)` rather than `del` since a key collected into
+    `expired` may already have been consumed by another thread by the time
+    this one gets to remove it.
+    """
     now = time.time()
-    expired = [code for code, entry in _authorization_codes.items() if entry["expires_at"] < now]
+    expired = [code for code, entry in list(_authorization_codes.items()) if entry["expires_at"] < now]
     for code in expired:
-        del _authorization_codes[code]
+        _authorization_codes.pop(code, None)
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
@@ -1955,12 +2004,18 @@ async def handle_request(method, path, headers, body, query_params):
     # Path-based endpoints (form-encoded or no body — must run before JSON parse)
     if path.startswith("/oauth2/authorize"):
         return handle_oauth2_authorize(method, path, headers, query_params)
+    # These three routes can invoke PreSignUp/PreTokenGeneration Lambda triggers,
+    # which may call back into ministack over HTTP — run_reentrant gives that
+    # callback its own thread instead of queuing behind this request's thread.
     if path.startswith("/saml2/idpresponse"):
-        return _saml2_idp_response(body, query_params)
+        return await run_reentrant(_saml2_idp_response, body, query_params,
+                                   thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/idpresponse"):
-        return _oauth2_idp_response(method, body, query_params)
+        return await run_reentrant(_oauth2_idp_response, method, body, query_params,
+                                   thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/token"):
-        return _oauth2_token({}, query_params, body, headers)
+        return await run_reentrant(_oauth2_token, {}, query_params, body, headers,
+                                   thread_name="ministack-cognito-trigger")
 
     try:
         data = json.loads(body) if body else {}
@@ -3159,14 +3214,23 @@ def _resend_confirmation_code(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     user = pool["_users"].get(username)
     if not user:
         if _hides_user_existence(pool, cid):
             return _code_delivery_response(_masked_destination(username))
         return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    if user.get("UserStatus") == "CONFIRMED":
+        return error_response_json(
+            "InvalidParameterException", "User is already confirmed.", 400
+        )
 
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
+    user["_confirmation_code_expires_at"] = time.time() + _SIGNUP_CODE_TTL
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code)
     return _code_delivery_response(_masked_destination(attrs.get("email") or username))
@@ -4002,6 +4066,9 @@ def _sign_up(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
     if username in pool["_users"]:
         return error_response_json("UsernameExistsException", "User already exists.", 400)
 
@@ -4049,6 +4116,7 @@ def _sign_up(data):
         "_groups": [],
         "_tokens": [],
         "_confirmation_code": "123456",
+        "_confirmation_code_expires_at": time.time() + _SIGNUP_CODE_TTL,
     }
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
@@ -4081,13 +4149,33 @@ def _confirm_sign_up(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
+
     user, err = _resolve_user(pool, username)
     if err:
         return err
 
-    # Accept any code in emulation
+    issued_code = user.get("_confirmation_code")
+    try:
+        code_bytes = code.encode("ascii")
+        issued_code_bytes = issued_code.encode("ascii")
+    except (AttributeError, UnicodeEncodeError):
+        code_bytes = b""
+        issued_code_bytes = b""
+    if not code_bytes or not hmac.compare_digest(code_bytes, issued_code_bytes):
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400
+        )
+    if time.time() > user.get("_confirmation_code_expires_at", 0):
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400
+        )
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
+    user.pop("_confirmation_code", None)
+    user.pop("_confirmation_code_expires_at", None)
     return json_response({})
 
 
@@ -4102,6 +4190,9 @@ def _forgot_password(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
 
     user, _err = _resolve_user(pool, username)
     if _err:
@@ -4130,6 +4221,9 @@ def _confirm_forgot_password(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
+    if secret_err:
+        return secret_err
 
     user, _err = _resolve_user(pool, username)
     if _err:
@@ -6158,8 +6252,14 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
                 return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-            # Consume code (one-time use)
-            del _authorization_codes[code]
+            # Consume code (one-time use). This handler runs off the loop
+            # (run_reentrant), so two concurrent requests for the same code
+            # can both reach this point after passing validation above — pop()
+            # is the atomic single-use gate; the loser must not proceed past it
+            # even though it already "validated" against the (about-to-be-stale)
+            # entry.
+            if _authorization_codes.pop(code, None) is not entry:
+                return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
             pool_id = entry["pool_id"]
             pool = _get_pool_unscoped(pool_id)
@@ -6300,9 +6400,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
     return _oauth2_error("unsupported_grant_type", "Unsupported grant type.")
 
 
-def handle_oauth2_token(method, path, headers, body, query_params):
+async def handle_oauth2_token(method, path, headers, body, query_params):
     """Public entry point called from app.py for POST /oauth2/token."""
-    return _oauth2_token({}, query_params, body, headers)
+    return await run_reentrant(_oauth2_token, {}, query_params, body, headers,
+                               thread_name="ministack-cognito-trigger")
 
 
 # -- /oauth2/userInfo (GET/POST) ---------------------------------------------

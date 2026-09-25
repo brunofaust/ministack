@@ -80,7 +80,7 @@ def test_ecs_run_task_stops_after_exit(ecs):
     )
     resp = ecs.run_task(cluster="task-lifecycle", taskDefinition="short-lived")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     # Poll until STOPPED (container exits almost immediately)
     stopped = False
@@ -170,7 +170,7 @@ def test_ecs_run_task_network_connectivity(ecs):
     )
     resp = ecs.run_task(cluster="net-test", taskDefinition="net-probe")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     # Poll until STOPPED — wget should succeed (exit 0) if network is correct
     success = False
@@ -218,7 +218,7 @@ def test_ecs_run_task_metadata_v4(ecs):
     )
     resp = ecs.run_task(cluster="metadata-test", taskDefinition="metadata-probe")
     task_arn = resp["tasks"][0]["taskArn"]
-    assert resp["tasks"][0]["lastStatus"] in ("PENDING", "RUNNING")
+    assert resp["tasks"][0]["lastStatus"] in ("PROVISIONING", "PENDING", "RUNNING")
 
     success = False
     for _ in range(30):
@@ -235,6 +235,50 @@ def test_ecs_run_task_metadata_v4(ecs):
             success = True
             break
     assert success, "Task should transition to STOPPED"
+
+
+def test_ecs_restore_helpers_are_defined_before_the_import_time_restore():
+    """Everything `restore_state` calls must be bound before the module runs it.
+
+    `ecs.py` calls `restore_state(_restored)` at module level, so a helper it
+    reaches that is defined further down the file raises NameError there. The
+    surrounding try/except catches it and ALL ECS state fails to restore, which
+    is only visible under PERSIST_STATE=1 and never in a test that calls
+    `restore_state` after the import. The file already carries `_attributes`
+    at the top for exactly this reason; this keeps the next one honest.
+    """
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(ecs_service))
+    defined_at = {
+        node.name: node.lineno
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+    restore = next(
+        n for n in tree.body
+        if isinstance(n, ast.FunctionDef) and n.name == "restore_state"
+    )
+    call_line = next(
+        n.lineno for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "restore_state"
+        and n.col_offset == 8  # the module-level try: block, not a nested call
+    )
+
+    late = sorted({
+        node.id
+        for node in ast.walk(restore)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+        and node.id in defined_at and defined_at[node.id] > call_line
+    })
+    assert not late, (
+        f"restore_state reaches {late}, defined after the import-time call at "
+        f"line {call_line}; move them above it or the warm-boot restore dies "
+        f"silently"
+    )
 
 
 def test_ecs_run_task_applies_container_command_overrides(monkeypatch):
@@ -1540,7 +1584,7 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
         "taskDefinition": "pending-test-td",
     })
     task = json.loads(response[2])["tasks"][0]
-    assert task["lastStatus"] == "PENDING"
+    assert task["lastStatus"] == "PROVISIONING"
     assert task["containers"][0]["lastStatus"] == "PENDING"
     # AWS omits a timestamp it has no value for rather than sending a null:
     # the task has not started, pulled or stopped yet.
@@ -1563,6 +1607,125 @@ def test_ecs_run_task_returns_pending_before_docker_start(monkeypatch):
     })[2])["tasks"][0]
     assert described["lastStatus"] == "STOPPED"
     assert described["containers"][0]["exitCode"] == 0
+
+
+def test_ecs_run_task_starts_provisioning_and_metadata_follows(monkeypatch):
+    """A task starts PROVISIONING and the metadata endpoint follows it,
+    reporting the container's own KnownStatus apart from the task's.
+    Reported by @iot-rocket."""
+    import threading
+
+    from ministack.services import ecs as _ecs
+    from ministack.services import ecs_metadata as _md
+
+    started = threading.Event()
+    release = threading.Event()
+    containers = {}
+
+    class FakeContainer:
+        def __init__(self, cid):
+            self.id = cid
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+
+        def reload(self):
+            pass
+
+        def wait(self):
+            return {"StatusCode": 0}
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, **kwargs):
+            pass
+
+    class FakeContainers:
+        def get(self, name):
+            if name in containers:
+                return containers[name]
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return list(containers.values())
+
+        def run(self, image, **kwargs):
+            started.set()
+            assert release.wait(timeout=5)
+            container = FakeContainer("awsvpc-test-container")
+            containers[container.id] = container
+            return container
+
+    monkeypatch.setattr(
+        _ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers())
+    )
+    _ecs._register_task_definition({
+        "family": "awsvpc-test-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    response = _ecs._run_task({
+        "cluster": "awsvpc-test-c",
+        "taskDefinition": "awsvpc-test-td",
+    })
+    task = json.loads(response[2])["tasks"][0]
+    arn = task["taskArn"]
+    assert task["lastStatus"] == "PROVISIONING"
+
+    assert started.wait(timeout=2)
+    assert _ecs._tasks[arn]["lastStatus"] == "ACTIVATING"
+    # Seeded from the container's own record entry, still PENDING while the
+    # task pulls: AWS reports the two apart.
+    assert _md._TASKS[arn]["KnownStatus"] == "ACTIVATING"
+    assert _md._TASKS[arn]["DesiredStatus"] == "RUNNING"
+    assert all(c["KnownStatus"] == "PENDING" for c in _md._TASKS[arn]["Containers"])
+
+    release.set()
+    _wait_until(lambda: _ecs._tasks[arn]["lastStatus"] == "RUNNING")
+    _wait_until(lambda: _md._TASKS[arn]["KnownStatus"] == "RUNNING")
+    assert all(c["KnownStatus"] == "RUNNING" for c in _md._TASKS[arn]["Containers"])
+
+    # DesiredStatus reaches the container payloads; KnownStatus stays per-container.
+    _ecs._stop_task({"cluster": "awsvpc-test-c", "task": arn})
+    assert _ecs._tasks[arn]["lastStatus"] == "STOPPED"
+
+
+def test_ecs_run_task_bridge_mode_also_starts_provisioning(monkeypatch):
+    """Every network mode starts PROVISIONING, not only awsvpc: the ENI is one
+    example of the "additional steps before the task is launched", not the
+    condition for the state (task-lifecycle)."""
+    import threading
+
+    from ministack.services import ecs as _ecs
+
+    release = threading.Event()
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return []
+
+        def run(self, image, **kwargs):
+            assert release.wait(timeout=5)
+            raise RuntimeError("stopped by the test")
+
+    monkeypatch.setattr(
+        _ecs, "_get_docker", lambda: SimpleNamespace(containers=FakeContainers())
+    )
+    _ecs._register_task_definition({
+        "family": "bridge-test-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+    response = _ecs._run_task({
+        "cluster": "bridge-test-c",
+        "taskDefinition": "bridge-test-td",
+    })
+    assert json.loads(response[2])["tasks"][0]["lastStatus"] == "PROVISIONING"
+    release.set()
 
 
 def test_ecs_run_task_startup_failure_is_a_stopped_task(monkeypatch):
@@ -1722,6 +1885,114 @@ def test_ecs_reset_during_pending_start_cleans_late_container(monkeypatch):
     assert task_arn not in _ecs._tasks
 
 
+def _version_probe_container(cid):
+    class FakeContainer:
+        def __init__(self):
+            self.id = cid
+            self.status = "running"
+            self.attrs = {"NetworkSettings": {"Networks": {}}}
+            self.removed = False
+
+        def reload(self):
+            pass
+
+        def wait(self):
+            return {"StatusCode": 0}
+
+        def stop(self, timeout=5):
+            self.status = "exited"
+
+        def remove(self, **kwargs):
+            self.removed = True
+
+    return FakeContainer()
+
+
+def _version_probe_docker(container):
+    class FakeContainers:
+        def get(self, name):
+            if name == container.id:
+                return container
+            raise Exception("not found")
+
+        def list(self, *args, **kwargs):
+            return [container]
+
+        def run(self, image, **kwargs):
+            return container
+
+    return SimpleNamespace(containers=FakeContainers())
+
+
+def test_ecs_task_version_counts_state_changes(monkeypatch):
+    """The version counter moves on every transition the record reports, so a
+    consumer can tell a stale copy from the current one."""
+    from ministack.services import ecs as _ecs
+
+    container = _version_probe_container("version-counter-container")
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _version_probe_docker(container))
+    _ecs._register_task_definition({
+        "family": "version-counter-td",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    response = _ecs._run_task({
+        "cluster": "version-counter-c",
+        "taskDefinition": "version-counter-td",
+    })
+    task = json.loads(response[2])["tasks"][0]
+    task_arn = task["taskArn"]
+    assert task["lastStatus"] == "PROVISIONING"
+    assert task["version"] == 1
+
+    # 3, not 4: ACTIVATING raises no state-change event, so the bumps to RUNNING
+    # are PROVISIONING, PENDING and RUNNING, which is what a real task reads.
+    _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
+    assert _ecs._tasks[task_arn]["version"] == 3
+
+    stopped = json.loads(_ecs._stop_task({
+        "cluster": "version-counter-c",
+        "task": task_arn,
+        "reason": "done here",
+    })[2])["task"]
+    assert stopped["lastStatus"] == "STOPPED"
+    assert stopped["version"] == 6
+
+
+def test_ecs_task_version_moves_once_for_a_natural_exit(monkeypatch):
+    """The exit is observed by whichever DescribeTasks notices it first; the
+    ones after it describe the same version. 6, as on a real task: the
+    desiredStatus flip, DEPROVISIONING and STOPPED each count."""
+    from ministack.services import ecs as _ecs
+
+    container = _version_probe_container("version-exit-container")
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _version_probe_docker(container))
+    _ecs._register_task_definition({
+        "family": "version-exit-td",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "version-exit-c",
+        "taskDefinition": "version-exit-td",
+    })[2])["tasks"][0]["taskArn"]
+    _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
+
+    container.status = "exited"
+    described = json.loads(_ecs._describe_tasks({
+        "cluster": "version-exit-c",
+        "tasks": [task_arn],
+    })[2])["tasks"][0]
+    assert described["lastStatus"] == "STOPPED"
+    assert described["version"] == 6
+
+    again = json.loads(_ecs._describe_tasks({
+        "cluster": "version-exit-c",
+        "tasks": [task_arn],
+    })[2])["tasks"][0]
+    assert again["version"] == 6
+
+
 def test_ecs_secret_resolution_failure_stops_before_docker_run(monkeypatch):
     from ministack.services import ecs as _ecs
 
@@ -1770,7 +2041,7 @@ def test_ecs_run_task_count_and_multi_container_startup_are_independent(monkeypa
         "count": 2,
     })
     tasks = json.loads(response[2])["tasks"]
-    assert all(task["lastStatus"] == "PENDING" for task in tasks)
+    assert all(task["lastStatus"] == "PROVISIONING" for task in tasks)
     _wait_until(lambda: len(fake_containers.calls) == 4)
     _wait_until(
         lambda: all(
@@ -1984,8 +2255,222 @@ def test_ecs_task_records_private_ipv4_attachment(monkeypatch):
     _wait_until(lambda: _ecs._task_ip(_ecs._tasks.get(task["taskArn"])) == "172.30.0.9")
     task = _ecs._tasks[task["taskArn"]]
     assert _ecs._task_ip(task) == "172.30.0.9"
-    assert task["attachmentsStatus"] == "ATTACHED"
+    # Not a member of the Task shape; the emulator used to invent it.
+    assert "attachmentsStatus" not in task
     assert task["attachments"][0]["type"] == "ElasticNetworkInterface"
+
+
+def _eni_probe_docker(ip):
+    class FakeContainer:
+        id = "container-000000000002"
+        attrs = {"NetworkSettings": {"Networks": {"ministack_default": {"IPAddress": ip}}}}
+
+        def reload(self):
+            pass
+
+    class FakeContainers:
+        def get(self, _name):
+            raise Exception("not found")
+
+        def list(self, *a, **k):
+            return []
+
+        def run(self, image, **kwargs):
+            return FakeContainer()
+
+    return SimpleNamespace(containers=FakeContainers())
+
+
+def test_ecs_awsvpc_attachment_carries_the_subnet_it_was_placed_in(monkeypatch):
+    """The attachment names the subnet the request asked for, one of the members
+    the Attachment reference lists for an elastic network interface."""
+    from ministack.services import ecs as _ecs
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.11"))
+    _ecs._register_task_definition({
+        "family": "eni-subnet-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "eni-subnet-c",
+        "taskDefinition": "eni-subnet-td",
+        "networkConfiguration": {"awsvpcConfiguration": {
+            "subnets": ["subnet-0a1b2c3d", "subnet-9f8e7d6c"],
+        }},
+    })[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
+    details = {d["name"]: d["value"]
+               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    assert details["subnetId"] == "subnet-0a1b2c3d"
+    assert details["privateIPv4Address"] == "172.30.0.11"
+
+
+def test_ecs_awsvpc_attachment_reads_the_cloudformation_casing(monkeypatch):
+    """A CloudFormation service replays its template's `NetworkConfiguration`.
+
+    The AWS::ECS::Service handler stores the template block verbatim, so it
+    reaches RunTask in PascalCase. Reading only the SDK's casing would leave
+    every CFN-defined service's tasks without a subnet.
+    """
+    from ministack.services import ecs as _ecs
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.41"))
+    _ecs._register_task_definition({
+        "family": "eni-cfncase-td",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "eni-cfncase-c",
+        "taskDefinition": "eni-cfncase-td",
+        "networkConfiguration": {"AwsvpcConfiguration": {
+            "Subnets": ["subnet-cfn00001"],
+        }},
+    })[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
+    details = {d["name"]: d["value"]
+               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    assert details["subnetId"] == "subnet-cfn00001"
+
+
+@pytest.mark.parametrize("network_configuration", [
+    None,
+    {},
+    {"awsvpcConfiguration": {}},
+    {"awsvpcConfiguration": {"subnets": []}},
+])
+def test_ecs_awsvpc_attachment_without_a_usable_subnet(monkeypatch, network_configuration):
+    """A guard: the request's network configuration is not read anywhere else,
+    so a body that leaves it out or leaves it empty must still start the task
+    and report the attachment, just without a subnet."""
+    from ministack.services import ecs as _ecs
+
+    uid = _uuid_mod.uuid4().hex[:8]
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.13"))
+    _ecs._register_task_definition({
+        "family": f"eni-nosubnet-td-{uid}",
+        "networkMode": "awsvpc",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    request = {"cluster": "eni-nosubnet-c", "taskDefinition": f"eni-nosubnet-td-{uid}"}
+    if network_configuration is not None:
+        request["networkConfiguration"] = network_configuration
+    task_arn = json.loads(_ecs._run_task(request)[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._tasks[task_arn].get("attachments"))
+    details = {d["name"]: d["value"]
+               for d in _ecs._tasks[task_arn]["attachments"][0]["details"]}
+    assert details == {"privateIPv4Address": "172.30.0.13"}
+
+
+def test_ecs_restore_stops_a_running_task_and_counts_it(monkeypatch):
+    """A restart stops every restored task, which is a change to the record:
+    without the bump a consumer's pre-restart copy still compares equal to a
+    task that is no longer running.
+
+    The saved state also drops the address the container had. That key is what
+    the live target-group sync reads, and the container it named is gone with
+    the process. The attachment keeps its own copy, which is right: AWS reports
+    a stopped task's attachment too, with the interface already DELETED.
+    """
+    from ministack.services import ecs as _ecs
+
+    container = _version_probe_container("restore-version-container")
+    container.attrs = {"NetworkSettings": {"Networks": {"n": {"IPAddress": "172.30.0.31"}}}}
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _version_probe_docker(container))
+    _ecs._register_task_definition({
+        "family": "restore-version-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "app", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "restore-version-c",
+        "taskDefinition": "restore-version-td",
+    })[2])["tasks"][0]["taskArn"]
+    _wait_until(lambda: _ecs._tasks[task_arn]["lastStatus"] == "RUNNING")
+    _wait_until(lambda: _ecs._tasks[task_arn].get("_container_ip"))
+    running_version = _ecs._tasks[task_arn]["version"]
+
+    state = _ecs.get_state()
+    saved = [t for t in state["tasks"]._data.values() if t["taskArn"] == task_arn][0]
+    assert _ecs._tasks[task_arn]["_container_ip"] == "172.30.0.31"
+    assert "_container_ip" not in saved
+    _ecs.reset()
+    _ecs.restore_state(state)
+
+    restored = _ecs._tasks[task_arn]
+    assert restored["lastStatus"] == "STOPPED"
+    assert restored["version"] == running_version + 1
+
+    # Restoring an already stopped task is not a transition.
+    state = _ecs.get_state()
+    _ecs.reset()
+    _ecs.restore_state(state)
+    assert _ecs._tasks[task_arn]["version"] == running_version + 1
+
+
+def test_ecs_bridge_task_reports_no_eni_attachment(monkeypatch):
+    """`attachments` is documented as the adapter a task has "if the task uses
+    the awsvpc network mode", so a bridge task reports none. Its address is still
+    known, which is what the target-group sync reads."""
+    from ministack.services import ecs as _ecs
+
+    monkeypatch.setattr(_ecs, "_get_docker", lambda: _eni_probe_docker("172.30.0.12"))
+    _ecs._register_task_definition({
+        "family": "eni-bridge-td",
+        "networkMode": "bridge",
+        "containerDefinitions": [{"name": "web", "image": "busybox"}],
+    })
+    task_arn = json.loads(_ecs._run_task({
+        "cluster": "eni-bridge-c",
+        "taskDefinition": "eni-bridge-td",
+    })[2])["tasks"][0]["taskArn"]
+
+    _wait_until(lambda: _ecs._task_ip(_ecs._tasks[task_arn]) == "172.30.0.12")
+    task = _ecs._tasks[task_arn]
+    assert task["attachments"] == []
+    assert "attachmentsStatus" not in task
+    described = json.loads(_ecs._describe_tasks({
+        "cluster": "eni-bridge-c",
+        "tasks": [task_arn],
+    })[2])["tasks"][0]
+    assert described["attachments"] == []
+    assert "_container_ip" not in described
+
+
+@pytest.mark.parametrize("mode", ["awsvpc", "bridge"])
+def test_ecs_first_container_to_report_an_address_owns_it(mode):
+    """A task has one address, not one per container.
+
+    A two-container awsvpc task on AWS reports a single attachment, and both
+    containers name that one attachment and that one private address. Each
+    container here calls _record_task_ip from its own thread, so without the
+    guard a sidecar coming up second would move the task's address, and with it
+    the target a load balancer is pointed at.
+    """
+    from ministack.services import ecs as _ecs
+
+    class FakeContainer:
+        def __init__(self, ip):
+            self.attrs = {"NetworkSettings": {"Networks": {"n": {"IPAddress": ip}}}}
+
+        def reload(self):
+            pass
+
+    task = {
+        "taskArn": f"arn:aws:ecs:us-east-1:000000000000:task/c/first-owner-{mode}",
+        "_network_mode": mode,
+        "_subnet": "subnet-0a1b2c3d",
+        "attachments": [],
+    }
+    _ecs._record_task_ip(task, FakeContainer("172.30.0.21"), "n")
+    _ecs._record_task_ip(task, FakeContainer("172.30.0.22"), "n")
+
+    assert _ecs._task_ip(task) == "172.30.0.21"
+    assert len(task["attachments"]) == (1 if mode == "awsvpc" else 0)
 
 
 def test_ecs_sync_service_targets_selects_tasks_by_group(monkeypatch):
