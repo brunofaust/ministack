@@ -190,6 +190,133 @@ def test_cognito_validates_secret_hash():
     assert _payload(verify_hash({"ClientSecret": secret}, "client-id", "alice", {"SecretHash": "bad"}))["__type"] == "NotAuthorizedException"
 
 
+def _confidential_cognito_user():
+    """Create a confirmed user and a client that requires secret credentials."""
+    from ministack.services import cognito
+
+    cognito.reset()
+    pool_id = _payload(cognito._create_user_pool({"PoolName": "busy-confidential"}))["UserPool"]["Id"]
+    client = _payload(cognito._create_user_pool_client({
+        "UserPoolId": pool_id,
+        "ClientName": "busy-confidential-client",
+        "GenerateSecret": True,
+        "ExplicitAuthFlows": ["ALLOW_USER_PASSWORD_AUTH", "ALLOW_CUSTOM_AUTH"],
+    }))["UserPoolClient"]
+    user = {
+        "Username": "alice",
+        "Enabled": True,
+        "UserStatus": "CONFIRMED",
+        "_password": "Password1!",
+        "Attributes": [{"Name": "sub", "Value": "alice-sub"}],
+    }
+    cognito._user_pools[pool_id]["_users"]["alice"] = user
+    return cognito, pool_id, client, user
+
+
+@pytest.mark.parametrize("admin", (False, True), ids=("public", "admin"))
+def test_bd_1436_confidential_auth_starts_require_secret_hash(admin):
+    """BD-1436: password and CUSTOM_AUTH starts require AuthParameters.SECRET_HASH."""
+    cognito, pool_id, client, _user = _confidential_cognito_user()
+    auth_params = {"USERNAME": "alice", "PASSWORD": "Password1!"}
+    data = {"ClientId": client["ClientId"], "AuthFlow": "USER_PASSWORD_AUTH", "AuthParameters": auth_params}
+    if admin:
+        data.update({"UserPoolId": pool_id, "AuthFlow": "ADMIN_USER_PASSWORD_AUTH"})
+        response = cognito._admin_initiate_auth(data)
+    else:
+        response = cognito._initiate_auth(data)
+    assert _payload(response)["__type"] == "NotAuthorizedException"
+
+    custom = {"ClientId": client["ClientId"], "AuthFlow": "CUSTOM_AUTH", "AuthParameters": {"USERNAME": "alice"}}
+    if admin:
+        custom["UserPoolId"] = pool_id
+        response = cognito._admin_initiate_auth(custom)
+    else:
+        response = cognito._initiate_auth(custom)
+    assert _payload(response)["__type"] == "NotAuthorizedException"
+
+
+@pytest.mark.parametrize("admin", (False, True), ids=("public", "admin"))
+def test_bd_1436_confidential_challenge_responses_require_secret_hash(admin):
+    """BD-1436: challenge responses do not mint tokens without SECRET_HASH."""
+    cognito, pool_id, client, user = _confidential_cognito_user()
+    user["UserStatus"] = "FORCE_CHANGE_PASSWORD"
+    data = {
+        "ClientId": client["ClientId"],
+        "ChallengeName": "NEW_PASSWORD_REQUIRED",
+        "ChallengeResponses": {"USERNAME": "alice", "NEW_PASSWORD": "Changed1!"},
+    }
+    if admin:
+        data["UserPoolId"] = pool_id
+        response = cognito._admin_respond_to_auth_challenge(data)
+    else:
+        response = cognito._respond_to_auth_challenge(data)
+    assert _payload(response)["__type"] == "NotAuthorizedException"
+
+
+def test_bd_1437_rejects_forged_access_token_with_known_sub():
+    """BD-1437: an unsigned JWT payload cannot impersonate a user by subject."""
+    cognito, pool_id, client, user = _confidential_cognito_user()
+    forged_payload = base64.urlsafe_b64encode(json.dumps({"sub": "alice-sub"}).encode()).rstrip(b"=").decode()
+    pool = cognito._user_pools[pool_id]
+    real_access_token = cognito._build_auth_result(pool_id, client["ClientId"], user)["AccessToken"]
+    assert cognito._user_from_token(real_access_token, pool, pool_id) is user
+    assert cognito._user_from_token(f"forged.{forged_payload}.signature", pool, pool_id) is None
+
+
+def test_bd_1438_confidential_refresh_api_requires_client_secret():
+    """BD-1438: GetTokensFromRefreshToken needs its confidential client secret."""
+    cognito, pool_id, client, user = _confidential_cognito_user()
+    client_id = client["ClientId"]
+    refresh_token = cognito._build_auth_result(pool_id, client_id, user)["RefreshToken"]
+    cognito._refresh_tokens[refresh_token] = {"pool_id": pool_id, "client_id": client_id, "username": "alice"}
+
+    refresh = cognito._get_tokens_from_refresh_token({"ClientId": client_id, "RefreshToken": refresh_token})
+    assert _payload(refresh)["__type"] == "NotAuthorizedException"
+
+
+@pytest.mark.parametrize("admin", (False, True), ids=("public", "admin"))
+def test_bd_1438_confidential_refresh_auth_requires_secret_hash(admin):
+    """BD-1438: native refresh authentication requires AuthParameters.SECRET_HASH."""
+    cognito, pool_id, client, user = _confidential_cognito_user()
+    client_id = client["ClientId"]
+    refresh_token = cognito._build_auth_result(pool_id, client_id, user)["RefreshToken"]
+    auth_params = {"REFRESH_TOKEN": refresh_token}
+    data = {"ClientId": client_id, "AuthFlow": "REFRESH_TOKEN_AUTH", "AuthParameters": auth_params}
+    if admin:
+        data.update({"UserPoolId": pool_id, "AuthFlow": "REFRESH_TOKEN_AUTH"})
+        response = cognito._admin_initiate_auth(data)
+    else:
+        response = cognito._initiate_auth(data)
+    assert _payload(response)["__type"] == "NotAuthorizedException"
+
+
+
+@pytest.mark.parametrize("grant_type", ("authorization_code", "refresh_token"))
+@pytest.mark.parametrize("client_secret", ("", "wrong-secret"), ids=("omitted", "wrong"))
+def test_bd_1438_confidential_oauth_grants_require_client_secret(grant_type, client_secret):
+    """BD-1438: OAuth code and refresh grants reject omitted and wrong secrets."""
+    cognito, pool_id, client, user = _confidential_cognito_user()
+    client_id = client["ClientId"]
+    refresh_token = cognito._build_auth_result(pool_id, client_id, user)["RefreshToken"]
+    cognito._refresh_tokens[refresh_token] = {"pool_id": pool_id, "client_id": client_id, "username": "alice"}
+
+    cognito._authorization_codes["busy-code"] = {
+        "client_id": client_id,
+        "pool_id": pool_id,
+        "username": "alice",
+        "redirect_uri": "",
+        "expires_at": time.time() + 60,
+    }
+    form = {"grant_type": grant_type, "client_id": client_id, "client_secret": client_secret}
+    if grant_type == "authorization_code":
+        form["code"] = "busy-code"
+    else:
+        form["refresh_token"] = refresh_token
+    oauth = cognito._oauth2_token({}, {}, urlencode(form).encode(), {})
+    assert oauth[0] == 400
+    assert _payload(oauth)["error"] == "invalid_client"
+
+
 def test_bd_1137_cognito_totp_accepts_current_and_adjacent_time_steps():
     """BD-1137: TOTP verification accepts the current step and its two neighbors."""
     from ministack.services import cognito
