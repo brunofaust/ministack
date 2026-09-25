@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 S3 Tables Service Emulator.
 
@@ -56,36 +58,59 @@ _SIGV4_CREDENTIAL_REGION_RE = re.compile(r"Credential=[^/]+/[^/]+/([^/]+)/")
 
 def _gateway_url() -> str:
     from ministack.core import tls as _tls
+
     scheme = "https" if _tls.use_ssl_enabled() else "http"
     return f"{scheme}://{_MINISTACK_HOST}:{_GATEWAY_PORT}"
+
 
 # ── In-memory state ────────────────────────────────────────
 
 _table_buckets = AccountRegionScopedDict()
-_namespaces = AccountRegionScopedDict()        # "bucket_arn\x00namespace" -> ns dict
-_tables = AccountRegionScopedDict()            # "bucket_arn\x00namespace\x00table" -> table dict
+_namespaces = AccountRegionScopedDict()  # "bucket_arn\x00namespace" -> ns dict
+_tables = AccountRegionScopedDict()  # "bucket_arn\x00namespace\x00table" -> table dict
+_bucket_maintenance = AccountRegionScopedDict()  # bucket_arn -> {type: {status, settings}}
+_table_maintenance = AccountRegionScopedDict()   # "bucket_arn\x00namespace\x00table" -> {type: {status, settings}}
+_bucket_encryption = AccountRegionScopedDict()  # bucket_arn -> {"sseAlgorithm": ..., "kmsKeyArn"?: ...}
+_resource_tags = AccountRegionScopedDict()  # resource arn -> {key: value}
 
 
 # ── Persistence ────────────────────────────────────────────
+
 
 def get_state():
     return {
         "table_buckets": copy.deepcopy(_table_buckets),
         "namespaces": copy.deepcopy(_namespaces),
         "tables": copy.deepcopy(_tables),
+        "bucket_maintenance": copy.deepcopy(_bucket_maintenance),
+        "table_maintenance": copy.deepcopy(_table_maintenance),
+        "bucket_encryption": copy.deepcopy(_bucket_encryption),
+        "resource_tags": copy.deepcopy(_resource_tags),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
     _table_buckets.update(data.get("table_buckets", {}))
     _namespaces.update(data.get("namespaces", {}))
     _tables.update(data.get("tables", {}))
+    _bucket_maintenance.update(data.get("bucket_maintenance", {}))
+    _table_maintenance.update(data.get("table_maintenance", {}))
+    _bucket_encryption.update(data.get("bucket_encryption", {}))
+    _resource_tags.update(data.get("resource_tags", {}))
 
 
 def reset():
     _table_buckets.clear()
     _namespaces.clear()
     _tables.clear()
+    _bucket_maintenance.clear()
+    _table_maintenance.clear()
+    _bucket_encryption.clear()
+    _resource_tags.clear()
 
 
 if PERSIST_STATE:
@@ -95,6 +120,7 @@ if PERSIST_STATE:
 
 
 # ── Helpers ────────────────────────────────────────────────
+
 
 def _bucket_arn(name):
     return f"arn:aws:s3tables:{get_region()}:{get_account_id()}:bucket/{name}"
@@ -119,7 +145,7 @@ def _bucket_name_from_arn(bucket_arn):
     prefix = "bucket/"
     if not spec.resource.startswith(prefix):
         return None
-    name = spec.resource[len(prefix):]
+    name = spec.resource[len(prefix) :]
     if not name or "/" in name:
         return None
     return name
@@ -181,34 +207,63 @@ def _set_bucket_region_value(store, bucket_arn, key, value):
     store.set_scoped(spec.account_id, spec.region, key, value)
 
 
+# Iceberg primitive type names S3 Tables accepts verbatim. Anything else used to
+# collapse to "string", so a `timestamptz` column came back as VARCHAR and every
+# `ts >= current_timestamp - interval ...` query failed with a binder error.
+_ICEBERG_PRIMITIVE_TYPES = frozenset(
+    {"string", "int", "long", "boolean", "date", "time", "timestamp", "timestamptz", "timestamp_ns",
+     "timestamptz_ns", "float", "double", "uuid", "binary"}
+)
+
+
 def _to_iceberg_type(kind):
-    return {"string": "string", "int": "int", "long": "long", "boolean": "boolean",
-            "date": "date", "timestamp": "timestamptz", "float": "float", "double": "double"
-            }.get(kind, "string")
+    if kind in _ICEBERG_PRIMITIVE_TYPES:
+        return kind
+    if isinstance(kind, str) and (kind.startswith("decimal(") or kind.startswith("fixed[")):
+        return kind
+    return "string"
 
 
 def _initial_iceberg_metadata(table_name, schema_fields, location):
     table_uuid = new_uuid()
     fields = []
     for i, f in enumerate(schema_fields):
-        fields.append({"id": i + 1, "name": f["name"], "required": f.get("required", False),
-                        "type": _to_iceberg_type(f.get("type", "string"))})
+        fields.append(
+            {
+                "id": i + 1,
+                "name": f["name"],
+                "required": f.get("required", False),
+                "type": _to_iceberg_type(f.get("type", "string")),
+            }
+        )
     schema = {"type": "struct", "schema-id": 0, "fields": fields}
     return {
-        "format-version": 3, "table-uuid": table_uuid, "location": location,
-        "last-sequence-number": 0, "last-updated-ms": int(time.time() * 1000),
-        "last-column-id": len(schema_fields), "current-schema-id": 0,
-        "schemas": [schema], "default-spec-id": 0,
+        "format-version": 2,
+        "table-uuid": table_uuid,
+        "location": location,
+        "last-sequence-number": 0,
+        "last-updated-ms": int(time.time() * 1000),
+        "last-column-id": len(schema_fields),
+        "current-schema-id": 0,
+        "schemas": [schema],
+        "default-spec-id": 0,
         "partition-specs": [{"spec-id": 0, "fields": []}],
-        "last-partition-id": 999, "default-sort-order-id": 0,
+        "last-partition-id": 999,
+        "default-sort-order-id": 0,
         "sort-orders": [{"order-id": 0, "fields": []}],
-        "properties": {}, "current-snapshot-id": -1, "refs": {},
-        "snapshots": [], "statistics": [], "snapshot-log": [], "metadata-log": [],
+        "properties": {},
+        "current-snapshot-id": -1,
+        "refs": {},
+        "snapshots": [],
+        "statistics": [],
+        "snapshot-log": [],
+        "metadata-log": [],
         "next-row-id": 0,
     }
 
 
 # ── S3 Tables control plane ───────────────────────────────
+
 
 def _create_table_bucket(data):
     name = data.get("name", "")
@@ -217,19 +272,82 @@ def _create_table_bucket(data):
     if name in _table_buckets:
         return error_response_json("ConflictException", f"Table bucket {name} already exists", 409)
     arn = _bucket_arn(name)
-    _table_buckets[name] = {"arn": arn, "name": name, "ownerAccountId": get_account_id(),
-                             "createdAt": now_iso(), "tableCount": 0}
+    _table_buckets[name] = {
+        "arn": arn,
+        "name": name,
+        "ownerAccountId": get_account_id(),
+        "createdAt": now_iso(),
+        "tableCount": 0,
+    }
     # Provision the backing S3 bucket so data-plane writes (Parquet, manifests)
     # have somewhere to land — mirrors real AWS where S3 Tables manages its own
     # underlying storage transparently.
     import ministack.services.s3 as _s3
+
     _s3._buckets.setdefault(name, {"created": now_iso(), "objects": {}, "region": get_region()})
+    # AWS auto-provisions the unreferenced-file-removal maintenance config for
+    # every new table bucket — seed it now so a GetTableBucketMaintenanceConfiguration
+    # right after create (what the Terraform provider does) returns a populated
+    # settings object instead of an empty one.
+    _bucket_maintenance[arn] = _default_bucket_maintenance_configuration()
+    if isinstance(data.get("encryptionConfiguration"), dict):
+        _bucket_encryption[arn] = dict(data["encryptionConfiguration"])
+    if isinstance(data.get("tags"), dict):
+        _resource_tags[arn] = {str(k): str(v) for k, v in data["tags"].items()}
     logger.info("S3Tables: created table bucket %s", name)
     return json_response({"arn": arn})
 
 
 def _list_table_buckets():
     return json_response({"tableBuckets": list(_table_buckets.values())})
+
+
+_DEFAULT_ENCRYPTION = {"sseAlgorithm": "AES256"}
+
+
+def _get_table_bucket_encryption(arn):
+    """GetTableBucketEncryption: AWS reports SSE-S3 when nothing was ever put."""
+    if not _find_bucket_by_arn(arn):
+        return _bucket_not_found(arn)
+    config = _bucket_encryption.get(_canonical_bucket_arn(arn)) or _DEFAULT_ENCRYPTION
+    return json_response({"encryptionConfiguration": dict(config)})
+
+
+def _put_table_bucket_encryption(arn, data):
+    if not _find_bucket_by_arn(arn):
+        return _bucket_not_found(arn)
+    config = data.get("encryptionConfiguration") or {}
+    if config.get("sseAlgorithm") not in ("AES256", "aws:kms"):
+        return error_response_json("BadRequestException", "encryptionConfiguration.sseAlgorithm must be AES256 or aws:kms", 400)
+    _bucket_encryption[_canonical_bucket_arn(arn)] = dict(config)
+    return 200, {"Content-Type": "application/json"}, b""
+
+
+def _delete_table_bucket_encryption(arn):
+    if not _find_bucket_by_arn(arn):
+        return _bucket_not_found(arn)
+    _bucket_encryption.pop(_canonical_bucket_arn(arn), None)
+    return 204, {}, b""
+
+
+def _list_tags_for_resource(arn):
+    """ListTagsForResource (GET /tag/{arn}) for table buckets and tables."""
+    return json_response({"tags": dict(_resource_tags.get(arn) or {})})
+
+
+def _tag_resource(arn, data):
+    tags = data.get("tags") or {}
+    if not isinstance(tags, dict):
+        return error_response_json("BadRequestException", "tags must be a map", 400)
+    _resource_tags.setdefault(arn, {}).update({str(k): str(v) for k, v in tags.items()})
+    return 204, {}, b""
+
+
+def _untag_resource(arn, tag_keys):
+    current = _resource_tags.setdefault(arn, {})
+    for key in tag_keys:
+        current.pop(key, None)
+    return 204, {}, b""
 
 
 def _get_table_bucket(arn):
@@ -254,13 +372,95 @@ def _delete_table_bucket(arn):
     for key in list(_tables.keys()):
         if key.startswith(arn + "\x00"):
             del _tables[key]
+            _table_maintenance.pop(key, None)
     for key in list(_namespaces.keys()):
         if key.startswith(arn + "\x00"):
             del _namespaces[key]
     del _table_buckets[name]
+    _bucket_maintenance.pop(arn, None)
     import ministack.services.s3 as _s3
+
     _s3._buckets.pop(name, None)
     return 204, {}, b""  # AWS answers 204 No Content on the deletes
+
+
+_BUCKET_MAINTENANCE_TYPES = ("icebergUnreferencedFileRemoval",)
+_TABLE_MAINTENANCE_TYPES = ("icebergCompaction", "icebergSnapshotManagement")
+
+
+def _default_bucket_maintenance_configuration():
+    return {
+        "icebergUnreferencedFileRemoval": {
+            "status": "enabled",
+            "settings": {
+                "icebergUnreferencedFileRemoval": {"unreferencedDays": 3, "nonCurrentDays": 10},
+            },
+        },
+    }
+
+
+def _default_table_maintenance_configuration():
+    return {
+        "icebergCompaction": {
+            "status": "enabled",
+            "settings": {"icebergCompaction": {"targetFileSizeMB": 512, "strategy": "auto"}},
+        },
+        "icebergSnapshotManagement": {
+            "status": "enabled",
+            "settings": {
+                "icebergSnapshotManagement": {"minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 120},
+            },
+        },
+    }
+
+
+def _get_table_bucket_maintenance_configuration(bucket_ref):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    config = _bucket_maintenance.get(bucket_arn) or _default_bucket_maintenance_configuration()
+    return json_response({"tableBucketARN": bucket_arn, "configuration": config})
+
+
+def _put_table_bucket_maintenance_configuration(bucket_ref, maint_type, data):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    if maint_type not in _BUCKET_MAINTENANCE_TYPES:
+        return error_response_json("ValidationException", f"Unknown table bucket maintenance type: {maint_type}", 400)
+    value = data.get("value", {}) if isinstance(data, dict) else {}
+    config = copy.deepcopy(_bucket_maintenance.get(bucket_arn) or _default_bucket_maintenance_configuration())
+    config[maint_type] = {"status": value.get("status", "enabled"), "settings": value.get("settings", {})}
+    _bucket_maintenance[bucket_arn] = config
+    return json_response({}, 204)
+
+
+def _get_table_maintenance_configuration(bucket_ref, namespace, table_name):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    key = _table_key(bucket_arn, namespace, table_name)
+    table = _tables.get(key)
+    if not table:
+        return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
+    config = _table_maintenance.get(key) or _default_table_maintenance_configuration()
+    return json_response({"tableARN": table["tableARN"], "configuration": config})
+
+
+def _put_table_maintenance_configuration(bucket_ref, namespace, table_name, maint_type, data):
+    bucket_arn = _existing_bucket_arn(bucket_ref)
+    if not bucket_arn:
+        return _bucket_not_found(bucket_ref)
+    key = _table_key(bucket_arn, namespace, table_name)
+    if key not in _tables:
+        return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
+    if maint_type not in _TABLE_MAINTENANCE_TYPES:
+        return error_response_json("ValidationException", f"Unknown table maintenance type: {maint_type}", 400)
+    value = data.get("value", {}) if isinstance(data, dict) else {}
+    config = copy.deepcopy(_table_maintenance.get(key) or _default_table_maintenance_configuration())
+    config[maint_type] = {"status": value.get("status", "enabled"), "settings": value.get("settings", {})}
+    _table_maintenance[key] = config
+    return json_response({}, 204)
 
 
 def _create_namespace(bucket_arn, data):
@@ -275,9 +475,13 @@ def _create_namespace(bucket_arn, data):
     key = _ns_key(bucket_arn, namespace)
     if key in _namespaces:
         return error_response_json("ConflictException", f"Namespace {namespace} already exists", 409)
-    _namespaces[key] = {"namespace": [namespace], "createdAt": now_iso(),
-                         "createdBy": get_account_id(), "ownerAccountId": get_account_id(),
-                         "tableBucketARN": bucket_arn}
+    _namespaces[key] = {
+        "namespace": [namespace],
+        "createdAt": now_iso(),
+        "createdBy": get_account_id(),
+        "ownerAccountId": get_account_id(),
+        "tableBucketARN": bucket_arn,
+    }
     logger.info("S3Tables: created namespace %s", namespace)
     return json_response({"namespace": [namespace], "tableBucketARN": bucket_arn})
 
@@ -331,24 +535,53 @@ def _create_table(bucket_arn, namespace, data):
     schema_fields = []
     metadata = data.get("metadata", {})
     iceberg_meta = metadata.get("iceberg", {})
-    schema_def = iceberg_meta.get("schema", {})
+    schema_def = iceberg_meta.get("schema", iceberg_meta.get("schemaV2", {}))
     for f in schema_def.get("field", schema_def.get("fields", [])):
-        schema_fields.append({"name": f["name"], "type": f.get("type", "string"),
-                               "required": f.get("required", False)})
+        schema_fields.append({"name": f["name"], "type": f.get("type", "string"), "required": f.get("required", False)})
+    logger.debug(
+        "S3Tables: create_table %s/%s schema_fields=%d metadata_keys=%s",
+        namespace,
+        table_name,
+        len(schema_fields),
+        list(metadata.keys()) if metadata else "none",
+    )
 
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = f"s3://{bucket_name}/{namespace}/{table_name}"
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
+    # Preserve field names from the input but ensure the schema has the
+    # Iceberg-required structure: {"type": "struct", "schema-id": 0, "fields": [
+    #   {"id": 1, "name": "...", "type": "string", "required": false}, ...]}
+    raw_schema = iceberg_meta.get("schema", iceberg_meta.get("schemaV2"))
+    if raw_schema and raw_schema.get("fields"):
+        fields = []
+        for i, f in enumerate(raw_schema["fields"]):
+            fields.append(
+                {
+                    "id": f.get("id", i + 1),
+                    "name": f["name"],
+                    "type": _to_iceberg_type(f.get("type", "string")) if isinstance(f.get("type"), str) else "string",
+                    "required": f.get("required", False),
+                }
+            )
+        iceberg_metadata["schemas"] = [{"type": "struct", "schema-id": 0, "fields": fields}]
+        iceberg_metadata["last-column-id"] = len(fields)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
 
     _tables[key] = {
-        "name": table_name, "tableARN": arn, "namespace": [namespace],
-        "tableBucketARN": bucket_arn, "format": fmt,
-        "createdAt": now_iso(), "modifiedAt": now_iso(),
+        "name": table_name,
+        "tableARN": arn,
+        "namespace": [namespace],
+        "tableBucketARN": bucket_arn,
+        "format": fmt,
+        "createdAt": now_iso(),
+        "modifiedAt": now_iso(),
         "ownerAccountId": get_account_id(),
-        "metadataLocation": metadata_location, "warehouseLocation": location,
-        "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
+        "metadataLocation": metadata_location,
+        "warehouseLocation": location,
+        "_iceberg_metadata": iceberg_metadata,
+        "_metadata_version": 0,
         "_schema_fields": schema_fields,
     }
 
@@ -356,6 +589,10 @@ def _create_table(bucket_arn, namespace, data):
         if b["arn"] == bucket_arn:
             b["tableCount"] = b.get("tableCount", 0) + 1
             break
+
+    # AWS auto-provisions compaction + snapshot-management maintenance for
+    # every new table — seed it now, same reasoning as table-bucket creation.
+    _table_maintenance[key] = _default_table_maintenance_configuration()
 
     logger.info("S3Tables: created table %s/%s", namespace, table_name)
     return json_response({"tableARN": arn, "versionToken": new_uuid()[:8]})
@@ -373,9 +610,15 @@ def _list_tables(bucket_arn, namespace=None):
         table_ns = table["namespace"][0] if isinstance(table["namespace"], list) else table["namespace"]
         if namespace and table_ns != namespace:
             continue
-        result.append({"name": table["name"], "tableARN": table["tableARN"],
-                        "namespace": table["namespace"], "format": table["format"],
-                        "createdAt": table["createdAt"]})
+        result.append(
+            {
+                "name": table["name"],
+                "tableARN": table["tableARN"],
+                "namespace": table["namespace"],
+                "format": table["format"],
+                "createdAt": table["createdAt"],
+            }
+        )
     return json_response({"tables": result})
 
 
@@ -412,8 +655,7 @@ def _get_table_metadata_location(bucket_arn, namespace, table_name):
     table = _tables.get(key)
     if not table:
         return error_response_json("NotFoundException", f"Table {table_name} not found", 404)
-    return json_response({"metadataLocation": table["metadataLocation"],
-                           "versionToken": new_uuid()[:8]})
+    return json_response({"metadataLocation": table["metadataLocation"], "versionToken": new_uuid()[:8]})
 
 
 def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
@@ -428,20 +670,94 @@ def _update_table_metadata_location(bucket_arn, namespace, table_name, data):
     new_loc = data.get("metadataLocation", "")
     table["metadataLocation"] = new_loc
     table["modifiedAt"] = now_iso()
-    return json_response({"metadataLocation": new_loc, "name": table_name,
-                           "versionToken": new_uuid()[:8]})
+    return json_response({"metadataLocation": new_loc, "name": table_name, "versionToken": new_uuid()[:8]})
 
 
 # ── Iceberg REST catalog (data plane for Spark) ───────────
 
-def _iceberg_config():
-    return json_response({"defaults": {
+
+def _iceberg_config(query_params=None, headers=None):
+    warehouse = ""
+    if query_params:
+        warehouse = query_params.get("warehouse", "")
+        if isinstance(warehouse, list):
+            warehouse = warehouse[0] if warehouse else ""
+    s3_endpoint = _reachable_s3_endpoint(headers)
+    # S3 connection properties go in ``defaults`` so a client that already
+    # supplies them (e.g. a Spark job with its own s3.endpoint pointing at
+    # host.docker.internal) is not overridden. Iceberg REST spec: ``defaults``
+    # are used only when the client has no value; ``overrides`` always win.
+    defaults = {
         "client.region": get_region(),
-        "s3.endpoint": _gateway_url(),
+        "s3.endpoint": s3_endpoint,
         "s3.access-key-id": "test",
         "s3.secret-access-key": "test",
         "s3.path-style-access": "true",
-    }, "overrides": {}})
+    }
+    overrides = {}
+    if warehouse:
+        overrides["prefix"] = warehouse
+    return json_response({"defaults": defaults, "overrides": overrides})
+
+
+def _resolve_container_ip():
+    """Return our own container IP on the Docker network, or None.
+
+    This is the address a sibling container (e.g. a Glue Spark job) can use
+    to reach MiniStack. Cached after the first successful resolution.
+    """
+    if hasattr(_resolve_container_ip, "_cached"):
+        return _resolve_container_ip._cached
+    ip = os.environ.get("MINISTACK_HOST", "")
+    if ip and ip not in ("localhost", "127.0.0.1", "host.docker.internal"):
+        _resolve_container_ip._cached = ip
+        return ip
+    try:
+        import docker
+        client = docker.from_env()
+        hostname = os.environ.get("HOSTNAME", "")
+        if hostname:
+            container = client.containers.get(hostname)
+            container.reload()
+            nets = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            for net_info in nets.values():
+                addr = net_info.get("IPAddress", "")
+                if addr:
+                    _resolve_container_ip._cached = addr
+                    return addr
+    except Exception:
+        pass
+    _resolve_container_ip._cached = None
+    return None
+
+
+def _reachable_s3_endpoint(headers=None):
+    """S3 endpoint URL the caller of this request can reach.
+
+    Used in every Iceberg REST response that carries s3.endpoint — the
+    /v1/config response and each LoadTable response. The Iceberg S3FileIO
+    builds its S3 client from this value, so it must be an address the CALLER
+    resolves: the request's own ``Host`` header when present (a host-side
+    client reached us at ``localhost:<published port>``, a sibling container
+    at ``ministack:4566``), else this container's network IP (a Docker caller
+    with no Host header), else the gateway URL.
+    """
+    host = ""
+    if headers:
+        for name, value in headers.items():
+            if str(name).lower() == "host" and value:
+                host = str(value).strip()
+                break
+    if host:
+        from ministack.core import tls as _tls
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        return f"{scheme}://{host}"
+    resolved = _resolve_container_ip()
+    if resolved:
+        from ministack.core import tls as _tls
+        scheme = "https" if _tls.use_ssl_enabled() else "http"
+        return f"{scheme}://{resolved}:{_GATEWAY_PORT}"
+    return _gateway_url()
 
 
 def _iceberg_error(message, exc_type, code):
@@ -451,9 +767,7 @@ def _iceberg_error(message, exc_type, code):
     distinct from the AWS ``{"__type", "message"}`` shape the S3 Tables control
     plane returns. A client hitting LoadTable on a not-yet-created table must
     receive a proper ``NoSuchTableException`` so it proceeds to create it."""
-    body = json.dumps(
-        {"error": {"message": message, "type": exc_type, "code": code}}
-    ).encode("utf-8")
+    body = json.dumps({"error": {"message": message, "type": exc_type, "code": code}}).encode("utf-8")
     return code, {"Content-Type": "application/json"}, body
 
 
@@ -468,103 +782,274 @@ def _iceberg_list_namespaces(allow_cross_region):
     return json_response({"namespaces": result})
 
 
+def _iceberg_create_namespace(data, allow_cross_region, bucket_filter=None):
+    """POST /iceberg/v1/namespaces — Iceberg REST createNamespace.
+
+    Delegates to the control-plane CreateNamespace, which stores the record.
+    The Iceberg REST spec returns the namespace and its properties on success,
+    and AlreadyExistsException (409) when the namespace exists.
+    """
+    ns_list = data.get("namespace", [])
+    ns_name = ns_list[0] if isinstance(ns_list, list) and ns_list else data.get("namespace", "")
+    if not ns_name:
+        return _iceberg_error("namespace is required", "BadRequestException", 400)
+    # Find the table bucket to create the namespace in. When the prefix
+    # carries a bucket filter (from the /v1/config warehouse), use that;
+    # otherwise fall back to the first visible bucket.
+    if bucket_filter:
+        buckets = _iceberg_values(
+            _table_buckets, lambda b: b.get("arn", "").endswith("/" + bucket_filter),
+            allow_cross_region)
+    else:
+        buckets = _iceberg_values(_table_buckets, lambda _b: True, allow_cross_region)
+    if not buckets:
+        return _iceberg_error("No table bucket found", "NoSuchNamespaceException", 404)
+    bucket = buckets[0]
+    bucket_arn = bucket.get("arn", "")
+    # Check if namespace already exists.
+    existing = _iceberg_values(
+        _namespaces, lambda ns: _namespace_name(ns) == ns_name, allow_cross_region)
+    if existing:
+        return _iceberg_error(
+            f"Namespace already exists: {ns_name}", "AlreadyExistsException", 409)
+    _create_namespace(bucket_arn, {"namespace": [ns_name]})
+    return json_response({"namespace": [ns_name], "properties": data.get("properties", {})})
+
+
 def _iceberg_get_namespace(namespace, allow_cross_region):
     if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
     return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
 
-def _iceberg_list_tables(namespace, allow_cross_region):
+def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
+    def _pred(table):
+        if _namespace_name(table) != namespace:
+            return False
+        if bucket_filter:
+            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
+        return True
+
     result = []
-    for table in _iceberg_values(_tables, lambda table: _namespace_name(table) == namespace, allow_cross_region):
+    for table in _iceberg_values(_tables, _pred, allow_cross_region):
         result.append({"namespace": [namespace], "name": table["name"]})
     return json_response({"identifiers": result})
 
 
-def _iceberg_load_table(namespace, table_name, allow_cross_region):
-    matches = _iceberg_values(
-        _tables,
-        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
-        allow_cross_region,
-    )
+def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter=None, headers=None):
+    def _pred(table):
+        if _namespace_name(table) != namespace or table["name"] != table_name:
+            return False
+        if bucket_filter:
+            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
+        return True
+
+    matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
-        return json_response({
-            "metadata-location": table.get("metadataLocation", ""),
-            "metadata": table.get("_iceberg_metadata", {}),
-            "config": {
-                "s3.access-key-id": "test", "s3.secret-access-key": "test",
-                "s3.endpoint": _gateway_url(), "s3.path-style-access": "true",
-                "s3.region": get_region(), "client.region": get_region(),
-            },
-        })
+        # Try to read the latest metadata from S3 (source of truth). Writers
+        # like DuckDB commit by writing metadata.json directly to S3 without
+        # going through the REST commit endpoint, so the in-memory metadata
+        # can be stale. Fall back to in-memory if S3 read fails.
+        metadata = table.get("_iceberg_metadata", {})
+        meta_loc = table.get("metadataLocation", "")
+        if meta_loc and meta_loc.startswith("s3://"):
+            try:
+                import ministack.services.s3 as _s3
+
+                rest = meta_loc[len("s3://") :]
+                bkt, key = rest.split("/", 1)
+                # Find the latest metadata file in the metadata directory
+                meta_dir = "/".join(key.split("/")[:-1]) + "/"
+                bucket_data = _s3._ensure_bucket(bkt)
+                if bucket_data:
+                    meta_files = sorted(
+                        k
+                        for k in bucket_data.get("objects", {})
+                        if k.startswith(meta_dir) and k.endswith(".metadata.json")
+                    )
+                    if meta_files:
+                        # Order vN.metadata.json numerically: lexically v10
+                        # sorts before v2, so from the 10th commit on the scan
+                        # would serve v9 forever. Spark-style zero-padded
+                        # names all map to -1 and keep their lexical order.
+                        from ministack.services.glue import _metadata_version_from_location
+
+                        meta_files.sort(key=_metadata_version_from_location)
+                        latest_key = meta_files[-1]
+                        raw = _s3._get_object_data(bkt, latest_key)
+                        if raw:
+                            metadata = json.loads(raw)
+                            meta_loc = f"s3://{bkt}/{latest_key}"
+            except Exception:
+                pass  # fall back to in-memory
+        return json_response(
+            {
+                "metadata-location": meta_loc,
+                "metadata": metadata,
+                "config": {
+                    "s3.endpoint": _reachable_s3_endpoint(headers),
+                    "s3.access-key-id": "test",
+                    "s3.secret-access-key": "test",
+                    "s3.path-style-access": "true",
+                    "s3.region": get_region(),
+                    "client.region": get_region(),
+                },
+            }
+        )
     return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
-def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
-    matches = _iceberg_values(
-        _tables,
-        lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
-        allow_cross_region,
-    )
+def _apply_iceberg_updates(metadata, updates):
+    """Apply a list of Iceberg REST commit ``updates`` to a table ``metadata``
+    dict in place. Shared by the S3 Tables and Glue Data Catalog Iceberg REST
+    catalogs so both apply commits (from DuckDB, Spark, ...) identically."""
+    for update in updates:
+        action = update.get("action", "")
+        if action == "add-snapshot":
+            snapshot = update.get("snapshot", {})
+            metadata.setdefault("snapshots", []).append(snapshot)
+            metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
+            metadata["last-updated-ms"] = int(time.time() * 1000)
+            metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
+        elif action == "set-snapshot-ref":
+            metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
+                "snapshot-id": update.get("snapshot-id", -1),
+                "type": update.get("type", "branch"),
+            }
+        elif action == "add-schema":
+            new_schema = update.get("schema", {})
+            existing = metadata.setdefault("schemas", [])
+            # Idempotent by schema-id: a client re-declaring its current,
+            # unchanged schema on every write (Spark does this) must not pile
+            # up a second entry with the same id -- Iceberg's schemasById()
+            # crashes on load with "Multiple entries with same key" if it does.
+            if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
+                existing.append(new_schema)
+            # Advance last-column-id to the highest field ID in the new
+            # schema, so a client allocating the next column's ID (e.g.
+            # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
+            field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
+            if field_ids:
+                metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
+        elif action == "set-current-schema":
+            schema_id = update.get("schema-id", 0)
+            if schema_id == -1:
+                # -1 means "the schema added earlier in this commit".
+                ids = [s.get("schema-id", 0) for s in metadata.get("schemas", [])]
+                schema_id = max(ids) if ids else 0
+            metadata["current-schema-id"] = schema_id
+        elif action in ("add-spec", "add-partition-spec"):
+            # "add-spec" is the Iceberg REST spec's action name (what
+            # duckdb-iceberg sends); "add-partition-spec" is a non-standard
+            # alias some hand-rolled callers use. Accept both.
+            new_spec = update.get("spec", {})
+            specs = metadata.setdefault("partition-specs", [])
+            # Idempotent by spec-id, for the same reason as add-schema above.
+            if not any(s.get("spec-id") == new_spec.get("spec-id") for s in specs):
+                specs.append(new_spec)
+        elif action == "set-default-spec":
+            spec_id = update.get("spec-id", 0)
+            if spec_id == -1:
+                ids = [s.get("spec-id", 0) for s in metadata.get("partition-specs", [])]
+                spec_id = max(ids) if ids else 0
+            metadata["default-spec-id"] = spec_id
+        elif action == "add-sort-order":
+            new_order = update.get("sort-order", {})
+            orders = metadata.setdefault("sort-orders", [])
+            # Idempotent by order-id, for the same reason as add-schema above.
+            if not any(o.get("order-id") == new_order.get("order-id") for o in orders):
+                orders.append(new_order)
+        elif action == "set-default-sort-order":
+            order_id = update.get("sort-order-id", 0)
+            if order_id == -1:
+                ids = [o.get("order-id", 0) for o in metadata.get("sort-orders", [])]
+                order_id = max(ids) if ids else 0
+            metadata["default-sort-order-id"] = order_id
+        elif action == "upgrade-format-version":
+            # Iceberg REST UpgradeFormatVersionUpdate (what Spark commits for
+            # a format-version table property on an existing table). Upgrades
+            # only: Iceberg refuses downgrades, and S3 Tables supports the
+            # format up to v3. Re-asserting the current version is a no-op.
+            requested = int(update.get("format-version", 0))
+            current = int(metadata.get("format-version", 2))
+            if requested < current:
+                raise ValueError(f"Cannot downgrade v{current} table to v{requested}")
+            if requested > 3:
+                raise ValueError(
+                    f"Cannot upgrade table to unsupported format version: v{requested} (supported: v3)")
+            metadata["format-version"] = requested
+        elif action == "set-properties":
+            metadata.setdefault("properties", {}).update(update.get("updates", {}))
+        elif action == "remove-properties":
+            for r in update.get("removals", []):
+                metadata.get("properties", {}).pop(r, None)
+        elif action == "set-location":
+            metadata["location"] = update.get("location", "")
+
+
+def _iceberg_requirement_failure(metadata, requirements):
+    """Return the message of the first violated Iceberg REST commit ``requirement``,
+    or None when the commit may proceed. Without this check two writers that both
+    read snapshot S0 could each append a snapshot whose manifest list omits the
+    other's data files, and the second commit silently discarded the first's rows
+    (last-writer-wins). Real S3 Tables answers a stale ``assert-ref-snapshot-id``
+    with 409 CommitFailedException so the client refreshes and retries."""
+    refs = metadata.get("refs") or {}
+    for requirement in requirements or []:
+        kind = requirement.get("type", "")
+        if kind == "assert-ref-snapshot-id":
+            ref = requirement.get("ref", "main")
+            expected = requirement.get("snapshot-id")
+            actual = refs.get(ref, {}).get("snapshot-id")
+            if actual is None and ref == "main" and metadata.get("current-snapshot-id", -1) not in (-1, None):
+                actual = metadata["current-snapshot-id"]
+            if expected != actual:
+                return f"Requirement failed: branch {ref} has changed: expected id {expected} != {actual}"
+        elif kind == "assert-table-uuid":
+            if requirement.get("uuid") != metadata.get("table-uuid"):
+                return (
+                    "Requirement failed: table UUID does not match: expected "
+                    f"{requirement.get('uuid')} != {metadata.get('table-uuid')}"
+                )
+        elif kind == "assert-current-schema-id":
+            if requirement.get("current-schema-id") != metadata.get("current-schema-id"):
+                return (
+                    "Requirement failed: current schema changed: expected id "
+                    f"{requirement.get('current-schema-id')} != {metadata.get('current-schema-id')}"
+                )
+        elif kind == "assert-create":
+            # The first commit of a staged create (DuckDB's CREATE TABLE + INSERT)
+            # asserts the table did not exist before it; a table nobody has
+            # committed a snapshot to yet is exactly that table.
+            if refs or metadata.get("current-snapshot-id", -1) not in (-1, None):
+                return "Requirement failed: table already exists"
+    return None
+
+
+def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter=None):
+    def _pred(table):
+        if _namespace_name(table) != namespace or table["name"] != table_name:
+            return False
+        if bucket_filter:
+            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
+        return True
+
+    matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
-        metadata = table.get("_iceberg_metadata", {})
-        for update in data.get("updates", []):
-            action = update.get("action", "")
-            if action == "add-snapshot":
-                snapshot = update.get("snapshot", {})
-                metadata.setdefault("snapshots", []).append(snapshot)
-                metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
-                metadata["last-updated-ms"] = int(time.time() * 1000)
-                metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
-            elif action == "set-snapshot-ref":
-                metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
-                    "snapshot-id": update.get("snapshot-id", -1),
-                    "type": update.get("type", "branch")}
-            elif action == "add-schema":
-                new_schema = update.get("schema", {})
-                existing = metadata.setdefault("schemas", [])
-                # Idempotent by schema-id: a client re-declaring its current,
-                # unchanged schema on every write (Spark does this) must not pile
-                # up a second entry with the same id -- Iceberg's schemasById()
-                # crashes on load with "Multiple entries with same key" if it does.
-                if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
-                    existing.append(new_schema)
-                # Advance last-column-id to the highest field ID in the new
-                # schema, so a client allocating the next column's ID (e.g.
-                # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
-                field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
-                if field_ids:
-                    metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
-            elif action == "set-current-schema":
-                metadata["current-schema-id"] = update.get("schema-id", 0)
-            elif action in ("add-spec", "add-partition-spec"):
-                # "add-spec" is the Iceberg REST spec's action name (what
-                # duckdb-iceberg sends); "add-partition-spec" is a non-standard
-                # alias some hand-rolled callers use. Accept both.
-                new_spec = update.get("spec", {})
-                specs = metadata.setdefault("partition-specs", [])
-                # Idempotent by spec-id, for the same reason as add-schema above.
-                if not any(s.get("spec-id") == new_spec.get("spec-id") for s in specs):
-                    specs.append(new_spec)
-            elif action == "set-default-spec":
-                metadata["default-spec-id"] = update.get("spec-id", 0)
-            elif action == "add-sort-order":
-                new_order = update.get("sort-order", {})
-                orders = metadata.setdefault("sort-orders", [])
-                # Idempotent by order-id, for the same reason as add-schema above.
-                if not any(o.get("order-id") == new_order.get("order-id") for o in orders):
-                    orders.append(new_order)
-            elif action == "set-default-sort-order":
-                metadata["default-sort-order-id"] = update.get("sort-order-id", 0)
-            elif action == "set-properties":
-                metadata.setdefault("properties", {}).update(update.get("updates", {}))
-            elif action == "remove-properties":
-                for r in update.get("removals", []):
-                    metadata.get("properties", {}).pop(r, None)
-            elif action == "set-location":
-                metadata["location"] = update.get("location", "")
+        metadata = copy.deepcopy(table.get("_iceberg_metadata", {}))
+        failure = _iceberg_requirement_failure(metadata, data.get("requirements", []))
+        if failure:
+            return _iceberg_error(failure, "CommitFailedException", 409)
+        # Stage the commit on a copy: a refused update (an illegal
+        # format-version change) must not leave the earlier updates of the
+        # same commit applied — an Iceberg commit is atomic.
+        try:
+            _apply_iceberg_updates(metadata, data.get("updates", []))
+        except ValueError as exc:
+            return _iceberg_error(str(exc), "BadRequestException", 400)
+        table["_iceberg_metadata"] = metadata
 
         table["_metadata_version"] = table.get("_metadata_version", 0) + 1
         v = table["_metadata_version"]
@@ -572,6 +1057,18 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region):
         new_loc = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v{v}.metadata.json"
         table["metadataLocation"] = new_loc
         table["modifiedAt"] = now_iso()
+        # Write the metadata.json to S3 so clients reading by location
+        # (DuckDB, Spark) see the committed state.
+        try:
+            import ministack.services.s3 as _s3
+
+            _s3._buckets.setdefault(bucket_name, {"created": now_iso(), "objects": {}, "region": get_region()})
+            meta_key = f"{namespace}/{table_name}/metadata/v{v}.metadata.json"
+            _s3._put_object(
+                bucket_name, meta_key, json.dumps(metadata).encode("utf-8"), {"content-type": "application/json"}
+            )
+        except Exception as exc:
+            logger.debug("s3tables: failed to write metadata.json for %s.%s: %s", namespace, table_name, exc)
         return json_response({"metadata-location": new_loc, "metadata": metadata})
 
     return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
@@ -592,15 +1089,24 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     # resent create must not silently replace the table (wiping its snapshots).
     key = _table_key(bucket_arn, namespace, table_name)
     if key in _tables:
-        return _iceberg_error(
-            f"Table already exists: {namespace}.{table_name}", "AlreadyExistsException", 409)
+        return _iceberg_error(f"Table already exists: {namespace}.{table_name}", "AlreadyExistsException", 409)
 
-    schema_fields = [{"name": f.get("name", ""), "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
-                       "required": f.get("required", False)} for f in schema.get("fields", [])]
+    schema_fields = [
+        {
+            "name": f.get("name", ""),
+            "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
+            "required": f.get("required", False),
+        }
+        for f in schema.get("fields", [])
+    ]
 
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
     location = data.get("location", f"s3://{bucket_name}/{namespace}/{table_name}")
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
+    # Honor a format-version from the client's request or properties.
+    fmt_ver = data.get("format-version") or data.get("properties", {}).get("format-version")
+    if fmt_ver is not None:
+        iceberg_metadata["format-version"] = int(fmt_ver)
     if schema:
         iceberg_metadata["schemas"] = [schema]
     partition_spec = data.get("partition-spec")
@@ -614,19 +1120,30 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
     arn = _table_arn(bucket_arn, namespace, table_name)
 
     table = {
-        "name": table_name, "tableARN": arn, "namespace": [namespace],
-        "tableBucketARN": bucket_arn, "format": "ICEBERG",
-        "createdAt": now_iso(), "modifiedAt": now_iso(),
+        "name": table_name,
+        "tableARN": arn,
+        "namespace": [namespace],
+        "tableBucketARN": bucket_arn,
+        "format": "ICEBERG",
+        "createdAt": now_iso(),
+        "modifiedAt": now_iso(),
         "ownerAccountId": get_account_id(),
-        "metadataLocation": metadata_location, "warehouseLocation": location,
-        "_iceberg_metadata": iceberg_metadata, "_metadata_version": 0,
+        "metadataLocation": metadata_location,
+        "warehouseLocation": location,
+        "_iceberg_metadata": iceberg_metadata,
+        "_metadata_version": 0,
         "_schema_fields": schema_fields,
     }
     _set_bucket_region_value(_tables, bucket_arn, key, table)
+    # Same auto-provisioned maintenance defaults as the control-plane CreateTable
+    # path — a table can be created via either route and both are read through
+    # the same Get/PutTableMaintenanceConfiguration control-plane operations.
+    _set_bucket_region_value(_table_maintenance, bucket_arn, key, _default_table_maintenance_configuration())
     return json_response({"metadata-location": metadata_location, "metadata": iceberg_metadata})
 
 
 # ── Iceberg REST router ───────────────────────────────────
+
 
 async def _handle_iceberg_request(method, path, headers, body, query_params):
     parts = [p for p in path.strip("/").split("/") if p]
@@ -636,10 +1153,14 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         return None
 
     if parts[1] == "v1" and len(parts) == 3 and parts[2] == "config" and method == "GET":
-        return _iceberg_config()
+        return _iceberg_config(query_params, headers)
 
-    # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit
-    if parts[1] == "v1" and parts[2] == "transactions" and method == "POST":
+    # POST /iceberg/v1/transactions/commit — DuckDB atomic multi-table commit.
+    # DuckDB prepends the /v1/config prefix (the warehouse) to every path, so
+    # this arrives as /iceberg/v1/{prefix}/transactions/commit. Match on the
+    # `transactions` segment wherever it lands, not a fixed position — otherwise
+    # a prefixed commit is silently dropped and the delivery writes nothing.
+    if parts[1] == "v1" and method == "POST" and "transactions" in parts[2:]:
         data = json.loads(body) if body else {}
         for change in data.get("table-changes", []):
             ident = change.get("identifier", {})
@@ -657,17 +1178,35 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     # Support two URL formats:
     #   Standard Iceberg REST: /iceberg/v1/{prefix}/namespaces/...
     #   S3 Tables (no prefix): /iceberg/v1/namespaces/...  (warehouse in query param)
-    if parts[2] == "namespaces":
-        ns_idx = 2
-    elif len(parts) >= 4 and parts[3] == "namespaces":
-        ns_idx = 3
-    else:
+    #
+    # The prefix carries the warehouse value from /v1/config, which for S3
+    # Tables is ``{account}:s3tablescatalog/{bucket-name}``. Extract the
+    # bucket name to scope table lookups -- without it, tables with the same
+    # name in different buckets collide and the wrong schema is returned.
+    # The prefix from /v1/config can contain ``/`` (e.g.
+    # ``000000000000:s3tablescatalog/bucket-name``), which splits into
+    # multiple URL segments. Scan for ``namespaces`` and treat everything
+    # between ``v1`` and ``namespaces`` as the prefix.
+    bucket_filter = None
+    ns_idx = None
+    for i in range(2, len(parts)):
+        if parts[i] == "namespaces":
+            ns_idx = i
+            break
+    if ns_idx is None:
         return None
+    if ns_idx > 2:
+        prefix = unquote("/".join(parts[2:ns_idx]))
+        if ":s3tablescatalog/" in prefix:
+            bucket_filter = prefix.split(":s3tablescatalog/", 1)[1]
 
-    rest = parts[ns_idx + 1:]  # segments after "namespaces"
+    rest = parts[ns_idx + 1 :]  # segments after "namespaces"
 
     if len(rest) == 0 and method == "GET":
         return _iceberg_list_namespaces(allow_cross_region)
+    if len(rest) == 0 and method == "POST":
+        data = json.loads(body) if body else {}
+        return _iceberg_create_namespace(data, allow_cross_region, bucket_filter)
     if len(rest) == 1 and method == "GET":
         return _iceberg_get_namespace(rest[0], allow_cross_region)
     if len(rest) >= 2 and rest[1] == "tables":
@@ -675,17 +1214,17 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         table_rest = rest[2:]
         if len(table_rest) == 0:
             if method == "GET":
-                return _iceberg_list_tables(namespace, allow_cross_region)
+                return _iceberg_list_tables(namespace, allow_cross_region, bucket_filter)
             if method == "POST":
                 data = json.loads(body) if body else {}
                 return _iceberg_create_table(namespace, data, allow_cross_region)
         if len(table_rest) == 1:
             table_name = table_rest[0]
             if method == "GET":
-                return _iceberg_load_table(namespace, table_name, allow_cross_region)
+                return _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter, headers=headers)
             if method == "POST":
                 data = json.loads(body) if body else {}
-                return _iceberg_commit_table(namespace, table_name, data, allow_cross_region)
+                return _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter)
             if method == "HEAD":
                 if _iceberg_values(
                     _tables,
@@ -698,6 +1237,7 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
 
 
 # ── S3 Tables control plane REST router ────────────────────
+
 
 async def handle_request(method, path, headers, body, query_params):
     # Iceberg REST catalog
@@ -716,18 +1256,47 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _list_table_buckets()
 
-    # GET|DELETE /buckets/{arn...} -> GetTableBucket|DeleteTableBucket
+    # GET|DELETE /buckets/{arn...}                    -> GetTableBucket|DeleteTableBucket
+    # GET        /buckets/{arn...}/maintenance         -> GetTableBucketMaintenanceConfiguration
+    # PUT        /buckets/{arn...}/maintenance/{type}  -> PutTableBucketMaintenanceConfiguration
     if len(parts) >= 2 and parts[0] == "buckets":
-        arn = "/".join(parts[1:])
+        remaining = "/".join(parts[1:])
+        arn, suffix = _split_arn_and_suffix(remaining, "bucket")
         if not arn.startswith("arn:"):
             arn = f"arn:aws:s3tables:{get_region()}:{get_account_id()}:bucket/{arn}"
-        # Check for sub-resource paths
-        if parts[-1] in ("encryption", "maintenance", "metrics", "policy", "storage-class"):
+        if suffix == "maintenance":
+            if method == "GET":
+                return _get_table_bucket_maintenance_configuration(arn)
+        elif suffix.startswith("maintenance/"):
+            maint_type = suffix[len("maintenance/"):]
+            if method == "PUT":
+                return _put_table_bucket_maintenance_configuration(arn, maint_type, data)
+        elif suffix == "encryption":
+            if method == "GET":
+                return _get_table_bucket_encryption(arn)
+            if method == "PUT":
+                return _put_table_bucket_encryption(arn, data)
+            if method == "DELETE":
+                return _delete_table_bucket_encryption(arn)
+        elif suffix in ("metrics", "policy", "storage-class"):
             return json_response({})  # stub
+        elif not suffix:
+            if method == "GET":
+                return _get_table_bucket(arn)
+            if method == "DELETE":
+                return _delete_table_bucket(arn)
+
+    # GET|POST|DELETE /tag/{arn...} -> ListTagsForResource | TagResource | UntagResource
+    if len(parts) >= 2 and parts[0] == "tag":
+        arn = "/".join(parts[1:])
         if method == "GET":
-            return _get_table_bucket(arn)
+            return _list_tags_for_resource(arn)
+        if method == "POST":
+            return _tag_resource(arn, data)
         if method == "DELETE":
-            return _delete_table_bucket(arn)
+            raw_keys = query_params.get("tagKeys", [])
+            keys = raw_keys if isinstance(raw_keys, list) else [raw_keys]
+            return _untag_resource(arn, [k for key in keys for k in str(key).split(",") if k])
 
     # PUT /namespaces/{arn...} -> CreateNamespace
     # GET /namespaces/{arn...} -> ListNamespaces
@@ -756,14 +1325,21 @@ async def handle_request(method, path, headers, body, query_params):
     # DELETE /tables/{arn...}/{namespace}/{name} -> DeleteTable
     # GET /tables/{arn...}/{namespace}/{name}/metadata-location -> GetTableMetadataLocation
     # PUT /tables/{arn...}/{namespace}/{name}/metadata-location -> UpdateTableMetadataLocation
+    # GET /tables/{arn...}/{namespace}/{name}/maintenance -> GetTableMaintenanceConfiguration
+    # PUT /tables/{arn...}/{namespace}/{name}/maintenance/{type} -> PutTableMaintenanceConfiguration
     if len(parts) >= 2 and parts[0] == "tables":
         remaining = "/".join(parts[1:])
         arn, suffix = _split_arn_and_suffix(remaining, "bucket")
         if not suffix:
             # GET /tables/{arn} -> ListTables
-            namespace = query_params.get("namespace", [""])[0] if isinstance(query_params.get("namespace"), list) else query_params.get("namespace", "")
+            namespace = (
+                query_params.get("namespace", [""])[0]
+                if isinstance(query_params.get("namespace"), list)
+                else query_params.get("namespace", "")
+            )
             return _list_tables(arn, namespace or None)
-        # suffix could be "namespace", "namespace/table", or "namespace/table/metadata-location"
+        # suffix could be "namespace", "namespace/table", "namespace/table/metadata-location",
+        # "namespace/table/maintenance", or "namespace/table/maintenance/{type}"
         suffix_parts = suffix.split("/")
         if len(suffix_parts) == 1:
             # PUT /tables/{arn}/{namespace} -> CreateTable
@@ -778,16 +1354,28 @@ async def handle_request(method, path, headers, body, query_params):
                 return _get_table_metadata_location(arn, suffix_parts[0], suffix_parts[1])
             if method == "PUT":
                 return _update_table_metadata_location(arn, suffix_parts[0], suffix_parts[1], data)
+        elif len(suffix_parts) == 3 and suffix_parts[2] == "maintenance":
+            if method == "GET":
+                return _get_table_maintenance_configuration(arn, suffix_parts[0], suffix_parts[1])
+        elif len(suffix_parts) == 4 and suffix_parts[2] == "maintenance":
+            if method == "PUT":
+                return _put_table_maintenance_configuration(
+                    arn, suffix_parts[0], suffix_parts[1], suffix_parts[3], data)
 
     # GET /get-table?tableBucketARN=&namespace=&name= -> GetTable
     if parts == ["get-table"] and method == "GET":
+
         def _qp(name):
-            v = query_params.get(name, [""])[0] if isinstance(query_params.get(name), list) else query_params.get(name, "")
+            v = (
+                query_params.get(name, [""])[0]
+                if isinstance(query_params.get(name), list)
+                else query_params.get(name, "")
+            )
             return v
+
         return _get_table(_qp("tableBucketARN"), _qp("namespace"), _qp("name"))
 
-    return error_response_json("UnknownOperationException",
-                                f"Unknown S3Tables operation: {method} {path}", 400)
+    return error_response_json("UnknownOperationException", f"Unknown S3Tables operation: {method} {path}", 400)
 
 
 def _split_arn_and_suffix(path_str, resource_type):
@@ -805,12 +1393,12 @@ def _split_arn_and_suffix(path_str, resource_type):
         return path_str, ""
 
     # arn:...:bucket/name — find the end of the bucket name
-    after_type = path_str[idx + len(f":{resource_type}/"):]
+    after_type = path_str[idx + len(f":{resource_type}/") :]
     # The bucket name is the next segment before any '/'
     slash_idx = after_type.find("/")
     if slash_idx == -1:
         # No suffix, whole thing is the ARN
         return path_str, ""
-    arn = path_str[:idx + len(f":{resource_type}/") + slash_idx]
-    suffix = after_type[slash_idx + 1:]
+    arn = path_str[: idx + len(f":{resource_type}/") + slash_idx]
+    suffix = after_type[slash_idx + 1 :]
     return arn, suffix

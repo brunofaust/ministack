@@ -361,6 +361,7 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
 def test_ministack_persist_lambda_roundtrip():
     import hashlib
     import os
+
     from ministack.services import lambda_svc as _lam
     code = b"fake-zip-bytes"
     sha = hashlib.sha256(code).hexdigest()
@@ -708,6 +709,23 @@ class TestExtractS3VhostBucket:
     def test_bare_bucket(self):
         assert _extract_s3_vhost_bucket("mybucket.localhost") == "mybucket"
 
+    def test_loopback_tails_match_even_when_ministack_host_is_a_container_name(self, monkeypatch):
+        # A host process reaching the published port says `<bucket>.localhost` while
+        # the container is addressed as MINISTACK_HOST=ministack. Before the fix the
+        # first path segment was parsed as the bucket (Terraform's S3 backend got
+        # NoSuchBucket for `busydone/dev/terraform.tfstate.tflock`).
+        import ministack.app as app_mod
+
+        assert app_mod._MINISTACK_HOST in app_mod._S3_VHOST_BASE_HOSTS
+        assert "localhost" in app_mod._S3_VHOST_BASE_HOSTS
+        assert "localhost.localstack.cloud" in app_mod._S3_VHOST_BASE_HOSTS
+        monkeypatch.setattr(app_mod, "_S3_VHOST_BASE_HOSTS", frozenset({"ministack", "localhost", "localhost.localstack.cloud"}))
+        assert _extract_s3_vhost_bucket("busydone-terraform-state.localhost:41080") == "busydone-terraform-state"
+        assert _extract_s3_vhost_bucket("mybucket.localhost.localstack.cloud:4566") == "mybucket"
+        assert _extract_s3_vhost_bucket("mybucket.ministack:4566") == "mybucket"
+        assert _extract_s3_vhost_bucket("ministack:4566") is None
+        assert _extract_s3_vhost_bucket("mybucket.other.example") is None
+
     def test_single_segment_s3_nested_bucket(self):
         assert _extract_s3_vhost_bucket("mybucket.s3.localhost") == "mybucket"
 
@@ -804,3 +822,47 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
 
     assert "ours-previous-run" not in fake_docker.live(), "boot sweep left our own orphan"
     assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
+
+
+def test_persistence_keeps_state_when_a_module_fails_to_load():
+    """A service that could not import must not overwrite its persisted state.
+
+    A failed import produces a stand-in module with no state. It used to report
+    an empty dict, which save_all happily wrote over the file — so one bad boot
+    (a missing dependency, a syntax error) silently destroyed every resource the
+    service had persisted. Recovering meant recreating them from scratch.
+    """
+    import json
+    import os
+    import tempfile
+
+    from ministack.core import persistence
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dir, original_flag = persistence.STATE_DIR, persistence.PERSIST_STATE
+        persistence.STATE_DIR, persistence.PERSIST_STATE = tmp, True
+        try:
+            path = os.path.join(tmp, "svc.json")
+            persistence.save_state("svc", {"things": {"a": 1}})
+            assert os.path.exists(path)
+
+            # A module that loaded and genuinely holds nothing still writes.
+            persistence.save_all({"svc": lambda: {"things": {}}})
+            with open(path) as f:
+                assert json.load(f)["payload"] == {"things": {}}
+
+            persistence.save_state("svc", {"things": {"a": 1}})
+            # A module that failed to load reports None, and the file survives.
+            persistence.save_all({"svc": lambda: None})
+            with open(path) as f:
+                assert json.load(f)["payload"] == {"things": {"a": 1}}, \
+                    "a failed module must not overwrite persisted state"
+        finally:
+            persistence.STATE_DIR, persistence.PERSIST_STATE = original_dir, original_flag
+
+
+def test_a_failed_service_module_reports_no_state():
+    """The stand-in for a module that would not import reports None."""
+    from ministack.app import _ErrorModule
+
+    assert _ErrorModule("appsync", "No module named 'graphql'").get_state() is None

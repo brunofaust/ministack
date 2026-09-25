@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 STS Service Emulator (AWS-compatible).
 
@@ -14,6 +16,7 @@ import time
 from urllib.parse import parse_qs
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.iam_evaluator import CredentialResolutionError, resolve_credential
 from ministack.core.responses import get_account_id, json_response, new_uuid
 from ministack.core.router import extract_access_key_id
 
@@ -22,6 +25,75 @@ from ministack.core.router import extract_access_key_id
 from ministack.services.iam import _error, _future, _gen_secret, _gen_session_access_key, _gen_session_token, _p, _xml
 
 _sessions: dict[str, dict] = {}
+
+
+def _evict_expired_sessions():
+    """Drop sessions past their Expiration — the store otherwise grows with
+    every AssumeRole and every vended identity-pool credential, forever.
+    Called on each insert; entries without an Expiration are kept."""
+    now = time.time()
+    for key in [k for k, s in _sessions.items()
+                if isinstance(s.get("Expiration"), (int, float))
+                and now > s["Expiration"]]:
+        _sessions.pop(key, None)
+
+
+def _session_expired(session) -> bool:
+    exp = session.get("Expiration")
+    return isinstance(exp, (int, float)) and time.time() > exp
+
+
+def register_session(access_key: str, session: dict) -> None:
+    """Register a temporary-credential session (AssumeRole, identity pools)."""
+    _evict_expired_sessions()
+    _sessions[access_key] = session
+
+
+def _caller_identity(
+    headers: dict, query_params=None
+) -> dict | CredentialResolutionError:
+    """Return the best-known originating principal for a new STS session."""
+    from ministack.app import AUTH
+
+    access_key = extract_access_key_id(headers, query_params) or "test"
+    if not AUTH:
+        # Session metadata is descriptive in permissive mode; issuing a
+        # session must not introduce credential rejection checks.
+        from ministack.core.iam_evaluator import resolve_caller_identity
+
+        identity = resolve_caller_identity(access_key)
+        account_id = get_account_id()
+        arn = identity["userArn"] if identity else f"arn:aws:iam::{account_id}:root"
+        principal_type = (
+            "AssumedRole" if ":assumed-role/" in arn
+            else "User" if ":user/" in arn else "Root"
+        )
+        return {
+            "accessKey": access_key,
+            "accountId": account_id,
+            "userArn": arn,
+            "userId": identity["userId"] if identity else account_id,
+            "principalType": principal_type,
+            "principalName": arn.rsplit("/", 1)[-1] if principal_type == "User" else "",
+            "isTemporary": bool(identity and identity.get("session")),
+        }
+    credential = resolve_credential(access_key, get_account_id())
+    if isinstance(credential, CredentialResolutionError):
+        return credential
+    return {
+        "accessKey": access_key,
+        "accountId": credential.account_id,
+        "userArn": credential.principal_arn,
+        "userId": credential.principal_id,
+        "principalType": credential.principal_type,
+        "principalName": credential.principal_name,
+        "isTemporary": credential.session_token is not None,
+    }
+
+
+def _credential_error_response(error: CredentialResolutionError):
+    code = "ExpiredToken" if error.code == "ExpiredTokenException" else error.code
+    return _error(403, code, error.message, ns="sts")
 
 
 def reset():
@@ -86,8 +158,13 @@ async def handle_request(method, path, headers, body, query_params):
             try:
                 access_key = auth.split("Credential=")[1].split("/")[0]
                 if access_key in _sessions:
-                    caller_arn = _sessions[access_key]["Arn"]
-                    caller_user_id = _sessions[access_key]["UserId"]
+                    session = _sessions[access_key]
+                    if _session_expired(session):
+                        return _error(403, "ExpiredToken",
+                                      "The security token included in the request is expired",
+                                      ns="sts")
+                    caller_arn = session["Arn"]
+                    caller_user_id = session["UserId"]
             except Exception:
                 pass
         if use_json:
@@ -106,6 +183,9 @@ async def handle_request(method, path, headers, body, query_params):
         assumed_arn, validation_error = _assumed_role_arn(role_arn, session_name)
         if validation_error:
             return validation_error
+        caller = _caller_identity(headers, query_params)
+        if isinstance(caller, CredentialResolutionError):
+            return _credential_error_response(caller)
 
         # When AUTH=true, validate role exists and trust policy permits the caller
         from ministack.app import AUTH
@@ -114,21 +194,32 @@ async def handle_request(method, path, headers, body, query_params):
             from ministack.services import iam as iam_svc
             # Extract role name from ARN
             role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
-            role = iam_svc._roles.get(role_name)
+            # Resolve the role in the account the ARN names, not the caller's. `_roles` is
+            # account-scoped, so a plain `.get()` looks in the CALLER's account — and a
+            # cross-account AssumeRole, where the role by definition lives somewhere else, then
+            # finds nothing and is refused with the role-missing message below (which reports an
+            # empty `User:`, since it never got as far as resolving the caller).
+            role_account = role_arn.split(":")[4] if role_arn.count(":") > 4 else ""
+            role = None
+            if role_account and role_account != get_account_id():
+                # The ARN's account is authoritative: a role that isn't found
+                # there does NOT fall back to a same-named role in the caller's
+                # account — that resolution exists nowhere in AWS, and the miss
+                # must surface as the same AccessDenied a denial produces (AWS
+                # deliberately doesn't disclose role existence).
+                try:
+                    role = iam_svc._roles.get_scoped(role_account, None, role_name)
+                except Exception:
+                    role = None
+            else:
+                role = iam_svc._roles.get(role_name)
             if role is None:
                 return _error(403, "AccessDenied",
                               f"User: is not authorized to perform: sts:AssumeRole on resource: {role_arn}",
                               ns="sts")
             # Evaluate trust policy
             trust_doc = role.get("AssumeRolePolicyDocument", "{}")
-            caller_key = extract_access_key_id(headers)
-            caller_arn = f"arn:aws:iam::{get_account_id()}:root"
-            if caller_key in _sessions:
-                caller_arn = _sessions[caller_key].get("Arn", caller_arn)
-            else:
-                key_record = iam_svc._access_keys.get(caller_key)
-                if key_record:
-                    caller_arn = f"arn:aws:iam::{get_account_id()}:user/{key_record['UserName']}"
+            caller_arn = caller["userArn"]
             if not evaluate_trust_policy(trust_doc, caller_arn):
                 return _error(403, "AccessDenied",
                               f"User: {caller_arn} is not authorized to perform: "
@@ -140,12 +231,17 @@ async def handle_request(method, path, headers, body, query_params):
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        _sessions[access_key] = {
+        register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session_name}",
             "SecretAccessKey": secret_key,
+            "SessionToken": session_token,
             "Expiration": time.time() + duration,
-        }
+            "AccountId": role_arn.split(":")[4],
+            "PrincipalType": "AssumedRole",
+            "SourceAccessKeyId": caller["accessKey"],
+            "SourcePrincipalArn": caller["userArn"],
+        })
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
@@ -179,12 +275,15 @@ async def handle_request(method, path, headers, body, query_params):
         secret_key = _gen_secret()
         session_token = _gen_session_token()
         role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
-        _sessions[access_key] = {
+        register_session(access_key, {
             "Arn": assumed_arn,
             "UserId": f"{role_id}:{session}",
             "SecretAccessKey": secret_key,
+            "SessionToken": session_token,
             "Expiration": time.time() + duration,
-        }
+            "AccountId": role_arn.split(":")[4],
+            "PrincipalType": "AssumedRole",
+        })
         provider = _p(params, "ProviderId") or "sts.amazonaws.com"
         if use_json:
             return json_response({
@@ -218,9 +317,29 @@ async def handle_request(method, path, headers, body, query_params):
         access_key = _gen_session_access_key()
         secret_key = _gen_secret()
         session_token = _gen_session_token()
-        # Record the secret so a presigned URL signed with these temporary
-        # credentials can be verified against the key it was actually signed with.
-        _sessions[access_key] = {"SecretAccessKey": secret_key}
+        caller = _caller_identity(headers, query_params)
+        if isinstance(caller, CredentialResolutionError):
+            return _credential_error_response(caller)
+        from ministack.app import AUTH
+        if AUTH and caller["isTemporary"]:
+            return _error(
+                403,
+                "AccessDenied",
+                "Cannot call GetSessionToken with session credentials",
+                ns="sts",
+            )
+        register_session(access_key, {
+            "Arn": caller["userArn"],
+            "UserId": caller["userId"],
+            "SecretAccessKey": secret_key,
+            "SessionToken": session_token,
+            "Expiration": time.time() + duration,
+            "AccountId": caller["accountId"],
+            "PrincipalType": caller["principalType"],
+            "PrincipalName": caller["principalName"],
+            "SourceAccessKeyId": caller["accessKey"],
+            "SourcePrincipalArn": caller["userArn"],
+        })
         if use_json:
             return json_response({
                 "Credentials": {"AccessKeyId": access_key, "SecretAccessKey": secret_key, "SessionToken": session_token, "Expiration": int(time.time() + duration)},
@@ -333,3 +452,11 @@ async def handle_request(method, path, headers, body, query_params):
                     ns="sts")
 
     return _error(400, "InvalidAction", f"Unknown STS action: {action}", ns="sts")
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

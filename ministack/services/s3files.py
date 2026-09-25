@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon S3 Files Service Emulator (s3files-2025-05-05).
 REST/JSON API. Routes, payloads, and response shapes match the AWS spec.
@@ -70,6 +72,10 @@ def get_state():
         "sync_configs": _sync_configs,
         "tags": _tags,
     })
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

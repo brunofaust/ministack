@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """IAM action extraction and AccessDenied response formatting.
 
 Maps MiniStack's internal service names to IAM namespaces, extracts the
@@ -10,6 +12,9 @@ import json
 import logging
 import os
 import re
+from urllib.parse import unquote
+
+from defusedxml.ElementTree import ParseError, fromstring
 
 logger = logging.getLogger("ministack")
 
@@ -68,11 +73,14 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "iot": "iot",
     "iot-data": "iot",
     "iot-jobs-data": "iot",
+    "iotwireless": "iotwireless",
     "kafka": "kafka",
     "kinesis": "kinesis",
     "kms": "kms",
     "lambda": "lambda",
+    "lambda-core": "lambda",
     "lambda-microvms": "lambda",
+    "location": "geo",
     "logs": "logs",
     "mediaconnect": "mediaconnect",
     "monitoring": "cloudwatch",
@@ -91,12 +99,15 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "secretsmanager": "secretsmanager",
     "servicediscovery": "servicediscovery",
     "ses": "ses",
+    "signer": "signer",
     "sns": "sns",
     "sqs": "sqs",
     "ssm": "ssm",
     "states": "states",
     "sts": "sts",
     "tagging": "tag",
+    "transcribe": "transcribe",
+    "translate": "translate",
     "transfer": "transfer",
     "waf": "waf",
     "waf-regional": "waf-regional",
@@ -145,28 +156,93 @@ _S3_ACTIONS: dict[tuple[str, int], str] = {
     ("DELETE", 2): "DeleteObject",
     ("HEAD", 2): "GetObject",
     ("POST", 2): "PutObject",
-    ("POST", 1): "DeleteObject",  # DeleteObjects (batch)
+    ("POST", 1): "PutObject",  # POST Object (the browser form upload); ?delete is a table row
 }
 
 # S3 query-param sub-operations
+# Sub-resource (query parameter) → IAM action, keyed by HTTP method. The values
+# are the IAM actions the Amazon S3 authorization reference lists, not the API
+# operation names: multipart uploads authorize as s3:PutObject
+# (CreateMultipartUpload, UploadPart, UploadPartCopy, CompleteMultipartUpload),
+# abort as s3:AbortMultipartUpload and the two listings under their own actions;
+# the DELETE configuration calls (lifecycle, encryption, replication, tagging,
+# CORS) authorize as the matching Put* action, because S3 defines no Delete*
+# action for them. The literal "s3:CreateMultipartUpload" matched no policy and
+# denied every upload above the SDK's multipart threshold — CDK publishes any
+# asset that size (Lambda layers) that way, so `cdk deploy` failed under
+# AUTH=true. Consulted at both the bucket and the object level.
 _S3_QUERY_ACTIONS: dict[str, dict[str, str]] = {
-    "tagging": {"GET": "GetBucketTagging", "PUT": "PutBucketTagging", "DELETE": "DeleteBucketTagging"},
+    "tagging": {"GET": "GetBucketTagging", "PUT": "PutBucketTagging", "DELETE": "PutBucketTagging"},
     "versioning": {"GET": "GetBucketVersioning", "PUT": "PutBucketVersioning"},
     "policy": {"GET": "GetBucketPolicy", "PUT": "PutBucketPolicy", "DELETE": "DeleteBucketPolicy"},
-    "cors": {"GET": "GetBucketCors", "PUT": "PutBucketCors", "DELETE": "DeleteBucketCors"},
+    "cors": {"GET": "GetBucketCORS", "PUT": "PutBucketCORS", "DELETE": "PutBucketCORS"},
     "lifecycle": {"GET": "GetLifecycleConfiguration", "PUT": "PutLifecycleConfiguration",
-                  "DELETE": "DeleteLifecycleConfiguration"},
+                  "DELETE": "PutLifecycleConfiguration"},
     "encryption": {"GET": "GetEncryptionConfiguration", "PUT": "PutEncryptionConfiguration",
-                   "DELETE": "DeleteEncryptionConfiguration"},
+                   "DELETE": "PutEncryptionConfiguration"},
     "notification": {"GET": "GetBucketNotification", "PUT": "PutBucketNotification"},
     "acl": {"GET": "GetBucketAcl", "PUT": "PutBucketAcl"},
     "website": {"GET": "GetBucketWebsite", "PUT": "PutBucketWebsite", "DELETE": "DeleteBucketWebsite"},
     "logging": {"GET": "GetBucketLogging", "PUT": "PutBucketLogging"},
     "replication": {"GET": "GetReplicationConfiguration", "PUT": "PutReplicationConfiguration",
-                    "DELETE": "DeleteReplicationConfiguration"},
+                    "DELETE": "PutReplicationConfiguration"},
     "location": {"GET": "GetBucketLocation"},
-    "uploads": {"GET": "ListMultipartUploads", "POST": "CreateMultipartUpload"},
+    "uploads": {"GET": "ListBucketMultipartUploads", "POST": "PutObject"},
+    "uploadId": {"GET": "ListMultipartUploadParts", "PUT": "PutObject",
+                 "POST": "PutObject", "DELETE": "AbortMultipartUpload"},
     "restore": {"POST": "RestoreObject"},
+}
+
+# Sub-resources that only exist at the bucket level. A DELETE of a
+# configuration authorizes as its Put action, like the shared table's rows.
+_S3_BUCKET_QUERY_ACTIONS: dict[str, dict[str, str]] = {
+    "versions": {"GET": "ListBucketVersions"},
+    "delete": {"POST": "DeleteObject"},   # DeleteObjects (batch)
+    "accelerate": {"GET": "GetAccelerateConfiguration", "PUT": "PutAccelerateConfiguration"},
+    "requestPayment": {"GET": "GetBucketRequestPayment", "PUT": "PutBucketRequestPayment"},
+    "publicAccessBlock": {"GET": "GetBucketPublicAccessBlock", "PUT": "PutBucketPublicAccessBlock",
+                          "DELETE": "PutBucketPublicAccessBlock"},
+    "ownershipControls": {"GET": "GetBucketOwnershipControls", "PUT": "PutBucketOwnershipControls",
+                          "DELETE": "PutBucketOwnershipControls"},
+    "intelligent-tiering": {"GET": "GetIntelligentTieringConfiguration",
+                            "PUT": "PutIntelligentTieringConfiguration",
+                            "DELETE": "PutIntelligentTieringConfiguration"},
+    "metrics": {"GET": "GetMetricsConfiguration", "PUT": "PutMetricsConfiguration",
+                "DELETE": "PutMetricsConfiguration"},
+    "analytics": {"GET": "GetAnalyticsConfiguration", "PUT": "PutAnalyticsConfiguration",
+                  "DELETE": "PutAnalyticsConfiguration"},
+    "inventory": {"GET": "GetInventoryConfiguration", "PUT": "PutInventoryConfiguration",
+                  "DELETE": "PutInventoryConfiguration"},
+    "object-lock": {"GET": "GetBucketObjectLockConfiguration",
+                    "PUT": "PutBucketObjectLockConfiguration"},
+    "policyStatus": {"GET": "GetBucketPolicyStatus"},
+}
+
+# Sub-resources whose IAM action differs between the bucket and the object
+# level, or that only exist on an object; these win over the shared table
+# for an object request.
+_S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
+    "tagging": {"GET": "GetObjectTagging", "PUT": "PutObjectTagging",
+                "DELETE": "DeleteObjectTagging"},
+    "acl": {"GET": "GetObjectAcl", "PUT": "PutObjectAcl"},
+    "retention": {"GET": "GetObjectRetention", "PUT": "PutObjectRetention"},
+    "legal-hold": {"GET": "GetObjectLegalHold", "PUT": "PutObjectLegalHold"},
+    "attributes": {"GET": "GetObjectAttributes"},
+    "select": {"POST": "GetObject"},   # SelectObjectContent reads the object
+    "torrent": {"GET": "GetObject"},
+}
+
+# An object request that names a version (``?versionId=``) authorizes as
+# the version-specific action.
+_S3_VERSIONED_ACTIONS: dict[str, str] = {
+    "GetObject": "GetObjectVersion",
+    "DeleteObject": "DeleteObjectVersion",
+    "GetObjectTagging": "GetObjectVersionTagging",
+    "PutObjectTagging": "PutObjectVersionTagging",
+    "DeleteObjectTagging": "DeleteObjectVersionTagging",
+    "GetObjectAcl": "GetObjectVersionAcl",
+    "PutObjectAcl": "PutObjectVersionAcl",
+    "GetObjectAttributes": "GetObjectVersionAttributes",
 }
 
 
@@ -174,15 +250,123 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
     parts = [p for p in path.split("/") if p]
     depth = min(len(parts), 2)
 
-    # Check sub-operation query params first (bucket-level)
+    action = None
+    # Sub-operation query params first: the level-specific table, then the
+    # shared one. A request for the service root has no sub-resources.
     if depth >= 1:
-        for qp, action_map in _S3_QUERY_ACTIONS.items():
-            if qp in query_params:
-                a = action_map.get(method)
-                if a:
-                    return a
+        level_table = _S3_OBJECT_QUERY_ACTIONS if depth == 2 else _S3_BUCKET_QUERY_ACTIONS
+        for table in (level_table, _S3_QUERY_ACTIONS):
+            for qp, action_map in table.items():
+                if qp in query_params:
+                    a = action_map.get(method)
+                    if a:
+                        action = a
+                        break
+            if action:
+                break
+    if action is None:
+        action = _S3_ACTIONS.get((method, depth))
 
-    return _S3_ACTIONS.get((method, depth))
+    if depth == 2 and action and _query_param(query_params, "versionId"):
+        action = _S3_VERSIONED_ACTIONS.get(action, action)
+    return action
+
+
+# Operations that take x-amz-bypass-governance-retention; when the header says
+# true they also need s3:BypassGovernanceRetention on the object.
+_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention"})
+
+
+def _s3_source_object(headers: dict) -> tuple[str, str] | None:
+    """The ``(arn, version_id)`` of a CopyObject / UploadPartCopy source, from
+    ``x-amz-copy-source`` (``/bucket/key`` or ``bucket/key``, optionally
+    ``?versionId=``), or None when the header is absent or malformed."""
+    src = headers.get("x-amz-copy-source", "")
+    if not src:
+        return None
+    src, _, query = src.partition("?")
+    src = unquote(src).lstrip("/")
+    if "/" not in src:
+        return None
+    version_id = ""
+    for pair in query.split("&"):
+        k, _, v = pair.partition("=")
+        if k == "versionId":
+            version_id = unquote(v)
+    return f"arn:aws:s3:::{src}", version_id
+
+
+def _s3_batch_delete_targets(bucket: str, body: bytes) -> list[tuple[str, str]]:
+    """``(arn, version_id)`` for every ``<Object>`` of a DeleteObjects body.
+    The SDKs send the elements in the S3 namespace; a bare body works too."""
+    targets: list[tuple[str, str]] = []
+    if not body:
+        return targets
+    try:
+        root = fromstring(body)
+    except (ParseError, ValueError):  # ValueError: defusedxml's forbidden constructs
+        return targets
+    for obj in root.iter():
+        if obj.tag.rpartition("}")[2] != "Object":
+            continue
+        key = version_id = ""
+        for child in obj:
+            tag = child.tag.rpartition("}")[2]
+            if tag == "Key":
+                key = child.text or ""
+            elif tag == "VersionId":
+                version_id = child.text or ""
+        if key:
+            targets.append((f"arn:aws:s3:::{bucket}/{key}", version_id))
+    return targets
+
+
+def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
+                         query_params: dict) -> list[tuple[str, str]]:
+    """``(iam_action, resource_arn)`` pairs an S3 request needs on top of the
+    primary check, per the S3 reference:
+
+    - CopyObject and UploadPartCopy read the source: ``s3:GetObject`` (or
+      ``s3:GetObjectVersion``) on the ``x-amz-copy-source`` object.
+    - GetObjectAttributes needs ``s3:GetObject`` next to
+      ``s3:GetObjectAttributes`` (the ``*Version*`` pair with a versionId).
+    - DeleteObjects is one ``s3:DeleteObject`` (``s3:DeleteObjectVersion``
+      for a versioned entry) per key. The first key is the primary check's
+      resource (see ``extract_resource_arn``); the rest are listed here.
+    - ``x-amz-bypass-governance-retention: true`` on DeleteObject,
+      DeleteObjects or PutObjectRetention adds
+      ``s3:BypassGovernanceRetention`` on every object.
+    """
+    parts = [p for p in path.split("/") if p]
+    action = _s3_action(method, path, query_params)
+    if not parts or not action:
+        return []
+    checks: list[tuple[str, str]] = []
+    bypass = headers.get("x-amz-bypass-governance-retention", "").strip().lower() == "true"
+
+    if len(parts) >= 2:
+        key_arn = f"arn:aws:s3:::{parts[0]}/{'/'.join(parts[1:])}"
+        if action == "PutObject":
+            source = _s3_source_object(headers)
+            if source:
+                arn, version_id = source
+                checks.append(("s3:GetObjectVersion" if version_id else "s3:GetObject", arn))
+        elif action == "GetObjectAttributes":
+            checks.append(("s3:GetObject", key_arn))
+        elif action == "GetObjectVersionAttributes":
+            checks.append(("s3:GetObjectVersion", key_arn))
+        if bypass and action in _S3_GOVERNANCE_BYPASS_ACTIONS:
+            checks.append(("s3:BypassGovernanceRetention", key_arn))
+        return checks
+
+    if method == "POST" and "delete" in query_params:
+        targets = _s3_batch_delete_targets(parts[0], body)
+        for arn, version_id in targets[1:]:
+            checks.append(("s3:DeleteObjectVersion" if version_id else "s3:DeleteObject", arn))
+        if bypass:
+            for arn, _ in targets:
+                checks.append(("s3:BypassGovernanceRetention", arn))
+    return checks
 
 
 # Lambda REST path → IAM action
@@ -260,7 +444,9 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "iot": ["iot"],
     "iot-data": ["iot-data"],
     "iot-jobs-data": ["iot-jobs-data"],
+    "iotwireless": ["iotwireless"],
     "kafka": ["kafka"],
+    "location": ["location"],
     "mediaconnect": ["mediaconnect"],
     "mq": ["mq"],
     "airflow": ["mwaa"],
@@ -271,6 +457,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "s3files": [],  # uses S3 namespace but different paths
     "s3tables": ["s3tables"],
     "scheduler": ["scheduler"],
+    "signer": ["signer"],
 }
 
 # Compiled route: (http_method, compiled_regex, operation_name, specificity)
@@ -314,7 +501,15 @@ def _compile_uri(uri_pattern: str) -> tuple[re.Pattern, int, dict[str, str]]:
         if seg.startswith("{") and seg.endswith("+}"):
             regex_parts.append(".+")
         elif seg.startswith("{") and seg.endswith("}"):
-            regex_parts.append("[^/]+")
+            # Lazy, not single-segment. A botocore label is non-greedy because
+            # the SDK percent-encodes any "/" the value carries, so it stays one
+            # segment on the wire; we match the decoded path, where those are
+            # separators again. Every ARN-valued label is in this position, as
+            # is an MQTT topic, so "[^/]+" resolves no action at all and the
+            # request authorizes against "*". The pattern is anchored and the
+            # literal segments around a label still bound it, and a route with
+            # more literals outscores one with fewer.
+            regex_parts.append(".+?")
         else:
             regex_parts.append(re.escape(seg))
             specificity += 1
@@ -600,7 +795,12 @@ def extract_resource_arn(service: str, method: str, path: str,
                          headers: dict, body: bytes,
                          query_params: dict, region: str,
                          account_id: str) -> str:
-    """Construct the resource ARN for the request, or '*' if unknown."""
+    """Construct the resource ARN for the request, or '*' if unknown.
+
+    ``query_params`` is the router's params dict, which for a query-protocol
+    POST carries the form-encoded body merged underneath the query string
+    (``app._routing_params``). The branches below read it directly.
+    """
 
     if service == "s3":
         parts = [p for p in path.split("/") if p]
@@ -610,12 +810,19 @@ def extract_resource_arn(service: str, method: str, path: str,
         if len(parts) >= 2:
             key = "/".join(parts[1:])
             return f"arn:aws:s3:::{bucket}/{key}"
+        if method == "POST" and "delete" in query_params:
+            # DeleteObjects authorizes per object, not on the bucket: the
+            # first key is the primary resource, s3_additional_checks()
+            # carries the rest.
+            targets = _s3_batch_delete_targets(bucket, body)
+            if targets:
+                return targets[0][0]
         return f"arn:aws:s3:::{bucket}"
 
     if service == "dynamodb":
-        table = _safe_json_field(body, "TableName")
-        if table:
-            return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+        resources = dynamodb_resource_arns(body, region, account_id)
+        if resources:
+            return resources[0]
         return "*"
 
     if service == "lambda":
@@ -722,6 +929,13 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- Target-based (JSON body) services ---
 
     if service == "events":
+        try:
+            event_data = json.loads(body or b"{}")
+        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+            event_data = {}
+        buses = eventbridge_resource_arns(body, region, account_id)
+        if buses:
+            return buses[0]
         name = _safe_json_field(body, "Name") or _safe_json_field(body, "RuleName")
         bus = _safe_json_field(body, "EventBusName") or "default"
         if name:
@@ -960,6 +1174,23 @@ def extract_resource_arn(service: str, method: str, path: str,
             return f"arn:aws:ses:{region}:{account_id}:identity/{identity}"
         return "*"
 
+    if service == "signer":
+        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
+        # carry no resource (Service Authorization Reference). The ARNs put a
+        # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
+        parts = [p for p in path.split("/") if p]
+        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+            return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
+        if parts and parts[0] == "signing-jobs":
+            if len(parts) > 1:
+                return f"arn:aws:signer:{region}:{account_id}:/signing-jobs/{parts[1]}"
+            if method == "POST":
+                profile = _safe_json_field(body, "profileName")
+                if profile:
+                    return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{profile}"
+        return "*"
+
     if service == "ssm":
         name = _param(body, query_params, "Name")
         if name:
@@ -1020,6 +1251,15 @@ def extract_resource_arn(service: str, method: str, path: str,
             pi = parts.index("pipes")
             if pi + 1 < len(parts):
                 return f"arn:aws:pipes:{region}:{account_id}:pipe/{parts[pi + 1]}"
+        return "*"
+
+    if service == "location":
+        # /tracking/v0/trackers/{TrackerName}[/...]; the ARN service is geo.
+        parts = [p for p in path.split("/") if p]
+        if "trackers" in parts:
+            ti = parts.index("trackers")
+            if ti + 1 < len(parts):
+                return f"arn:aws:geo:{region}:{account_id}:tracker/{parts[ti + 1]}"
         return "*"
 
     if service == "mq":
@@ -1170,8 +1410,20 @@ def extract_resource_arn(service: str, method: str, path: str,
 
     # --- IoT (REST path-based, multiple resource types) ---
 
-    if service == "iot":
+    # Both data planes carry iot: actions on iot: ARNs, and their paths are the
+    # ones the map below already names: a publish is /topics/{topic}, a shadow
+    # and a job execution are /things/{thingName}/... . Routed by credential
+    # scope, they arrive here as their own service keys.
+    if service in ("iot", "iot-data", "iot-jobs-data"):
         parts = [p for p in path.split("/") if p]
+        # Publish and the retained-message calls take everything after the
+        # prefix as the topic, and a topic is multi-level: the ARN is
+        # topic/sensors/a/temperature, not topic/sensors. The separators arrive
+        # percent-encoded from the SDK, which is why iot_data._publish unquotes
+        # as well.
+        if len(parts) > 1 and parts[0] in ("topics", "retainedMessage"):
+            topic = unquote("/".join(parts[1:]))
+            return f"arn:aws:iot:{region}:{account_id}:topic/{topic}"
         _IOT_RESOURCES = {
             "things": "thing",
             "thing-types": "thingtype",
@@ -1179,15 +1431,14 @@ def extract_resource_arn(service: str, method: str, path: str,
             "policies": "policy",
             "certificates": "cert",
             "rules": "rule",
+            "jobs": "job",
+            "provisioning-templates": "provisioningtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
                 si = parts.index(segment)
                 if si + 1 < len(parts):
-                    name = parts[si + 1]
-                    if rtype == "cert":
-                        return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
-                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{name}"
+                    return f"arn:aws:iot:{region}:{account_id}:{rtype}/{parts[si + 1]}"
         return "*"
 
     # --- API Gateway (REST path-based) ---
@@ -1294,6 +1545,105 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     return "*"
+
+
+def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Every event-bus ARN a ``PutEvents`` request addresses, in request order.
+
+    AWS authorizes ``events:PutEvents`` per bus, and one call can carry entries
+    for several, so the caller checks each. Entries that are not objects, and
+    bus names that are not strings, are skipped rather than crashing the
+    enforcement path on a malformed request.
+    """
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    entries = data.get("Entries") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    arns = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        bus = entry.get("EventBusName")
+        if not isinstance(bus, str) or not bus:
+            bus = "default"
+        arn = bus if bus.startswith("arn:") else (
+            f"arn:aws:events:{region}:{account_id}:event-bus/{bus}")
+        if arn not in arns:
+            arns.append(arn)
+    return arns
+
+
+def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
+    """Return every table ARN addressed by a DynamoDB JSON request."""
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    table = data.get("TableName") if isinstance(data, dict) else None
+    if isinstance(table, str) and table:
+        index = data.get("IndexName")
+        suffix = f"/index/{index}" if isinstance(index, str) and index else ""
+        return [
+            f"arn:aws:dynamodb:{region}:{account_id}:table/{table}{suffix}"
+        ]
+    else:
+        request_items = data.get("RequestItems") if isinstance(data, dict) else None
+        tables = list(request_items) if isinstance(request_items, dict) else []
+    return [
+        f"arn:aws:dynamodb:{region}:{account_id}:table/{name}"
+        for name in tables
+        if isinstance(name, str) and name
+    ]
+
+
+def dynamodb_service_context(body: bytes) -> dict:
+    """The DynamoDB condition keys a request carries.
+
+    ``dynamodb:Attributes`` is the list of *top-level* attributes the request
+    names: AWS resolves a ``ProjectionExpression`` of ``"Name, Address.City"``
+    to ``["Name", "Address"]``, and a placeholder is substituted per path
+    segment, not on the whole path. The key is omitted when the request names
+    no attributes, which is how AWS evaluates it ("evaluated only on the
+    attributes specified in the request").
+
+    ``dynamodb:Select`` always has a value on AWS for the operations that
+    return attributes (``ALL_ATTRIBUTES`` unless the request says otherwise),
+    so it is set on every request: leaving it unresolved lets a policy that
+    conditions on it with ``StringEqualsIfExists`` pass a request AWS refuses.
+    """
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    names = data.get("ExpressionAttributeNames")
+    names = names if isinstance(names, dict) else {}
+
+    attributes = []
+    projection = data.get("ProjectionExpression")
+    if isinstance(projection, str):
+        for part in projection.split(","):
+            # Top level only: the path's first segment, before any "." or "[".
+            head = re.split(r"[.\[]", part.strip(), maxsplit=1)[0].strip()
+            if head:
+                attributes.append(names.get(head, head))
+    # AttributesToGet is the legacy form of the same projection.
+    legacy = data.get("AttributesToGet")
+    if isinstance(legacy, list):
+        attributes.extend(a for a in legacy if isinstance(a, str) and a)
+
+    context = {}
+    if attributes:
+        context["dynamodb:Attributes"] = attributes
+    select = data.get("Select")
+    if not isinstance(select, str) or not select:
+        select = "SPECIFIC_ATTRIBUTES" if attributes else "ALL_ATTRIBUTES"
+    context["dynamodb:Select"] = select
+    return context
 
 
 def access_denied_response(service: str, action: str, principal_arn: str,

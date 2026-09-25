@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon Route 53 Emulator.
 REST/XML API — service credential scope: route53.
@@ -62,6 +64,10 @@ def get_state():
             "hc_caller_refs": copy.deepcopy(_hc_caller_refs),
             "changes": copy.deepcopy(_changes),
         }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Kinesis Data Streams Emulator.
 JSON-based API via X-Amz-Target (Kinesis_20131202).
@@ -55,6 +57,10 @@ def get_state():
         "shard_iterators": copy.deepcopy(_shard_iterators),
         "consumers": copy.deepcopy(_consumers),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -499,6 +505,7 @@ def _describe_stream_summary(data):
         "StreamCreationTimestamp": stream["CreationTimestamp"],
         "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
         "EncryptionType": stream.get("EncryptionType", "NONE"),
+        **({"KeyId": stream["KeyId"]} if stream.get("KeyId") else {}),
         "OpenShardCount": len(stream["shards"]),
         "ConsumerCount": consumer_count,
     }})
@@ -1218,6 +1225,10 @@ def _stream_desc(stream, shard_ids=None):
         "HasMoreShards": False,
         "EnhancedMonitoring": [{"ShardLevelMetrics": []}],
         "EncryptionType": stream.get("EncryptionType", "NONE"),
+        # KeyId accompanies EncryptionType on AWS, and is omitted entirely when
+        # the stream is not encrypted. Storing it without echoing it here leaves
+        # kms_key_id reading empty on an encrypted stream.
+        **({"KeyId": stream["KeyId"]} if stream.get("KeyId") else {}),
     }
 
 

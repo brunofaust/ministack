@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EMR (Elastic MapReduce) Service Emulator.
 JSON protocol via X-Amz-Target: ElasticMapReduce.{Operation}
@@ -71,6 +73,10 @@ def get_state():
         "_steps": _steps,
         "_block_public_access": _block_public_access,
     })
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

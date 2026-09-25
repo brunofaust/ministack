@@ -38,6 +38,72 @@ def _call(service, method, path="/v2/email/tags", *, body=None, query=None):
     return status, json.loads(raw.decode("utf-8")) if raw else {}
 
 
+def test_ses_v2_target_delegates_to_ses_v2_handler(monkeypatch):
+    """The legacy SES dispatcher must not retain a separate v2 implementation."""
+    from ministack.services import ses, ses_v2
+
+    received = {}
+
+    async def delegated_handler(method, path, headers, body, query_params):
+        received.update(
+            method=method,
+            path=path,
+            headers=headers,
+            body=body,
+            query_params=query_params,
+        )
+        return 204, {}, b""
+
+    monkeypatch.setattr(ses_v2, "handle_request", delegated_handler)
+    result = asyncio.run(
+        ses.handle_request(
+            "POST", "/", {"x-amz-target": "SESv2.SendEmail"}, b"{}", {"key": ["value"]}
+        )
+    )
+
+    assert result == (204, {}, b"")
+    assert received == {
+        "method": "POST",
+        "path": "/",
+        "headers": {"x-amz-target": "SESv2.SendEmail"},
+        "body": b"{}",
+        "query_params": {"key": ["value"]},
+    }
+
+
+@pytest.mark.parametrize("prefix", ["", "/v2/email"])
+@pytest.mark.parametrize("suffix", ["", "/"])
+@pytest.mark.parametrize("bulk", [False, True])
+def test_ses_target_send_uses_real_v2_handler(ses_v2, prefix, suffix, bulk):
+    from ministack.services import ses
+
+    template = {"TemplateContent": {"Subject": "Hello {{name}}", "Text": "Welcome"},
+                "TemplateData": json.dumps({"name": "Alice"})}
+    destination = {"ToAddresses": ["recipient@example.com"]}
+    body = {"FromEmailAddress": "sender@example.com"}
+    if bulk:
+        operation, route = "SendBulkEmail", "/outbound-bulk-emails"
+        body.update(DefaultContent={"Template": template},
+                    BulkEmailEntries=[{"Destination": destination}])
+    else:
+        operation, route = "SendEmail", "/outbound-emails"
+        body.update(Content={"Template": template}, Destination=destination)
+
+    status, _, raw = asyncio.run(ses.handle_request(
+        "POST", prefix + route + suffix, {"x-amz-target": f"SESv2.{operation}"},
+        json.dumps(body).encode(), {},
+    ))
+
+    assert status == 200
+    response = json.loads(raw)
+    message_id = response["BulkEmailEntryResults"][0]["MessageId"] if bulk else response["MessageId"]
+    records = ses_v2._sent_emails_list()
+    assert len(records) == 1
+    assert records[0]["MessageId"] == message_id
+    assert records[0]["Subject"] == "Hello Alice"
+    assert records[0]["To"] == destination["ToAddresses"]
+
+
 def _send_template(ses_v2, template, template_data, *, to="recipient@example.com"):
     return _call(
         ses_v2,
@@ -453,4 +519,137 @@ def test_ses_v2_send_email_rejects_unusable_templates_without_recording_sends(
 
     assert status == expected_status
     assert body["name"] == expected_error
+    assert ses_v2._sent_emails_list() == []
+
+
+async def _post_via_app(path, body):
+    """Drive MiniStack's ASGI ``app`` in-process so the /v2/email router is exercised."""
+    from ministack.app import app as asgi_app
+
+    raw = json.dumps(body).encode("utf-8")
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": raw, "more_body": False}
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("utf-8"),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"localhost:4566"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(raw)).encode("ascii")),
+        ],
+        "client": ("127.0.0.1", 55555),
+        "server": ("127.0.0.1", 4566),
+    }
+    await asgi_app(scope, receive, send)
+    start = next(m for m in messages if m["type"] == "http.response.start")
+    payload = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
+    return start["status"], json.loads(payload.decode("utf-8")) if payload else {}
+
+
+def _bulk_body(template, entries):
+    return {
+        "FromEmailAddress": "noreply@example.com",
+        "DefaultContent": {"Template": dict(template, TemplateData=json.dumps({"name": "Default"}))},
+        "BulkEmailEntries": entries,
+    }
+
+
+def _bulk_entry(to, **replacement):
+    entry = {"Destination": {"ToAddresses": [to]}}
+    if replacement:
+        entry["ReplacementEmailContent"] = {
+            "ReplacementTemplate": {"ReplacementTemplateData": json.dumps(replacement)}
+        }
+    return entry
+
+
+def test_ses_v2_send_bulk_email_via_app_router_with_inline_template(ses_v2):
+    status, body = asyncio.run(
+        _post_via_app(
+            "/v2/email/outbound-bulk-emails",
+            _bulk_body(
+                {"TemplateContent": {"Subject": "Hi {{name}}", "Text": "Body {{name}}"}},
+                [_bulk_entry("a@example.com", name="Alice"), _bulk_entry("b@example.com")],
+            ),
+        )
+    )
+
+    assert status == 200
+    results = body["BulkEmailEntryResults"]
+    assert len(results) == 2
+    assert all(r["Status"] == "SUCCESS" and r["MessageId"] for r in results)
+    assert len({r["MessageId"] for r in results}) == 2
+
+    records = ses_v2._sent_emails_list()
+    assert [r["Type"] for r in records] == ["v2.SendBulkEmail"] * 2
+    assert [r["MessageId"] for r in records] == [r["MessageId"] for r in results]
+    assert records[0]["To"] == ["a@example.com"]
+    assert records[0]["Subject"] == "Hi Alice"
+    assert records[1]["Subject"] == "Hi Default"
+    assert records[1]["BodyText"] == "Body Default"
+    assert "Template" not in records[0]
+    assert list(ses_v2._templates.values()) == []
+
+
+def test_ses_v2_send_bulk_email_via_app_router_with_stored_template(ses_v2):
+    _call(
+        ses_v2,
+        "POST",
+        "/v2/email/templates",
+        body={"TemplateName": "bulk-tpl", "TemplateContent": {"Subject": "S {{name}}", "Text": "T {{name}}"}},
+    )
+
+    status, body = asyncio.run(
+        _post_via_app(
+            "/v2/email/outbound-bulk-emails",
+            _bulk_body(
+                {"TemplateName": "bulk-tpl"},
+                [
+                    _bulk_entry("a@example.com", name="A"),
+                    _bulk_entry("b@example.com", name="B"),
+                    _bulk_entry("c@example.com"),
+                ],
+            ),
+        )
+    )
+
+    assert status == 200
+    results = body["BulkEmailEntryResults"]
+    assert len(results) == 3
+    assert all(r["Status"] == "SUCCESS" for r in results)
+
+    records = ses_v2._sent_emails_list()
+    assert [r["Subject"] for r in records] == ["S A", "S B", "S Default"]
+    assert all(r["Template"] == "bulk-tpl" for r in records)
+
+
+def test_ses_v2_send_bulk_email_rejects_missing_template_without_recording_sends(ses_v2):
+    status, body = asyncio.run(
+        _post_via_app(
+            "/v2/email/outbound-bulk-emails",
+            _bulk_body({"TemplateName": "missing"}, [_bulk_entry("a@example.com")]),
+        )
+    )
+
+    assert status == 404
+    assert body["name"] == "NotFoundException"
     assert ses_v2._sent_emails_list() == []

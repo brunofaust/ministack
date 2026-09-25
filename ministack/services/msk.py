@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon MSK (Managed Streaming for Apache Kafka) Service Emulator.
 REST/JSON protocol — signing name: kafka. Endpoint prefix: kafka.
@@ -83,6 +85,10 @@ def get_state():
         "scram_secrets": _scram_secrets,
         "tags": _tags,
     })
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -313,7 +319,6 @@ def _list_clusters(query_params) -> tuple:
         summaries.append(info)
     return _json({
         "ClusterInfoList": summaries,
-        "NextToken": None,
     })
 
 
@@ -365,7 +370,7 @@ def _list_nodes(arn: str) -> tuple:
                 "Endpoints": [bootstrap["BootstrapBrokerString"].split(",")[0]],
             },
         })
-    return _json({"NodeInfoList": nodes, "NextToken": None})
+    return _json({"NodeInfoList": nodes})
 
 
 # ---------------------------------------------------------------------------
@@ -424,7 +429,6 @@ def _create_configuration(body) -> tuple:
 def _list_configurations(query_params) -> tuple:
     return _json({
         "Configurations": list(_configurations.values()),
-        "NextToken": None,
     })
 
 
@@ -446,7 +450,7 @@ def _list_configuration_revisions(arn: str) -> tuple:
         "Description": r["Description"],
         "Revision": r["Revision"],
     } for r in revs]
-    return _json({"Revisions": summaries, "NextToken": None})
+    return _json({"Revisions": summaries})
 
 
 def _describe_configuration_revision(arn: str, revision: str) -> tuple:
@@ -530,7 +534,6 @@ def _list_scram_secrets(arn: str) -> tuple:
         return validation_error
     return _json({
         "SecretArnList": list(_scram_secrets.get(arn, [])),
-        "NextToken": None,
     })
 
 

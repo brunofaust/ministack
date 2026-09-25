@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 DynamoDB Streams Emulator.
 Supports: ListStreams, DescribeStream, GetShardIterator, GetRecords.
@@ -411,6 +413,10 @@ def _get_records(data):
 def get_state():
     # All state lives in the dynamodb module; nothing to persist here.
     return {}
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

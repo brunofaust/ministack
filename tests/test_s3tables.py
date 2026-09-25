@@ -21,7 +21,6 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-
 _ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 
@@ -643,6 +642,63 @@ def test_s3tables_iceberg_transactions_commit(s3tables):
 
 
 
+def test_s3tables_iceberg_upgrade_format_version(s3tables):
+    """A commit carrying the Iceberg REST ``upgrade-format-version`` action
+    (what Spark sends for ``.tableProperty("format-version", "3")`` on an
+    existing table) moves the table's metadata to that version; re-asserting
+    the current version is a no-op and a downgrade is refused with 400.
+    Real S3 Tables supports Iceberg format version 3."""
+    bucket_name = f"tb-fv-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["format-version"] == 2
+
+        resp = _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+            payload={"requirements": [],
+                     "updates": [{"action": "upgrade-format-version", "format-version": 3}]},
+        )
+        assert resp["metadata"]["format-version"] == 3
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["format-version"] == 3
+
+        # Re-asserting the version the table already has is a no-op commit.
+        resp = _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+            payload={"requirements": [],
+                     "updates": [{"action": "upgrade-format-version", "format-version": 3}]},
+        )
+        assert resp["metadata"]["format-version"] == 3
+
+        # A downgrade is refused, and the table keeps its version.
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            _iceberg_json(
+                f"/iceberg/v1/namespaces/{ns}/tables/{table}", method="POST",
+                payload={"requirements": [],
+                         "updates": [{"action": "upgrade-format-version", "format-version": 2}]},
+            )
+        assert exc_info.value.code == 400
+        assert b"downgrade" in exc_info.value.read()
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert loaded["metadata"]["format-version"] == 3
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
 def test_s3tables_iceberg_create_table_rejects_resend_instead_of_wiping_data(s3tables):
     """CreateTable is not idempotent per the Iceberg REST spec -- a resent create
     (e.g. a client retry after a lost response to a create that already landed)
@@ -1022,3 +1078,212 @@ def test_s3tables_deletes_answer_204(s3tables):
     assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
     r = s3tables.delete_table_bucket(tableBucketARN=arn)
     assert r["ResponseMetadata"]["HTTPStatusCode"] == 204
+
+
+def test_s3tables_iceberg_load_table_serves_the_numerically_latest_metadata(s3tables, s3):
+    """LoadTable's scan for the newest metadata.json must order vN numerically:
+    lexically v10 sorts before v2, so from the 10th commit on a lexical scan
+    serves v9 forever while the table keeps advancing."""
+    bucket_name = f"tb-vsort-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns, table = "vsortns", "vsorttbl"
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        base = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")["metadata"]
+        for v in range(1, 12):
+            doc = dict(base, **{"last-sequence-number": v})
+            s3.put_object(
+                Bucket=bucket_name,
+                Key=f"{ns}/{table}/metadata/v{v}.metadata.json",
+                Body=json.dumps(doc).encode(),
+            )
+
+        resp = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        assert resp["metadata-location"].endswith("/v11.metadata.json"), resp["metadata-location"]
+        assert resp["metadata"]["last-sequence-number"] == 11
+    finally:
+        try:
+            s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table)
+        except Exception:
+            pass
+        try:
+            s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns)
+        except Exception:
+            pass
+        s3tables.delete_table_bucket(tableBucketARN=bucket_arn)
+
+
+def test_s3tables_iceberg_prefixed_lookup_scopes_to_the_bucket(s3tables):
+    """Two table buckets holding a same-named table must resolve per the
+    ``{account}:s3tablescatalog/{bucket}`` prefix — without the filter the
+    first match wins and the wrong table's schema comes back."""
+    ns, table = "scopens", "orders"
+    arns = {}
+    try:
+        for b in ("tb-scope-a", "tb-scope-b"):
+            arns[b] = s3tables.create_table_bucket(name=b)["arn"]
+            s3tables.create_namespace(tableBucketARN=arns[b], namespace=[ns])
+            s3tables.create_table(
+                tableBucketARN=arns[b], namespace=ns, name=table, format="ICEBERG",
+                metadata={"iceberg": {"schema": {"fields": [
+                    {"name": f"col_{b[-1]}", "type": "string"}]}}},
+            )
+        for b in ("tb-scope-a", "tb-scope-b"):
+            resp = _iceberg_json(
+                f"/iceberg/v1/000000000000:s3tablescatalog/{b}/namespaces/{ns}/tables/{table}")
+            fields = resp["metadata"]["schemas"][0]["fields"]
+            assert [f["name"] for f in fields] == [f"col_{b[-1]}"], (b, fields)
+    finally:
+        for b, arn in arns.items():
+            try:
+                s3tables.delete_table(tableBucketARN=arn, namespace=ns, name=table)
+                s3tables.delete_namespace(tableBucketARN=arn, namespace=ns)
+            except Exception:
+                pass
+            try:
+                s3tables.delete_table_bucket(tableBucketARN=arn)
+            except Exception:
+                pass
+
+
+def test_iceberg_unknown_path_answers_404_envelope():
+    """A path neither catalog serves must be an Iceberg error envelope, not an
+    empty 200 a client would read as success."""
+    import urllib.error
+
+    try:
+        _iceberg_json("/iceberg/v9/definitely/not/a/route")
+        raise AssertionError("expected HTTP error")
+    except urllib.error.HTTPError as e:
+        assert e.code == 404
+        doc = json.loads(e.read())
+        assert doc["error"]["type"] == "NotFoundException"
+
+
+def test_table_bucket_encryption_defaults_to_sse_s3_and_round_trips(s3tables):
+    arn = s3tables.create_table_bucket(name="enc-roundtrip")["arn"]
+    try:
+        default = s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"]
+        assert default == {"sseAlgorithm": "AES256"}
+        s3tables.put_table_bucket_encryption(
+            tableBucketARN=arn, encryptionConfiguration={"sseAlgorithm": "aws:kms", "kmsKeyArn": "arn:aws:kms:us-east-1:000000000000:key/k"}
+        )
+        stored = s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"]
+        assert stored["sseAlgorithm"] == "aws:kms"
+        s3tables.delete_table_bucket_encryption(tableBucketARN=arn)
+        assert s3tables.get_table_bucket_encryption(tableBucketARN=arn)["encryptionConfiguration"] == {"sseAlgorithm": "AES256"}
+    finally:
+        s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_table_bucket_tags_round_trip(s3tables):
+    arn = s3tables.create_table_bucket(name="tag-roundtrip", tags={"Name": "tag-roundtrip"})["arn"]
+    try:
+        assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"Name": "tag-roundtrip"}
+        s3tables.tag_resource(resourceArn=arn, tags={"env": "dev"})
+        assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"Name": "tag-roundtrip", "env": "dev"}
+        s3tables.untag_resource(resourceArn=arn, tagKeys=["Name"])
+        assert s3tables.list_tags_for_resource(resourceArn=arn)["tags"] == {"env": "dev"}
+    finally:
+        s3tables.delete_table_bucket(tableBucketARN=arn)
+
+
+def test_s3tables_iceberg_commit_rejects_stale_ref_requirement(s3tables):
+    """A commit whose ``assert-ref-snapshot-id`` no longer matches ``main`` must get
+    409 CommitFailedException instead of silently replacing the newer snapshot —
+    the lost-update that made concurrent DuckDB writers drop each other's rows."""
+    import urllib.error
+
+    bucket_name = f"tb-req-{_uuid_mod.uuid4().hex[:6]}"
+    bucket_arn = s3tables.create_table_bucket(name=bucket_name)["arn"]
+    ns = f"ns_{_uuid_mod.uuid4().hex[:6]}"
+    table = f"t_{_uuid_mod.uuid4().hex[:6]}"
+
+    def commit(snapshot_id, expected_ref_snapshot):
+        return _iceberg_json(
+            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            method="POST",
+            payload={
+                "requirements": [
+                    {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": expected_ref_snapshot}
+                ],
+                "updates": [
+                    {
+                        "action": "add-snapshot",
+                        "snapshot": {
+                            "snapshot-id": snapshot_id,
+                            "sequence-number": 1,
+                            "timestamp-ms": 1700000000000,
+                            "manifest-list": f"s3://{bucket_name}/{ns}/{table}/metadata/snap-{snapshot_id}.avro",
+                            "summary": {"operation": "append"},
+                        },
+                    },
+                    {"action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id},
+                ],
+            },
+        )
+
+    try:
+        s3tables.create_namespace(tableBucketARN=bucket_arn, namespace=[ns])
+        s3tables.create_table(tableBucketARN=bucket_arn, namespace=ns, name=table, format="ICEBERG")
+
+        commit(1001, None)  # first writer: main must not exist yet
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            commit(1002, None)  # stale writer: still believes main does not exist
+        assert exc.value.code == 409
+        body = json.loads(exc.value.read().decode("utf-8"))
+        assert body["error"]["type"] == "CommitFailedException"
+        assert "has changed" in body["error"]["message"]
+        commit(1003, 1001)  # refreshed writer: expects the current tip
+
+        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        metadata = loaded.get("metadata", {})
+        snap_ids = [s.get("snapshot-id") for s in metadata.get("snapshots", [])]
+        assert snap_ids == [1001, 1003], snap_ids
+        assert metadata.get("current-snapshot-id") == 1003
+    finally:
+        for call in (
+            lambda: s3tables.delete_table(tableBucketARN=bucket_arn, namespace=ns, name=table),
+            lambda: s3tables.delete_namespace(tableBucketARN=bucket_arn, namespace=ns),
+            lambda: s3tables.delete_table_bucket(tableBucketARN=bucket_arn),
+        ):
+            try:
+                call()
+            except Exception:
+                pass
+
+
+def test_s3tables_create_table_keeps_timestamptz_and_decimal_field_types(s3tables):
+    """A `timestamptz`/`decimal` field is stored with that Iceberg type, not collapsed to `string`."""
+    import urllib.parse
+    import urllib.request
+
+    bucket = f"types-{_uuid()[:8]}" if "_uuid" in globals() else f"types-{__import__('uuid').uuid4().hex[:8]}"
+    arn = s3tables.create_table_bucket(name=bucket)["arn"]
+    s3tables.create_namespace(tableBucketARN=arn, namespace=["ns"])
+    s3tables.create_table(
+        tableBucketARN=arn,
+        namespace="ns",
+        name="events",
+        format="ICEBERG",
+        metadata={
+            "iceberg": {
+                "schema": {
+                    "fields": [
+                        {"name": "ts", "type": "timestamptz", "required": True},
+                        {"name": "amount", "type": "decimal(10,2)"},
+                        {"name": "note", "type": "mystery"},
+                    ]
+                }
+            }
+        },
+    )
+    endpoint = __import__("os").environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    url = f"{endpoint}/iceberg/v1/{urllib.parse.quote(arn, safe='')}/namespaces/ns/tables/events"
+    with urllib.request.urlopen(url) as response:
+        metadata = __import__("json").load(response)["metadata"]
+    schema = metadata["schemas"][-1] if metadata.get("schemas") else metadata["schema"]
+    types = {field["name"]: field["type"] for field in schema["fields"]}
+    assert types == {"ts": "timestamptz", "amount": "decimal(10,2)", "note": "string"}

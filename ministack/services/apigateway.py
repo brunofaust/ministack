@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 API Gateway HTTP API v2 Emulator.
 
@@ -51,7 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -389,6 +391,10 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PATCH":
                 return _update_api(api_id, data)
 
+        # /v2/apis/{apiId}/cors
+        if api_id and sub == "cors" and method == "DELETE":
+            return _delete_cors_configuration(api_id)
+
         # /v2/apis/{apiId}/routes[/{routeId}[/routeresponses[/{routeResponseId}]]]
         if api_id and sub == "routes":
             rr_segment = parts[5] if len(parts) > 5 else None
@@ -556,6 +562,36 @@ def _cors_preflight_response(cors_cfg: dict, origin: str) -> tuple:
 def _b64url_decode(segment: str) -> bytes:
     padded = segment + "=" * ((4 - len(segment) % 4) % 4)
     return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+
+def _iam_caller_identity_v2(headers, query_params):
+    """The payload-2.0 ``requestContext.authorizer.iam`` block for an AWS_IAM
+    route — field names per the AWS-maintained typed event model
+    (aws-lambda-go ``APIGatewayV2HTTPRequestContextAuthorizerIAMDescription``).
+    Key resolution only; unknown keys return None and the event carries no
+    authorizer block."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
+
+    info = resolve_caller_identity(extract_access_key_id(headers, query_params))
+    if not info:
+        return None
+    iam = {
+        "accessKey": info["accessKey"],
+        "accountId": info["accountId"],
+        "callerId": info["userId"] or None,
+        "principalOrgId": info.get("principalOrgId"),
+        "userArn": info["userArn"] or None,
+        "userId": info["userId"] or None,
+    }
+    session = info.get("session") or {}
+    if session.get("_identity_id"):
+        iam["cognitoIdentity"] = {
+            "amr": session.get("_cognito_amr") or [],
+            "identityId": session.get("_identity_id"),
+            "identityPoolId": session.get("_identity_pool_id"),
+        }
+    return iam
 
 
 def _jwt_unauthorized(message: str = "Unauthorized") -> tuple:
@@ -814,13 +850,6 @@ def _evaluate_authorizer_policy(policy_doc, route_arn):
     return "Allow" if allow else "NoMatch"
 
 
-def _build_route_arn(region, account_id, api_id, stage, method, path):
-    return (
-        f"arn:aws:execute-api:{region}:{account_id}:"
-        f"{api_id}/{stage}/{method}/{path.lstrip('/')}"
-    )
-
-
 def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars):
     """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
 
@@ -928,7 +957,7 @@ async def _authorize_request_v2(
     if not authorizer:
         return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
 
-    route_arn = _build_route_arn(owner_region, owner_account_id, api_id, stage, method, path)
+    route_arn = execute_api_arn(owner_region, owner_account_id, api_id, stage, method, path)
     payload_version = str(authorizer.get("authorizerPayloadFormatVersion") or "2.0")
     simple_response = payload_version == "2.0" and bool(authorizer.get("enableSimpleResponses"))
     ttl = _authorizer_ttl(authorizer)
@@ -1282,6 +1311,7 @@ async def _handle_execute_in_scope(
     authorizer_claims = None
     authorizer_scopes = []
     authorizer_lambda_ctx = None
+    authorizer_iam = None
     if auth_type == "JWT":
         authorizer_id = route.get("authorizerId")
         if not authorizer_id:
@@ -1294,6 +1324,13 @@ async def _handle_execute_in_scope(
             return auth_error
         authorizer_claims = claims or {}
         authorizer_scopes = scopes or []
+    elif auth_type == "AWS_IAM":
+        # Same stance as REST (v1): signatures are never verified; a request
+        # with no Authorization header is rejected, a resolvable access key
+        # fills requestContext.authorizer.iam (aws-lambda-go event shape).
+        if not any(k.lower() == "authorization" for k in request_headers):
+            return _jwt_forbidden()
+        authorizer_iam = _iam_caller_identity_v2(request_headers, query_params or {})
     elif auth_type == "CUSTOM":
         # A route's AuthorizationType is CUSTOM when it references a Lambda
         # (REQUEST-type) authorizer — same convention as REST (v1): the
@@ -1344,6 +1381,7 @@ async def _handle_execute_in_scope(
             authorizer_claims=authorizer_claims,
             authorizer_scopes=authorizer_scopes,
             authorizer_lambda_context=authorizer_lambda_ctx,
+            authorizer_iam=authorizer_iam,
             owner_account_id=owner_account_id,
             owner_region=owner_region,
         )
@@ -1498,6 +1536,7 @@ async def _invoke_lambda_proxy(
     authorizer_claims=None,
     authorizer_scopes=None,
     authorizer_lambda_context=None,
+    authorizer_iam=None,
     owner_account_id=None,
     owner_region=None,
 ):
@@ -1587,6 +1626,8 @@ async def _invoke_lambda_proxy(
         }
     elif authorizer_lambda_context is not None:
         event["requestContext"]["authorizer"] = {"lambda": authorizer_lambda_context}
+    elif authorizer_iam is not None:
+        event["requestContext"]["authorizer"] = {"iam": authorizer_iam}
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
@@ -1794,11 +1835,27 @@ def _update_api(api_id, data):
     api = _apis.get(api_id)
     if not api:
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
-    for k in ("name", "corsConfiguration", "routeSelectionExpression",
-              "disableSchemaValidation", "disableExecuteApiEndpoint", "version"):
+    for k in ("name", "routeSelectionExpression", "apiKeySelectionExpression",
+              "disableSchemaValidation", "disableExecuteApiEndpoint", "version",
+              "description"):
         if k in data:
             api[k] = data[k]
+    # A CORS configuration is replaced wholesale, never removed here: the API
+    # has DeleteCorsConfiguration for that, so an empty one is nothing to
+    # apply. A caller that means to remove it deletes it.
+    if data.get("corsConfiguration"):
+        api["corsConfiguration"] = data["corsConfiguration"]
     return _apigw_response(api)
+
+
+def _delete_cors_configuration(api_id):
+    """DeleteCorsConfiguration: the operation that removes an HTTP API's CORS
+    configuration (UpdateApi replaces it, it cannot clear it)."""
+    api = _apis.get(api_id)
+    if not api:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    api.pop("corsConfiguration", None)
+    return 204, {}, b""
 
 
 # ---- Control plane: Routes ----

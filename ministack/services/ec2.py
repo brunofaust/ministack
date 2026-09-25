@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EC2 Service Emulator.
 Query API (Action=...) — instances exist in memory only, no real VMs launched.
@@ -131,6 +133,55 @@ _images = AccountRegionScopedDict()             # ami_id -> registered image rec
 # on every later EC2 request in a scope.
 _default_initialized_scopes = set()
 
+
+# ---------------------------------------------------------------------------
+# Availability Zones
+# ---------------------------------------------------------------------------
+
+_AZ_ID_DIRECTIONS = {
+    "north": "n", "south": "s", "east": "e", "west": "w", "central": "c",
+    "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
+}
+
+
+def _az_id_prefix(region):
+    """Region -> the AZ-id prefix AWS codes it with: eu-central-1 -> euc1, ap-southeast-2 -> apse2."""
+
+    parts = region.split("-")
+    if len(parts) < 3:
+        return region.replace("-", "")
+    geo, middles, index = parts[0], parts[1:-1], parts[-1]
+    coded = "".join(_AZ_ID_DIRECTIONS.get(part, part[:1]) for part in middles)
+    return f"{geo}{coded}{index}"
+
+
+def _az_id_for_zone_name(zone_name):
+    """Zone name -> its AZ id, e.g. eu-west-3a -> euw3-az1 (matches DescribeAvailabilityZones)."""
+
+    region, letter = zone_name[:-1], zone_name[-1]
+    n = ord(letter.lower()) - ord("a") + 1
+    return f"{_az_id_prefix(region)}-az{n}"
+
+
+def _zone_name_for_az_id(az_id):
+    """AZ id -> the zone name it belongs to in this region, or None.
+
+    The inverse of ``_az_id_for_zone_name`` over the zones this region
+    fabricates. CreateSubnet takes ``AvailabilityZoneId`` on its own, and on
+    AWS the two members are one mapping, not two independent inputs: the
+    CreateSubnet reference's own examples always answer a consistent pair
+    (``us-east-2a``/``use2-az1``, ``us-west-2-lax-1a``/``usw2-lax1-az1``).
+    Resolving the name from the id is what keeps the stored subnet a record
+    AWS could actually produce.
+    """
+    if not az_id:
+        return None
+    region = get_region()
+    for letter in "abc":
+        name = f"{region}{letter}"
+        if _az_id_for_zone_name(name) == az_id:
+            return name
+    return None
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -283,6 +334,10 @@ def _restore_vpc_peering_store(restored):
         )
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return
@@ -294,6 +349,7 @@ def restore_state(data):
     _restore_regional_store(_placement_groups, data.get("placement_groups", {}))
     _restore_regional_store(_vpcs, data.get("vpcs", {}))
     _restore_regional_store(_subnets, data.get("subnets", {}))
+    _backfill_subnet_availability_zone_ids()
     _restore_regional_store(_internet_gateways, data.get("internet_gateways", {}))
     _restore_regional_store(_addresses, data.get("addresses", {}))
     _restore_regional_store(_tags, data.get("tags", {}))
@@ -354,6 +410,13 @@ def _restore_regional_store(store, restored):
         store.set_scoped(get_account_id(), region, key, value)
 
 
+def _backfill_subnet_availability_zone_ids():
+    """State saved before AvailabilityZoneId existed on subnets has none: backfill
+    it so DescribeSubnets doesn't KeyError on a restored pre-upgrade snapshot."""
+    for subnet in _subnets.all_values():
+        subnet.setdefault("AvailabilityZoneId", _az_id_for_zone_name(subnet["AvailabilityZone"]))
+
+
 try:
     _restored = load_state("ec2")
     if _restored:
@@ -407,6 +470,7 @@ def _init_defaults():
                 "VpcId": _DEFAULT_VPC_ID,
                 "CidrBlock": cidr,
                 "AvailabilityZone": az,
+                "AvailabilityZoneId": _az_id_for_zone_name(az),
                 "AvailableIpAddressCount": 4091,
                 "State": "available",
                 "DefaultForAz": True,
@@ -1195,10 +1259,16 @@ def _reboot_instances(p):
 # (ami_id, name, description, platform, root_device_name)
 # platform: "windows" or "" (Linux/Unix — matches AWS's empty-field behaviour)
 # root_device_name: Windows AMIs use /dev/sda1, Linux HVM uses /dev/xvda.
+# (ami_id, name, description, platform, root_device, owner_id, owner_alias).
+# Owner ids are the real publishing accounts — 137112412989 (Amazon Linux),
+# 801119661308 (Windows), 099720109477 (Canonical) — with ImageOwnerAlias
+# "amazon" on the Amazon-published pair and none on Canonical's, exactly as
+# DescribeImages reports them on AWS. That is what makes Owners=["amazon"]
+# (Terraform's aws_ami data source) select the same images it selects there.
 _STUB_AMIS = [
-    ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2", "", "/dev/xvda"),
-    ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04", "", "/dev/xvda"),
-    ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022", "windows", "/dev/sda1"),
+    ("ami-0abcdef1234567890", "amzn2-ami-hvm-2.0.20231116.0-x86_64-gp2", "Amazon Linux 2", "", "/dev/xvda", "137112412989", "amazon"),
+    ("ami-0123456789abcdef0", "ubuntu/images/hvm-ssd/ubuntu-22.04-amd64-server", "Ubuntu 22.04", "", "/dev/xvda", "099720109477", None),
+    ("ami-0fedcba9876543210", "Windows_Server-2022-English-Full-Base", "Windows Server 2022", "windows", "/dev/sda1", "801119661308", "amazon"),
 ]
 
 
@@ -1218,12 +1288,17 @@ def _image_view(image):
         "Architecture": image["Architecture"],
         "VirtualizationType": image["VirtualizationType"],
         "OwnerId": image.get("OwnerId") or get_account_id(),
-        "IsPublic": "false",
+        # An AMI is public exactly when its launch permissions carry the
+        # ``all`` group, as on AWS.
+        "IsPublic": ("true" if any(perm.get("Group") == "all"
+                                   for perm in image.get("LaunchPermissions") or [])
+                     else "false"),
+        "LaunchPermissions": image.get("LaunchPermissions") or [],
         "Backed": True,
     }
 
 
-def _stub_image_view(ami_id, name, desc, platform, root_device):
+def _stub_image_view(ami_id, name, desc, platform, root_device, owner_id, owner_alias):
     return {
         "ImageId": ami_id,
         "Name": name,
@@ -1234,7 +1309,8 @@ def _stub_image_view(ami_id, name, desc, platform, root_device):
         "BlockDeviceMappings": [],
         "Architecture": "x86_64",
         "VirtualizationType": "hvm",
-        "OwnerId": get_account_id(),
+        "OwnerId": owner_id,
+        "ImageOwnerAlias": owner_alias,
         "IsPublic": "true",
         "Backed": False,
     }
@@ -1250,6 +1326,8 @@ def _image_matches_filters(view, filters):
             actual = [view["Description"]]
         elif name == "owner-id":
             actual = [view["OwnerId"]]
+        elif name == "owner-alias":
+            actual = [view.get("ImageOwnerAlias") or ""]
         elif name == "architecture":
             actual = [view["Architecture"]]
         elif name == "virtualization-type":
@@ -1318,17 +1396,36 @@ def _image_bdm_xml(view):
 
 def _image_owner_matches(view, owners):
     """Owner.N: "a combination of AWS account IDs, self, amazon, aws-backup-vault, and
-    aws-marketplace". Every image here belongs to the calling account, so an alias or another
-    account's id matches nothing."""
+    aws-marketplace". A registered image belongs to the calling account (matched by id or
+    ``self``); the seeded public images carry their real publishing account and, for the
+    Amazon-published ones, the ``amazon`` alias — so ``Owners=["amazon"]`` selects them as
+    it does on AWS."""
     account = get_account_id()
-    return view["OwnerId"] == account and any(o in ("self", account) for o in owners)
+    for o in owners:
+        if o == view["OwnerId"]:
+            return True
+        if o == "self" and view["OwnerId"] == account:
+            return True
+        if o == view.get("ImageOwnerAlias"):
+            return True
+    return False
 
 
 def _image_executable_by_matches(view, users):
     """ExecutableBy.N: "Specify an AWS account ID, self (the sender of the request), or all
-    (public AMIs)." Nothing here is shared by explicit launch permission, so only `all`
-    selects anything and it selects the public images."""
-    return "all" in users and view["IsPublic"] == "true"
+    (public AMIs)." ``all`` selects public images; ``self`` or an account ID selects images
+    whose launch permissions name that account explicitly."""
+    perms = view.get("LaunchPermissions") or []
+    perm_users = {perm.get("UserId") for perm in perms if perm.get("UserId")}
+    account = get_account_id()
+    for u in users:
+        if u == "all" and view["IsPublic"] == "true":
+            return True
+        if u == "self" and account in perm_users:
+            return True
+        if u in perm_users:
+            return True
+    return False
 
 
 def _describe_images(p):
@@ -1338,7 +1435,23 @@ def _describe_images(p):
     filters = _parse_filters(p)
     # Registered images first: those are the ones that actually boot. The stubs
     # stay so a workload naming one keeps launching a metadata-only instance.
-    views = [_image_view(img) for img in _images.values()]
+    # Visibility matches AWS: the caller's own images, plus other accounts'
+    # images in this region whose launch permissions name the caller (or the
+    # ``all`` group). A shared image keeps its owner's OwnerId.
+    account = get_account_id()
+    region = get_region()
+    visible = []
+    for (img_account, img_region, _key), img in _images.all_items():
+        if img_region != region:
+            continue
+        if img_account == account:
+            visible.append(img)
+            continue
+        perms = img.get("LaunchPermissions") or []
+        if any(perm.get("Group") == "all" or perm.get("UserId") == account
+               for perm in perms):
+            visible.append(img)
+    views = [_image_view(img) for img in visible]
     seen = {v["ImageId"] for v in views}
     views += [_stub_image_view(*stub) for stub in _STUB_AMIS if stub[0] not in seen]
 
@@ -1356,6 +1469,10 @@ def _describe_images(p):
         # provider on aws_instance — it resolves them from DescribeImages before
         # RunInstances and fails with "finding Root Device Name for AMI" if absent.
         platform_xml = f"<platform>{view['Platform']}</platform>" if view["Platform"] else ""
+        owner_alias_xml = (
+            f"<imageOwnerAlias>{view['ImageOwnerAlias']}</imageOwnerAlias>"
+            if view.get("ImageOwnerAlias") else ""
+        )
         tag_items = "".join(
             f"<item><key>{_esc(t['Key'])}</key><value>{_esc(t.get('Value', ''))}</value></item>"
             for t in _tags.get(view["ImageId"], []))
@@ -1365,6 +1482,7 @@ def _describe_images(p):
             <imageLocation>{_esc(view['Name'])}</imageLocation>
             <imageState>available</imageState>
             <imageOwnerId>{view['OwnerId']}</imageOwnerId>
+            {owner_alias_xml}
             <isPublic>{view['IsPublic']}</isPublic>
             <architecture>{view['Architecture']}</architecture>
             <imageType>machine</imageType>
@@ -1932,8 +2050,27 @@ def _get_ministack_network(client):
 
 
 def _registered_image(image_id):
-    """The registered image record for an AMI id, or None."""
-    return _images.get(image_id) if image_id else None
+    """The registered image record for an AMI id, or None.
+
+    Resolves in the caller's scope first; a miss falls through to another
+    account's image in this region that the caller holds a launch permission
+    for (or a public one) — launch permission is exactly the right to run it.
+    """
+    if not image_id:
+        return None
+    image = _images.get(image_id)
+    if image is not None:
+        return image
+    account = get_account_id()
+    region = get_region()
+    for (img_account, img_region, key), img in _images.all_items():
+        if key != image_id or img_region != region or img_account == account:
+            continue
+        perms = img.get("LaunchPermissions") or []
+        if any(perm.get("Group") == "all" or perm.get("UserId") == account
+               for perm in perms):
+            return img
+    return None
 
 
 # Set the first time a container is launched. A registration can be withdrawn while its
@@ -2048,6 +2185,105 @@ def _deregister_image(p):
     _images.pop(image_id, None)
     _tags.pop(image_id, None)
     return _xml(200, "DeregisterImageResponse", "<return>true</return>")
+
+
+def _parse_launch_permission_list(p, prefix):
+    """LaunchPermission.{Add|Remove}.N.{UserId|Group} off the Query wire."""
+    perms = []
+    i = 1
+    while True:
+        user = _p(p, f"{prefix}.{i}.UserId")
+        group = _p(p, f"{prefix}.{i}.Group")
+        if not user and not group:
+            break
+        perms.append({"UserId": user} if user else {"Group": group})
+        i += 1
+    return perms
+
+
+def _modify_image_attribute(p):
+    """launchPermission add/remove — the AMI sharing flow. Owner-only: another
+    account's image answers ``AuthFailure`` "Not authorized for image:{id}"
+    (the error real EC2 returns to a non-owner), an unknown id NotFound."""
+    image_id = _p(p, "ImageId")
+    if not image_id:
+        return _error("MissingParameter", "The request must contain the parameter ImageId", 400)
+    image = _images.get(image_id)
+    if not image:
+        region = get_region()
+        if any(key == image_id and img_region == region
+               for (_acct, img_region, key), _img in _images.all_items()):
+            return _error("AuthFailure",
+                          f"Not authorized for image:{image_id}", 400)
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+
+    add = _parse_launch_permission_list(p, "LaunchPermission.Add")
+    remove = _parse_launch_permission_list(p, "LaunchPermission.Remove")
+    # Legacy flat form: Attribute=launchPermission + OperationType=add|remove
+    # + UserId.N / UserGroup.N (what older SDKs and the CLI shorthand send).
+    if not add and not remove and _p(p, "Attribute") == "launchPermission":
+        flat = ([{"UserId": u} for u in _parse_member_list(p, "UserId")]
+                + [{"Group": g} for g in _parse_member_list(p, "UserGroup")])
+        if _p(p, "OperationType") == "remove":
+            remove = flat
+        else:
+            add = flat
+    if not add and not remove:
+        return _error("InvalidParameterCombination",
+                      "The request must contain launch permissions to add or remove", 400)
+    for perm in add + remove:
+        if perm.get("Group") and perm["Group"] != "all":
+            return _error("InvalidParameterValue",
+                          f"Value ({perm['Group']}) for parameter Group is invalid. Valid value: all", 400)
+
+    perms = image.setdefault("LaunchPermissions", [])
+    for perm in add:
+        if perm not in perms:
+            perms.append(perm)
+    for perm in remove:
+        if perm in perms:
+            perms.remove(perm)
+    return _xml(200, "ModifyImageAttributeResponse", "<return>true</return>")
+
+
+def _describe_image_attribute(p):
+    image_id = _p(p, "ImageId")
+    attribute = _p(p, "Attribute")
+    image = _images.get(image_id) if image_id else None
+    if not image:
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+    if attribute == "launchPermission":
+        items = "".join(
+            (f"<item><userId>{perm['UserId']}</userId></item>" if perm.get("UserId")
+             else f"<item><group>{perm['Group']}</group></item>")
+            for perm in image.get("LaunchPermissions") or [])
+        return _xml(200, "DescribeImageAttributeResponse",
+                    f"<imageId>{image_id}</imageId>"
+                    f"<launchPermission>{items}</launchPermission>")
+    if attribute == "description":
+        return _xml(200, "DescribeImageAttributeResponse",
+                    f"<imageId>{image_id}</imageId>"
+                    f"<description><value>{_esc(image.get('Description') or '')}</value></description>")
+    return _error("InvalidParameterValue",
+                  f"Value ({attribute}) for parameter attribute is invalid.", 400)
+
+
+def _reset_image_attribute(p):
+    image_id = _p(p, "ImageId")
+    attribute = _p(p, "Attribute")
+    if attribute != "launchPermission":
+        # launchPermission is the only resettable image attribute in the model.
+        return _error("InvalidParameterValue",
+                      f"Value ({attribute}) for parameter attribute is invalid. "
+                      "Valid value: launchPermission", 400)
+    image = _images.get(image_id) if image_id else None
+    if not image:
+        return _error("InvalidAMIID.NotFound",
+                      f"The image id '[{image_id}]' does not exist", 400)
+    image["LaunchPermissions"] = []
+    return _xml(200, "ResetImageAttributeResponse", "<return>true</return>")
 
 
 # ── Container lifecycle ────────────────────────────────────
@@ -2681,9 +2917,11 @@ def _create_default_vpc(p):
         ("172.31.0.0/20", "a"), ("172.31.16.0/20", "b"), ("172.31.32.0/20", "c"),
     ]):
         subnet_id = _new_subnet_id()
+        az = f"{get_region()}{az_suffix}"
         _subnets[subnet_id] = {
             "SubnetId": subnet_id, "VpcId": vpc_id, "CidrBlock": sub_cidr,
-            "AvailabilityZone": f"{get_region()}{az_suffix}",
+            "AvailabilityZone": az,
+            "AvailabilityZoneId": _az_id_for_zone_name(az),
             "AvailableIpAddressCount": 4091, "State": "available",
             "DefaultForAz": True, "MapPublicIpOnLaunch": True,
             "OwnerId": get_account_id(),
@@ -2738,13 +2976,23 @@ def _matches_subnet_filters(subnet, filters):
 def _create_subnet(p):
     vpc_id = _p(p, "VpcId") or _DEFAULT_VPC_ID
     cidr = _p(p, "CidrBlock") or "10.0.1.0/24"
-    az = _p(p, "AvailabilityZone") or f"{get_region()}a"
+    # AvailabilityZone and AvailabilityZoneId are one mapping on AWS, never two
+    # independent inputs: every CreateSubnet response pairs a zone name with
+    # that zone's own id. Honouring a supplied id alongside a conflicting name
+    # stored a pair (us-east-1a / use1-az2) that no real account can return, so
+    # the id resolves the name when it is the only one given, and the name wins
+    # the derivation whenever it is present.
+    requested_az = _p(p, "AvailabilityZone")
+    requested_az_id = _p(p, "AvailabilityZoneId")
+    az = requested_az or _zone_name_for_az_id(requested_az_id) or f"{get_region()}a"
+    az_id = _az_id_for_zone_name(az)
     subnet_id = _new_subnet_id()
     _subnets[subnet_id] = {
         "SubnetId": subnet_id,
         "VpcId": vpc_id,
         "CidrBlock": cidr,
         "AvailabilityZone": az,
+        "AvailabilityZoneId": az_id,
         "AvailableIpAddressCount": 251,
         "State": "available",
         "DefaultForAz": False,
@@ -3244,35 +3492,13 @@ def _describe_vpc_endpoint_services(p):
     """)
 
 
-# ---------------------------------------------------------------------------
-# Availability Zones
-# ---------------------------------------------------------------------------
-
-_AZ_ID_DIRECTIONS = {
-    "north": "n", "south": "s", "east": "e", "west": "w", "central": "c",
-    "northeast": "ne", "northwest": "nw", "southeast": "se", "southwest": "sw",
-}
-
-
-def _az_id_prefix(region):
-    """Region -> the AZ-id prefix AWS codes it with: eu-central-1 -> euc1, ap-southeast-2 -> apse2."""
-
-    parts = region.split("-")
-    if len(parts) < 3:
-        return region.replace("-", "")
-    geo, middles, index = parts[0], parts[1:-1], parts[-1]
-    coded = "".join(_AZ_ID_DIRECTIONS.get(part, part[:1]) for part in middles)
-    return f"{geo}{coded}{index}"
-
-
 def _describe_availability_zones(p):
     """AZ ids are deliberately unlike the zone names: AWS shuffles names per account, so AZa is different,
     while az1 is the same across accounts. The shuffle on AWS is per-account stable."""
 
     region = get_region()
-    prefix = _az_id_prefix(region)
     # 3 AZs with a=1, b=2, c=3 for ministack
-    zones = [(f"{region}{letter}", f"{prefix}-az{n}") for n, letter in enumerate("abc", start=1)]
+    zones = [(f"{region}{letter}", _az_id_for_zone_name(f"{region}{letter}")) for letter in "abc"]
     # groupName / networkBorderGroup / optInStatus are optional members, so an
     # SDK silently returns a zone with those keys absent rather than erroring —
     # a consumer that reads them (Terraform's aws_availability_zones exposes
@@ -3288,6 +3514,7 @@ def _describe_availability_zones(p):
         <groupName>{group_name}</groupName>
         <networkBorderGroup>{region}</networkBorderGroup>
         <optInStatus>opt-in-not-required</optInStatus>
+        <zoneType>availability-zone</zoneType>
     </item>""" for name, zone_id in zones)
     return _xml(200, "DescribeAvailabilityZonesResponse",
                 f"<availabilityZoneInfo>{items}</availabilityZoneInfo>")
@@ -4019,9 +4246,25 @@ def _sg_xml(sg):
 
 
 def _perm_xml(r):
+    def _range_desc(entry):
+        return (f"<description>{_esc(entry['Description'])}</description>"
+                if isinstance(entry, dict) and entry.get("Description") else "")
+
     ranges = "".join(
-        f"<item><cidrIp>{ip['CidrIp']}</cidrIp></item>"
+        f"<item><cidrIp>{ip['CidrIp']}</cidrIp>{_range_desc(ip)}</item>"
         for ip in r.get("IpRanges", [])
+    )
+    # Every family the permission carries is reported: the members are
+    # ipv6Ranges (cidrIpv6) and prefixListIds (prefixListId) on IpPermission,
+    # and a read that omits them makes a configured IPv6 or prefix-list rule
+    # invisible, so Terraform re-applies it on every plan.
+    ranges6 = "".join(
+        f"<item><cidrIpv6>{_esc(ip6['CidrIpv6'])}</cidrIpv6>{_range_desc(ip6)}</item>"
+        for ip6 in r.get("Ipv6Ranges", []) if isinstance(ip6, dict) and ip6.get("CidrIpv6")
+    )
+    prefixes = "".join(
+        f"<item><prefixListId>{_esc(pl['PrefixListId'])}</prefixListId>{_range_desc(pl)}</item>"
+        for pl in r.get("PrefixListIds", []) if isinstance(pl, dict) and pl.get("PrefixListId")
     )
     groups = ""
     for pair in r.get("UserIdGroupPairs", []):
@@ -4041,7 +4284,8 @@ def _perm_xml(r):
         <ipProtocol>{r.get('IpProtocol','-1')}</ipProtocol>
         {from_port}{to_port}
         <ipRanges>{ranges}</ipRanges>
-        <ipv6Ranges/><prefixListIds/><groups>{groups}</groups>
+        <ipv6Ranges>{ranges6}</ipv6Ranges>
+        <prefixListIds>{prefixes}</prefixListIds><groups>{groups}</groups>
     </item>"""
 
 
@@ -4083,6 +4327,7 @@ def _subnet_fields_xml(subnet, tag="item"):
         <cidrBlock>{subnet['CidrBlock']}</cidrBlock>
         <availableIpAddressCount>{subnet['AvailableIpAddressCount']}</availableIpAddressCount>
         <availabilityZone>{subnet['AvailabilityZone']}</availabilityZone>
+        <availabilityZoneId>{subnet['AvailabilityZoneId']}</availabilityZoneId>
         <defaultForAz>{'true' if subnet['DefaultForAz'] else 'false'}</defaultForAz>
         <mapPublicIpOnLaunch>{'true' if subnet['MapPublicIpOnLaunch'] else 'false'}</mapPublicIpOnLaunch>
         <ownerId>{subnet['OwnerId']}</ownerId>
@@ -6192,6 +6437,23 @@ def _parse_lt_data(params, prefix="LaunchTemplateData"):
     ebs_opt = _p(params, f"{prefix}.EbsOptimized")
     if ebs_opt:
         data["EbsOptimized"] = ebs_opt.lower() == "true"
+    # MetadataOptions — the IMDS settings of
+    # LaunchTemplateInstanceMetadataOptionsRequest. Dropping them made every
+    # refresh report them as newly added.
+    metadata = {}
+    for member in ("HttpTokens", "HttpEndpoint", "HttpProtocolIpv6", "InstanceMetadataTags"):
+        value = _p(params, f"{prefix}.MetadataOptions.{member}")
+        if value:
+            metadata[member] = value
+    hop_limit = _p(params, f"{prefix}.MetadataOptions.HttpPutResponseHopLimit")
+    if hop_limit:
+        metadata["HttpPutResponseHopLimit"] = int(hop_limit)
+    if metadata:
+        data["MetadataOptions"] = metadata
+    # InstanceInitiatedShutdownBehavior (stop | terminate)
+    shutdown = _p(params, f"{prefix}.InstanceInitiatedShutdownBehavior")
+    if shutdown:
+        data["InstanceInitiatedShutdownBehavior"] = shutdown
     return data
 
 
@@ -6275,6 +6537,23 @@ def _lt_data_xml(data):
         xml += f"<tagSpecificationSet>{inner}</tagSpecificationSet>"
     if data.get("Monitoring"):
         xml += f"<monitoring><enabled>{str(data['Monitoring'].get('Enabled', False)).lower()}</enabled></monitoring>"
+    if data.get("MetadataOptions"):
+        mo = data["MetadataOptions"]
+        # The response shape carries a State the request has no member for;
+        # a template's options are in effect as stored, so it reads applied.
+        inner = f"<state>{_esc(mo.get('State', 'applied'))}</state>"
+        for member, tag in (("HttpTokens", "httpTokens"),
+                            ("HttpPutResponseHopLimit", "httpPutResponseHopLimit"),
+                            ("HttpEndpoint", "httpEndpoint"),
+                            ("HttpProtocolIpv6", "httpProtocolIpv6"),
+                            ("InstanceMetadataTags", "instanceMetadataTags")):
+            if mo.get(member) is not None:
+                inner += f"<{tag}>{_esc(str(mo[member]))}</{tag}>"
+        xml += f"<metadataOptions>{inner}</metadataOptions>"
+    if data.get("InstanceInitiatedShutdownBehavior"):
+        xml += ("<instanceInitiatedShutdownBehavior>"
+                f"{_esc(data['InstanceInitiatedShutdownBehavior'])}"
+                "</instanceInitiatedShutdownBehavior>")
     return xml
 
 
@@ -6741,9 +7020,17 @@ def _create_fleet(p):
         for slot, launched in zip(slots, slot_buckets):
             if not launched:
                 continue
-            if instance_tags:
+            # The slot's launch template contributes its own instance tags; the
+            # request's TagSpecifications (instant fleets only, per the model)
+            # are layered on top. On a duplicate key the request wins — that
+            # precedence is MiniStack's choice, not a measured AWS behaviour.
+            merged = {t["Key"]: t["Value"] for t in slot.get("instance_tags") or []}
+            merged.update({t["Key"]: t["Value"] for t in instance_tags})
+            if merged:
                 for inst in launched:
-                    _tags[inst["InstanceId"]] = instance_tags[:]
+                    _tags[inst["InstanceId"]] = [
+                        {"Key": k, "Value": v} for k, v in merged.items()
+                    ]
             instance_items.append({
                 "InstanceIds": [inst["InstanceId"] for inst in launched],
                 "InstanceType": slot["instance_type"],
@@ -6804,6 +7091,19 @@ def _slot_from_lt_data(spec, lt_data):
         "user_data": (lt_data or {}).get("UserData") or "",
         "sg_ids": (lt_data or {}).get("SecurityGroupIds") or None,
         "iam_profile": iam_profile,
+        # RequestLaunchTemplateData.TagSpecifications is "the tags to apply to
+        # the resources that are created during instance launch", and
+        # CreateFleetRequest.TagSpecifications points at the launch template as
+        # THE way to tag instances of a maintain/request fleet. Only the
+        # `instance` specs belong on the instance; a `volume` spec is for the
+        # volume.
+        "instance_tags": [
+            dict(tag)
+            for spec in ((lt_data or {}).get("TagSpecifications") or [])
+            if spec.get("ResourceType") == "instance"
+            for tag in (spec.get("Tags") or [])
+            if tag.get("Key")
+        ],
     }
 
 
@@ -6871,6 +7171,9 @@ _ACTION_MAP = {
     "ReplaceIamInstanceProfileAssociation": _replace_iam_instance_profile_association,
     "DescribeImages": _describe_images,
     "RegisterImage": _register_image,
+    "ModifyImageAttribute": _modify_image_attribute,
+    "DescribeImageAttribute": _describe_image_attribute,
+    "ResetImageAttribute": _reset_image_attribute,
     "DeregisterImage": _deregister_image,
     "CreateSecurityGroup": _create_security_group,
     "DeleteSecurityGroup": _delete_security_group,

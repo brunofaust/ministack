@@ -446,6 +446,55 @@ def test_cognito_admin_add_remove_user_from_group(cognito_idp):
     members = cognito_idp.list_users_in_group(UserPoolId=pid, GroupName="editors")["Users"]
     assert not any(u["Username"] == "liam" for u in members)
 
+def test_cognito_admin_list_user_auth_events_requires_addons(cognito_idp):
+    addon_msg = (
+        "This is an add on feature. Please update AdvancedSecurityMode"
+        " for your user pool to access this API."
+    )
+
+    pid = cognito_idp.create_user_pool(PoolName="AuthEventsPlainPool")["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="mona")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="mona")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+    assert exc.value.response["Error"]["Message"] == addon_msg
+
+    # The add-on gate fires before user resolution: an unknown user in a pool
+    # without add-ons still gets the add-on error, not UserNotFound.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="ghost")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsOffPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "OFF"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="olga")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="olga")
+    assert exc.value.response["Error"]["Code"] == "UserPoolAddOnNotEnabledException"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsAuditPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "AUDIT"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="axel")
+    resp = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="axel")
+    assert resp["AuthEvents"] == []
+
+    pid = cognito_idp.create_user_pool(
+        PoolName="AuthEventsAddonsPool",
+        UserPoolAddOns={"AdvancedSecurityMode": "ENFORCED"},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="nils")
+    resp = cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="nils")
+    assert resp["AuthEvents"] == []
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_list_user_auth_events(UserPoolId=pid, Username="ghost")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+    assert exc.value.response["Error"]["Message"] == "User does not exist."
+
 def test_cognito_domain_crud(cognito_idp):
     pid = cognito_idp.create_user_pool(PoolName="DomainPool")["UserPool"]["Id"]
     resp = cognito_idp.create_user_pool_domain(UserPoolId=pid, Domain="my-test-domain")
@@ -877,6 +926,106 @@ def test_cognito_identity_pool_roles(cognito_identity):
     assert roles["Roles"]["authenticated"] == "arn:aws:iam::000000000000:role/AuthRole"
     assert roles["Roles"]["unauthenticated"] == "arn:aws:iam::000000000000:role/UnauthRole"
 
+def test_cognito_identity_pool_role_mappings_round_trip(cognito_identity):
+    """SetIdentityPoolRoles keeps the RoleMappings it is given and
+    GetIdentityPoolRoles serves them back; a later call without RoleMappings
+    clears them, since the call sets the whole configuration."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="RoleMappingsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example:client"
+    mapping = {"Type": "Token", "AmbiguousRoleResolution": "AuthenticatedRole"}
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthRole"},
+        RoleMappings={provider: mapping},
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"] == {"authenticated": "arn:aws:iam::000000000000:role/AuthRole"}
+    assert roles["RoleMappings"] == {provider: mapping}
+
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=iid,
+        Roles={"authenticated": "arn:aws:iam::000000000000:role/AuthRole"},
+    )
+    roles = cognito_identity.get_identity_pool_roles(IdentityPoolId=iid)
+    assert roles["Roles"] == {"authenticated": "arn:aws:iam::000000000000:role/AuthRole"}
+    assert roles.get("RoleMappings", {}) == {}
+
+
+def test_cognito_identity_pool_principal_tags(cognito_identity):
+    """SetPrincipalTagAttributeMap stores a provider's attribute mapping and
+    GetPrincipalTagAttributeMap reports it back."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    resp = cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid,
+        IdentityProviderName=provider,
+        UseDefaults=False,
+        PrincipalTags={"tenant": "custom:tenant"},
+    )
+    assert resp["IdentityPoolId"] == iid
+    assert resp["IdentityProviderName"] == provider
+    assert resp["UseDefaults"] is False
+    assert resp["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    got = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert got["UseDefaults"] is False
+    assert got["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+    # A second provider on the same pool keeps its own mapping.
+    other = "cognito-idp.us-east-1.amazonaws.com/us-east-1_other"
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=other,
+        UseDefaults=False, PrincipalTags={"email": "email"})
+    assert cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+    )["PrincipalTags"] == {"tenant": "custom:tenant"}
+
+
+def test_cognito_identity_pool_principal_tags_unconfigured_provider(cognito_identity):
+    """A provider nobody has configured is not readable, and UseDefaults
+    round-trips without materializing a tag map."""
+    iid = cognito_identity.create_identity_pool(
+        IdentityPoolName="PrincipalTagDefaultsPool",
+        AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    provider = "cognito-idp.us-east-1.amazonaws.com/us-east-1_example"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId=iid, IdentityProviderName=provider)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["Error"]["Message"] == (
+        f"No Principal Tags configured for Provider {provider}")
+
+    # UseDefaults selects the mapping AWS applies when it vends credentials; it
+    # does not populate PrincipalTags. terraform-provider-aws sends both
+    # members together like this on destroy.
+    cognito_identity.set_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider,
+        UseDefaults=True, PrincipalTags={})
+    defaulted = cognito_identity.get_principal_tag_attribute_map(
+        IdentityPoolId=iid, IdentityProviderName=provider)
+    assert defaulted["UseDefaults"] is True
+    assert defaulted["PrincipalTags"] == {}
+
+
+def test_cognito_identity_pool_principal_tags_unknown_pool(cognito_identity):
+    with pytest.raises(ClientError) as exc:
+        cognito_identity.get_principal_tag_attribute_map(
+            IdentityPoolId="us-east-1:00000000-0000-0000-0000-000000000000",
+            IdentityProviderName="cognito-idp.us-east-1.amazonaws.com/us-east-1_example")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_cognito_list_identities(cognito_identity):
     resp = cognito_identity.create_identity_pool(
         IdentityPoolName="ListIdPool",
@@ -1298,6 +1447,53 @@ def test_cognito_refresh_token_returns_correct_user(cognito_idp):
     user = cognito_idp.get_user(AccessToken=new_token)
     assert user["Username"] == "qa-second", "Refresh must return tokens for qa-second not qa-first"
 
+def test_cognito_refresh_token_rejects_unknown_token(cognito_idp):
+    """A refresh token the pool never issued must not mint a session for the first pool user."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-refresh-unknown")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="qa-refresh-unknown-app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-only-user")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="qa-only-user", Password="OnlyPass1!", Permanent=True)
+    for call in (
+        lambda: cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH", AuthParameters={"REFRESH_TOKEN": "this-is-not-a-real-token"}
+        ),
+        lambda: cognito_idp.admin_initiate_auth(
+            UserPoolId=pid, ClientId=cid, AuthFlow="REFRESH_TOKEN_AUTH",
+            AuthParameters={"REFRESH_TOKEN": "this-is-not-a-real-token"},
+        ),
+        lambda: cognito_idp.get_tokens_from_refresh_token(ClientId=cid, RefreshToken="this-is-not-a-real-token"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
+
+
+def test_cognito_confirm_forgot_password_rejects_wrong_code(cognito_idp):
+    """ConfirmForgotPassword answers CodeMismatchException unless the code ForgotPassword issued is sent."""
+    pid = cognito_idp.create_user_pool(PoolName="qa-forgot-code")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="qa-forgot-code-app")["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-forgot")
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="qa-forgot", Password="OldPass1!", Permanent=True)
+    # No code requested yet: nothing can match.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_forgot_password(ClientId=cid, Username="qa-forgot", ConfirmationCode="000000", Password="NewPass2!")
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+    cognito_idp.forgot_password(ClientId=cid, Username="qa-forgot")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_forgot_password(ClientId=cid, Username="qa-forgot", ConfirmationCode="000000", Password="NewPass2!")
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+    cognito_idp.confirm_forgot_password(ClientId=cid, Username="qa-forgot", ConfirmationCode="654321", Password="NewPass2!")
+    auth = cognito_idp.admin_initiate_auth(
+        UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "qa-forgot", "PASSWORD": "NewPass2!"},
+    )
+    assert "AuthenticationResult" in auth
+
+
 def test_cognito_signup_unconfirmed_with_auto_verify(cognito_idp):
     """SignUp with AutoVerifiedAttributes must return UserConfirmed=False."""
     pid = cognito_idp.create_user_pool(PoolName="qa-autoverify", AutoVerifiedAttributes=["email"])["UserPool"]["Id"]
@@ -1384,6 +1580,19 @@ def test_cognito_force_change_password_challenge(cognito_idp):
     assert auth.get("ChallengeName") == "NEW_PASSWORD_REQUIRED"
     assert "Session" in auth
 
+def _totp_code(secret_b32: str) -> str:
+    """RFC 6238 code for the secret AssociateSoftwareToken returned —
+    HMAC-SHA1, 30-second step, 6 digits."""
+    import hashlib
+    import hmac
+    import struct
+
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    mac = hmac.new(key, struct.pack(">Q", int(time.time() // 30)), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
+
+
 def test_cognito_totp_full_flow(cognito_idp):
     """Full TOTP MFA flow: SetUserPoolMfaConfig ON → AssociateSoftwareToken →
     VerifySoftwareToken → InitiateAuth returns SOFTWARE_TOKEN_MFA challenge →
@@ -1424,8 +1633,13 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert "SecretCode" in assoc
     assert len(assoc["SecretCode"]) > 0
 
-    # Verify (accept any code)
-    verify = cognito_idp.verify_software_token(AccessToken=access_token, UserCode="123456")
+    # A wrong code is refused — that refusal is what an MFA test exists for.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.verify_software_token(AccessToken=access_token, UserCode="000000")
+    assert exc.value.response["Error"]["Code"] == "EnableSoftwareTokenMFAException"
+
+    verify = cognito_idp.verify_software_token(
+        AccessToken=access_token, UserCode=_totp_code(assoc["SecretCode"]))
     assert verify["Status"] == "SUCCESS"
 
     # Now auth should return SOFTWARE_TOKEN_MFA challenge
@@ -1438,12 +1652,23 @@ def test_cognito_totp_full_flow(cognito_idp):
     assert auth2.get("ChallengeName") == "SOFTWARE_TOKEN_MFA"
     assert "Session" in auth2
 
-    # Respond with any TOTP code → get tokens
+    # A wrong challenge code is refused with CodeMismatchException.
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_respond_to_auth_challenge(
+            UserPoolId=pid,
+            ClientId=cid,
+            ChallengeName="SOFTWARE_TOKEN_MFA",
+            ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "000000"},
+        )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+    # The correct code, derived from the enrolled secret, gets tokens.
     result = cognito_idp.admin_respond_to_auth_challenge(
         UserPoolId=pid,
         ClientId=cid,
         ChallengeName="SOFTWARE_TOKEN_MFA",
-        ChallengeResponses={"USERNAME": "totp-user", "SOFTWARE_TOKEN_MFA_CODE": "123456"},
+        ChallengeResponses={"USERNAME": "totp-user",
+                            "SOFTWARE_TOKEN_MFA_CODE": _totp_code(assoc["SecretCode"])},
     )
     assert "AuthenticationResult" in result
     assert "AccessToken" in result["AuthenticationResult"]
@@ -2166,6 +2391,73 @@ def test_cognito_saml_presignup_lambda_autoconfirms_invited_user(cognito_idp, la
     assert attrs.get("email_verified") == "true"
 
 
+def test_cognito_saml_presignup_lambda_reentrant_callback_does_not_deadlock(cognito_idp, lam):
+    """A PreSignUp trigger that calls back into ministack's own Cognito Admin
+    API (e.g. to look up the user as part of a federation-linking flow) must
+    run off the event loop thread, so the nested HTTP callback can be served
+    without queuing behind the trigger's own execution and hitting the Lambda
+    timeout.
+    """
+    handler = (
+        "import json, os, urllib.request\n"
+        "def handler(event, ctx):\n"
+        "    req = urllib.request.Request(\n"
+        "        os.environ['AWS_ENDPOINT_URL'],\n"
+        "        data=json.dumps({\n"
+        "            'UserPoolId': event['userPoolId'],\n"
+        "            'Username': 'marker-user',\n"
+        "        }).encode(),\n"
+        "        headers={\n"
+        "            'Content-Type': 'application/x-amz-json-1.1',\n"
+        "            'X-Amz-Target': 'AWSCognitoIdentityProviderService.AdminGetUser',\n"
+        "        },\n"
+        "        method='POST',\n"
+        "    )\n"
+        "    with urllib.request.urlopen(req, timeout=6) as resp:\n"
+        "        json.loads(resp.read())\n"
+        "    return event\n"
+    )
+    fn_name = "ministack-presignup-reentrant-callback"
+    lam.create_function(
+        FunctionName=fn_name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler)},
+        Timeout=8,
+    )
+    fn_arn = lam.get_function(FunctionName=fn_name)["Configuration"]["FunctionArn"]
+    pid, cid = _setup_saml_pool(cognito_idp, lambda_config={"PreSignUp": fn_arn})
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="marker-user", MessageAction="SUPPRESS")
+
+    url = (
+        f"{ENDPOINT}/oauth2/authorize?"
+        f"response_type=code&client_id={cid}"
+        f"&redirect_uri=http://localhost:3000/callback"
+        f"&identity_provider=TestSAML&state=mystate&scope=openid"
+    )
+    try:
+        _no_redirect_opener.open(url)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location", "")
+    relay_state = _parse_qs(urlparse(location).query).get("RelayState", [""])[0]
+
+    saml_resp = _build_mock_saml_response(name_id="reentrant@example.com")
+    form_data = _urlencode({"SAMLResponse": saml_resp, "RelayState": relay_state}).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/saml2/idpresponse", data=form_data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        _no_redirect_opener.open(req)
+        assert False, "Expected redirect"
+    except urllib.error.HTTPError as e:
+        assert e.code == 302, f"PreSignUp Lambda's own callback deadlocked or timed out: got {e.code}"
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="TestSAML_reentrant@example.com")
+    assert user["UserStatus"] == "EXTERNAL_PROVIDER"
+
+
 # ---------------------------------------------------------------------------
 # OIDC federation (external OIDC IdP — e.g. Keycloak in front of Cognito)
 # ---------------------------------------------------------------------------
@@ -2734,11 +3026,6 @@ def _post_form(url, data, headers=None, follow_redirects=True):
         return resp.status, _lower_headers(resp.headers), resp.read()
     except urllib.error.HTTPError as e:
         return e.code, _lower_headers(e.headers), e.read()
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(newurl, code, msg, headers, fp)
 
 
 # ---------------------------------------------------------------------------
@@ -3702,6 +3989,79 @@ def test_oauth2_token_code_reuse():
     assert status2 == 400
     resp2 = json.loads(body2)
     assert resp2['error'] == 'invalid_grant'
+
+
+def test_oauth2_token_concurrent_code_redemption_is_single_use(monkeypatch):
+    """/oauth2/token runs off the event loop (run_reentrant), so two
+    concurrent requests for the same authorization code can race on the
+    check-then-delete of `_authorization_codes` instead of the interpreter
+    serialising them for free. Exactly one may pass the consume gate; the
+    other must get a clean invalid_grant — never a KeyError from an
+    unguarded double-delete.
+
+    Exercised as a direct, in-process unit test (not over HTTP): the actual
+    race window between validating a code and consuming it is a handful of
+    bytecodes, far too narrow to reproduce reliably by racing HTTP clients
+    against the live server. A barrier inserted at `_find_pool_by_client_id`
+    — the call site that immediately precedes the consume line — forces both
+    threads into that window at the same instant instead of hoping.
+    """
+    import threading
+
+    from ministack.services import cognito as _cognito_mod
+
+    code = "race-test-code-" + secrets.token_hex(8)
+    entry = {
+        "client_id": "race-client",
+        "pool_id": "nonexistent-pool",  # never resolves — only the consume gate is under test
+        "redirect_uri": "",
+        "scope": "",
+        "username": "u",
+        "nonce": "",
+        "expires_at": time.time() + 300,
+        "code_challenge": None,
+    }
+    _cognito_mod._authorization_codes[code] = entry
+
+    barrier = threading.Barrier(2)
+    original_lookup = _cognito_mod._find_pool_by_client_id
+
+    def _synced_lookup(client_id):
+        barrier.wait(timeout=5)
+        return original_lookup(client_id)
+
+    monkeypatch.setattr(_cognito_mod, "_find_pool_by_client_id", _synced_lookup)
+
+    form = {"grant_type": "authorization_code", "code": code, "redirect_uri": "", "client_id": "race-client"}
+    raw_body = _urlencode(form).encode()
+    results = [None, None]
+
+    def _redeem(i):
+        try:
+            results[i] = _cognito_mod._oauth2_token({}, {}, raw_body, {})
+        except Exception as e:  # noqa: BLE001 — surfaced by the assertion below, not swallowed
+            results[i] = e
+
+    threads = [threading.Thread(target=_redeem, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not any(isinstance(r, Exception) for r in results), (
+        f"consume gate must reject the loser cleanly, never crash: {results}"
+    )
+    statuses = sorted(status for status, _, _ in results)
+    # One thread's pop() wins and proceeds (past this test's fake pool, so it
+    # surfaces as the pool-not-found path); the other must see the code
+    # already gone and get a clean invalid_grant. Never two winners, never an
+    # unhandled exception propagating as something other than these two.
+    assert statuses == [400, 400], f"expected two clean 400s (winner + loser), got {results}"
+    bodies = [json.loads(body)["error"] for _, _, body in results]
+    assert sorted(bodies) == ["invalid_grant", "server_error"], (
+        f"expected exactly one consumer (server_error past the gate) and one rejected "
+        f"replay (invalid_grant), got {bodies}"
+    )
 
 
 def test_oauth2_token_refresh_token():
@@ -5283,7 +5643,7 @@ def test_cognito_unsigned_user_pool_operations_pin_the_owning_region():
     assert software_token["SecretCode"]
     assert west.verify_software_token(
         AccessToken=access_token,
-        UserCode="123456",
+        UserCode=_totp_code(software_token["SecretCode"]),
     )["Status"] == "SUCCESS"
     west.set_user_mfa_preference(
         AccessToken=access_token,
@@ -7794,3 +8154,315 @@ def test_cognito_required_custom_attribute_is_refused(cognito_idp):
             CustomAttributes=[{"Name": "tenant", "AttributeDataType": "String",
                                "Required": True}])
     assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+
+
+def test_cognito_user_pool_keeps_mfa_and_attribute_update_settings(cognito_idp):
+    """UserAttributeUpdateSettings and a false SoftwareTokenMfaConfiguration
+    round-trip.
+
+    Both are declared on aws_cognito_user_pool. The provider sends the attribute
+    settings on Create and Update, and the MFA config through
+    SetUserPoolMfaConfig as an empty object — `enabled = false` serialises with
+    the false field omitted. Neither was reported back: the settings were never
+    stored, and `{}` was treated as never-set. Terraform proposed the same two
+    blocks on every plan, and applying did not settle it.
+    """
+    pool = cognito_idp.create_user_pool(
+        PoolName="qa-pool-settings",
+        MfaConfiguration="OPTIONAL",
+        UserAttributeUpdateSettings={
+            "AttributesRequireVerificationBeforeUpdate": ["email", "phone_number"]
+        },
+    )["UserPool"]
+    pid = pool["Id"]
+
+    assert pool["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email", "phone_number"]
+    described = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert described["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email", "phone_number"]
+
+    # An update must carry the setting through, not drop it.
+    cognito_idp.update_user_pool(
+        UserPoolId=pid,
+        MfaConfiguration="OPTIONAL",
+        UserAttributeUpdateSettings={
+            "AttributesRequireVerificationBeforeUpdate": ["email"]
+        },
+    )
+    described = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    assert described["UserAttributeUpdateSettings"][
+        "AttributesRequireVerificationBeforeUpdate"
+    ] == ["email"]
+
+    # The empty object the provider sends for `enabled = false` is a value that
+    # was set, not an unset field, so it has to be reported as {"Enabled": false}.
+    cognito_idp.set_user_pool_mfa_config(
+        UserPoolId=pid,
+        SoftwareTokenMfaConfiguration={},
+        MfaConfiguration="OPTIONAL",
+    )
+    mfa = cognito_idp.get_user_pool_mfa_config(UserPoolId=pid)
+    assert mfa["SoftwareTokenMfaConfiguration"] == {"Enabled": False}
+
+    # A pool that never configured software-token MFA still reports nothing,
+    # which is what keeps an unset field from reading as drift.
+    other = cognito_idp.create_user_pool(PoolName="qa-pool-no-mfa")["UserPool"]["Id"]
+    assert "SoftwareTokenMfaConfiguration" not in cognito_idp.get_user_pool_mfa_config(
+        UserPoolId=other
+    )
+
+
+def _pool_with_client(cognito_idp, prevent):
+    """A pool plus an app client with a given PreventUserExistenceErrors value."""
+    pid = cognito_idp.create_user_pool(PoolName="ExistencePool")["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid,
+        ClientName="existence",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_ADMIN_USER_PASSWORD_AUTH",
+                           "ALLOW_USER_SRP_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+        PreventUserExistenceErrors=prevent,
+    )["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="known@example.test", MessageAction="SUPPRESS",
+    )
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pid, Username="known@example.test",
+        Password="Correct1!", Permanent=True,
+    )
+    return pid, cid
+
+
+def test_cognito_prevent_user_existence_errors_masks_initiate_auth(cognito_idp):
+    """An unknown username must be indistinguishable from a wrong password."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    def failure(username):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.initiate_auth(
+                ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+                AuthParameters={"USERNAME": username, "PASSWORD": "Wrong1!"},
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    unknown = failure("unknown@example.test")
+    known = failure("known@example.test")
+
+    assert unknown == known, "the two failures must not be distinguishable"
+    assert unknown[0] == "NotAuthorizedException"
+    # And the message must not name the address that was probed.
+    assert "unknown@example.test" not in unknown[1]
+
+
+def test_cognito_prevent_user_existence_errors_legacy_still_reports(cognito_idp):
+    """LEGACY keeps the distinct error, which is what AWS does."""
+    _pid, cid = _pool_with_client(cognito_idp, "LEGACY")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+            AuthParameters={"USERNAME": "unknown@example.test", "PASSWORD": "Wrong1!"},
+        )
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_forgot_password(cognito_idp):
+    """ForgotPassword answers as though a code was sent."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    resp = cognito_idp.forgot_password(ClientId=cid, Username="unknown@example.test")
+    delivery = resp["CodeDeliveryDetails"]
+    assert delivery["DeliveryMedium"] == "EMAIL"
+    # The destination is masked, so it cannot be used to confirm the address.
+    assert delivery["Destination"] != "unknown@example.test"
+    assert "***" in delivery["Destination"]
+
+
+def test_cognito_prevent_user_existence_errors_masks_resend_confirmation(cognito_idp):
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    resp = cognito_idp.resend_confirmation_code(
+        ClientId=cid, Username="unknown@example.test",
+    )
+    assert resp["CodeDeliveryDetails"]["DeliveryMedium"] == "EMAIL"
+
+
+def test_cognito_prevent_user_existence_errors_masks_confirm_forgot_password(cognito_idp):
+    """An unknown username looks like a bad code."""
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_forgot_password(
+            ClientId=cid, Username="unknown@example.test",
+            ConfirmationCode="000000", Password="Another1!",
+        )
+    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
+
+
+def test_cognito_prevent_user_existence_errors_delivery_details_identical(cognito_idp):
+    """The masked destination must carry no trace of whether the user exists.
+
+    Masking only the unknown-user path would leave the oracle in place: a full
+    address for a real user and a mask for an unknown one is still a yes/no
+    answer. The two usernames below mask to the same string, so an identical
+    response proves the field is a function of the request alone.
+    """
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+    real = "known@example.test"          # exists
+    unknown = "kevin@elsewhere.test"     # does not — same mask: k***@e***.test
+
+    for call in ("forgot_password", "resend_confirmation_code"):
+        send = getattr(cognito_idp, call)
+        a = send(ClientId=cid, Username=real)["CodeDeliveryDetails"]
+        b = send(ClientId=cid, Username=unknown)["CodeDeliveryDetails"]
+        assert a == b, f"{call} distinguishes the two users: {a} vs {b}"
+        assert a["Destination"] == "k****@e****"
+        assert real not in a["Destination"]
+
+
+def test_cognito_prevent_user_existence_errors_admin_directory_still_reports(cognito_idp):
+    """The setting covers the admin auth flow, not the admin directory reads.
+
+    AWS names ADMIN_USER_PASSWORD_AUTH among the flows it masks, so
+    AdminInitiateAuth must fail the same way for an unknown user as for a wrong
+    password. AdminGetUser is not an auth flow and keeps reporting the truth,
+    which provisioning scripts branch on.
+    """
+    pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="unknown@example.test")
+    assert exc.value.response["Error"]["Code"] == "UserNotFoundException"
+
+    def admin_failure(username):
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.admin_initiate_auth(
+                UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
+                AuthParameters={"USERNAME": username, "PASSWORD": "Wrong1!"},
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    assert admin_failure("unknown@example.test") == admin_failure("known@example.test")
+    assert admin_failure("unknown@example.test")[0] == "NotAuthorizedException"
+
+
+def test_cognito_prevent_user_existence_errors_masks_srp_challenge(cognito_idp):
+    """USER_SRP_AUTH must not leak at RespondToAuthChallenge.
+
+    This is the flow a browser SDK uses. InitiateAuth answers a
+    PASSWORD_VERIFIER challenge without resolving the user at all, so masking
+    InitiateAuth alone would leave the whole browser sign-in leaking one step
+    later, where the password proof is checked.
+    """
+    _pid, cid = _pool_with_client(cognito_idp, "ENABLED")
+
+    def srp_failure(username):
+        started = cognito_idp.initiate_auth(
+            ClientId=cid, AuthFlow="USER_SRP_AUTH",
+            AuthParameters={"USERNAME": username, "SRP_A": "ab" * 32},
+        )
+        assert started["ChallengeName"] == "PASSWORD_VERIFIER"
+        with pytest.raises(ClientError) as exc:
+            cognito_idp.respond_to_auth_challenge(
+                ClientId=cid, ChallengeName="PASSWORD_VERIFIER",
+                Session=started["Session"],
+                ChallengeResponses={
+                    "USERNAME": username,
+                    "PASSWORD_CLAIM_SIGNATURE": "sig",
+                    "PASSWORD_CLAIM_SECRET_BLOCK": "blk",
+                    "TIMESTAMP": "Mon Aug 31 00:00:00 UTC 2026",
+                },
+            )
+        err = exc.value.response["Error"]
+        return err["Code"], err["Message"]
+
+    assert srp_failure("unknown@example.test") == (
+        "NotAuthorizedException", "Incorrect username or password.")
+
+
+def test_cognito_identity_pool_credentials_are_sts_sessions(cognito_identity):
+    """Vended identity-pool credentials compose with the rest of the emulator:
+    GetCallerIdentity resolves them as the pool role assumed with the AWS
+    session name CognitoIdentityCredentials (previously they were unregistered,
+    so AUTH=true rejected them as an invalid security token)."""
+    import boto3
+
+    pool_id = cognito_identity.create_identity_pool(
+        IdentityPoolName="SessionPool", AllowUnauthenticatedIdentities=True,
+    )["IdentityPoolId"]
+    cognito_identity.set_identity_pool_roles(
+        IdentityPoolId=pool_id,
+        Roles={"unauthenticated": "arn:aws:iam::000000000000:role/UnauthPoolRole"},
+    )
+    identity_id = cognito_identity.get_id(IdentityPoolId=pool_id)["IdentityId"]
+    creds = cognito_identity.get_credentials_for_identity(
+        IdentityId=identity_id)["Credentials"]
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    session_sts = boto3.client(
+        "sts", endpoint_url=endpoint, region_name="us-east-1",
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+    ident = session_sts.get_caller_identity()
+    assert ident["Arn"] == (
+        "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
+    assert ident["UserId"].endswith(":CognitoIdentityCredentials")
+
+
+def test_cognito_presignup_trigger_fires_on_plain_signup(cognito_idp, lam):
+    """A pool's PreSignUp Lambda runs on ordinary SignUp: autoConfirmUser
+    confirms the account (no code delivery), and a rejecting trigger blocks
+    the sign-up with UserLambdaValidationException, as on AWS."""
+    import io
+    import zipfile
+
+    fname = f"presignup-{_uuid_mod.uuid4().hex[:8]}"
+    code = (
+        "def handler(event, context):\n"
+        "    if event['userName'].startswith('deny'):\n"
+        "        raise Exception('no room for you')\n"
+        "    event['response']['autoConfirmUser'] = True\n"
+        "    event['response']['autoVerifyEmail'] = True\n"
+        "    return event\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+    fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fname}"
+
+    pid = cognito_idp.create_user_pool(
+        PoolName=f"presignup-{fname}",
+        LambdaConfig={"PreSignUp": fn_arn},
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+
+    resp = cognito_idp.sign_up(
+        ClientId=cid, Username="alice", Password="Passw0rd!x",
+        UserAttributes=[{"Name": "email", "Value": "alice@example.com"}])
+    assert resp["UserConfirmed"] is True
+    assert "CodeDeliveryDetails" not in resp
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="alice")
+    assert user["UserStatus"] == "CONFIRMED"
+    attrs = {a["Name"]: a["Value"] for a in user["UserAttributes"]}
+    assert attrs.get("email_verified") == "true"
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(ClientId=cid, Username="deny-bob", Password="Passw0rd!x")
+    assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+    with pytest.raises(ClientError):
+        cognito_idp.admin_get_user(UserPoolId=pid, Username="deny-bob")
+
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    lam.delete_function(FunctionName=fname)

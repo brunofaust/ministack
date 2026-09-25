@@ -38,6 +38,31 @@ def test_athena_query(athena):
     results = athena.get_query_results(QueryExecutionId=query_id)
     assert len(results["ResultSet"]["Rows"]) >= 1
 
+def test_athena_query_returns_timestamptz_values(athena):
+    """A TIMESTAMP WITH TIME ZONE column round-trips: DuckDB needs pytz to hand the value back."""
+    resp = athena.start_query_execution(
+        QueryString="SELECT TIMESTAMPTZ '2026-01-01 00:00:00+00' AS ts, 1 AS num",
+        QueryExecutionContext={"Database": "default"},
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
+    )
+    query_id = resp["QueryExecutionId"]
+    state = None
+    reason = None
+    for _ in range(20):
+        status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]
+        state = status["State"]
+        reason = status.get("StateChangeReason")
+        if state in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.2)
+    assert state == "SUCCEEDED", f"Query ended in state: {state} ({reason})"
+    rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+    values = [cell["VarCharValue"] for cell in rows[-1]["Data"]]
+    # Rendered in UTC whatever the host's zone, millisecond precision and a
+    # trailing " UTC" — exactly what Athena's GetQueryResults returns.
+    assert values[0] == "2026-01-01 00:00:00.000 UTC", values
+    assert values[1] == "1"
+
 def test_athena_workgroup(athena):
     athena.create_work_group(
         Name="test-wg",
@@ -784,3 +809,69 @@ def test_athena_mixed_glue_and_s3_uri(athena, glue, monkeypatch, tmp_path):
 @pytest.fixture(scope="module", autouse=True)
 def _create_s3_results_bucket(s3):
     s3.create_bucket(Bucket="athena-results")
+
+
+def test_athena_managed_results_workgroup_creates_default_bucket(athena, s3):
+    """A managed-results workgroup query succeeds: the emulator creates the default results bucket itself."""
+    name = f"managed-{_uuid_mod.uuid4().hex[:8]}"
+    athena.create_work_group(
+        Name=name,
+        Configuration={"EnforceWorkGroupConfiguration": True, "ManagedQueryResultsConfiguration": {"Enabled": True}},
+    )
+    query_id = athena.start_query_execution(
+        QueryString="SELECT 42 AS answer", QueryExecutionContext={"Database": "default"}, WorkGroup=name
+    )["QueryExecutionId"]
+    status = None
+    for _ in range(20):
+        status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]
+        if status["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.2)
+    assert status["State"] == "SUCCEEDED", status.get("StateChangeReason")
+    rows = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]["Rows"]
+    assert rows[-1]["Data"][0]["VarCharValue"] == "42"
+    location = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["ResultConfiguration"]["OutputLocation"]
+    bucket = location.removeprefix("s3://").split("/", 1)[0]
+    assert bucket in {b["Name"] for b in s3.list_buckets()["Buckets"]}
+
+
+def test_athena_reads_an_s3tables_iceberg_table_through_the_federated_catalog(athena, s3tables):
+    """`"s3tablescatalog/<bucket>"."<ns>"."<table>"` reads the rows a DuckDB writer committed through the Iceberg REST catalog."""
+    import duckdb
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    netloc = endpoint.split("://", 1)[1]
+    bucket = f"athena-tb-{_uuid_mod.uuid4().hex[:8]}"
+    arn = s3tables.create_table_bucket(name=bucket)["arn"]
+    s3tables.create_namespace(tableBucketARN=arn, namespace=["logs"])
+    writer = duckdb.connect()
+    writer.execute("INSTALL httpfs; LOAD httpfs; INSTALL iceberg; LOAD iceberg")
+    writer.execute(
+        "CREATE SECRET (TYPE s3, KEY_ID 'test', SECRET 'test', REGION 'us-east-1', "
+        f"ENDPOINT '{netloc}', URL_STYLE 'path', USE_SSL false)"
+    )
+    writer.execute(f"ATTACH '{arn}' AS tb (TYPE iceberg, ENDPOINT '{endpoint}/iceberg', AUTHORIZATION_TYPE 'none')")
+    writer.execute("CREATE TABLE tb.logs.events (id INTEGER, org_id INTEGER, message VARCHAR)")
+    writer.execute("INSERT INTO tb.logs.events VALUES (1, 7, 'first'), (2, 7, 'second'), (3, 8, 'other org')")
+    writer.close()
+
+    query_id = athena.start_query_execution(
+        QueryString=(
+            'SELECT id, message, COUNT(*) OVER() AS _total FROM "s3tablescatalog/'
+            f'{bucket}"."logs"."events" WHERE org_id = 7 ORDER BY id DESC'
+        ),
+        QueryExecutionContext={"Database": "logs"},
+        ResultConfiguration={"OutputLocation": "s3://athena-results/"},
+    )["QueryExecutionId"]
+    status = None
+    for _ in range(50):
+        status = athena.get_query_execution(QueryExecutionId=query_id)["QueryExecution"]["Status"]
+        if status["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.2)
+    assert status["State"] == "SUCCEEDED", status.get("StateChangeReason")
+    result = athena.get_query_results(QueryExecutionId=query_id)["ResultSet"]
+    assert [c["Name"] for c in result["ResultSetMetadata"]["ColumnInfo"]] == ["id", "message", "_total"]
+    rows = [[cell.get("VarCharValue") for cell in row["Data"]] for row in result["Rows"]]
+    assert rows[0] == ["id", "message", "_total"], "Athena returns the header row first"
+    assert rows[1:] == [["2", "second", "2"], ["1", "first", "2"]]

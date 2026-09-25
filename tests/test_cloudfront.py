@@ -826,6 +826,69 @@ def test_cloudfront_function_create_publish_describe_get_delete(cloudfront):
     assert exc.value.response["Error"]["Code"] == "NoSuchFunctionExists"
 
 
+def test_bd958_cloudfront_function_arn_tags_round_trip(cloudfront):
+    """BD-958: CloudFront function ARNs support TagResource and ListTagsForResource."""
+    name = f"fn-tags-{_uuid_mod.uuid4().hex[:8]}"
+    created = cloudfront.create_function(
+        Name=name,
+        FunctionConfig={"Comment": "taggable", "Runtime": "cloudfront-js-1.0"},
+        FunctionCode=b"function handler(event) { return event.request; }",
+    )
+    function_arn = created["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+
+    cloudfront.tag_resource(
+        Resource=function_arn,
+        Tags={"Items": [{"Key": "environment", "Value": "test"}]},
+    )
+
+    tags = cloudfront.list_tags_for_resource(Resource=function_arn)["Tags"]["Items"]
+
+    assert tags == [{"Key": "environment", "Value": "test"}]
+
+    cloudfront.delete_function(Name=name, IfMatch=_cf_resp_etag(created))
+
+
+def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
+    """UpdateFunction changes the DEVELOPMENT stage only: "To copy the updates
+    from the DEVELOPMENT stage to LIVE, you must publish the function". The
+    published version keeps serving until PublishFunction runs again."""
+    name = f"fn-live-{_uuid_mod.uuid4().hex[:8]}"
+    published = b"function handler(event) { return 'published'; }"
+    updated = b"function handler(event) { return 'updated'; }"
+
+    cr = cloudfront.create_function(
+        Name=name,
+        FunctionConfig={"Comment": "v1", "Runtime": "cloudfront-js-1.0"},
+        FunctionCode=published,
+    )
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(cr))
+
+    upd = cloudfront.update_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+        FunctionConfig={"Comment": "v2", "Runtime": "cloudfront-js-1.0"},
+        FunctionCode=updated,
+    )
+
+    live = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+    assert live["FunctionConfig"]["Comment"] == "v1"
+    live_body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"]
+    assert (live_body.read() if hasattr(live_body, "read") else live_body) == published
+    dev_body = cloudfront.get_function(Name=name, Stage="DEVELOPMENT")["FunctionCode"]
+    assert (dev_body.read() if hasattr(dev_body, "read") else dev_body) == updated
+
+    cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(upd))
+    live_body = cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"]
+    assert (live_body.read() if hasattr(live_body, "read") else live_body) == updated
+    live = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]
+    assert live["FunctionConfig"]["Comment"] == "v2"
+
+    cloudfront.delete_function(
+        Name=name,
+        IfMatch=_cf_resp_etag(cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")),
+    )
+
+
 def test_cloudfront_function_duplicate_name(cloudfront):
     name = f"fn-dup-{_uuid_mod.uuid4().hex[:8]}"
     cloudfront.create_function(
@@ -1504,6 +1567,37 @@ def _rhp_config(name):
     }
 
 
+def test_cloudfront_response_headers_policy_omits_absent_header_configs(cloudfront):
+    config = _rhp_config(f"rhp-{_uuid_mod.uuid4().hex[:8]}")
+    config.pop("CustomHeadersConfig")
+    config.pop("RemoveHeadersConfig")
+
+    created = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=config)
+    policy_id = created["ResponseHeadersPolicy"]["Id"]
+    returned_config = cloudfront.get_response_headers_policy_config(Id=policy_id)["ResponseHeadersPolicyConfig"]
+
+    assert "CustomHeadersConfig" not in returned_config
+    assert "RemoveHeadersConfig" not in returned_config
+
+    cloudfront.delete_response_headers_policy(Id=policy_id, IfMatch=created["ETag"])
+
+
+def test_cloudfront_response_headers_policy_serializes_explicitly_empty_header_configs(cloudfront):
+    config = _rhp_config(f"rhp-{_uuid_mod.uuid4().hex[:8]}")
+    config["CustomHeadersConfig"] = {"Quantity": 0}
+    config["RemoveHeadersConfig"] = {"Quantity": 0}
+
+    created = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=config)
+    returned_config = created["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]
+
+    assert returned_config["CustomHeadersConfig"]["Quantity"] == 0
+    assert returned_config["RemoveHeadersConfig"]["Quantity"] == 0
+
+    cloudfront.delete_response_headers_policy(
+        Id=created["ResponseHeadersPolicy"]["Id"], IfMatch=created["ETag"]
+    )
+
+
 def test_cloudfront_create_and_get_response_headers_policy(cloudfront):
     name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
@@ -1666,13 +1760,13 @@ def test_cloudfront_list_anycast_ip_lists_empty(cloudfront):
 
 
 def test_cloudfront_list_cache_policies_round_trip(cloudfront):
-    baseline = cloudfront.list_cache_policies()["CachePolicyList"]["Quantity"]
+    baseline = cloudfront.list_cache_policies(Type="custom")["CachePolicyList"]["Quantity"]
 
     name = f"cp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_cache_policy(CachePolicyConfig=_cache_policy_config(name))
     pid = create["CachePolicy"]["Id"]
 
-    listed = cloudfront.list_cache_policies()["CachePolicyList"]
+    listed = cloudfront.list_cache_policies(Type="custom")["CachePolicyList"]
     assert listed["Quantity"] == baseline + 1
     names = [s["CachePolicy"]["CachePolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
@@ -1683,13 +1777,13 @@ def test_cloudfront_list_cache_policies_round_trip(cloudfront):
 
 
 def test_cloudfront_list_origin_request_policies_round_trip(cloudfront):
-    baseline = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]["Quantity"]
+    baseline = cloudfront.list_origin_request_policies(Type="custom")["OriginRequestPolicyList"]["Quantity"]
 
     name = f"orp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_origin_request_policy(OriginRequestPolicyConfig=_orp_config(name))
     pid = create["OriginRequestPolicy"]["Id"]
 
-    listed = cloudfront.list_origin_request_policies()["OriginRequestPolicyList"]
+    listed = cloudfront.list_origin_request_policies(Type="custom")["OriginRequestPolicyList"]
     assert listed["Quantity"] == baseline + 1
     names = [s["OriginRequestPolicy"]["OriginRequestPolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
@@ -1699,13 +1793,13 @@ def test_cloudfront_list_origin_request_policies_round_trip(cloudfront):
 
 
 def test_cloudfront_list_response_headers_policies_round_trip(cloudfront):
-    baseline = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]["Quantity"]
+    baseline = cloudfront.list_response_headers_policies(Type="custom")["ResponseHeadersPolicyList"]["Quantity"]
 
     name = f"rhp-{_uuid_mod.uuid4().hex[:8]}"
     create = cloudfront.create_response_headers_policy(ResponseHeadersPolicyConfig=_rhp_config(name))
     pid = create["ResponseHeadersPolicy"]["Id"]
 
-    listed = cloudfront.list_response_headers_policies()["ResponseHeadersPolicyList"]
+    listed = cloudfront.list_response_headers_policies(Type="custom")["ResponseHeadersPolicyList"]
     assert listed["Quantity"] == baseline + 1
     names = [s["ResponseHeadersPolicy"]["ResponseHeadersPolicyConfig"]["Name"] for s in listed["Items"]]
     assert name in names
@@ -2546,3 +2640,19 @@ def test_cf_saas_connection_group_tagging(cloudfront):
     )
     tags = cloudfront.list_tags_for_resource(Resource=cg["Arn"])["Tags"]["Items"]
     assert {"Key": "env", "Value": "test"} in tags
+
+
+def test_cloudfront_get_distribution_xml_has_no_namespace_prefixes(cloudfront):
+    """Re-serialising the client's own namespaced config used to invent ns0:
+    prefixes on every child, which SDK REST-XML parsers read as absent members.
+    Raw HTTP because boto3's parser is namespace-tolerant and masked the bug."""
+    dist_id = cloudfront.create_distribution(
+        DistributionConfig=_CF_DIST_CONFIG)["Distribution"]["Id"]
+    req = urllib.request.Request(
+        f"{ENDPOINT}/2020-05-31/distribution/{dist_id}",
+        headers={"Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/cloudfront/aws4_request, SignedHeaders=host, Signature=00"},
+    )
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read()
+    assert b"ns0:" not in raw, "namespace prefixes leaked into the response XML"
+    assert b"<Origins>" in raw and b"<DefaultCacheBehavior>" in raw

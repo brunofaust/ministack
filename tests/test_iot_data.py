@@ -12,6 +12,7 @@ bridge layer.
 from __future__ import annotations
 
 import base64
+from contextlib import nullcontext
 import io as _io
 import json
 import os
@@ -199,14 +200,14 @@ async def _ws_subscribe_and_collect(
     ws_url: str, topic: str, ready_event: threading.Event, received: list, stop: threading.Event
 ):
     async with websockets.connect(ws_url, subprotocols=["mqtt"]) as ws:
-        await ws.send(_make_connect("test-client"))
+        await ws.send(_make_connect(_unique("ws-subscriber")))
         # Wait for CONNACK
-        await asyncio.wait_for(ws.recv(), timeout=2.0)
+        await asyncio.wait_for(ws.recv(), timeout=15.0)
         # Subscribe
         await ws.send(_make_subscribe(packet_id=1, topic=topic, qos=0))
         # Retained PUBLISH frames may precede SUBACK in the in-process broker.
         while True:
-            msg = await asyncio.wait_for(ws.recv(), timeout=2.0)
+            msg = await asyncio.wait_for(ws.recv(), timeout=15.0)
             if _record_publish(msg, received) == 9:  # SUBACK
                 break
         ready_event.set()
@@ -1619,35 +1620,165 @@ def _default_ws_url() -> str:
     return f"ws://prefix-ats.iot.us-east-1.{ws_host}:{ws_port}/mqtt"
 
 
-def _collect_shadow_frames(sub_filter, publish_fn, want, timeout=5.0):
+def _collect_shadow_frames(sub_filter, publish_fn, want, timeout=5.0, readiness_timeout=5.0):
     """Subscribe over WS, run ``publish_fn`` once ready, and return the
     collected ``(topic, payload)`` PUBLISH frames."""
     from conftest import patch_endpoint_dns
 
     ready = threading.Event()
     stop = threading.Event()
+    finished = threading.Event()
+    subscriber_started = threading.Event()
+    cancellation_requested = threading.Event()
     received: list = []
+    thread_errors: list[BaseException] = []
+    subscriber_control = {}
+    control_lock = threading.Lock()
+
+    def _run_subscriber():
+        loop = None
+        task = None
+        coroutine = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            coroutine = _ws_subscribe_and_collect(
+                _default_ws_url(), sub_filter, ready, received, stop
+            )
+            task = loop.create_task(coroutine)
+            with control_lock:
+                subscriber_control["loop"] = loop
+                subscriber_control["task"] = task
+            subscriber_started.set()
+            loop.run_until_complete(task)
+        except asyncio.CancelledError as error:
+            if not cancellation_requested.is_set():
+                thread_errors.append(error)
+        except BaseException as error:
+            thread_errors.append(error)
+        finally:
+            subscriber_started.set()
+            with control_lock:
+                finished.set()
+                if coroutine is not None and task is None:
+                    coroutine.close()
+                if loop is not None:
+                    loop.close()
 
     with patch_endpoint_dns():
         t = threading.Thread(
-            target=lambda: asyncio.run(
-                _ws_subscribe_and_collect(
-                    _default_ws_url(), sub_filter, ready, received, stop
-                )
-            ),
+            target=_run_subscriber,
             daemon=True,
         )
         t.start()
-        assert ready.wait(timeout=5), "WebSocket subscriber did not become ready"
+        caller_error = None
+        try:
+            readiness_deadline = time.time() + readiness_timeout
+            while not ready.is_set() and not finished.is_set() and time.time() < readiness_deadline:
+                ready.wait(timeout=0.05)
+            if thread_errors:
+                raise thread_errors[0]
+            assert ready.is_set(), "WebSocket subscriber did not become ready"
 
-        publish_fn()
+            publish_fn()
 
-        deadline = time.time() + timeout
-        while time.time() < deadline and len(received) < want:
-            time.sleep(0.05)
-        stop.set()
-        t.join(timeout=2)
+            deadline = time.time() + timeout
+            while time.time() < deadline and len(received) < want:
+                time.sleep(0.05)
+        except BaseException as error:
+            caller_error = error
+        finally:
+            stop.set()
+            cancellation_requested.set()
+            subscriber_started.wait()
+            with control_lock:
+                loop = subscriber_control.get("loop")
+                task = subscriber_control.get("task")
+                if loop is not None and task is not None and not finished.is_set():
+                    loop.call_soon_threadsafe(task.cancel)
+            t.join()
+
+        if caller_error is not None:
+            raise caller_error
+        if thread_errors:
+            raise thread_errors[0]
     return received
+
+
+def test_bd_1154_shadow_collector_propagates_subscriber_failure_and_stops(monkeypatch):
+    """BD-1154: readiness failures preserve their cause and stop the subscriber."""
+    import conftest
+
+    captured = {}
+
+    async def fail_subscriber(_url, _topic, _ready, _received, stop):
+        captured["stop"] = stop
+        captured["thread"] = threading.current_thread()
+        raise RuntimeError("CONNACK failed")
+
+    monkeypatch.setattr(conftest, "patch_endpoint_dns", nullcontext)
+    monkeypatch.setattr(sys.modules[__name__], "_ws_subscribe_and_collect", fail_subscriber)
+
+    with pytest.raises(RuntimeError, match="CONNACK failed"):
+        _collect_shadow_frames("devices/+/status", pytest.fail, want=1)
+
+    assert captured["stop"].is_set()
+    assert not captured["thread"].is_alive()
+
+
+def test_bd_1154_shadow_collector_cancels_subscriber_blocked_during_readiness(monkeypatch):
+    """BD-1154: readiness timeout cancels and joins a blocked subscriber."""
+    import conftest
+
+    captured = {}
+
+    async def blocked_subscriber(_url, _topic, _ready, _received, stop):
+        captured["stop"] = stop
+        captured["thread"] = threading.current_thread()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            captured["cancelled"] = True
+
+    monkeypatch.setattr(conftest, "patch_endpoint_dns", nullcontext)
+    monkeypatch.setattr(sys.modules[__name__], "_ws_subscribe_and_collect", blocked_subscriber)
+
+    with pytest.raises(AssertionError, match="WebSocket subscriber did not become ready"):
+        _collect_shadow_frames(
+            "devices/+/status",
+            pytest.fail,
+            want=1,
+            readiness_timeout=0.05,
+        )
+
+    assert captured["cancelled"] is True
+    assert captured["stop"].is_set()
+    assert not captured["thread"].is_alive()
+
+
+def test_bd_1154_shadow_collector_propagates_setup_failure_without_hanging(monkeypatch):
+    """BD-1154: setup failures signal completion and terminate the subscriber thread."""
+    import conftest
+
+    captured = {}
+    real_thread = threading.Thread
+
+    class TrackingThread(real_thread):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            captured["thread"] = self
+
+    def invalid_ws_url():
+        raise ValueError("invalid websocket port")
+
+    monkeypatch.setattr(conftest, "patch_endpoint_dns", nullcontext)
+    monkeypatch.setattr(threading, "Thread", TrackingThread)
+    monkeypatch.setattr(sys.modules[__name__], "_default_ws_url", invalid_ws_url)
+
+    with pytest.raises(ValueError, match="invalid websocket port"):
+        _collect_shadow_frames("devices/+/status", pytest.fail, want=1)
+
+    assert not captured["thread"].is_alive()
 
 
 def test_shadow_update_over_mqtt_emits_accepted_delta_documents(iot_data_client):

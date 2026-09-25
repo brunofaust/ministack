@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Config Service Emulator.
 JSON-based API via X-Amz-Target (prefix: StarlingDoveService).
@@ -64,6 +66,10 @@ def get_state():
             "_delivery_channels": _delivery_channels,
         }
     )
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

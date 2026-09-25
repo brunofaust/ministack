@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 API Gateway REST API v1 Emulator.
 
@@ -100,7 +102,7 @@ import urllib.request
 
 import yaml
 
-from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -109,7 +111,14 @@ from ministack.core.responses import (
     get_region,
     new_uuid,
 )
-from ministack.services.apigateway import _timeout_from_env, _urlopen_async
+from ministack.services.apigateway import (
+    _b64url_decode,
+    _fetch_jwks,
+    _resolve_jwks_url,
+    _timeout_from_env,
+    _urlopen_async,
+    _verify_rs256_signature,
+)
 
 
 def _now_unix():
@@ -1387,13 +1396,6 @@ def _deny_error(explicit):
     )
 
 
-def _build_method_arn(region, account_id, api_id, stage_name, method, request_path):
-    return (
-        f"arn:aws:execute-api:{region}:{account_id}:"
-        f"{api_id}/{stage_name}/{method}/{request_path.lstrip('/')}"
-    )
-
-
 def _arn_matches(pattern, arn):
     """Match an IAM policy Resource against a method ARN, honoring `*`/`?` globs."""
     regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
@@ -1522,6 +1524,193 @@ def _cache_authorizer_result(key, expires_at, policy_doc, context):
     _authorizer_cache[key] = (expires_at, policy_doc, context)
 
 
+def _iam_caller_identity(headers, query_params):
+    """The payload-1.0 ``requestContext.identity`` fields for an AWS_IAM method.
+
+    Key resolution only — signatures are never verified. Unknown/absent keys
+    return None and the event keeps its two-field identity (the documented
+    no-IAM behaviour). For a Cognito identity-pool session the cognito* fields
+    ride along, ``cognitoAuthenticationProvider`` in the documented
+    ``<provider>,<provider>:CognitoSignIn:<sub>`` format.
+    """
+    from ministack.core.iam_evaluator import resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
+
+    info = resolve_caller_identity(extract_access_key_id(headers, query_params))
+    if not info:
+        return None
+    identity = {
+        "accessKey": info["accessKey"],
+        "accountId": info["accountId"],
+        "caller": info["userId"] or None,
+        "user": info["userId"] or None,
+        "userArn": info["userArn"] or None,
+        "principalOrgId": info.get("principalOrgId"),
+        "cognitoAuthenticationProvider": None,
+        "cognitoAuthenticationType": None,
+        "cognitoIdentityId": None,
+        "cognitoIdentityPoolId": None,
+    }
+    session = info.get("session") or {}
+    if session.get("_identity_id"):
+        identity.update({
+            "cognitoAuthenticationProvider": session.get("_cognito_auth_provider"),
+            "cognitoAuthenticationType": session.get("_cognito_auth_type"),
+            "cognitoIdentityId": session.get("_identity_id"),
+            "cognitoIdentityPoolId": session.get("_identity_pool_id"),
+        })
+    return identity
+
+
+def _cognito_pool_issuers(authorizer):
+    """The token issuers a COGNITO_USER_POOLS authorizer accepts.
+
+    Each ``providerARNs`` entry is a user-pool ARN
+    (``arn:aws:cognito-idp:{region}:{account}:userpool/{poolId}``) and the
+    issuer Cognito stamps into a token minted by that pool is
+    ``https://cognito-idp.{region}.amazonaws.com/{poolId}``. Unparsable and
+    non-``cognito-idp`` entries are skipped rather than raising: CreateAuthorizer
+    stores the list verbatim, so a malformed ARN only surfaces here and must not
+    take down the request handler.
+    """
+    issuers = []
+    for arn in authorizer.get("providerARNs") or []:
+        try:
+            parsed = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if parsed.service != "cognito-idp" or not parsed.region:
+            continue
+        pool_id = parsed.resource.split("/", 1)[-1] if "/" in parsed.resource else ""
+        if pool_id:
+            issuers.append(f"https://cognito-idp.{parsed.region}.amazonaws.com/{pool_id}")
+    return issuers
+
+
+def _cognito_token_from_request(authorizer, headers, query_params, stage):
+    """The raw JWT named by a Cognito authorizer's ``identitySource``.
+
+    REST identity sources use the ``method.request.header.X`` syntax (not the
+    HTTP API's ``$request.header.X``), and AWS defaults the field to the
+    Authorization header. A ``Bearer `` prefix is tolerated — Cognito authorizers
+    accept the bare token, but clients routinely send the OAuth-style form.
+    """
+    source = authorizer.get("identitySource") or "method.request.header.Authorization"
+    present, values = _request_identity_sources(source, headers, query_params, stage)
+    if not present or not values:
+        return None
+    token = (values[0] or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    return token or None
+
+
+def _stringify_claims(claims):
+    """Render JWT claims as the backend receives them.
+
+    API Gateway passes claims through as strings. A list-valued claim —
+    ``cognito:groups`` being the one that matters — arrives space-joined inside
+    square brackets (``"[admins staff]"``), which is why a handler cannot simply
+    index it as an array.
+    """
+    out = {}
+    for key, value in (claims or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            out[key] = "true" if value else "false"
+        elif isinstance(value, list):
+            out[key] = "[" + " ".join(str(v) for v in value) + "]"
+        elif isinstance(value, dict):
+            out[key] = json.dumps(value, separators=(",", ":"))
+        else:
+            out[key] = str(value)
+    return out
+
+
+def _token_scopes(claims):
+    """The OAuth scopes carried by an access token (``scope`` or ``scp``)."""
+    scopes = []
+    raw_scope = claims.get("scope")
+    raw_scp = claims.get("scp")
+    if isinstance(raw_scope, str):
+        scopes.extend([s for s in raw_scope.split(" ") if s])
+    if isinstance(raw_scp, list):
+        scopes.extend([str(s) for s in raw_scp])
+    elif isinstance(raw_scp, str):
+        scopes.extend([s for s in raw_scp.split(" ") if s])
+    return sorted(set(scopes))
+
+
+async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_params, stage):
+    """Verify a user-pool token for a COGNITO_USER_POOLS method.
+
+    Returns ``(claims, error_response)``. Unlike the HTTP API's JWT authorizer
+    there is no audience to check: a REST Cognito authorizer is configured with
+    pool ARNs only, so AWS validates the signature, the standard time claims and
+    that ``iss`` names one of those pools — never the app client. Both ID and
+    access tokens are accepted, as on AWS.
+    """
+    issuers = _cognito_pool_issuers(authorizer)
+    if not issuers:
+        # An authorizer with no usable pool cannot authorize anything; AWS
+        # reports this as a configuration error rather than letting it through.
+        return None, _gw_error(500, "Internal server error")
+
+    token = _cognito_token_from_request(authorizer, headers, query_params, stage)
+    if not token:
+        return None, _gw_error(401, "Unauthorized")
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, _gw_error(401, "Unauthorized")
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        claims = json.loads(_b64url_decode(parts[1]))
+    except (ValueError, json.JSONDecodeError):
+        return None, _gw_error(401, "Unauthorized")
+    if not isinstance(claims, dict) or not isinstance(header, dict):
+        return None, _gw_error(401, "Unauthorized")
+
+    issuer = claims.get("iss")
+    if issuer not in issuers:
+        return None, _gw_error(401, "Unauthorized")
+
+    kid = header.get("kid")
+    jwks_url = await _resolve_jwks_url({"jwtConfiguration": {"issuer": issuer}})
+    if not kid or not jwks_url:
+        return None, _gw_error(401, "Unauthorized")
+    try:
+        keys = ((await _fetch_jwks(jwks_url)).get("keys") or [])
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, _gw_error(401, "Unauthorized")
+    jwk = next((k for k in keys if k.get("kid") == kid), None)
+    if not jwk or not _verify_rs256_signature(token, jwk):
+        return None, _gw_error(401, "Unauthorized")
+
+    now = int(time.time())
+    try:
+        if "exp" in claims and int(claims["exp"]) <= now:
+            return None, _gw_error(401, "Unauthorized")
+        if "nbf" in claims and int(claims["nbf"]) > now:
+            return None, _gw_error(401, "Unauthorized")
+        if "iat" in claims and int(claims["iat"]) > now:
+            return None, _gw_error(401, "Unauthorized")
+    except (TypeError, ValueError):
+        return None, _gw_error(401, "Unauthorized")
+
+    # authorizationScopes on the method turns the check into an OAuth one: the
+    # token must carry at least one of the listed scopes, and a token without
+    # scopes at all (an ID token) can never satisfy it.
+    required_scopes = method_obj.get("authorizationScopes") or []
+    if required_scopes:
+        granted = _token_scopes(claims)
+        if not any(scope in granted for scope in required_scopes):
+            return None, _gw_error(403, "Forbidden")
+
+    return claims, None
+
+
 async def _authorize_request_v1(
     api_id, stage_name, method_obj, method, request_path, resource,
     headers, body, query_params, path_params, stage,
@@ -1542,8 +1731,19 @@ async def _authorize_request_v1(
         if not _header_ci(headers, "authorization"):
             return _gw_error(403, "Missing Authentication Token"), None
         return None, None
+    if auth_type == "COGNITO_USER_POOLS":
+        authorizer_id = method_obj.get("authorizerId")
+        authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+        if not authorizer:
+            return _gw_error(500, "Internal server error"), None
+        claims, auth_error = await _validate_cognito_authorizer(
+            authorizer, method_obj, headers, query_params, stage
+        )
+        if auth_error:
+            return auth_error, None
+        return None, {"claims": _stringify_claims(claims)}
     if auth_type != "CUSTOM":
-        # COGNITO_USER_POOLS and any future type: not enforced here (pass through).
+        # Any future authorization type: not enforced here (pass through).
         return None, None
 
     authorizer_id = method_obj.get("authorizerId")
@@ -1551,7 +1751,7 @@ async def _authorize_request_v1(
     if not authorizer:
         return _gw_error(500, "Internal server error"), None
 
-    method_arn = _build_method_arn(
+    method_arn = execute_api_arn(
         owner_region, owner_account_id, api_id, stage_name, method, request_path
     )
     atype = (authorizer.get("type") or "TOKEN").upper()
@@ -1746,6 +1946,9 @@ async def _handle_execute_in_scope(
         # non-proxy `AWS` (custom / "lambda") integration returns the handler's
         # output as the body verbatim. Same event in, different response
         # contract out.
+        caller_identity = None
+        if (method_obj.get("authorizationType") or "").upper() == "AWS_IAM":
+            caller_identity = _iam_caller_identity(headers, query_params)
         invoke = _invoke_lambda_proxy_v1 if int_type == "AWS_PROXY" else _invoke_lambda_custom_v1
         return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
@@ -1754,6 +1957,7 @@ async def _handle_execute_in_scope(
             owner_region=owner_region,
             binary_media_types=api.get("binaryMediaTypes") or [],
             authorizer_context=authorizer_context,
+            caller_identity=caller_identity,
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
@@ -1798,6 +2002,7 @@ def _build_lambda_event_v1(
     *,
     binary_media_types=None,
     authorizer_context=None,
+    caller_identity=None,
 ):
     """Build the API Gateway v1 payload format 1.0 event handed to Lambda.
 
@@ -1866,6 +2071,11 @@ def _build_lambda_event_v1(
 
     # A custom authorizer's returned context (values stringified) plus its
     # principalId reach the integration under requestContext.authorizer.
+    if caller_identity:
+        # AWS_IAM methods report the resolved caller: accessKey/accountId/
+        # caller/user/userArn, plus the cognito* fields for identity-pool
+        # sessions — per the payload 1.0 identity shape.
+        event["requestContext"]["identity"].update(caller_identity)
     if authorizer_context is not None:
         event["requestContext"]["authorizer"] = authorizer_context
 
@@ -1889,6 +2099,7 @@ async def _invoke_lambda_proxy_v1(
     owner_region=None,
     binary_media_types=None,
     authorizer_context=None,
+    caller_identity=None,
 ):
     """Invoke Lambda through an AWS_PROXY integration and interpret its
     `{statusCode, headers, body}` response envelope."""
@@ -1899,6 +2110,7 @@ async def _invoke_lambda_proxy_v1(
         headers, body, query_params, path_params,
         binary_media_types=binary_media_types,
         authorizer_context=authorizer_context,
+        caller_identity=caller_identity,
     )
 
     lambda_response, err = await _call_lambda(
@@ -1989,6 +2201,7 @@ async def _invoke_lambda_custom_v1(
     owner_region=None,
     binary_media_types=None,
     authorizer_context=None,
+    caller_identity=None,
 ):
     """Invoke Lambda through a non-proxy (custom) ``AWS`` integration.
 
@@ -2011,6 +2224,7 @@ async def _invoke_lambda_custom_v1(
         headers, body, query_params, path_params,
         binary_media_types=binary_media_types,
         authorizer_context=authorizer_context,
+        caller_identity=caller_identity,
     )
 
     result, err = await _call_lambda_raw(
@@ -2655,6 +2869,7 @@ def _put_method(api_id, resource_id, http_method, data):
         "httpMethod": http_method,
         "authorizationType": data.get("authorizationType", "NONE"),
         "authorizerId": data.get("authorizerId"),
+        "authorizationScopes": data.get("authorizationScopes", []),
         "apiKeyRequired": data.get("apiKeyRequired", False),
         "operationName": data.get("operationName", ""),
         "requestParameters": data.get("requestParameters", {}),
@@ -2891,29 +3106,38 @@ def _create_deployment(api_id, data):
     # If stageName is provided, create/update the stage automatically
     stage_name = data.get("stageName")
     if stage_name:
-        existing_stage = _stages_v1.get(api_id, {}).get(stage_name)
-        if existing_stage:
-            existing_stage["deploymentId"] = deployment_id
-            existing_stage["lastUpdatedDate"] = _now_unix()
-        else:
-            stage = {
-                "stageName": stage_name,
-                "deploymentId": deployment_id,
-                "description": data.get("stageDescription", ""),
-                "createdDate": _now_unix(),
-                "lastUpdatedDate": _now_unix(),
-                "variables": data.get("variables", {}),
-                "methodSettings": {},
-                "accessLogSettings": {},
-                "cacheClusterEnabled": False,
-                "cacheClusterSize": None,
-                "tracingEnabled": False,
-                "tags": {},
-                "documentationVersion": None,
-            }
-            _stages_v1.setdefault(api_id, {})[stage_name] = stage
+        _deploy_to_stage(api_id, deployment_id, stage_name,
+                         data.get("stageDescription", ""), data.get("variables", {}))
 
     return _v1_response(deployment, 201)
+
+
+def _deploy_to_stage(api_id, deployment_id, stage_name, description="", variables=None):
+    """Point a stage at a deployment, creating the stage when it does not
+    exist — what CreateDeployment does for its stageName, and what an
+    AWS::ApiGateway::Deployment update does for a changed StageName."""
+    existing_stage = _stages_v1.get(api_id, {}).get(stage_name)
+    if existing_stage:
+        existing_stage["deploymentId"] = deployment_id
+        existing_stage["lastUpdatedDate"] = _now_unix()
+        return existing_stage
+    stage = {
+        "stageName": stage_name,
+        "deploymentId": deployment_id,
+        "description": description,
+        "createdDate": _now_unix(),
+        "lastUpdatedDate": _now_unix(),
+        "variables": variables or {},
+        "methodSettings": {},
+        "accessLogSettings": {},
+        "cacheClusterEnabled": False,
+        "cacheClusterSize": None,
+        "tracingEnabled": False,
+        "tags": {},
+        "documentationVersion": None,
+    }
+    _stages_v1.setdefault(api_id, {})[stage_name] = stage
+    return stage
 
 
 def _get_deployments(api_id, query_params):
@@ -3021,6 +3245,10 @@ def _create_authorizer(api_id, data):
         ),
         "providerARNs": data.get("providerARNs", []),
     }
+    if "authType" in data:
+        # An informational field (OpenAPI import/export); reported when set,
+        # as GetAuthorizer does.
+        authorizer["authType"] = data["authType"]
     _authorizers_v1.setdefault(api_id, {})[auth_id] = authorizer
     return _v1_response(authorizer, 201)
 

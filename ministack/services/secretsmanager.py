@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 SecretsManager Service Emulator.
 JSON-based API via X-Amz-Target.
@@ -54,6 +56,10 @@ def get_state():
         "secrets": copy.deepcopy(_secrets),
         "resource_policies": copy.deepcopy(_resource_policies),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -160,17 +166,22 @@ def _find_stage_version(secret, stage):
     return None, None
 
 
-def resolve_secret_string(secret_id, version_stage="AWSCURRENT"):
-    """Return the SecretString for *secret_id* at *version_stage*, or None.
+def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None):
+    """Return the SecretString for *secret_id* at *version_stage* (or the
+    version *version_id*), or None.
 
-    Used by other services (e.g. ECS) that need to read a secret value
-    in-process without going through the HTTP API. Returns None if the secret
-    does not exist, is scheduled for deletion, or has no value for the stage.
+    Used by other services (e.g. ECS, CloudFormation dynamic references) that
+    need to read a secret value in-process without going through the HTTP API.
+    Returns None if the secret does not exist, is scheduled for deletion, or
+    has no value for the stage / version.
     """
     _, secret = _resolve(secret_id, use_arn_scope=True)
     if not secret or secret.get("DeletedDate"):
         return None
-    _, ver = _find_stage_version(secret, version_stage)
+    if version_id:
+        ver = secret["Versions"].get(version_id)
+    else:
+        _, ver = _find_stage_version(secret, version_stage)
     if not ver:
         return None
     return ver.get("SecretString")

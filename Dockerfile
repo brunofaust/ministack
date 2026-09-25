@@ -1,10 +1,15 @@
 # Non-release builds use the maintainer-requested latest published full image.
 ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
 
-FROM python:3.13-alpine AS builder
+# glibc base (not Alpine): DuckDB ships no musl wheel, and the Athena emulator
+# needs DuckDB + its httpfs/iceberg extensions to read S3 Tables (Iceberg) tables
+# through "s3tablescatalog/<bucket>" the way Athena does on AWS.
+FROM python:3.13-slim-bookworm AS builder
 
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
+        "duckdb>=1.4" \
+        "pytz>=2024.1" \
         "cbor2>=5.4.0" \
         "defusedxml>=0.7" \
         "docker>=7.0.0" \
@@ -14,7 +19,13 @@ RUN pip install --no-cache-dir --no-compile \
         "asyncssh>=2.14" \
         "boto3>=1.34" \
         "jsonata-python>=0.7.0" \
+        "graphql-core==3.2.12" \
         "awscli==1.45.63"
+
+# Bake the DuckDB extensions the Athena emulator loads at query time into a
+# fixed, root-owned directory; the runtime user never downloads anything.
+RUN python -c "import duckdb; c = duckdb.connect(); c.execute(\"SET extension_directory = '/opt/duckdb_ext'\"); c.execute('INSTALL httpfs; INSTALL iceberg; LOAD httpfs; LOAD iceberg')" \
+    && find /opt/duckdb_ext -type f -name '*.duckdb_extension' | sort
 
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).
 RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
@@ -25,13 +36,15 @@ RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
 # Plugin artifacts are release-stable; release builds pin this donor by digest.
 FROM ${PLUGIN_DONOR_IMAGE} AS plugin-donor
 
-FROM python:3.13-alpine
+FROM python:3.13-slim-bookworm
 
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
 # Upgrade base packages to pick up latest security patches.
-RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
+RUN apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get install -y --no-install-recommends nodejs bash openssl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* /usr/bin/wget /bin/wget \
     && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
               /usr/local/bin/pip*
 
@@ -42,6 +55,7 @@ COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
 COPY --from=builder /usr/local/bin/hypercorn /usr/local/bin/hypercorn
+COPY --from=builder /opt/duckdb_ext /opt/duckdb_ext
 
 COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
@@ -49,7 +63,7 @@ RUN chmod +x /usr/local/bin/awslocal
 COPY ministack/ ministack/
 COPY --from=plugin-donor /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
 
-RUN addgroup -S ministack && adduser -S ministack -G ministack
+RUN groupadd --system ministack && useradd --system --gid ministack --create-home --home-dir /home/ministack ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
 RUN mkdir -p /docker-entrypoint-initaws.d/ready.d \
              /etc/localstack/init/boot.d \
@@ -73,6 +87,7 @@ ENV MINISTACK_VERSION=${MINISTACK_VERSION} \
     DSQL_STRICT=0 \
     ELASTICACHE_BASE_PORT=16379 \
     LAMBDA_EXECUTOR=local \
+    DUCKDB_EXTENSION_DIR=/opt/duckdb_ext \
     USE_SSL=0 \
     PYTHONUNBUFFERED=1 \
     PYTHONOPTIMIZE=2 \

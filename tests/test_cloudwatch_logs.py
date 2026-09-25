@@ -641,6 +641,59 @@ def test_logs_describe_includes_log_group_arn_without_star(logs):
     assert ":*" not in described["logGroupArn"].split("log-group:")[-1]
 
 
+def test_logs_describe_reports_the_log_group_class(logs):
+    """DescribeLogGroups reports logGroupClass on every group: the member is
+    on the LogGroup shape, CreateLogGroup takes it, and "if you omit this
+    parameter, the default of STANDARD is used". A consumer that reads it
+    back (Terraform's aws_cloudwatch_log_group) plans a replacement when the
+    member is missing. Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    default_group = f"/intg/lg-class/{_uuid.uuid4().hex[:8]}"
+    ia_group = f"/intg/lg-class-ia/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=default_group)
+    logs.create_log_group(logGroupName=ia_group, logGroupClass="INFREQUENT_ACCESS")
+    try:
+        described = logs.describe_log_groups(logGroupNamePrefix=default_group)["logGroups"][0]
+        assert described["logGroupClass"] == "STANDARD"
+        described = logs.describe_log_groups(logGroupNamePrefix=ia_group)["logGroups"][0]
+        assert described["logGroupClass"] == "INFREQUENT_ACCESS"
+    finally:
+        logs.delete_log_group(logGroupName=default_group)
+        logs.delete_log_group(logGroupName=ia_group)
+
+
+def test_logs_create_log_group_refuses_an_unknown_class(logs):
+    """logGroupClass is an enum of three values."""
+    import uuid as _uuid
+
+    group = f"/intg/lg-class-bad/{_uuid.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        logs.create_log_group(logGroupName=group, logGroupClass="ARCHIVE")
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterException"
+    assert "logGroupClass" in exc.value.response["Error"]["Message"]
+
+
+def test_logs_describe_reports_the_kms_key(logs):
+    """kmsKeyId is on the LogGroup shape and CreateLogGroup takes it; it is
+    reported only when the group has one."""
+    import uuid as _uuid
+
+    key_arn = f"arn:aws:kms:us-east-1:000000000000:key/{_uuid.uuid4()}"
+    group = f"/intg/lg-kms/{_uuid.uuid4().hex[:8]}"
+    plain = f"/intg/lg-nokms/{_uuid.uuid4().hex[:8]}"
+    logs.create_log_group(logGroupName=group, kmsKeyId=key_arn)
+    logs.create_log_group(logGroupName=plain)
+    try:
+        described = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]
+        assert described["kmsKeyId"] == key_arn
+        described = logs.describe_log_groups(logGroupNamePrefix=plain)["logGroups"][0]
+        assert "kmsKeyId" not in described
+    finally:
+        logs.delete_log_group(logGroupName=group)
+        logs.delete_log_group(logGroupName=plain)
+
+
 def test_logs_start_live_tail_receives_put_events(logs):
     """StartLiveTail stays open and receives matching PutLogEvents until disconnect."""
     import threading
@@ -1776,3 +1829,79 @@ def test_logs_delivery_source_tag_round_trip(logs):
     logs.untag_resource(resourceArn=arn, tagKeys=["env"])
     assert logs.list_tags_for_resource(resourceArn=arn)["tags"] == {"team": "events"}
     logs.delete_delivery_source(name=src_name)
+
+
+def test_logs_subscription_filter_delivers_for_non_default_account():
+    """Subscription-filter → Lambda delivery under a 12-digit-key tenant.
+
+    Guards the account-scoped path end-to-end: the destination function is
+    resolved in the caller's account and invoked via the config-scope wrapper
+    (a bare-thread invoke would otherwise run the subscriber's bookkeeping
+    under the default account)."""
+    import io
+    import zipfile
+
+    account = "271828182845"
+
+    def _acct(service):
+        return boto3.client(
+            service,
+            endpoint_url=_endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=account,
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    logs_c = _acct("logs")
+    lam_c = _acct("lambda")
+    sqs_c = _acct("sqs")
+    suffix = _uuid_mod.uuid4().hex[:8]
+
+    qname = f"subfilter-xacct-signal-{suffix}"
+    q_url = sqs_c.create_queue(QueueName=qname)["QueueUrl"]
+
+    fn = f"subfilter-xacct-{suffix}"
+    code = (
+        "import os, boto3\n"
+        f"QNAME = {qname!r}\n"
+        "def handler(event, context):\n"
+        "    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+        "    url = sqs.get_queue_url(QueueName=QNAME)['QueueUrl']\n"
+        "    sqs.send_message(QueueUrl=url, MessageBody='delivered')\n"
+        "    return {'ok': True}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam_c.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=f"arn:aws:iam::{account}:role/lambda-role",
+        Handler="index.handler",
+        Timeout=30,
+        Code={"ZipFile": buf.getvalue()},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:{account}:function:{fn}"
+
+    group = f"/intg/subfilter-xacct/{suffix}"
+    logs_c.create_log_group(logGroupName=group)
+    logs_c.create_log_stream(logGroupName=group, logStreamName="s1")
+    logs_c.put_subscription_filter(
+        logGroupName=group,
+        filterName="xacct-filter",
+        filterPattern="ERROR",
+        destinationArn=func_arn,
+    )
+    logs_c.put_log_events(
+        logGroupName=group,
+        logStreamName="s1",
+        logEvents=[{"timestamp": int(time.time() * 1000), "message": "ERROR boom"}],
+    )
+
+    deadline = time.time() + 30
+    got = []
+    while time.time() < deadline and not got:
+        msgs = sqs_c.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+        got = msgs.get("Messages", [])
+    assert got, "subscription-filter → Lambda delivery never arrived for a non-default account"

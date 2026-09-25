@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 ElastiCache Service Emulator.
 Query API (Action=...) for control plane.
@@ -206,6 +208,10 @@ def _restore_clusters(incoming):
         record["CacheClusterStatus"] = "available"
         _clusters.set_scoped(account_id, region, name, record)
         _pending_cluster_respawn.add((account_id, region, name))
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -2348,9 +2354,17 @@ def _cluster_xml_inner(c):
     parameter_group = c.get("CacheParameterGroup", {})
     security_groups_xml = _security_groups_xml(c.get("SecurityGroups", []))
     log_delivery_configs_xml = _log_delivery_configs_xml(c.get("LogDeliveryConfigurations", []))
+    # CacheClusterCreateTime is a TStamp; the store keeps a float epoch, the
+    # wire wants ISO8601 (same conversion as CacheNodeCreateTime below).
+    cluster_created = c.get("CacheClusterCreateTime") or time.time()
+    if isinstance(cluster_created, (int, float)):
+        cluster_created_iso = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(cluster_created))
+    else:
+        cluster_created_iso = str(cluster_created)
     return (
         f"<CacheClusterId>{c['CacheClusterId']}</CacheClusterId>"
         f"<CacheClusterStatus>{c['CacheClusterStatus']}</CacheClusterStatus>"
+        f"<CacheClusterCreateTime>{cluster_created_iso}</CacheClusterCreateTime>"
         f"<Engine>{c['Engine']}</Engine>"
         f"<EngineVersion>{c['EngineVersion']}</EngineVersion>"
         f"<CacheNodeType>{c['CacheNodeType']}</CacheNodeType>"

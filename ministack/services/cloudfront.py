@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFront Service Emulator.
 REST/XML API — service credential scope: cloudfront.
@@ -166,6 +168,10 @@ def reset():
     _cache_policies.clear()
     _origin_request_policies.clear()
     _response_headers_policies.clear()
+    _managed_cache_policies.clear()
+    _managed_origin_request_policies.clear()
+    _managed_response_headers_policies.clear()
+    _seed_all_managed_policies()
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
@@ -188,6 +194,10 @@ def get_state():
             "tenant_invalidations": _tenant_invalidations,
         }
     )
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -302,6 +312,26 @@ def _local_tag_name(el) -> str:
     return t.split("}")[-1] if "}" in t else t
 
 
+def _strip_namespace(el):
+    """Rewrite an element tree's tags to their local names, in place.
+
+    A stored ``config_xml`` is the client's own request body, which declares
+    ``xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/"`` on
+    ``DistributionConfig`` — so ``fromstring`` qualifies every tag as
+    ``{ns}Tag``. Re-serialising that inside a response whose root carries
+    ``xmlns`` as a plain attribute makes ElementTree invent an ``ns0:`` prefix
+    for all of them, and AWS SDKs parse REST-XML without namespace awareness:
+    ``ns0:Origins`` does not match ``Origins``, so the whole config reads as
+    absent. Only the root tag was being corrected, which is why
+    ``GetDistribution`` returned a ``DistributionConfig`` containing nothing but
+    the handful of elements built with unqualified names.
+    """
+    el.tag = _local_tag_name(el)
+    for child in el:
+        _strip_namespace(child)
+    return el
+
+
 def _add_xml_block(parent, source_el):
     block = SubElement(parent, _local_tag_name(source_el))
     block.text = source_el.text
@@ -395,6 +425,101 @@ def _ensure_distribution_config_sdk_compat(config_el):
         SubElement(og, "Quantity").text = "0"
 
 
+# CloudFormation's DistributionConfig is the API's, in JSON, with a few
+# differences: a {Quantity, Items} block is a plain list (Aliases, Origins,
+# CacheBehaviors, AllowedMethods, ...; OriginGroups and GeoRestriction keep
+# the block), CachedMethods sits next to AllowedMethods instead of inside it,
+# and these member names are spelled differently. Keyed by the API structure
+# the member sits in.
+_CFN_DISTRIBUTION_CONFIG_RENAMES = {
+    ("DistributionConfig", "IPV6Enabled"): "IsIPV6Enabled",
+    ("Origin", "OriginCustomHeaders"): "CustomHeaders",
+    ("CustomOriginConfig", "OriginSSLProtocols"): "OriginSslProtocols",
+    ("ViewerCertificate", "AcmCertificateArn"): "ACMCertificateArn",
+    ("ViewerCertificate", "IamCertificateId"): "IAMCertificateId",
+    ("ViewerCertificate", "SslSupportMethod"): "SSLSupportMethod",
+    ("GeoRestriction", "Locations"): "Items",
+}
+
+_api_model = None
+
+
+def _api_shape(name):
+    """A shape of the CloudFront API model botocore ships, loaded once."""
+    global _api_model
+    if _api_model is None:
+        import botocore.session
+
+        _api_model = botocore.session.get_session().get_service_model("cloudfront")
+    return _api_model.shape_for(name)
+
+
+def _distribution_config_xml(config: dict):
+    """The ``DistributionConfig`` element for a configuration given in
+    CloudFormation's JSON shape: what ``CreateDistribution`` would have
+    stored had the same configuration arrived on the wire, so every read
+    path parses a CloudFormation-provisioned distribution like any other.
+    Walks the API model, so a member the API defines renders and one it
+    does not (the legacy ``CNAMEs``, ``CustomOrigin``, ``S3Origin``) is
+    dropped; an element that would come out empty is omitted, as the API
+    omits ``Items`` at ``Quantity`` 0."""
+    root = Element("DistributionConfig")
+    _render_config_member(root, _api_shape("DistributionConfig"), config)
+    return root
+
+
+def _render_config_member(el, shape, value):
+    if shape.type_name == "structure":
+        if not isinstance(value, dict):
+            return
+        members = shape.members
+        value = {_CFN_DISTRIBUTION_CONFIG_RENAMES.get((shape.name, k), k): v
+                 for k, v in value.items()}
+        if "AllowedMethods" in members and (
+                isinstance(value.get("AllowedMethods"), list) or "CachedMethods" in value):
+            # The API nests CachedMethods inside AllowedMethods, so a
+            # CachedMethods on its own needs one: GET and HEAD, the first of
+            # the three choices the reference lists (it states no default).
+            value["AllowedMethods"] = {"Items": value.get("AllowedMethods") or ["GET", "HEAD"],
+                                       "CachedMethods": value.pop("CachedMethods", None)}
+        if "Quantity" in members and "Items" in members:
+            value.setdefault("Quantity", len(value.get("Items") or []))
+        if "Enabled" in members and "Enabled" not in value:
+            # Six structures carry an Enabled the template may omit:
+            # TrustedSigners and TrustedKeyGroups are on when they list
+            # anything; Logging, OriginShield and GrpcConfig are on when the
+            # block is present; DistributionConfig defaults to on, as
+            # _get_enabled reads it.
+            value["Enabled"] = bool(value.get("Items")) if "Items" in members else True
+        for name, member in members.items():
+            item = value.get(name)
+            if item is None:
+                continue
+            if member.type_name == "structure" and "Items" in member.members and isinstance(item, list):
+                item = {"Items": item}
+            _append_config_member(el, member.serialization.get("name", name), member, item)
+    elif shape.type_name == "list":
+        if not isinstance(value, list):
+            return
+        tag = shape.member.serialization.get("name", "member")
+        for item in value:
+            _append_config_member(el, tag, shape.member, item)
+    elif isinstance(value, bool):
+        el.text = "true" if value else "false"
+    elif not isinstance(value, (dict, list)):
+        el.text = str(value)
+
+
+def _append_config_member(parent, tag, shape, value):
+    """Render ``value`` under ``tag`` and attach it only when something came
+    out: an empty list, or a structure none of whose keys the API knows,
+    leaves no element behind."""
+    child = Element(tag)
+    _render_config_member(child, shape, value)
+    if len(child) or child.text is not None:
+        parent.append(child)
+
+
 def _build_distribution_xml(parent, dist):
     """Append Distribution child elements to parent."""
     SubElement(parent, "Id").text = dist["Id"]
@@ -404,7 +529,7 @@ def _build_distribution_xml(parent, dist):
     SubElement(parent, "InProgressInvalidationBatches").text = "0"
     SubElement(parent, "DomainName").text = dist["DomainName"]
     # Re-parse and embed the stored config XML
-    config_el = fromstring(dist["config_xml"])
+    config_el = _strip_namespace(fromstring(dist["config_xml"]))
     _ensure_distribution_config_sdk_compat(config_el)
     config_el.tag = "DistributionConfig"
     parent.append(config_el)
@@ -530,18 +655,34 @@ def _resolve_taggable_cloudfront_arn(arn: str):
     return arn, None
 
 
+def _function_view(fn: dict, stage: str) -> dict:
+    """The function body a stage serves.
+
+    An update lands in DEVELOPMENT only — "The changes are made only to the
+    version of the function that is in the DEVELOPMENT stage. To copy the
+    updates from the DEVELOPMENT stage to LIVE, you must publish the function"
+    — so LIVE keeps serving the body captured at the last publish. A record
+    from before this snapshot existed falls back to the live body.
+    """
+    if stage == "LIVE":
+        return fn.get("live_body") or fn
+    return fn
+
+
 def _function_summary_builder(fn: dict, stage: str, status: str, last_modified: str):
+    view = _function_view(fn, stage)
+
     def build(root):
         fc = SubElement(root, "FunctionConfig")
-        SubElement(fc, "Comment").text = fn.get("comment", "")
-        kvs_arns = fn.get("kvs_arns", [])
+        SubElement(fc, "Comment").text = view.get("comment", "")
+        kvs_arns = view.get("kvs_arns", [])
         kvs = SubElement(fc, "KeyValueStoreAssociations")
         SubElement(kvs, "Quantity").text = str(len(kvs_arns))
         items_el = SubElement(kvs, "Items")
         for arn in kvs_arns:
             assoc = SubElement(items_el, "KeyValueStoreAssociation")
             SubElement(assoc, "KeyValueStoreARN").text = arn
-        SubElement(fc, "Runtime").text = fn["runtime"]
+        SubElement(fc, "Runtime").text = view.get("runtime", fn["runtime"])
         md = SubElement(root, "FunctionMetadata")
         SubElement(md, "CreatedTime").text = fn["created"]
         SubElement(md, "FunctionARN").text = fn["arn"]
@@ -614,6 +755,8 @@ def _cf_create_function(headers, body):
         "last_modified_live": None,
         "dev_etag": dev_etag,
         "live_etag": None,
+        # The body PublishFunction froze; LIVE serves this, not the working copy.
+        "live_body": None,
     }
     _functions[name] = fn
     logger.info("CreateFunction name=%s", name)
@@ -684,7 +827,7 @@ def _cf_get_function(name: str, stage: str):
         if not fn["live_etag"]:
             return _error("NoSuchFunctionExists", "The specified function does not exist.", 404)
         etag = fn["live_etag"]
-        code = fn["code"]
+        code = _function_view(fn, "LIVE").get("code", fn["code"])
     elif stage == "DEVELOPMENT":
         etag = fn["dev_etag"]
         code = fn["code"]
@@ -711,6 +854,14 @@ def _cf_publish_function(name: str, headers):
     now = _now_iso()
     fn["live_etag"] = new_uuid()
     fn["last_modified_live"] = now
+    # Publishing copies DEVELOPMENT to LIVE; later updates to the development
+    # body must not reach the stage that is serving traffic.
+    fn["live_body"] = {
+        "comment": fn["comment"],
+        "runtime": fn["runtime"],
+        "kvs_arns": list(fn.get("kvs_arns", [])),
+        "code": fn["code"],
+    }
     logger.info("PublishFunction name=%s", name)
 
     lm = fn["last_modified_live"]
@@ -753,8 +904,8 @@ def _cf_update_function(name: str, headers, body):
     fn["code"] = code
     fn["last_modified_dev"] = now
     fn["dev_etag"] = new_uuid()
-    fn["live_etag"] = None
-    fn["last_modified_live"] = None
+    # LIVE is untouched: an update changes the DEVELOPMENT stage only, and the
+    # published version keeps serving until PublishFunction copies this one.
     logger.info("UpdateFunction name=%s", name)
 
     return _xml_response(
@@ -946,7 +1097,7 @@ def _create_cache_policy(body):
 
 
 def _get_cache_policy(policy_id):
-    policy = _cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -957,7 +1108,7 @@ def _get_cache_policy(policy_id):
 
 
 def _get_cache_policy_config(policy_id):
-    policy = _cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -968,6 +1119,8 @@ def _get_cache_policy_config(policy_id):
 
 
 def _update_cache_policy(policy_id, headers, body):
+    if policy_id in _managed_cache_policies:
+        return _managed_policy_error("cache policy", policy_id)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1002,6 +1155,8 @@ def _update_cache_policy(policy_id, headers, body):
 
 
 def _delete_cache_policy(policy_id, headers):
+    if policy_id in _managed_cache_policies:
+        return _managed_policy_error("cache policy", policy_id)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1026,7 +1181,7 @@ def _delete_cache_policy(policy_id, headers):
 
 
 def _list_distributions_by_cache_policy(policy_id):
-    if not _cache_policies.get(policy_id):
+    if not (_cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)):
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
     dist_ids = _distributions_using_cache_policy(policy_id)
 
@@ -1137,7 +1292,7 @@ def _policy_create(store, spec, body):
 
 
 def _policy_get(store, spec, pid):
-    policy = store.get(pid)
+    policy = store.get(pid) or spec["managed"].get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
@@ -1145,7 +1300,7 @@ def _policy_get(store, spec, pid):
 
 
 def _policy_get_config(store, spec, pid):
-    policy = store.get(pid)
+    policy = store.get(pid) or spec["managed"].get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["config_tag"], lambda r: spec["build_config"](r, policy["Config"]),
@@ -1153,6 +1308,8 @@ def _policy_get_config(store, spec, pid):
 
 
 def _policy_update(store, spec, pid, headers, body):
+    if pid in spec["managed"]:
+        return _managed_policy_error(spec["label"], pid)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1177,6 +1334,8 @@ def _policy_update(store, spec, pid, headers, body):
 
 
 def _policy_delete(store, spec, pid, headers):
+    if pid in spec["managed"]:
+        return _managed_policy_error(spec["label"], pid)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1193,7 +1352,7 @@ def _policy_delete(store, spec, pid, headers):
 
 
 def _policy_list_distributions(store, spec, pid):
-    if not store.get(pid):
+    if not (store.get(pid) or spec["managed"].get(pid)):
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     dist_ids = _distributions_using_policy(pid)
 
@@ -1289,7 +1448,7 @@ def _parse_rhp_config(el):
     if not name:
         return None, _error("InvalidArgument", "The response headers policy name is required.", 400)
     cfg = {"Name": name, "Comment": _text(el, "Comment"), "Cors": None, "Security": None,
-           "ServerTiming": None, "CustomHeaders": [], "RemoveHeaders": []}
+           "ServerTiming": None}
 
     cors_el = _find(el, "CorsConfig")
     if cors_el is not None:
@@ -1358,6 +1517,7 @@ def _parse_rhp_config(el):
 
     ch_el = _find(el, "CustomHeadersConfig")
     if ch_el is not None:
+        cfg["CustomHeaders"] = []
         items_el = _find(ch_el, "Items")
         if items_el is not None:
             for it in items_el:
@@ -1370,6 +1530,7 @@ def _parse_rhp_config(el):
 
     rh_el = _find(el, "RemoveHeadersConfig")
     if rh_el is not None:
+        cfg["RemoveHeaders"] = []
         items_el = _find(rh_el, "Items")
         if items_el is not None:
             for it in items_el:
@@ -1439,23 +1600,25 @@ def _build_rhp_config_xml(parent, cfg):
         if st.get("SamplingRate") is not None:
             SubElement(stel, "SamplingRate").text = _fmt_rate(st["SamplingRate"])
 
-    ch = SubElement(parent, "CustomHeadersConfig")
-    SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
-    if cfg["CustomHeaders"]:
-        items = SubElement(ch, "Items")
-        for hdr in cfg["CustomHeaders"]:
-            it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
-            SubElement(it, "Header").text = hdr["Header"]
-            SubElement(it, "Value").text = hdr["Value"]
-            SubElement(it, "Override").text = _bstr(hdr["Override"])
+    if "CustomHeaders" in cfg:
+        ch = SubElement(parent, "CustomHeadersConfig")
+        SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
+        if cfg["CustomHeaders"]:
+            items = SubElement(ch, "Items")
+            for hdr in cfg["CustomHeaders"]:
+                it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
+                SubElement(it, "Header").text = hdr["Header"]
+                SubElement(it, "Value").text = hdr["Value"]
+                SubElement(it, "Override").text = _bstr(hdr["Override"])
 
-    rh = SubElement(parent, "RemoveHeadersConfig")
-    SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
-    if cfg["RemoveHeaders"]:
-        items = SubElement(rh, "Items")
-        for hdr in cfg["RemoveHeaders"]:
-            it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
-            SubElement(it, "Header").text = hdr["Header"]
+    if "RemoveHeaders" in cfg:
+        rh = SubElement(parent, "RemoveHeadersConfig")
+        SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
+        if cfg["RemoveHeaders"]:
+            items = SubElement(rh, "Items")
+            for hdr in cfg["RemoveHeaders"]:
+                it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
+                SubElement(it, "Header").text = hdr["Header"]
 
 
 def _build_rhp_xml(parent, policy):
@@ -1473,6 +1636,196 @@ _RHP_SPEC = {
     "in_use": "ResponseHeadersPolicyInUse", "parse": _parse_rhp_config,
     "build_resource": _build_rhp_xml, "build_config": _build_rhp_config_xml,
 }
+
+
+# ---------------------------------------------------------------------------
+# AWS-managed cache / origin-request / response-headers policies.
+#
+# Real AWS ships a fixed catalog of managed policies with stable IDs that
+# are identical in every account and region — there is no "owner" account,
+# unlike the per-account customer stores above (``_cache_policies`` etc.,
+# which are ``AccountScopedDict``). Terraform's
+# ``data "aws_cloudfront_cache_policy" { name = "Managed-CachingDisabled" }``
+# (and the origin-request / response-headers equivalents) resolve by NAME
+# against this catalog at PLAN time. MiniStack already implements full CRUD
+# for *custom* policies (CreateCachePolicy, CreateDistribution, ...) but
+# never seeded the managed set, so any Terraform plan referencing e.g.
+# "Managed-CachingDisabled" aborted before a single resource was created:
+#   Error: no matching CloudFront Cache Policy (Managed-CachingDisabled)
+#
+# Modeled directly on the IAM AWS-managed-policy pattern (see
+# ``_aws_managed_policies`` in services/iam.py, PR #609): a plain,
+# non-account-scoped module-level dict seeded at import time and in
+# ``reset()`` — every account/tenant reads the same catalog, and it is
+# immutable from a session's perspective (Update/Delete on a managed ID
+# are rejected the same way real AWS rejects them).
+#
+# Only the commonly-referenced subset is seeded, not AWS's full ~15-policy
+# catalog — see docs/busydone-gaps/cloudfront-managed-policies.md for the
+# exact seeded-vs-skipped list and the scope rationale. IDs, TTLs, and
+# forwarding/header behaviour below are transcribed verbatim from the AWS
+# Managed Policy Reference (fetched 2026-08-15):
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html
+#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-response-headers-policies.html
+# ---------------------------------------------------------------------------
+_managed_cache_policies: dict = {}
+_managed_origin_request_policies: dict = {}
+_managed_response_headers_policies: dict = {}
+
+# Real AWS's original managed-policy set was published on this date; used
+# as a plausible fixed LastModifiedTime rather than "now" so it doesn't
+# drift on every reset. Not independently verified per-policy — low-stakes
+# relative to the Id (which callers key lookups on).
+_MANAGED_POLICY_LAST_MODIFIED = "2020-05-20T04:34:00.000Z"
+
+
+def _make_managed_policy_record(policy_id: str, config: dict) -> dict:
+    return {
+        "Id": policy_id,
+        "ETag": new_uuid(),
+        "LastModifiedTime": _MANAGED_POLICY_LAST_MODIFIED,
+        "Config": config,
+    }
+
+
+def _managed_policy_error(label: str, policy_id: str) -> tuple:
+    """Real AWS rejects Update/Delete on a managed policy's fixed Id.
+    Mirrors the AccessDenied convention IAM already uses for its own
+    AWS-managed policies (see ``_delete_policy`` in services/iam.py)."""
+    return _error(
+        "AccessDenied",
+        f"The specified {label} ({policy_id}) is an AWS-managed CloudFront policy "
+        "and cannot be modified or deleted.",
+        403,
+    )
+
+
+def _seed_managed_cache_policies() -> None:
+    seeds = [
+        ("4135ea2d-6df8-44a3-9df3-4b5a84be39ad", {
+            "Name": "Managed-CachingDisabled",
+            "Comment": "Policy with caching disabled",
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
+            "Parameters": {
+                "EnableAcceptEncodingGzip": False, "EnableAcceptEncodingBrotli": False,
+                "HeaderBehavior": "none", "Headers": [],
+                "CookieBehavior": "none", "Cookies": [],
+                "QueryStringBehavior": "none", "QueryStrings": [],
+            },
+        }),
+        ("658327ea-f89d-4fab-a63d-7e88639e58f6", {
+            "Name": "Managed-CachingOptimized",
+            "Comment": "Policy with caching enabled. Supports Gzip and Brotli compression.",
+            "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": {
+                "EnableAcceptEncodingGzip": True, "EnableAcceptEncodingBrotli": True,
+                "HeaderBehavior": "none", "Headers": [],
+                "CookieBehavior": "none", "Cookies": [],
+                "QueryStringBehavior": "none", "QueryStrings": [],
+            },
+        }),
+    ]
+    for policy_id, cfg in seeds:
+        _managed_cache_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+
+
+def _seed_managed_origin_request_policies() -> None:
+    seeds = [
+        ("216adef6-5c7f-47e4-b989-5492eafa07d3", {
+            "Name": "Managed-AllViewer",
+            "Comment": "Includes all values (headers, cookies, and query strings) in the viewer request.",
+            "HeaderBehavior": "allViewer", "Headers": [],
+            "CookieBehavior": "all", "Cookies": [],
+            "QueryStringBehavior": "all", "QueryStrings": [],
+        }),
+        ("b689b0a8-53d0-40ab-baf2-68738e2966ac", {
+            "Name": "Managed-AllViewerExceptHostHeader",
+            "Comment": "Includes all values (headers, cookies, and query strings) in the viewer request, "
+                       "except for the Host header.",
+            "HeaderBehavior": "allExcept", "Headers": ["Host"],
+            "CookieBehavior": "all", "Cookies": [],
+            "QueryStringBehavior": "all", "QueryStrings": [],
+        }),
+    ]
+    for policy_id, cfg in seeds:
+        _managed_origin_request_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+
+
+def _rhp_managed_security_headers_block() -> dict:
+    """The shared 5-header ``SecurityHeadersPolicy`` block, verbatim from the
+    AWS Managed Policy Reference — reused by both *-and-SecurityHeadersPolicy
+    combo policies below."""
+    return {
+        "XSSProtection": {"Override": False, "Protection": True, "ModeBlock": True, "ReportUri": None},
+        "FrameOptions": {"Override": False, "FrameOption": "SAMEORIGIN"},
+        "ReferrerPolicy": {"Override": False, "ReferrerPolicy": "strict-origin-when-cross-origin"},
+        "ContentTypeOptions": {"Override": True},
+        "StrictTransportSecurity": {
+            "Override": False, "IncludeSubdomains": None, "Preload": None,
+            "AccessControlMaxAgeSec": 31536000,
+        },
+    }
+
+
+def _seed_managed_response_headers_policies() -> None:
+    simple_cors = {
+        "AllowOrigins": ["*"], "AllowHeaders": ["*"], "AllowMethods": ["GET"],
+        "AllowCredentials": False, "OriginOverride": False,
+        "ExposeHeaders": None, "MaxAgeSec": None,
+    }
+    preflight_cors = {
+        "AllowOrigins": ["*"], "AllowHeaders": ["*"],
+        "AllowMethods": ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+        "AllowCredentials": False, "OriginOverride": False,
+        "ExposeHeaders": ["*"], "MaxAgeSec": None,
+    }
+    seeds = [
+        ("60669652-455b-4ae9-85a4-c4c02393f86c", {
+            "Name": "Managed-SimpleCORS",
+            "Comment": "Policy to allow simple CORS requests from any origin.",
+            "Cors": dict(simple_cors), "Security": None, "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+        ("5cc3b908-e619-4b99-88e5-2cf7f45965bd", {
+            "Name": "Managed-CORS-With-Preflight",
+            "Comment": "Policy to allow CORS requests from any origin, including preflight requests.",
+            "Cors": dict(preflight_cors), "Security": None, "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+        ("e61eb60c-9c35-4d20-a928-2b84e02af89c", {
+            "Name": "Managed-CORS-and-SecurityHeadersPolicy",
+            "Comment": "Policy to allow simple CORS requests from any origin, and add a set of security "
+                       "headers to every response.",
+            "Cors": dict(simple_cors), "Security": _rhp_managed_security_headers_block(), "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+        ("eaab4381-ed33-4a86-88ca-d9558dc6cd63", {
+            "Name": "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+            "Comment": "Policy to allow CORS requests from any origin, including preflight requests, and "
+                       "add a set of security headers to every response.",
+            "Cors": dict(preflight_cors), "Security": _rhp_managed_security_headers_block(), "ServerTiming": None,
+            "CustomHeaders": [], "RemoveHeaders": [],
+        }),
+    ]
+    for policy_id, cfg in seeds:
+        _managed_response_headers_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+
+
+def _seed_all_managed_policies() -> None:
+    _seed_managed_cache_policies()
+    _seed_managed_origin_request_policies()
+    _seed_managed_response_headers_policies()
+
+
+# Wire the managed catalogs into the shared ORP/RHP spec dicts so the
+# generic ``_policy_get``/``_policy_update``/``_policy_delete``/
+# ``_list_policies`` helpers can look them up without a third store
+# parameter at every call site.
+_ORP_SPEC["managed"] = _managed_origin_request_policies
+_RHP_SPEC["managed"] = _managed_response_headers_policies
+
+_seed_all_managed_policies()
 
 
 # ---------------------------------------------------------------------------
@@ -1535,18 +1888,27 @@ def _list_anycast_ip_lists(query_params):
 
 
 def _list_cache_policies(query_params):
-    """CachePolicyList wrapping stored custom cache policies (Type=custom)."""
+    """CachePolicyList wrapping AWS-managed + stored custom cache policies,
+    filtered by the optional ``Type`` param (``managed`` | ``custom``);
+    omitted returns both, matching real AWS."""
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    policies = list(_cache_policies.values())
+    type_filter = _qval(query_params, "Type", "") or None
+    if type_filter not in (None, "managed", "custom"):
+        return _error("InvalidArgument", "Invalid Type value.", 400)
+    entries = []
+    if type_filter in (None, "managed"):
+        entries.extend(("managed", p) for p in _managed_cache_policies.values())
+    if type_filter in (None, "custom"):
+        entries.extend(("custom", p) for p in _cache_policies.values())
 
     def build(root):
         SubElement(root, "MaxItems").text = max_items
-        SubElement(root, "Quantity").text = str(len(policies))
-        if policies:
+        SubElement(root, "Quantity").text = str(len(entries))
+        if entries:
             items_el = SubElement(root, "Items")
-            for policy in policies:
+            for kind, policy in entries:
                 summary = SubElement(items_el, "CachePolicySummary")
-                SubElement(summary, "Type").text = "custom"
+                SubElement(summary, "Type").text = kind
                 cp = SubElement(summary, "CachePolicy")
                 _build_cache_policy_xml(cp, policy)
 
@@ -1554,22 +1916,31 @@ def _list_cache_policies(query_params):
 
 
 def _list_policies(store, spec, query_params):
-    """Generic ``*PolicyList`` wrapping stored custom policies (Type=custom).
+    """Generic ``*PolicyList`` wrapping AWS-managed + stored custom policies,
+    filtered by the optional ``Type`` param (``managed`` | ``custom``);
+    omitted returns both, matching real AWS.
 
     Shared by origin request policies and response headers policies; the
-    summary member and resource tag come from ``spec``.
+    summary member, resource tag, and managed catalog come from ``spec``.
     """
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    policies = list(store.values())
+    type_filter = _qval(query_params, "Type", "") or None
+    if type_filter not in (None, "managed", "custom"):
+        return _error("InvalidArgument", "Invalid Type value.", 400)
+    entries = []
+    if type_filter in (None, "managed"):
+        entries.extend(("managed", p) for p in spec["managed"].values())
+    if type_filter in (None, "custom"):
+        entries.extend(("custom", p) for p in store.values())
 
     def build(root):
         SubElement(root, "MaxItems").text = max_items
-        SubElement(root, "Quantity").text = str(len(policies))
-        if policies:
+        SubElement(root, "Quantity").text = str(len(entries))
+        if entries:
             items_el = SubElement(root, "Items")
-            for policy in policies:
+            for kind, policy in entries:
                 summary = SubElement(items_el, spec["summary_tag"])
-                SubElement(summary, "Type").text = "custom"
+                SubElement(summary, "Type").text = kind
                 res = SubElement(summary, spec["resource_tag"])
                 spec["build_resource"](res, policy)
 
@@ -2043,7 +2414,7 @@ def _get_distribution_config(dist_id):
     if not dist:
         return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
 
-    config_el = fromstring(dist["config_xml"])
+    config_el = _strip_namespace(fromstring(dist["config_xml"]))
     _ensure_distribution_config_sdk_compat(config_el)
     config_el.tag = "DistributionConfig"
     config_el.set("xmlns", NS)
@@ -2054,8 +2425,9 @@ def _get_distribution_config(dist_id):
 def _dist_config_el(dist):
     """Parsed DistributionConfig element for a stored distribution.
 
-    CloudFormation-provisioned records carry an empty ``config_xml``; parse
-    defensively so account-wide scans never fail on them."""
+    A CloudFormation-provisioned record persisted before the provisioner
+    rendered its configuration carries an empty ``config_xml``; parse
+    defensively so account-wide scans never fail on one."""
     xml = dist.get("config_xml")
     if xml:
         try:

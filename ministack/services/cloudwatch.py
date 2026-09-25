@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudWatch Metrics Service Emulator.
 Supports legacy Query API (form-encoded), smithy-rpc-v2-cbor (botocore 1.42+),
@@ -114,6 +116,10 @@ def get_state():
         "dashboards": copy.deepcopy(_dashboards),
         "resource_tags": copy.deepcopy(_resource_tags),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -901,17 +907,11 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "AlarmName": name,
             "AlarmArn": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}",
             "AlarmDescription": cbor_data.get("AlarmDescription", ""),
-            "MetricName": cbor_data.get("MetricName"),
-            "Namespace": cbor_data.get("Namespace"),
-            "Statistic": cbor_data.get("Statistic", "Average"),
-            "ExtendedStatistic": cbor_data.get("ExtendedStatistic"),
-            "Period": int(cbor_data.get("Period", 60)),
             "EvaluationPeriods": int(cbor_data.get("EvaluationPeriods", 1)),
             "DatapointsToAlarm": int(
                 cbor_data.get("DatapointsToAlarm")
                 or cbor_data.get("EvaluationPeriods", 1)
             ),
-            "Threshold": float(cbor_data.get("Threshold", 0)),
             "ComparisonOperator": cbor_data.get("ComparisonOperator"),
             "TreatMissingData": cbor_data.get("TreatMissingData", "missing"),
             "StateValue": _alarms[name]["StateValue"]
@@ -920,15 +920,33 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": int(time.time()),
+            "StateUpdatedTimestamp": _alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+            if name in _alarms
+            else int(time.time()),
             "ActionsEnabled": cbor_data.get("ActionsEnabled", True),
             "AlarmActions": cbor_data.get("AlarmActions", []),
             "OKActions": cbor_data.get("OKActions", []),
             "InsufficientDataActions": cbor_data.get("InsufficientDataActions", []),
-            "Dimensions": cbor_data.get("Dimensions", []),
-            "Unit": cbor_data.get("Unit"),
             "AlarmConfigurationUpdatedTimestamp": int(time.time()),
         }
+        if "Statistic" in cbor_data:
+            alarm["Statistic"] = cbor_data["Statistic"]
+        if "Period" in cbor_data:
+            alarm["Period"] = int(cbor_data["Period"])
+        if "Threshold" in cbor_data:
+            alarm["Threshold"] = float(cbor_data["Threshold"])
+        for field in (
+            "MetricName",
+            "Namespace",
+            "Metrics",
+            "ExtendedStatistic",
+            "Dimensions",
+            "Unit",
+            "ThresholdMetricId",
+        ):
+            if field in cbor_data:
+                alarm[field] = cbor_data[field]
+        tags = cbor_data.get("Tags", [])
     else:
         name = _p(params, "AlarmName")
         dims = []
@@ -955,18 +973,12 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "AlarmName": name,
             "AlarmArn": f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}",
             "AlarmDescription": _p(params, "AlarmDescription"),
-            "MetricName": _p(params, "MetricName"),
-            "Namespace": _p(params, "Namespace"),
-            "Statistic": _p(params, "Statistic") or "Average",
-            "ExtendedStatistic": _p(params, "ExtendedStatistic") or None,
-            "Period": int(_p(params, "Period") or "60"),
             "EvaluationPeriods": int(_p(params, "EvaluationPeriods") or "1"),
             "DatapointsToAlarm": int(
                 _p(params, "DatapointsToAlarm")
                 or _p(params, "EvaluationPeriods")
                 or "1"
             ),
-            "Threshold": float(_p(params, "Threshold") or "0"),
             "ComparisonOperator": _p(params, "ComparisonOperator"),
             "TreatMissingData": _p(params, "TreatMissingData") or "missing",
             "StateValue": _alarms[name]["StateValue"]
@@ -975,20 +987,54 @@ def _put_metric_alarm(params, cbor_data, is_cbor, is_json=False):
             "StateReason": _alarms[name]["StateReason"]
             if name in _alarms
             else "Unchecked: Initial alarm creation",
-            "StateUpdatedTimestamp": int(time.time()),
+            "StateUpdatedTimestamp": _alarms[name].get("StateUpdatedTimestamp", int(time.time()))
+            if name in _alarms
+            else int(time.time()),
             "ActionsEnabled": _p(params, "ActionsEnabled") != "false",
             "AlarmActions": alarm_actions,
             "OKActions": ok_actions,
             "InsufficientDataActions": [],
-            "Dimensions": dims,
-            "Unit": _p(params, "Unit") or None,
             "AlarmConfigurationUpdatedTimestamp": int(time.time()),
         }
+        if statistic := _p(params, "Statistic"):
+            alarm["Statistic"] = statistic
+        if period := _p(params, "Period"):
+            alarm["Period"] = int(period)
+        if threshold := _p(params, "Threshold"):
+            alarm["Threshold"] = float(threshold)
+        if threshold_metric_id := _p(params, "ThresholdMetricId"):
+            alarm["ThresholdMetricId"] = threshold_metric_id
+        if metric_name := _p(params, "MetricName"):
+            alarm["MetricName"] = metric_name
+        if namespace := _p(params, "Namespace"):
+            alarm["Namespace"] = namespace
+        if extended_statistic := _p(params, "ExtendedStatistic"):
+            alarm["ExtendedStatistic"] = extended_statistic
+        if dims:
+            alarm["Dimensions"] = dims
+        if unit := _p(params, "Unit"):
+            alarm["Unit"] = unit
+        if metrics := _query_metric_data_queries(params, "Metrics"):
+            alarm["Metrics"] = metrics
+        tags = []
+        ti = 1
+        while _p(params, f"Tags.member.{ti}.Key"):
+            tags.append(
+                {
+                    "Key": _p(params, f"Tags.member.{ti}.Key"),
+                    "Value": _p(params, f"Tags.member.{ti}.Value"),
+                }
+            )
+            ti += 1
 
     is_new = name not in _alarms
     _alarms[name] = alarm
 
     if is_new:
+        if tags:
+            _resource_tags[alarm["AlarmArn"]] = {
+                tag["Key"]: tag.get("Value", "") for tag in tags
+            }
         _record_history(
             name,
             "INSUFFICIENT_DATA",
@@ -1120,16 +1166,42 @@ def _describe_alarms(params, cbor_data, is_cbor, is_json=False):
             {"MetricAlarms": metric_alarms, "CompositeAlarms": composite_results}
         )
 
-    metric_members = "".join(
-        f"<member><AlarmName>{a['AlarmName']}</AlarmName><AlarmArn>{a['AlarmArn']}</AlarmArn>"
-        f"<StateValue>{a['StateValue']}</StateValue><MetricName>{a.get('MetricName','')}</MetricName>"
-        f"<Namespace>{a.get('Namespace','')}</Namespace><Threshold>{a.get('Threshold','')}</Threshold>"
-        f"<ComparisonOperator>{a.get('ComparisonOperator','')}</ComparisonOperator>"
-        f"<EvaluationPeriods>{a.get('EvaluationPeriods','')}</EvaluationPeriods>"
-        f"<StateReason>{a.get('StateReason','')}</StateReason>"
-        f"</member>"
-        for a in metric_alarms
-    )
+    metric_members = ""
+    for alarm in metric_alarms:
+        optional_fields = "".join(
+            f"<{field}>{alarm[field]}</{field}>"
+            for field in (
+                "MetricName",
+                "Namespace",
+                "Statistic",
+                "ExtendedStatistic",
+                "Period",
+                "Unit",
+                "Threshold",
+                "ThresholdMetricId",
+            )
+            if field in alarm
+        )
+        if "Dimensions" in alarm:
+            dimensions = "".join(
+                f"<member><Name>{dimension['Name']}</Name>"
+                f"<Value>{dimension.get('Value', '')}</Value></member>"
+                for dimension in alarm["Dimensions"]
+            )
+            optional_fields += f"<Dimensions>{dimensions}</Dimensions>"
+        metrics = "".join(
+            _metric_data_query_xml(query) for query in alarm.get("Metrics", [])
+        )
+        if metrics:
+            optional_fields += f"<Metrics>{metrics}</Metrics>"
+        metric_members += (
+            f"<member><AlarmName>{alarm['AlarmName']}</AlarmName>"
+            f"<AlarmArn>{alarm['AlarmArn']}</AlarmArn>"
+            f"<StateValue>{alarm['StateValue']}</StateValue>{optional_fields}"
+            f"<ComparisonOperator>{alarm.get('ComparisonOperator','')}</ComparisonOperator>"
+            f"<EvaluationPeriods>{alarm.get('EvaluationPeriods','')}</EvaluationPeriods>"
+            f"<StateReason>{alarm.get('StateReason','')}</StateReason></member>"
+        )
     comp_members = "".join(
         f"<member><AlarmName>{a['AlarmName']}</AlarmName><AlarmArn>{a['AlarmArn']}</AlarmArn>"
         f"<AlarmRule>{a.get('AlarmRule','')}</AlarmRule>"
@@ -1604,6 +1676,89 @@ def _p(params, key, default=""):
     return val[0] if isinstance(val, list) else val
 
 
+def _query_metric_data_queries(params, field_name):
+    """Decode Query-protocol MetricDataQuery members without inventing optional fields."""
+    queries = []
+    qi = 1
+    while _p(params, f"{field_name}.member.{qi}.Id"):
+        base = f"{field_name}.member.{qi}"
+        query = {"Id": _p(params, f"{base}.Id")}
+        for field in ("Expression", "Label", "AccountId"):
+            if value := _p(params, f"{base}.{field}"):
+                query[field] = value
+        if return_data := _p(params, f"{base}.ReturnData"):
+            query["ReturnData"] = return_data.lower() == "true"
+        if period := _p(params, f"{base}.Period"):
+            query["Period"] = int(period)
+
+        metric_stat_base = f"{base}.MetricStat"
+        metric_base = f"{metric_stat_base}.Metric"
+        metric = {}
+        for field in ("Namespace", "MetricName"):
+            if value := _p(params, f"{metric_base}.{field}"):
+                metric[field] = value
+        dimensions = []
+        di = 1
+        while _p(params, f"{metric_base}.Dimensions.member.{di}.Name"):
+            dimensions.append(
+                {
+                    "Name": _p(params, f"{metric_base}.Dimensions.member.{di}.Name"),
+                    "Value": _p(params, f"{metric_base}.Dimensions.member.{di}.Value"),
+                }
+            )
+            di += 1
+        if dimensions:
+            metric["Dimensions"] = dimensions
+
+        metric_stat = {}
+        if metric:
+            metric_stat["Metric"] = metric
+        if stat_period := _p(params, f"{metric_stat_base}.Period"):
+            metric_stat["Period"] = int(stat_period)
+        for field in ("Stat", "Unit"):
+            if value := _p(params, f"{metric_stat_base}.{field}"):
+                metric_stat[field] = value
+        if metric_stat:
+            query["MetricStat"] = metric_stat
+
+        queries.append(query)
+        qi += 1
+    return queries
+
+
+def _metric_data_query_xml(query):
+    """Serialize one MetricDataQuery for the legacy Query response protocol."""
+    fields = [f"<Id>{query['Id']}</Id>"]
+    for field in ("Expression", "Label", "AccountId"):
+        if field in query:
+            fields.append(f"<{field}>{query[field]}</{field}>")
+    if "ReturnData" in query:
+        fields.append(f"<ReturnData>{str(query['ReturnData']).lower()}</ReturnData>")
+    if "Period" in query:
+        fields.append(f"<Period>{query['Period']}</Period>")
+    if metric_stat := query.get("MetricStat"):
+        metric_fields = []
+        if metric := metric_stat.get("Metric"):
+            direct_fields = "".join(
+                f"<{field}>{metric[field]}</{field}>"
+                for field in ("Namespace", "MetricName")
+                if field in metric
+            )
+            if "Dimensions" in metric:
+                dimensions = "".join(
+                    f"<member><Name>{dimension['Name']}</Name>"
+                    f"<Value>{dimension.get('Value', '')}</Value></member>"
+                    for dimension in metric["Dimensions"]
+                )
+                direct_fields += f"<Dimensions>{dimensions}</Dimensions>"
+            metric_fields.append(f"<Metric>{direct_fields}</Metric>")
+        for field in ("Period", "Stat", "Unit"):
+            if field in metric_stat:
+                metric_fields.append(f"<{field}>{metric_stat[field]}</{field}>")
+        fields.append(f"<MetricStat>{''.join(metric_fields)}</MetricStat>")
+    return f"<member>{''.join(fields)}</member>"
+
+
 def _cbor_timestamp(value):
     """Encode an epoch/ISO timestamp as CBOR tag 1 (epoch date-time).
 
@@ -1697,8 +1852,54 @@ def _cbor_ok(data: dict):
     )
 
 
+def _json_timestamp(value):
+    """Encode one timestamp member for awsJson1_0, which models it as epoch seconds.
+
+    The XML path builds every timestamp as an ISO-8601 string (``_ts_iso``) and
+    the JSON branches return those same dicts unchanged, so an AWS SDK — which
+    parses a smithy ``timestamp`` over awsJson1_0 as a number — fails the whole
+    response with ``Expected real number, got implicit NaN``. Same class of bug
+    as the CBOR tag-1 issue (#1261), one protocol over: the data is right and
+    only its encoding is wrong.
+    """
+    if isinstance(value, str):
+        epoch = _parse_ts(value)
+        if epoch is not None:
+            # Int epoch, not float: the project convention for JSON bodies
+            # (Java SDK v2 rejects high-precision float timestamps).
+            return int(epoch)
+    return value
+
+
+def _json_timestamps(value):
+    """Recursively convert Timestamp members in a JSON response to epoch seconds.
+
+    Applied inside ``_json_ok`` rather than at each return site. CloudWatch has
+    five JSON responses carrying timestamps — GetMetricStatistics,
+    GetMetricData, DescribeAlarms, DescribeAlarmsForMetric and
+    DescribeAlarmHistory — and a per-shape converter for each, mirroring the
+    ``_cbor_*`` family, would be five chances to miss one and five more for
+    every response added later. Every timestamp member in this service's model
+    is named ``Timestamp`` or ``Timestamps``, so the key is a reliable marker.
+    """
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key.endswith("Timestamps") and isinstance(item, list):
+                out[key] = [_json_timestamp(each) for each in item]
+            elif key.endswith("Timestamp"):
+                out[key] = _json_timestamp(item)
+            else:
+                out[key] = _json_timestamps(item)
+        return out
+    if isinstance(value, list):
+        return [_json_timestamps(item) for item in value]
+    return value
+
+
 def _json_ok(data: dict):
-    return 200, {"Content-Type": "application/json"}, json.dumps(data).encode()
+    return (200, {"Content-Type": "application/json"},
+            json.dumps(_json_timestamps(data)).encode())
 
 
 def _xml(status, root_tag, inner):
@@ -1754,6 +1955,15 @@ def cloudformation_put_metric_alarm(alarm: dict) -> None:
             "Unchecked: Initial alarm creation",
         )
     _evaluate_alarm(alarm)
+
+
+def cloudformation_set_metric_alarm_tags(name: str, tags: list) -> None:
+    """Replace the tag set of a metric alarm created from a template. PutMetricAlarm
+    ignores Tags on an existing alarm, so a template's Tags are applied the way
+    CloudFormation does it: the full set replaces what is there (TagResource for
+    what is declared, UntagResource for what was dropped)."""
+    arn = f"arn:aws:cloudwatch:{get_region()}:{get_account_id()}:alarm:{name}"
+    _resource_tags[arn] = {t["Key"]: t.get("Value", "") for t in tags}
 
 
 def cloudformation_delete_metric_alarm(name: str) -> None:

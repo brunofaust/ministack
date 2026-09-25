@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Best-effort delivery of MiniStack's Aurora MySQL IAM auth plugin."""
 
 import io
@@ -150,3 +152,15 @@ def ensure_iam_auth_plugin(
                 connection.close()
             except Exception:
                 pass
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass
+
+
+def reset() -> None:
+    pass

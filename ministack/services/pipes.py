@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EventBridge Pipes service emulator.
 
@@ -48,6 +50,10 @@ def get_state():
         "pipes": copy.deepcopy(_pipes),
         "positions": copy.deepcopy(_positions),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

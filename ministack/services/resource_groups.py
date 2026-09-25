@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Resource Groups (resource-groups, apiVersion 2017-11-27) emulator.
 REST/JSON. Routes, methods, and shapes match the AWS spec.
@@ -53,6 +55,10 @@ def get_state():
         "group_tags": _group_tags,
         "account_settings": _account_settings,
     })
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Lambda Service Emulator.
 Supports: CreateFunction, DeleteFunction, GetFunction, GetFunctionConfiguration,
@@ -49,13 +51,15 @@ from urllib.parse import quote, unquote
 
 from ministack.core import container_reaper
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.concurrency import run_reentrant
+from ministack.core.concurrency import run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
+    DURABLE_ENV_VARS,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
-    INVOKE_DEPTH_EVENT_KEY,
     INVOKE_DEPTH_HEADER,
     acquire_worker,
+    ensure_spawned,
+    execution_credentials,
     invalidate_worker,
     reap_idle_workers,
     release_worker,
@@ -386,6 +390,88 @@ def _provided_runtime_code_dir(code_zip: bytes) -> str:
         return code_dir
 
 
+# Content-addressed extraction cache for the docker executor (issue #1600).
+# One shared read-only tree per distinct code zip and per distinct layer zip,
+# extracted straight from memory once under the lock — which also paces a
+# cold-start burst: concurrent first-time extractions queue instead of
+# saturating the disk, the collapse mode reported in #1600. Containers
+# receive the tree by read-only bind mount or docker cp, so nothing inside a
+# container can observe the sharing: real Lambda extracts once per execution
+# environment and mounts /var/task and /opt read-only. Directories accumulate
+# per distinct blob within ``tempfile.gettempdir()``; ``reset()`` removes
+# them, like the provided-runtime cache above.
+_DOCKER_EXTRACT_CACHE = os.path.join(tempfile.gettempdir(), "ministack-lambda-extract")
+_docker_extract_lock = threading.Lock()
+_docker_extract_dirs: dict[str, str] = {}
+
+
+def _docker_extracted_dir(blob: bytes, kind: str) -> str:
+    """Extract ``blob`` once into a shared per-sha directory and return it."""
+    key = f"{kind}-{hashlib.sha256(blob).hexdigest()}"
+    with _docker_extract_lock:
+        cached = _docker_extract_dirs.get(key)
+        if cached and os.path.isdir(cached):
+            return cached
+        target = os.path.join(_DOCKER_EXTRACT_CACHE, key)
+        if os.path.isdir(target):
+            # Leftover from a previous process — contents may be partial.
+            import shutil
+            shutil.rmtree(target, ignore_errors=True)
+        os.makedirs(target, exist_ok=True)
+        try:
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                _extract_zip_preserving_mode(zf, target)
+            if kind == "code":
+                bootstrap = os.path.join(target, "bootstrap")
+                if os.path.exists(bootstrap):
+                    os.chmod(bootstrap, 0o755)
+        except BaseException:
+            # A partial tree must not linger (issue #1600) nor ever be served.
+            import shutil
+            shutil.rmtree(target, ignore_errors=True)
+            raise
+        _docker_extract_dirs[key] = target
+        return target
+
+
+def _b64_sha_to_hex(b64_sha: str) -> str | None:
+    """CodeSha256 as stored on records (base64 of the digest) → the hex the
+    extraction cache keys by. Same digest, no re-hashing of blobs."""
+    try:
+        return base64.b64decode(b64_sha).hex() if b64_sha else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _sweep_extract_cache() -> None:
+    """Drop cached extraction trees whose blob no longer backs any function,
+    function version, or layer version — the same reference-based policy the
+    lambda-blob persistence sweep uses. Called when references disappear
+    (function delete, code update, layer-version delete); reset() still
+    clears everything wholesale. Runs on stored CodeSha256 values only, so a
+    sweep never hashes a byte."""
+    live_code: set[str] = set()
+    live_layer: set[str] = set()
+    for func in _functions._data.values():
+        for cfg in [func.get("config") or {}] + [
+                (v or {}).get("config") or {} for v in (func.get("versions") or {}).values()]:
+            sha = _b64_sha_to_hex(cfg.get("CodeSha256", ""))
+            if sha:
+                live_code.add(sha)
+    for layer in _layers._data.values():
+        for ver in layer.get("versions", []):
+            sha = _b64_sha_to_hex((ver.get("Content") or {}).get("CodeSha256", ""))
+            if sha:
+                live_layer.add(sha)
+    with _docker_extract_lock:
+        for key in list(_docker_extract_dirs):
+            kind, _, sha = key.partition("-")
+            live = live_code if kind == "code" else live_layer
+            if sha not in live:
+                import shutil
+                shutil.rmtree(_docker_extract_dirs.pop(key), ignore_errors=True)
+
+
 # ── Persistence ────────────────────────────────────────────
 
 # Lambda code zips are stored on disk as content-addressed blob files under
@@ -533,6 +619,10 @@ def get_state():
     }
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if data:
         funcs = data.get("functions", {})
@@ -563,6 +653,20 @@ def restore_state(data):
         _function_urls.update(data.get("function_urls", {}))
         _restore_esm_positions(_kinesis_positions, data.get("kinesis_positions", {}))
         _restore_esm_positions(_dynamodb_stream_positions, data.get("dynamodb_stream_positions", {}))
+        # A SnapStart version persisted mid-publish restores as State=Pending
+        # with no provisioning thread behind it — and Pending SnapStart
+        # versions answer 409 on Invoke and are skipped by the generic state
+        # flipper, so without re-provisioning here the version would be
+        # uninvokable forever. Re-run the publish-time initialization.
+        for scoped_key, func in list(_functions._data.items()):
+            fn_name = scoped_key[-1]
+            for ver_record in (func.get("versions") or {}).values():
+                cfg = ver_record.get("config") or {}
+                if (
+                    cfg.get("State") == "Pending"
+                    and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
+                ):
+                    _snapstart_provision_version_async(fn_name, ver_record)
         if _esms.has_any():
             _ensure_poller()
 
@@ -1078,6 +1182,13 @@ def _layer_arn(name: str) -> str:
     return f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{name}"
 
 
+def _esm_arn(esm_id: str) -> str:
+    return (
+        f"arn:aws:lambda:{get_region()}:{get_account_id()}"
+        f":event-source-mapping:{esm_id}"
+    )
+
+
 def _now_iso() -> str:
     now = datetime.now(timezone.utc)
     ms = now.microsecond // 1000
@@ -1201,11 +1312,7 @@ def _durable_env_overlay() -> dict[str, str]:
     ctx = _durable_ctx.get()
     if not ctx:
         return {}
-    return {
-        "AWS_LAMBDA_DURABLE_EXECUTION_ARN": ctx.get("arn", ""),
-        "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": ctx.get("token", ""),
-        "AWS_LAMBDA_DURABLE_EXECUTION_NAME": ctx.get("name", ""),
-    }
+    return {var: ctx.get(key, "") for var, key in DURABLE_ENV_VARS.items()}
 
 
 def invoke_durable_resume(function_name: str, durable_arn: str, original_event: dict) -> None:
@@ -1237,7 +1344,14 @@ def invoke_durable_resume(function_name: str, durable_arn: str, original_event: 
         },
     }
     try:
+        _replay_started = time.time()
         result = _execute_function(func, resume_event)
+        lambda_durable.record_invocation_completed(
+            durable_arn,
+            start_ts=_replay_started,
+            request_id=new_uuid(),
+            error=(result.get("body") if result.get("error") else None),
+        )
         # If the resume still returns PENDING, schedule the next wakeup.
         try:
             payload = result.get("body")
@@ -1276,6 +1390,160 @@ def _durable_arn_lookup(name_or_arn: str) -> str | None:
     if not func:
         return None
     return func.get("FunctionArn") or _func_arn(canonical)
+
+
+# ---------------------------------------------------------------------------
+# SnapStart
+# ---------------------------------------------------------------------------
+# AWS accepts ``SnapStart.ApplyOn`` on CreateFunction and
+# UpdateFunctionConfiguration and reports ``{ApplyOn, OptimizationStatus}`` on
+# every read. $LATEST always reports OptimizationStatus=Off — a snapshot only
+# exists per published version — while a version published with
+# ApplyOn=PublishedVersions reports On, sits in State=Pending while the
+# snapshot is created, then transitions to Active. Supported runtimes per the
+# SnapStart docs: Java 11+, Python 3.12+, .NET 8+, for both Zip and
+# container-image packages; incompatible with ephemeral storage above 512 MB.
+
+_SNAPSTART_APPLY_ON_VALUES = ("PublishedVersions", "None")
+
+
+def _snapstart_runtime_supported(runtime: str) -> bool:
+    m = re.match(r"^(java|python|dotnet)(\d+)(?:\.(\d+))?", runtime or "")
+    if not m:
+        return False
+    family, major, minor = m.group(1), int(m.group(2)), int(m.group(3) or 0)
+    if family == "java":
+        return major >= 11
+    if family == "python":
+        return (major, minor) >= (3, 12)
+    return major >= 8  # dotnet
+
+
+def _validate_snapstart(snap: dict | None, *, runtime: str, package_type: str,
+                        ephemeral_size) -> tuple | None:
+    """Validate a SnapStart request block against AWS's documented constraints."""
+    if snap is None:
+        return None
+    apply_on = (snap or {}).get("ApplyOn", "None")
+    if apply_on not in _SNAPSTART_APPLY_ON_VALUES:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{apply_on}' at "
+            "'snapStart.applyOn' failed to satisfy constraint: Member must "
+            "satisfy enum value set: [PublishedVersions, None]",
+            400,
+        )
+    if apply_on == "None":
+        return None
+    if package_type != "Image" and not _snapstart_runtime_supported(runtime):
+        return error_response_json(
+            "InvalidParameterValueException",
+            f"SnapStart is not supported for the {runtime} runtime.",
+            400,
+        )
+    try:
+        too_big = ephemeral_size is not None and int(ephemeral_size) > 512
+    except (TypeError, ValueError):
+        too_big = False
+    if too_big:
+        return error_response_json(
+            "InvalidParameterValueException",
+            "SnapStart is not supported with ephemeral storage greater than "
+            "512 MB.",
+            400,
+        )
+    return None
+
+
+def _snapstart_response(snap: dict | None) -> dict:
+    apply_on = (snap or {}).get("ApplyOn") or "None"
+    return {"ApplyOn": apply_on, "OptimizationStatus": "Off"}
+
+
+def _stamp_snapstart_published_version(ver_config: dict) -> bool:
+    """AWS creates the snapshot when a version is published: the version
+    reports OptimizationStatus=On and stays Pending until the snapshot is
+    ready. Returns True when the version is SnapStart-enabled so the caller
+    schedules the Pending→Active transition."""
+    if (ver_config.get("SnapStart") or {}).get("ApplyOn") != "PublishedVersions":
+        return False
+    ver_config["SnapStart"] = {
+        "ApplyOn": "PublishedVersions",
+        "OptimizationStatus": "On",
+    }
+    ver_config["State"] = "Pending"
+    ver_config["StateReason"] = "The function is being created."
+    ver_config["StateReasonCode"] = "Creating"
+    return True
+
+
+def _snapstart_provision_version_async(name: str, ver_record: dict) -> None:
+    """SnapStart moves initialization to PublishVersion: create the version's
+    execution environment now — a warm worker for python, a pooled RIE
+    container for java/dotnet/Image — instead of at first invoke.
+
+    Success flips the version Pending → Active with the environment already
+    warm (the snapshot's observable effect); an init failure — a handler that
+    won't import, a before-snapshot/after-restore hook that raises — lands the
+    version in State=Failed, as AWS surfaces a failed snapshot. This thread
+    owns the version's state transition; the generic Pending flipper skips
+    SnapStart versions.
+    """
+    ver_config = ver_record["config"]
+    code_zip = ver_record.get("code_zip")
+
+    def _provision():
+        try:
+            account_id, region = _account_region_from_function_config(ver_config)
+            _request_account_id.set(account_id)
+            _request_region.set(region)
+        except ArnParseError:
+            pass
+        try:
+            runtime = ver_config.get("Runtime", "")
+            package_type = ver_config.get("PackageType", "Zip")
+            use_docker = (
+                LAMBDA_STRICT
+                or package_type == "Image"
+                or LAMBDA_EXECUTOR == "docker"
+                or not runtime.startswith("python")
+            )
+            if use_docker:
+                if _docker_available and _get_docker_client() is not None:
+                    container, tmpdir = _spawn_lambda_container(ver_config, code_zip)
+                    key = _warm_pool_key(ver_config["FunctionName"], ver_config)
+                    entry = _pool_register(key, container, tmpdir)
+                    _pool_release(entry)
+                    _ensure_reaper_thread()
+                # Docker unreachable: nothing to pre-warm; the invoke path
+                # falls back exactly as it always did.
+            elif code_zip:
+                worker, _reason = acquire_worker(
+                    ver_config["FunctionName"], ver_config, code_zip,
+                    qualifier=ver_config.get("Version", "$LATEST"),
+                )
+                try:
+                    ensure_spawned(worker)
+                finally:
+                    release_worker(worker)
+                _ensure_reaper_thread()
+        except Exception as exc:
+            logger.warning("Lambda %s: SnapStart init failed at publish: %s",
+                           name, exc)
+            ver_config["State"] = "Failed"
+            ver_config["StateReason"] = str(exc)
+            ver_config["StateReasonCode"] = "FunctionError"
+            return
+        ver_config["State"] = "Active"
+        ver_config["StateReason"] = ""
+        ver_config["StateReasonCode"] = ""
+        ver_config["LastUpdateStatus"] = "Successful"
+
+    ctx_snapshot = contextvars.copy_context()
+    threading.Thread(
+        target=ctx_snapshot.run, args=(_provision,), daemon=True,
+        name="ministack-lambda-snapstart-init",
+    ).start()
 
 
 def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
@@ -1336,7 +1604,7 @@ def _build_config(name: str, data: dict, code_zip: bytes | None = None) -> dict:
         "KMSKeyArn": data.get("KMSKeyArn", ""),
         "RevisionId": new_uuid(),
         "EphemeralStorage": data.get("EphemeralStorage", {"Size": 512}),
-        "SnapStart": {"ApplyOn": "None", "OptimizationStatus": "Off"},
+        "SnapStart": _snapstart_response(data.get("SnapStart")),
         "LoggingConfig": data.get(
             "LoggingConfig",
             {
@@ -1536,6 +1804,25 @@ def _validate_latest_mutation_qualifier(func_name: str, qualifier: str | None):
     )
 
 
+def _is_rie_sentinel_scope(spec) -> bool:
+    """True for the ARN scope the AWS Lambda RIE manufactures.
+
+    Under ``LAMBDA_EXECUTOR=docker`` the handler's
+    ``context.invoked_function_arn`` comes from the RIE inside the official
+    image, which hardcodes ``arn:aws:lambda:us-east-1:012345678912:function:…``
+    — account AND region, with no override (verified in
+    aws-lambda-runtime-interface-emulator ``internal/lambda/rie/handlers.go``).
+    A function that self-registers that ARN (the textbook
+    ``context.invoked_function_arn`` pattern, e.g. into a Cognito
+    ``LambdaConfig`` trigger) then points at a scope where nothing exists. An
+    ARN carrying exactly that scope is treated as "self": it re-resolves in
+    the caller's own account and region. A tenant genuinely running as
+    012345678912 in us-east-1 is unaffected — its account matches the caller
+    and resolution never reaches this fallback.
+    """
+    return spec.account_id == "012345678912" and spec.region == "us-east-1"
+
+
 def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | None, str]:
     if isinstance(function_ref, str) and function_ref.startswith("arn:"):
         try:
@@ -1546,8 +1833,11 @@ def _get_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict | Non
             name, qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
             if name:
                 if spec.account_id != get_account_id():
-                    return None, None, name
-                func = _functions.get_scoped(get_account_id(), spec.region, name)
+                    if not _is_rie_sentinel_scope(spec):
+                        return None, None, name
+                    spec = None  # RIE self-ARN: resolve in the caller's scope
+                region = spec.region if spec else get_region()
+                func = _functions.get_scoped(get_account_id(), region, name)
                 if not _function_qualifier_exists(func, qualifier):
                     return None, None, name
                 record, config = _effective_func_record_for_qualifier(func, qualifier)
@@ -1571,8 +1861,11 @@ def _get_base_func_record_for_ref(function_ref: str) -> tuple[dict | None, dict 
             name, _qualifier = _lambda_function_name_and_qualifier_from_arn(function_ref)
             if name:
                 if spec.account_id != get_account_id():
-                    return None, None, name
-                func = _functions.get_scoped(get_account_id(), spec.region, name)
+                    if not _is_rie_sentinel_scope(spec):
+                        return None, None, name
+                    spec = None  # RIE self-ARN: resolve in the caller's scope
+                region = spec.region if spec else get_region()
+                func = _functions.get_scoped(get_account_id(), region, name)
                 return func, (func or {}).get("config"), name
 
     name, _qualifier = _resolve_name_and_qualifier(function_ref)
@@ -1960,6 +2253,15 @@ def _create_function(data: dict):
         data = dict(data)
         data["Layers"] = layers_cfg
 
+    err = _validate_snapstart(
+        data.get("SnapStart"),
+        runtime=data.get("Runtime", ""),
+        package_type=data.get("PackageType", "Zip"),
+        ephemeral_size=(data.get("EphemeralStorage") or {}).get("Size", 512),
+    )
+    if err:
+        return err
+
     # Validate the execution role before building anything: _build_config
     # returns a config dict, so the error has to be raised by the caller, and
     # nothing may be persisted for a function that is going to be refused.
@@ -1992,6 +2294,11 @@ def _create_function(data: dict):
         "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
         "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
         "s3_object_ref": _s3_object_ref,
+        # Whether the caller explicitly chose an architecture, as distinct from
+        # the stored x86_64 default. The wire shape is identical either way;
+        # only the Docker executor reads this, to pin the container platform
+        # for functions that actually declared one.
+        "architectures_declared": "Architectures" in data,
         "versions": {},
         "next_version": 1,
         "tags": data.get("Tags", {}),
@@ -2008,10 +2315,13 @@ def _create_function(data: dict):
         _functions[name]["next_version"] = ver_num + 1
         ver_config = copy.deepcopy(config)
         ver_config["Version"] = str(ver_num)
-        _functions[name]["versions"][str(ver_num)] = {
+        ver_record = {
             "config": ver_config,
             "code_zip": code_zip,
         }
+        _functions[name]["versions"][str(ver_num)] = ver_record
+        if _stamp_snapstart_published_version(ver_config):
+            _snapstart_provision_version_async(name, ver_record)
         config["Version"] = str(ver_num)
 
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
@@ -2334,12 +2644,19 @@ def _delete_function(name: str, query_params: dict, path_qualifier: str | None =
                 409,
             )
         _functions[name]["versions"].pop(qualifier, None)
+        # The version's warm worker (SnapStart pre-initialized it at publish,
+        # or a past invoke spawned it) has nothing left to serve.
+        invalidate_worker(name, qualifier=qualifier,
+                          account=get_account_id(), region=get_region())
     else:
         del _functions[name]
         invalidate_worker(name, account=get_account_id(), region=get_region())
         # Docker pool too — otherwise the function's pooled containers leak
         # until _WARM_CONTAINER_TTL eviction.
         _pool_kill_function(get_account_id(), name)
+    # The deleted record may have been the last reference to its extracted
+    # code tree in the docker executor cache.
+    _sweep_extract_cache()
     return 204, {}, b""
 
 
@@ -2352,6 +2669,11 @@ def _update_code(name: str, data: dict):
         )
     func = _functions[name]
     code_zip = None
+    # UpdateFunctionCode is where AWS lets the architecture change (the
+    # UpdateFunctionConfiguration model has no Architectures member).
+    if "Architectures" in data:
+        func["config"]["Architectures"] = data["Architectures"]
+        func["architectures_declared"] = True
     if "ImageUri" in data:
         func["config"]["ImageUri"] = data["ImageUri"]
         func["config"]["PackageType"] = "Image"
@@ -2402,6 +2724,8 @@ def _update_code(name: str, data: dict):
 
     # Invalidate only the old $LATEST worker — published version workers stay alive
     invalidate_worker(name, qualifier="$LATEST", account=get_account_id(), region=get_region())
+    # The replaced zip's extracted tree may now be unreferenced.
+    _sweep_extract_cache()
     # Docker pool: the new CodeSha256 changes the pool key so new invokes
     # spawn fresh containers anyway, but the old containers under the old key
     # would linger until _WARM_CONTAINER_TTL. Reap them now.
@@ -2413,10 +2737,13 @@ def _update_code(name: str, data: dict):
         func["next_version"] = ver_num + 1
         ver_config = copy.deepcopy(func["config"])
         ver_config["Version"] = str(ver_num)
-        func["versions"][str(ver_num)] = {
+        ver_record = {
             "config": ver_config,
             "code_zip": func.get("code_zip"),
         }
+        func["versions"][str(ver_num)] = ver_record
+        if _stamp_snapstart_published_version(ver_config):
+            _snapstart_provision_version_async(name, ver_record)
         func["config"]["Version"] = str(ver_num)
 
     return json_response(func["config"])
@@ -2439,6 +2766,21 @@ def _update_config(name: str, data: dict):
         data = dict(data)
         data["Layers"] = layers_cfg
     config = _functions[name]["config"]
+    if "SnapStart" in data or "Runtime" in data or "EphemeralStorage" in data:
+        # Validate the *effective* combination, so enabling SnapStart, moving
+        # to an unsupported runtime, or raising ephemeral storage past 512 MB
+        # while SnapStart is on are all refused before any field mutates.
+        effective_snap = data.get("SnapStart", config.get("SnapStart"))
+        err = _validate_snapstart(
+            effective_snap,
+            runtime=data.get("Runtime") or config.get("Runtime", ""),
+            package_type=config.get("PackageType", "Zip"),
+            ephemeral_size=(data.get("EphemeralStorage")
+                            or config.get("EphemeralStorage")
+                            or {}).get("Size", 512),
+        )
+        if err:
+            return err
     for key in (
         "Runtime",
         "Handler",
@@ -2459,6 +2801,7 @@ def _update_config(name: str, data: dict):
         "DurableConfig",
         "TenancyConfig",
         "CapacityProviderConfig",
+        "SnapStart",
     ):
         if key in data:
             if key == "Layers":
@@ -2472,8 +2815,14 @@ def _update_config(name: str, data: dict):
                             layer["CodeSize"] = _layer_codesize_for_arn(layer["Arn"])
                         layers_cfg.append(layer)
                 config["Layers"] = layers_cfg
+            elif key == "SnapStart":
+                # Request carries only ApplyOn; the stored/echoed shape adds
+                # OptimizationStatus, which is always Off on $LATEST.
+                config["SnapStart"] = _snapstart_response(data["SnapStart"])
             else:
                 config[key] = data[key]
+    if "Architectures" in data:
+        _functions[name]["architectures_declared"] = True
     if "ImageConfig" in data:
         config["ImageConfigResponse"] = {"ImageConfig": data["ImageConfig"]}
     config["LastModified"] = _now_iso()
@@ -2545,6 +2894,21 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
                 404,
             )
 
+    exec_config = exec_record.get("config") or {}
+    if (
+        executed_version != "$LATEST"
+        and (exec_config.get("SnapStart") or {}).get("OptimizationStatus") == "On"
+        and exec_config.get("State") == "Pending"
+    ):
+        # AWS: invoking a SnapStart version while its snapshot is being
+        # created answers ResourceConflictException until it goes Active.
+        return error_response_json(
+            "ResourceConflictException",
+            "The operation cannot be performed at this time. "
+            "The function is currently in the following state: Pending",
+            409,
+        )
+
     if invocation_type == "DryRun":
         return 204, {"X-Amz-Executed-Version": executed_version}, b""
 
@@ -2571,6 +2935,8 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
             function_arn=_func_arn(name),
             version=executed_version,
             input_payload=event_payload,
+            execution_timeout=(func.get("config", {}) or {}).get(
+                "DurableConfig", {}).get("ExecutionTimeout"),
         )
         durable_arn = rec["DurableExecutionArn"]
         _durable_ctx.set({
@@ -2630,6 +2996,15 @@ async def _invoke(name: str, event: dict, headers: dict, path_qualifier: str | N
         _de_rec = lambda_durable._executions.get(durable_arn)
         if _de_rec:
             resp_headers["X-Amz-Durable-Checkpoint-Token"] = _de_rec["CheckpointToken"]
+        # Every handler invocation of a durable execution ends with an
+        # InvocationCompleted history event (initial and each replay), before
+        # any terminal ExecutionSucceeded/Failed the payload may cause.
+        lambda_durable.record_invocation_completed(
+            durable_arn,
+            start_ts=(_de_rec or {}).get("StartTimestamp") or time.time(),
+            request_id=new_uuid(),
+            error=(result.get("body") if result.get("error") else None),
+        )
         # Inspect the SDK's return value: PENDING → schedule the next wakeup
         # from the latest WAIT timestamp; SUCCEEDED/FAILED → mark terminal.
         try:
@@ -3073,6 +3448,13 @@ def _schedule_state_transition(func_name: str, delay: float) -> None:
             if (
                 cfg.get("State") not in (None, "", "Pending")
                 and cfg.get("LastUpdateStatus") not in (None, "", "InProgress")
+            ):
+                continue
+            # A pending SnapStart version is mid-initialization: its
+            # provisioning thread owns the Pending → Active/Failed decision.
+            if (
+                cfg.get("Version") not in (None, "", "$LATEST")
+                and (cfg.get("SnapStart") or {}).get("OptimizationStatus") == "On"
             ):
                 continue
             cfg["State"] = "Active"
@@ -3582,6 +3964,7 @@ def _parse_docker_flags(flags: str) -> dict:
     parser.add_argument("--shm-size")
     parser.add_argument("--tmpfs", action="append", default=[])
     parser.add_argument("--add-host", action="append", default=[])
+    parser.add_argument("--security-opt", action="append", default=[])
     parser.add_argument("--privileged", action="store_true")
     parser.add_argument("--read-only", action="store_true")
     args, _ = parser.parse_known_args(shlex.split(flags))
@@ -3615,6 +3998,8 @@ def _parse_docker_flags(flags: str) -> dict:
         kwargs["mem_limit"] = args.memory
     if args.shm_size:
         kwargs["shm_size"] = args.shm_size
+    if args.security_opt:
+        kwargs["security_opt"] = args.security_opt
     if args.privileged:
         kwargs["privileged"] = True
     if args.read_only:
@@ -3637,8 +4022,208 @@ def _parse_docker_flags(flags: str) -> dict:
     return kwargs
 
 
-def _spawn_lambda_container(config: dict, code_zip: bytes | None):
+def _declared_docker_platform(config: dict):
+    """The linux/* platform to pin, or None when the function never declared one.
+
+    Every stored config carries ``Architectures`` because AWS's x86_64 default
+    is echoed on the wire — so the config alone cannot say whether the caller
+    chose an architecture. The function record tracks that at create/update
+    time, and only an explicit choice pins the container platform: pinning the
+    stored default onto undeclared functions would break arm64 hosts with no
+    amd64 binfmt handler, whose functions ran natively before.
+    """
+    func = _functions.get(config.get("FunctionName") or "")
+    if not func or not func.get("architectures_declared"):
+        return None
+    arch = (config.get("Architectures") or ["x86_64"])[0]
+    return "linux/arm64" if arch == "arm64" else "linux/amd64"
+
+
+def _spawn_lambda_container(config: dict, code_zip: bytes | None,
+                            _pin_platform: bool = True):
+    """Create and start a Lambda container.
+
+    Extraction happens into the shared content-addressed cache
+    (``_docker_extracted_dir``), which owns its directories — a failure
+    anywhere in the spawn leaks nothing per cold start (issue #1600), and
+    ``reset()`` clears the cache itself.
+    """
+    return _spawn_lambda_container_impl(config, code_zip, _pin_platform)
+
+
+_PY_CTX_ARN_SHIM = '''\
+"""MiniStack shim: hand user code the control-plane ARN in its context."""
+import importlib
+import os
+
+_real = os.environ.get("_MS_REAL_HANDLER", "index.handler")
+_mod_name, _, _fn_name = _real.rpartition(".")
+_target = getattr(importlib.import_module(_mod_name.replace("/", ".")), _fn_name)
+_ARN = os.environ.get("_LAMBDA_FUNCTION_ARN", "")
+
+
+def handler(event, context):
+    if _ARN:
+        try:
+            context.invoked_function_arn = _ARN
+        except Exception:
+            pass
+    return _target(event, context)
+'''
+
+_JS_CTX_ARN_SHIM = '''\
+// MiniStack shim: hand user code the control-plane ARN in its context, and
+// reach the gateway over plain HTTP when a library insists on HTTPS.
+const path = require("path");
+const fs = require("fs");
+const http = require("http");
+const https = require("https");
+const REAL = process.env._MS_REAL_HANDLER || "index.handler";
+const ARN = process.env._LAMBDA_FUNCTION_ARN || "";
+const TASK_ROOT = process.env.LAMBDA_TASK_ROOT || "/var/task";
+// The container talks to MiniStack over http://<gateway host>:<port>, but the
+// response submitters the CDK bundles into its custom-resource handlers
+// (nodejs-entrypoint, the provider framework, AwsCustomResource) build the
+// ResponseURL PUT from the URL's hostname and path only and hand it to
+// https.request, so it goes out over TLS to port 443 whatever the URL says,
+// and a Node custom resource never signalled its stack. Downgrade https to
+// http for the gateway hosts only; the https default 443 becomes the gateway
+// port, any other explicit port is kept.
+try {
+  const EP = new URL(process.env.AWS_ENDPOINT_URL || "http://host.docker.internal:4566");
+  const EP_PORT = EP.port || (EP.protocol === "https:" ? "443" : "80");
+  const PLAIN_HOSTS = new Set(
+    [EP.hostname, "localhost", "127.0.0.1", "host.docker.internal"]
+      .concat((process.env._MS_GATEWAY_HOSTS || "").split(","))
+      .filter(Boolean));
+  const origHttpsRequest = https.request;
+  https.request = function (input, options, callback) {
+    // Keep the caller's own arguments for the pass-through below: Node's
+    // ClientRequest reads (input, options, cb) positionally and, for a
+    // non-string input, takes cb from the SECOND argument — so replaying a
+    // normalised (input, undefined, callback) would drop the callback and the
+    // handler would never see its response. A copy, not `arguments` itself:
+    // this file is not in strict mode, so `arguments` stays aliased to the
+    // parameters and the normalisation below would rewrite it too.
+    const original = Array.prototype.slice.call(arguments);
+    if (typeof options === "function") { callback = options; options = undefined; }
+    let opts;
+    if (typeof input === "string" || input instanceof URL) {
+      const u = new URL(String(input));
+      opts = Object.assign({ hostname: u.hostname, port: u.port, path: u.pathname + u.search,
+                             protocol: u.protocol }, options || {});
+    } else {
+      opts = Object.assign({}, input, options || {});
+    }
+    const host = opts.hostname || String(opts.host || "").split(":")[0];
+    const rawPort = opts.port ? String(opts.port) : "";
+    // Only the gateway hosts, and only the https default port or the gateway
+    // port itself: a handler that dials its own TLS sidecar on another port
+    // of localhost keeps TLS.
+    if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
+      return origHttpsRequest.apply(https, original);
+    }
+    opts.protocol = "http:";
+    opts.hostname = host;
+    opts.host = host + ":" + EP_PORT;
+    opts.port = EP_PORT;
+    // Node's default http agent (keep-alive with an idle timeout) replaces
+    // whatever https agent the caller set.
+    opts.agent = undefined;
+    delete opts._defaultAgent;
+    return http.request(opts, callback);
+  };
+  https.get = function () {
+    // Same argument shapes as request(), forwarded untouched.
+    const req = https.request.apply(https, arguments);
+    req.end();
+    return req;
+  };
+  // A handler that did `import { request } from "node:https"` holds a live
+  // binding that only refreshes on request; refresh it now.
+  require("module").syncBuiltinESMExports();
+} catch (e) {
+  // A bad AWS_ENDPOINT_URL costs the downgrade, not the function.
+}
+const dot = REAL.lastIndexOf(".");
+const modPart = REAL.slice(0, dot);
+const fnName = REAL.slice(dot + 1);
+let cached = null;
+async function load() {
+  if (cached) return cached;
+  const base = path.join(TASK_ROOT, modPart);
+  for (const ext of [".mjs", ".js", ".cjs"]) {
+    const p = base + ext;
+    if (fs.existsSync(p)) {
+      const m = await import("file://" + p);
+      cached = m[fnName] || (m.default && m.default[fnName]);
+      if (cached) return cached;
+    }
+  }
+  throw new Error("ministack context shim: handler not found: " + REAL);
+}
+exports.handler = async (event, context) => {
+  if (ARN) { try { context.invokedFunctionArn = ARN; } catch (e) {} }
+  const fn = await load();
+  if (fn.length >= 3) {
+    return await new Promise((resolve, reject) =>
+      fn(event, context, (err, res) => (err ? reject(err) : resolve(res))));
+  }
+  return fn(event, context);
+};
+'''
+
+
+def _write_context_arn_shim(code_dir: str, runtime: str, handler: str) -> str | None:
+    """Drop a context-ARN shim into the code dir; return its handler string.
+
+    Returns None (no shim, original handler runs directly) for runtimes we
+    can't wrap, a handler already pointing at the shim's name, or a code dir
+    that already contains a same-named file.
+    """
+    if handler.rpartition(".")[0].replace("/", ".") == "_msctx_shim":
+        return None
+    if runtime.startswith("python"):
+        name, shim_handler, source = "_msctx_shim.py", "_msctx_shim.handler", _PY_CTX_ARN_SHIM
+    elif runtime.startswith("nodejs"):
+        name, shim_handler, source = "_msctx_shim.js", "_msctx_shim.handler", _JS_CTX_ARN_SHIM
+    else:
+        return None
+    shim_path = os.path.join(code_dir, name)
+    if os.path.exists(shim_path):
+        # On a shared cached code dir an earlier cold start of the same code
+        # already wrote the shim: ours by content means use it. A same-named
+        # file that came from the user's own zip is left alone.
+        try:
+            with open(shim_path) as f:
+                if f.read() == source:
+                    return shim_handler
+        except OSError:
+            pass
+        return None
+    try:
+        # Another container of the same code may already hold the dir as a
+        # read-only mount; a rename lands the file whole rather than truncated.
+        tmp_path = f"{shim_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w") as f:
+            f.write(source)
+        os.replace(tmp_path, shim_path)
+    except OSError as exc:
+        logger.warning("Lambda context-ARN shim not written (%s); "
+                       "container will report the RIE default ARN", exc)
+        return None
+    return shim_handler
+
+
+def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
+                                 _pin_platform: bool):
     """Create and start a Lambda container for the given config.
+
+    A function that explicitly declared an architecture is pinned to it — but
+    only best-effort: a host that cannot run the declared platform (no qemu or
+    Rosetta for the emulation) logs the mismatch and retries on the host's own
+    architecture instead of failing an invoke that worked before the pin
+    existed. `_pin_platform=False` is that retry.
 
     Returns (container, tmpdir). The caller is responsible for pool registration
     and for `_kill_pool_entry` on cleanup (tmpdir is None for Image-type).
@@ -3679,40 +4264,18 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     if package_type == "Zip":
         if not code_zip:
             raise ValueError("Zip PackageType requires code_zip bytes")
-        tmpdir = tempfile.mkdtemp(prefix="ministack-lambda-docker-")
-        code_dir = os.path.join(tmpdir, "code")
-        os.makedirs(code_dir)
-        code_zip_path = os.path.join(tmpdir, "code.zip")
-        with open(code_zip_path, "wb") as f:
-            f.write(code_zip)
-        with zipfile.ZipFile(code_zip_path) as zf:
-            _extract_zip_preserving_mode(zf, code_dir)
-        if is_provided:
-            bootstrap = os.path.join(code_dir, "bootstrap")
-            if os.path.exists(bootstrap):
-                os.chmod(bootstrap, 0o755)
+        code_dir = _docker_extracted_dir(code_zip, "code")
         for layer_ref in layers_list:
             layer_arn_str = layer_ref if isinstance(layer_ref, str) else layer_ref.get("Arn", "")
             layer_zip = _resolve_layer_zip(layer_arn_str)
             if not layer_zip:
                 continue
-            idx = len(layers_dirs)
-            layer_dir = os.path.join(tmpdir, f"layer_{idx}")
-            os.makedirs(layer_dir)
-            layer_zip_path = os.path.join(tmpdir, f"layer_{idx}.zip")
-            with open(layer_zip_path, "wb") as lf:
-                lf.write(layer_zip)
-            with zipfile.ZipFile(layer_zip_path) as lzf:
-                _extract_zip_preserving_mode(lzf, layer_dir)
-            layers_dirs.append(layer_dir)
+            layers_dirs.append(_docker_extracted_dir(layer_zip, "layer"))
 
     # Shared environment
     container_env: dict[str, str] = {
         "AWS_DEFAULT_REGION": get_region(),
         "AWS_REGION": get_region(),
-        "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-        "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-        "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
         "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
         "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
         "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -3720,6 +4283,7 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         "_LAMBDA_FUNCTION_ARN": config.get("FunctionArn", ""),
         "_LAMBDA_TIMEOUT": str(timeout),
     }
+    container_env.update(execution_credentials(config))
     if is_provided:
         container_env["LAMBDA_TASK_ROOT"] = "/var/task"
     container_env["_HANDLER"] = handler
@@ -3771,6 +4335,11 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
         # Rewrite localhost/127.0.0.1 → host.docker.internal for container access
         endpoint = _rewrite_host_for_container(endpoint)
     container_env["AWS_ENDPOINT_URL"] = endpoint
+    # The host MiniStack advertises for itself (custom-resource ResponseURLs
+    # carry it); the Node shim downgrades https to http for it.
+    advertised_host = os.environ.get("MINISTACK_HOST", "").split(":")[0]
+    if advertised_host:
+        container_env["_MS_GATEWAY_HOSTS"] = advertised_host
 
     # Mounts (Zip only — Image bakes code in). Layers are NEVER bind-mounted:
     # AWS merges every layer's contents into /opt (so /opt/python, /opt/lib,
@@ -3815,11 +4384,49 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
     else:
         # Zip: RIE expects handler as CMD (or "bootstrap" for provided)
         run_kwargs["command"] = ["bootstrap"] if is_provided else [handler]
+        # The RIE inside the official images hardcodes
+        # arn:aws:lambda:us-east-1:012345678912:function:{name} as the
+        # context's invoked_function_arn — account AND region, no override —
+        # so a handler that self-registers its own ARN (the textbook
+        # ``context.invoked_function_arn`` pattern) stores a scope where
+        # nothing exists. For the runtimes whose code dir we own, run the
+        # handler through a shim that overwrites the context ARN with the
+        # control-plane FunctionArn (already in ``_LAMBDA_FUNCTION_ARN``)
+        # before user code sees it. ``provided`` bootstraps and Image-type
+        # functions own their code path end-to-end and cannot be shimmed.
+        shim_cmd = _write_context_arn_shim(code_dir, runtime, handler)
+        if shim_cmd:
+            container_env["_MS_REAL_HANDLER"] = handler
+            run_kwargs["command"] = [shim_cmd]
 
     if mounts:
         run_kwargs["mounts"] = mounts
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+
+    # AWS runs a function on the architecture it declares. Docker otherwise
+    # picks the host's, so an arm64 function on an x86_64 host quietly ran as
+    # x86_64 — fine until a layer carries a native wheel, at which point the
+    # handler dies at import naming the library rather than the mismatch
+    # ("no pq wrapper available" from psycopg, for instance). Set it before the
+    # flags merge so an explicit --platform in LAMBDA_DOCKER_FLAGS still wins.
+    # Only a function whose creator explicitly chose an architecture is pinned:
+    # every stored record carries the x86_64 default, and pinning that onto
+    # functions that never declared one would break arm64 hosts without a
+    # binfmt handler that ran those functions natively before.
+    docker_platform = _declared_docker_platform(config) if _pin_platform else None
+    docker_arch = docker_platform.rsplit("/", 1)[1] if docker_platform else None
+    if docker_platform:
+        run_kwargs["platform"] = docker_platform
+
+    def _platform_fallback(reason):
+        """The declared platform cannot run here: log it, run on the host's."""
+        logger.warning(
+            "Lambda %s declares %s but this host cannot run it (%s); "
+            "running on the host architecture instead. Install a binfmt/qemu "
+            "handler (or Rosetta) for real cross-architecture execution.",
+            config.get("FunctionName"), docker_platform, reason)
+        return _spawn_lambda_container(config, code_zip, _pin_platform=False)
 
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
@@ -3847,15 +4454,21 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
 
     # Pull the image on first use (both Zip RIE images and user Image types)
     try:
-        client.images.get(image)
+        local_image = client.images.get(image)
+        # A cached image of the wrong architecture is as unusable as no image:
+        # docker refuses to start it, and without this check the refusal arrives
+        # as an opaque run error rather than a pull. Only checked when the
+        # function pinned a platform — with no declaration any cached image is
+        # the host's, which is what will run.
+        if docker_arch and local_image.attrs.get("Architecture") not in (None, docker_arch):
+            raise docker_lib.errors.ImageNotFound("cached image is the wrong architecture")
     except docker_lib.errors.ImageNotFound:
-        logger.info("Pulling Lambda image: %s", image)
+        logger.info("Pulling Lambda image: %s (%s)", image, docker_platform or "host platform")
         try:
-            client.images.pull(image)
+            client.images.pull(image, platform=docker_platform)
         except Exception as exc:
-            if tmpdir and os.path.exists(tmpdir):
-                import shutil
-                shutil.rmtree(tmpdir, ignore_errors=True)
+            if docker_platform:
+                return _platform_fallback(f"pull failed: {exc}")
             raise RuntimeError(f"Failed to pull image {image}: {exc}")
 
     try:
@@ -3879,11 +4492,34 @@ def _spawn_lambda_container(config: dict, code_zip: bytes | None):
             container.start()
         else:
             container = client.containers.run(**run_kwargs)
-    except Exception:
-        if tmpdir and os.path.exists(tmpdir):
-            import shutil
-            shutil.rmtree(tmpdir, ignore_errors=True)
+    except Exception as exc:
+        if docker_platform:
+            return _platform_fallback(f"container create/start failed: {exc}")
         raise
+
+    if docker_platform:
+        # A host with no emulation handler starts the container fine and its
+        # entrypoint dies instantly with an exec-format error — docker raises
+        # nothing, and without this check the failure surfaces later as an
+        # opaque invoke timeout. An immediate exit while pinned means the host
+        # cannot run the declared platform: fall back to the host's.
+        time.sleep(0.25)
+        try:
+            container.reload()
+            died = container.status == "exited"
+        except Exception:
+            died = False
+        if died:
+            try:
+                tail = container.logs(tail=5).decode(errors="replace").strip()
+            except Exception:
+                tail = ""
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+            return _platform_fallback(
+                f"container exited immediately: {tail or 'no output'}")
 
     return container, tmpdir
 
@@ -4162,6 +4798,15 @@ def _inflight_key(config: dict) -> str:
     return f"{account}:{region}:{config.get('FunctionName', '?')}:{config.get('Version', '$LATEST')}"
 
 
+def _reserved_concurrency(func: dict, config: dict) -> int | None:
+    reserved = (func or {}).get("concurrency")
+    if isinstance(reserved, dict):
+        reserved = reserved.get("ReservedConcurrentExecutions")
+    if reserved is None:
+        reserved = config.get("ReservedConcurrentExecutions")
+    return None if reserved is None else int(reserved)
+
+
 def _acquire_execution_slot(func: dict, config: dict):
     """Reserve one unit of concurrency, or None when a cap is reached.
 
@@ -4174,14 +4819,10 @@ def _acquire_execution_slot(func: dict, config: dict):
     so both are consulted rather than assuming either shape.
     """
     global _inflight_total
-    reserved = (func or {}).get("concurrency")
-    if isinstance(reserved, dict):
-        reserved = reserved.get("ReservedConcurrentExecutions")
-    if reserved is None:
-        reserved = config.get("ReservedConcurrentExecutions")
+    reserved = _reserved_concurrency(func, config)
     key = _inflight_key(config)
     with _inflight_lock:
-        if reserved and _inflight.get(key, 0) >= int(reserved):
+        if reserved and _inflight.get(key, 0) >= reserved:
             return None, "function"
         if _ACCOUNT_CONCURRENCY_CAP > 0 and _inflight_total >= _ACCOUNT_CONCURRENCY_CAP:
             return None, "account"
@@ -4277,18 +4918,19 @@ def _execute_function_dispatch(func: dict, config: dict, event: dict,
     else:
         runtime = config.get("Runtime", "python3.12")
         if runtime.startswith("provided"):
-            result = _execute_function_provided(func, event)
-        elif (runtime.startswith("python") or runtime.startswith("nodejs")) \
-                and not _durable_ctx.get():
-            # Warm pool reuses worker subprocesses whose env was fixed at
-            # spawn time. Durable invocations need per-call env (the
-            # DurableExecutionArn + CheckpointToken change every invoke),
-            # so route them through the per-call local executor.
-            result = _execute_function_warm(func, event)
+            # A durable invocation needs a per-call environment (the
+            # DurableExecutionArn and CheckpointToken change every invoke) and a
+            # pooled worker's env is fixed at spawn, so provided.* durable
+            # invocations keep the one-shot executor. python and nodejs carry
+            # that context in the event instead, which is why they can be pooled.
+            if _durable_ctx.get():
+                result = _execute_function_provided(func, event)
+            else:
+                result = _execute_function_provided_warm(func, event, request_id)
         elif runtime.startswith(("python", "nodejs")):
-            # Durable python/nodejs falls through to local subprocess (per
-            # the elif above we already filtered durable out of warm).
-            result = _execute_function_local(func, event)
+            # Durable invocations included: their per-call context rides in
+            # the event, so the pooled worker can serve them.
+            result = _execute_function_warm(func, event)
         else:
             # java*/dotnet*/ruby* need the real RIE image — there's no
             # in-process executor that can run JVM bytecode or .NET IL.
@@ -4453,17 +5095,19 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         # can set ``_X_AMZN_TRACE_ID`` in os.environ before calling the
         # handler. Per-invocation, not bake-time, so it can't live in the
         # worker's spawn env.
-        _xray = _xray_trace_id_for_invocation(config)
-        if _xray:
-            event["_x_amzn_trace_id"] = _xray
-        # Same channel for the recursive-loop depth: the worker's env is
-        # fixed at spawn time, so it has to ride in the event. Both worker
-        # bootstraps move it to the environment and drop the key before the
-        # handler runs. Non-dict payloads have nowhere to carry it, and lose
-        # the counter.
-        if isinstance(event, dict):
-            event[INVOKE_DEPTH_EVENT_KEY] = _invoke_depth.get()
-        result = worker.invoke(event, new_uuid())
+        # The per-invocation values travel beside the payload, never inside
+        # it: on AWS the trace header is a reserved environment variable that
+        # "changes with each invocation", the request id is on the context
+        # object, and the payload the handler receives is the caller's, of
+        # whatever JSON type. A pooled worker's spawn environment is fixed, so
+        # the values ride the envelope and the bootstrap applies them per call.
+        result = worker.invoke(
+            event,
+            new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+            depth=_invoke_depth.get(),
+            durable=_durable_env_overlay(),
+        )
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
         else:
@@ -4492,6 +5136,102 @@ def _execute_function_warm(func: dict, event: dict) -> dict:
         release_worker(worker)
 
 
+def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
+    """Build the process environment for a ``provided.*`` bootstrap binary.
+
+    Shared by the one-shot executor and the warm ``ProvidedWorker`` so the two
+    paths cannot drift. Per-invocation values (X-Ray trace ID) are deliberately
+    absent: a reused environment cannot carry them in env, and the Runtime API
+    has headers for exactly that. The one-shot executor adds its per-call
+    overlays after calling this helper. Custom runtimes have no Python/Node
+    shim to propagate MiniStack's per-call recursion depth; the one-shot path
+    retains its legacy spawn-time depth overlay instead of freezing it here.
+    """
+    env_vars = _runtime_env_vars(config)
+    proc_env = dict(os.environ)
+    proc_env.update({
+        "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
+        "AWS_DEFAULT_REGION": get_region(),
+        "AWS_REGION": get_region(),
+        "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
+        "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
+        "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
+        "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
+        "LAMBDA_TASK_ROOT": code_dir,
+        "_HANDLER": config.get("Handler", "bootstrap"),
+    })
+    proc_env.update(execution_credentials(config))
+    proc_env.update(env_vars)
+    proc_env.update(_durable_env_overlay())
+    # Override AWS_ENDPOINT_URL *after* function env vars so Lambda binaries
+    # always call back to this MiniStack instance.
+    endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+    if not endpoint:
+        hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
+        if hostname:
+            endpoint = _normalize_endpoint_url(hostname)
+    if endpoint:
+        proc_env["AWS_ENDPOINT_URL"] = endpoint
+    return proc_env
+
+
+def _execute_function_provided_warm(func: dict, event: dict,
+                                    request_id: str | None = None) -> dict:
+    """Execute a ``provided.*`` Lambda on a pooled, reused environment."""
+    config = func.get("config") or func
+    code_zip = func.get("code_zip")
+    if not code_zip:
+        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+
+    func_name = config.get("FunctionName", "unknown")
+    qualifier = config.get("Version", "$LATEST")
+    _ensure_reaper_thread()
+    worker, reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    if worker is None and reason == "func_cap":
+        return _throttle_response(
+            reason_code="ReservedFunctionConcurrentInvocationLimitExceeded",
+            msg=f"Rate Exceeded: function {func_name} warm-worker ceiling reached",
+        )
+    try:
+        # Invocation metadata belongs in Runtime API headers, not in the user
+        # payload (which need not be a dict and may contain similarly named keys).
+        result = worker.invoke(
+            event, request_id or new_uuid(),
+            trace_id=_xray_trace_id_for_invocation(config),
+        )
+        if result.get("status") == "ok":
+            return {"body": result.get("result"), "log": result.get("log", "")}
+        payload = result.get("error_payload")
+        if isinstance(payload, dict):
+            return {"body": payload, "error": True, "log": result.get("log", "")}
+        error_msg = result.get("error", "Unknown error")
+        error_type = ("Runtime.ExitError" if "timed out" in error_msg.lower()
+                      else "Runtime.HandlerError")
+        return {
+            "body": {"errorMessage": error_msg, "errorType": error_type},
+            "error": True,
+            "log": result.get("log", ""),
+        }
+    except Exception as e:
+        logger.error("Warm provided-runtime execution error for %s: %s", func_name, e)
+        account, region = _account_region_from_function_config(config)
+        invalidate_worker(func_name, qualifier=qualifier, account=account, region=region)
+        worker = None  # invalidation already removed and reaped the worker
+        # A Python class name is not an AWS error type: a bootstrap that is
+        # missing or cannot be executed is `Runtime.InvalidEntrypoint`, and the
+        # environment failures AWS names Runtime.* carry their own type.
+        error_type = getattr(e, "error_type", "") or "Runtime.Unknown"
+        # Do not transparently invoke again: the handler may already have
+        # performed side effects before its environment failed.
+        return {
+            "body": {"errorMessage": str(e), "errorType": error_type},
+            "error": True,
+            "log": "",
+        }
+    finally:
+        release_worker(worker)
+
+
 def _execute_function_provided(func: dict, event: dict) -> dict:
     """Execute a provided-runtime Lambda (Go/Rust binary) via a minimal Lambda Runtime API."""
     config = func.get("config") or func
@@ -4500,7 +5240,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
 
     timeout = config.get("Timeout", 30)
-    env_vars = _runtime_env_vars(config)
 
     try:
         import http.server
@@ -4605,23 +5344,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
         server_ready.wait(timeout=5)
 
         try:
-            # Build environment for the Lambda binary
-            proc_env = dict(os.environ)
-            proc_env.update({
-                "AWS_LAMBDA_RUNTIME_API": f"127.0.0.1:{port}",
-                "AWS_DEFAULT_REGION": get_region(),
-                "AWS_REGION": get_region(),
-                "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                "AWS_LAMBDA_FUNCTION_NAME": config.get("FunctionName", "unknown"),
-                "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config.get("MemorySize", 128)),
-                "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
-                "AWS_LAMBDA_LOG_STREAM_NAME": new_uuid(),
-                "LAMBDA_TASK_ROOT": code_dir,
-                "_HANDLER": config.get("Handler", "bootstrap"),
-            })
-            proc_env.update(env_vars)
-            proc_env.update(_durable_env_overlay())
+            proc_env = _provided_worker_env(config, code_dir, port)
             # X-Ray active tracing. ``_execute_function_provided`` builds
             # ``proc_env`` per-invocation, so a per-call trace ID is safe
             # here (unlike the RIE pool). aws-xray-sdk reads this env var
@@ -4630,19 +5353,6 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
             if _xray_trace_id:
                 proc_env["_X_AMZN_TRACE_ID"] = _xray_trace_id
             proc_env[INVOKE_DEPTH_ENV] = str(_invoke_depth.get())
-            # Override AWS_ENDPOINT_URL *after* function env vars so
-            # Lambda binaries always call back to this MiniStack
-            # instance.  Function-level env vars may carry the
-            # host-mapped URL which is unreachable from inside the
-            # container.
-            endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
-            if not endpoint:
-                hostname = os.environ.get("LOCALSTACK_HOSTNAME", "")
-                if hostname:
-                    endpoint = _normalize_endpoint_url(hostname)
-            if endpoint:
-                proc_env["AWS_ENDPOINT_URL"] = endpoint
-
             # Spawn under the code lock: no fork may overlap an extraction
             # write elsewhere, or the child inherits the open write fd and
             # execve fails with ETXTBSY (#1051).
@@ -4765,9 +5475,6 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                 {
                     "AWS_DEFAULT_REGION": get_region(),
                     "AWS_REGION": get_region(),
-                    "AWS_ACCESS_KEY_ID": _account_region_from_function_config(config)[0],
-                    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
-                    "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
                     "AWS_LAMBDA_FUNCTION_NAME": config["FunctionName"],
                     "AWS_LAMBDA_FUNCTION_MEMORY_SIZE": str(config["MemorySize"]),
                     "AWS_LAMBDA_FUNCTION_VERSION": config.get("Version", "$LATEST"),
@@ -4780,6 +5487,7 @@ def _execute_function_local(func: dict, event: dict) -> dict:
                     "_LAMBDA_LAYERS_DIRS": os.pathsep.join(layers_dirs),
                 }
             )
+            env.update(execution_credentials(config))
             endpoint = _normalize_endpoint_url(os.environ.get("AWS_ENDPOINT_URL", ""))
             if not endpoint:
                 endpoint = _normalize_endpoint_url(env_vars.get("AWS_ENDPOINT_URL", ""))
@@ -4929,10 +5637,13 @@ def _publish_version(name: str, data: dict):
     if data.get("Description"):
         ver_config["Description"] = data["Description"]
 
-    func["versions"][str(ver_num)] = {
+    ver_record = {
         "config": ver_config,
         "code_zip": func.get("code_zip"),
     }
+    func["versions"][str(ver_num)] = ver_record
+    if _stamp_snapstart_published_version(ver_config):
+        _snapstart_provision_version_async(name, ver_record)
     return json_response(ver_config, 201)
 
 
@@ -5163,6 +5874,15 @@ def _add_permission(
         condition.setdefault("StringEquals", {})["aws:PrincipalOrgID"] = data["PrincipalOrgID"]
     if "FunctionUrlAuthType" in data:
         condition.setdefault("StringEquals", {})["lambda:FunctionUrlAuthType"] = data["FunctionUrlAuthType"]
+    if "EventSourceToken" in data:
+        condition.setdefault("StringEquals", {})["lambda:EventSourceToken"] = data["EventSourceToken"]
+    if "InvokedViaFunctionUrl" in data:
+        # Lambda writes this one as a Bool condition with a string value
+        # (https://docs.aws.amazon.com/lambda/latest/dg/urls-auth.html).
+        invoked = data["InvokedViaFunctionUrl"]
+        if not isinstance(invoked, bool):
+            invoked = str(invoked).lower() == "true"
+        condition["Bool"] = {"lambda:InvokedViaFunctionUrl": "true" if invoked else "false"}
     if condition:
         statement["Condition"] = condition
 
@@ -5521,6 +6241,9 @@ def _delete_layer_version(layer_name: str, version: int):
     if not layer:
         return 204, {}, b""
     layer["versions"] = [vc for vc in layer["versions"] if vc["Version"] != version]
+    # The removed version may have been the last reference to its extracted
+    # layer tree in the docker executor cache.
+    _sweep_extract_cache()
     return 204, {}, b""
 
 
@@ -6011,8 +6734,18 @@ def _delete_provisioned_concurrency(func_name: str, qualifier: str):
 
 
 def _esm_response(esm: dict) -> dict:
-    """Return ESM dict without internal-only fields."""
-    return {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    """Return ESM dict without internal-only fields.
+
+    EventSourceMappingArn is derived here rather than stored on the record so
+    that mappings created before it existed — restored state included — report
+    it too. Callers cannot construct this ARN themselves, and ListTags is keyed
+    on it, so omitting it leaves tags unreadable.
+    """
+    out = {k: v for k, v in esm.items() if k not in ("FunctionName", "Enabled")}
+    esm_id = esm.get("UUID")
+    if esm_id:
+        out["EventSourceMappingArn"] = _esm_arn(esm_id)
+    return out
 
 
 def _resolve_existing_esm_function(function_ref: str):
@@ -6243,6 +6976,49 @@ _dynamodb_stream_positions_lock = threading.Lock()
 _esm_backoff_until = AccountRegionScopedDict()
 _ESM_BACKOFF_SECONDS = 1.0
 
+# SQS batches run off the poll thread so a slow handler can't stall other ESMs.
+# Per-ESM limit is ScalingConfig.MaximumConcurrency, else this default.
+_ESM_SQS_DEFAULT_CONCURRENCY = 5
+# esm_uuid -> dispatched batches not yet finished.
+_esm_inflight: dict[str, int] = {}
+_esm_inflight_lock = threading.Lock()
+# Set when a dispatched batch finishes, so _poll_loop refills the slot at once.
+_esm_wake = threading.Event()
+
+
+def _sqs_esm_concurrency(esm: dict, func_rec: dict, config: dict, queue: dict | None = None) -> int:
+    """In-flight batches allowed for one SQS event source mapping.
+
+    FIFO is 1: "Amazon SQS ensures that messages in the same group are
+    delivered to Lambda in order", and a batch here spans groups, so two in
+    flight reorder one. Serial until the poller splits batches by
+    MessageGroupId.
+    """
+    if (queue or {}).get("is_fifo"):
+        return 1
+    limit = (esm.get("ScalingConfig") or {}).get("MaximumConcurrency") or _ESM_SQS_DEFAULT_CONCURRENCY
+    reserved = _reserved_concurrency(func_rec, config)
+    return min(limit, reserved) if reserved else limit
+
+
+def _dispatch_esm_batch(esm_id: str, fn, *args) -> None:
+    with _esm_inflight_lock:
+        _esm_inflight[esm_id] = _esm_inflight.get(esm_id, 0) + 1
+
+    def _task():
+        try:
+            fn(*args)
+        finally:
+            with _esm_inflight_lock:
+                remaining = _esm_inflight.get(esm_id, 0) - 1
+                if remaining > 0:
+                    _esm_inflight[esm_id] = remaining
+                else:
+                    _esm_inflight.pop(esm_id, None)
+            _esm_wake.set()
+
+    spawn_background(_task, thread_name="ministack-esm")
+
 
 def _init_stream_position(esm_id, source_arn, starting):
     """Anchor a DynamoDB-stream ESM's read position at subscription time so
@@ -6278,6 +7054,7 @@ def _poll_loop():
     """Background thread: polls SQS/Kinesis/DynamoDB for active ESMs and invokes Lambda."""
     while True:
         processed = False
+        _esm_wake.clear()
         try:
             processed = _poll_sqs() or processed
         except Exception as e:
@@ -6294,7 +7071,7 @@ def _poll_loop():
         # immediately rather than waiting out the idle cadence below, so
         # throughput isn't throttled to batch_size-per-tick.
         if not processed:
-            time.sleep(1 if _esms.has_any() else 5)
+            _esm_wake.wait(1 if _esms.has_any() else 5)
 
 
 def _iter_all_esms():
@@ -6321,8 +7098,8 @@ def _sqs_message_attributes_to_camel_case(attrs: dict) -> dict:
 
 
 def _poll_sqs():
-    """Returns True if any ESM advanced past a batch this pass (successfully
-    invoked, or filtered out entirely)."""
+    """Returns True if any ESM took a batch this pass (dispatched for invoke,
+    or filtered out entirely)."""
     from ministack.services import sqs as _sqs
 
     processed_any = False
@@ -6362,6 +7139,9 @@ def _poll_sqs():
             esm_id = esm["UUID"]
             if _esm_backoff_until.get(esm_id, 0) > time.time():
                 continue
+            # Only this thread increments, so the count can't rise before dispatch.
+            if _esm_inflight.get(esm_id, 0) >= _sqs_esm_concurrency(esm, func_rec, _cfg, queue):
+                continue
 
             batch_size = esm.get("BatchSize", 10)
             now = time.time()
@@ -6373,16 +7153,31 @@ def _poll_sqs():
             records = []
             for msg in batch:
                 first_recv = msg.get("first_receive_at") or now
+                attributes = {
+                    "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
+                    "SentTimestamp": str(int(msg["sent_at"] * 1000)),
+                    "SenderId": get_account_id(),
+                    "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
+                }
+                # AWSTraceHeader carries X-Ray / OpenTelemetry trace context
+                # through SQS into the consumer; AWS delivers it inside the
+                # record's attributes map when the producer set it.
+                trace_header = (msg.get("sys") or {}).get("AWSTraceHeader")
+                if trace_header:
+                    attributes["AWSTraceHeader"] = trace_header
+                # FIFO records carry their sequencing attributes, per the
+                # documented FIFO event shape.
+                if msg.get("group_id"):
+                    attributes["MessageGroupId"] = msg["group_id"]
+                if msg.get("dedup_id"):
+                    attributes["MessageDeduplicationId"] = msg["dedup_id"]
+                if msg.get("seq") is not None:
+                    attributes["SequenceNumber"] = str(msg["seq"])
                 records.append({
                     "messageId": msg["id"],
                     "receiptHandle": msg["receipt_handle"],
                     "body": msg["body"],
-                    "attributes": {
-                        "ApproximateReceiveCount": str(msg.get("receive_count", 1)),
-                        "SentTimestamp": str(int(msg["sent_at"] * 1000)),
-                        "SenderId": get_account_id(),
-                        "ApproximateFirstReceiveTimestamp": str(int(first_recv * 1000)),
-                    },
+                    "attributes": attributes,
                     "messageAttributes": _sqs_message_attributes_to_camel_case(
                         msg.get("message_attributes", {})
                     ),
@@ -6403,65 +7198,75 @@ def _poll_sqs():
                 processed_any = True
                 continue
 
-            event = {"Records": records}
-            result = _execute_function(func_rec, event)
-
-            if result.get("error"):
-                err_body = result.get("body") or {}
-                err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
-                err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
-                esm["LastProcessingResult"] = "FAILED"
-                logger.warning(
-                    "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
-                    func_name, queue_name, err_type, err_msg, result.get("log", ""),
-                )
-                # Failed messages stay invisible for their visibility timeout
-                # rather than advancing, so don't report this as processed.
-                _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
-            else:
-                processed_any = True
-                _esm_backoff_until.pop(esm_id, None)
-                # Check for ReportBatchItemFailures — partial batch response
-                failed_ids = set()
-                if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
-                    body = result.get("body")
-                    if isinstance(body, dict):
-                        for failure in body.get("batchItemFailures", []):
-                            fid = failure.get("itemIdentifier", "")
-                            if fid:
-                                failed_ids.add(fid)
-                    elif isinstance(body, str):
-                        try:
-                            parsed = json.loads(body)
-                            for failure in parsed.get("batchItemFailures", []):
-                                fid = failure.get("itemIdentifier", "")
-                                if fid:
-                                    failed_ids.add(fid)
-                        except (json.JSONDecodeError, AttributeError):
-                            pass
-
-                # Delete only the messages that succeeded (not in failed_ids)
-                succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
-                receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
-                if receipt_handles:
-                    _sqs._delete_messages_for_esm(queue_url, receipt_handles)
-
-                n_failed = len(batch) - len(succeeded)
-                if n_failed:
-                    esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
-                    logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
-                                func_name, len(succeeded), queue_name, n_failed)
-                else:
-                    esm["LastProcessingResult"] = f"OK - {len(batch)} records"
-                    logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
-                log_output = result.get("log", "")
-                if log_output:
-                    logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
+            _dispatch_esm_batch(
+                esm_id, _run_sqs_batch, esm, func_rec, {"Records": records}, batch, queue_url, queue_name
+            )
+            processed_any = True
         finally:
             _request_account_id.reset(account_token)
             _request_region.reset(region_token)
 
     return processed_any
+
+
+def _run_sqs_batch(esm, func_rec, event, batch, queue_url, queue_name):
+    from ministack.services import sqs as _sqs
+
+    esm_id = esm["UUID"]
+    func_name = esm["FunctionName"]
+    result = _execute_function(func_rec, event)
+
+    if result.get("error"):
+        err_body = result.get("body") or {}
+        err_type = err_body.get("errorType") if isinstance(err_body, dict) else None
+        err_msg = err_body.get("errorMessage") if isinstance(err_body, dict) else None
+        esm["LastProcessingResult"] = "FAILED"
+        logger.warning(
+            "ESM: Lambda %s failed processing SQS batch from %s (errorType=%s errorMessage=%s)\n%s",
+            func_name, queue_name, err_type, err_msg, result.get("log", ""),
+        )
+        # Failed messages stay invisible for their visibility timeout; pace
+        # retries so the poll loop doesn't spin on a broken ESM.
+        _esm_backoff_until[esm_id] = time.time() + _ESM_BACKOFF_SECONDS
+        return
+
+    _esm_backoff_until.pop(esm_id, None)
+    # Check for ReportBatchItemFailures — partial batch response
+    failed_ids = set()
+    if "ReportBatchItemFailures" in esm.get("FunctionResponseTypes", []):
+        body = result.get("body")
+        if isinstance(body, dict):
+            for failure in body.get("batchItemFailures", []):
+                fid = failure.get("itemIdentifier", "")
+                if fid:
+                    failed_ids.add(fid)
+        elif isinstance(body, str):
+            try:
+                parsed = json.loads(body)
+                for failure in parsed.get("batchItemFailures", []):
+                    fid = failure.get("itemIdentifier", "")
+                    if fid:
+                        failed_ids.add(fid)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+
+    # Delete only the messages that succeeded (not in failed_ids)
+    succeeded = [msg for msg in batch if msg["id"] not in failed_ids]
+    receipt_handles = {msg["receipt_handle"] for msg in succeeded if msg.get("receipt_handle")}
+    if receipt_handles:
+        _sqs._delete_messages_for_esm(queue_url, receipt_handles)
+
+    n_failed = len(batch) - len(succeeded)
+    if n_failed:
+        esm["LastProcessingResult"] = f"OK - {len(succeeded)} records, {n_failed} partial failures"
+        logger.info("ESM: Lambda %s processed %d SQS messages from %s (%d partial failures)",
+                    func_name, len(succeeded), queue_name, n_failed)
+    else:
+        esm["LastProcessingResult"] = f"OK - {len(batch)} records"
+        logger.info("ESM: Lambda %s processed %d SQS messages from %s", func_name, len(batch), queue_name)
+    log_output = result.get("log", "")
+    if log_output:
+        logger.info("ESM: Lambda %s output:\n%s", func_name, log_output)
 
 
 def _poll_kinesis():
@@ -7164,6 +7969,9 @@ def reset():
     with _provided_code_lock:
         _provided_code_dirs.clear()
     shutil.rmtree(_PROVIDED_CODE_CACHE, ignore_errors=True)
+    with _docker_extract_lock:
+        _docker_extract_dirs.clear()
+    shutil.rmtree(_DOCKER_EXTRACT_CACHE, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 WAF v2 Service Emulator.
 JSON-based API via X-Amz-Target: AWSWAF_20190729.
@@ -55,6 +57,10 @@ def get_state():
         "_associations": copy.deepcopy(_associations),
         "_waf_tags": copy.deepcopy(_waf_tags),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

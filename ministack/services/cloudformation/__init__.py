@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation Service Emulator -- AWS-compatible.
 Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
@@ -28,16 +30,6 @@ _stack_events = AccountRegionScopedDict()  # stack_id -> [event list]
 _exports = AccountRegionScopedDict()       # export_name -> {StackId, Name, Value}
 _change_sets = AccountRegionScopedDict()   # cs_id -> change set dict
 
-# Re-exports for compatibility
-from .engine import (  # noqa: E402
-    _NO_VALUE,
-    _evaluate_conditions,
-    _extract_deps,
-    _parse_template,
-    _resolve_parameters,
-    _resolve_refs,
-    _topological_sort,
-)
 from .helpers import _p  # noqa: E402
 
 
@@ -59,7 +51,9 @@ async def handle_request(method: str, path: str, headers: dict,
             except (json.JSONDecodeError, TypeError):
                 pass
     elif method == "POST" and body:
-        form_params = parse_qs(body.decode("utf-8", errors="replace"))
+        # keep_blank_values: an empty list arrives as ``Tags=`` and must stay
+        # distinguishable from an omitted parameter.
+        form_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         for k, v in form_params.items():
             params[k] = v
 
@@ -78,6 +72,8 @@ def reset():
     _change_sets.clear()
     from ministack.services.cloudformation import custom_resource as _cr
     _cr.reset()
+    from ministack.services.cloudformation import wait_conditions as _wc
+    _wc.reset()
 
 
 # Stores that need to survive a PERSIST_STATE=1 stop/restore cycle. The actual
@@ -97,6 +93,10 @@ def get_state():
     return {key: copy.deepcopy(store()) for store, key in _PERSISTED_STORES}
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return
@@ -114,9 +114,7 @@ def restore_state(data):
 
 
 # Must be last — handlers imports from this module
-from ministack.core.responses import get_account_id
-
-from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402
+from .handlers import _ACTION_HANDLERS  # noqa: E402
 
 # Restore persisted stack metadata on first import (a CloudFormation request, or
 # the eager boot import when a state file exists). Failure falls back to a fresh

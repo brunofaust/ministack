@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon OpenSearch Service emulator.
 
@@ -157,6 +159,10 @@ def get_state():
         "packages": copy.deepcopy(_packages),
         "domain_packages": copy.deepcopy(_domain_packages),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

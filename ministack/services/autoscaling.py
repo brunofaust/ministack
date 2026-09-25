@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AutoScaling Service Emulator.
 Query API (Action=...) — groups, launch configs, policies, hooks, scheduled actions.
@@ -59,6 +61,10 @@ def get_state():
         "scheduled_actions": copy.deepcopy(_scheduled_actions),
         "tags": copy.deepcopy(_tags),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

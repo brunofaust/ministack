@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 SES v2 Service Emulator.
 REST/JSON API via path /v2/email/...
@@ -56,6 +58,10 @@ def get_state() -> dict:
         "_config_sets": _config_sets,
         "_ses_tags": _ses_tags,
     })
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data: dict):
@@ -278,8 +284,12 @@ def _local_ses_v2_resource_arn(arn):
 
 
 async def handle_request(method, path, headers, body, query_params):
-    # Strip /v2/email prefix
-    sub = path[len("/v2/email"):]
+    # The SES dispatcher also accepts unprefixed REST paths when selected by
+    # a SESv2 target header. Preserve those paths and trailing-slash handling
+    # from its former inline v2 implementation.
+    sub = path.rstrip("/")
+    if sub.startswith("/v2/email"):
+        sub = sub[len("/v2/email"):]
 
     try:
         data = json.loads(body) if body else {}
@@ -310,7 +320,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     # POST /v2/email/outbound-emails  (SendEmail)
     if sub == "/outbound-emails" and method == "POST":
-        msg_id = f"ministack-{new_uuid()}"
+        msg_id = f"{new_uuid()}@email.amazonses.com"
         source = data.get("FromEmailAddress", "")
         dest = data.get("Destination", {})
         to_addrs = dest.get("ToAddresses", [])
@@ -382,6 +392,68 @@ async def handle_request(method, path, headers, body, query_params):
         logger.info("SESv2 SendEmail: MessageId=%s | %s -> %s%s", msg_id, source, to_addrs,
                     f" | template={template_name}" if template_name else "")
         return json_response({"MessageId": msg_id})
+
+    # POST /v2/email/outbound-bulk-emails  (SendBulkEmail)
+    if sub == "/outbound-bulk-emails" and method == "POST":
+        source = data.get("FromEmailAddress", "")
+        config_set = data.get("ConfigurationSetName", "")
+        tpl = data.get("DefaultContent", {}).get("Template", {})
+        if not tpl:
+            return _json_err("BadRequestException", "DefaultContent.Template is required")
+        stored, template_name, err = _resolve_send_template(tpl)
+        if err:
+            return err
+        default_data = tpl.get("TemplateData", "")
+        entries = data.get("BulkEmailEntries", [])
+        if not entries:
+            return _json_err("BadRequestException", "BulkEmailEntries is required")
+
+        results = []
+        for entry in entries:
+            dest = entry.get("Destination", {})
+            to_addrs = dest.get("ToAddresses", [])
+            cc_addrs = dest.get("CcAddresses", [])
+            bcc_addrs = dest.get("BccAddresses", [])
+            template_data = (
+                entry.get("ReplacementEmailContent", {})
+                     .get("ReplacementTemplate", {})
+                     .get("ReplacementTemplateData", default_data)
+            )
+            rendered = _render_template(stored, template_data)
+            subj = rendered.get("Subject", "")
+            body_text = rendered.get("Text", "")
+            body_html = rendered.get("Html", "")
+            msg_id = f"{new_uuid()}@email.amazonses.com"
+
+            all_addrs = to_addrs + cc_addrs + bcc_addrs
+            if source and all_addrs:
+                mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
+                                               subj, body_text, body_html, msg_id)
+                _smtp_relay(source, all_addrs, mime_str)
+
+            record = {
+                "MessageId": msg_id,
+                "Source": source,
+                "To": to_addrs,
+                "CC": cc_addrs,
+                "BCC": bcc_addrs,
+                "Subject": subj,
+                "BodyText": body_text,
+                "BodyHtml": body_html,
+                "TemplateData": template_data,
+                "Timestamp": time.time(),
+                "Type": "v2.SendBulkEmail",
+            }
+            if template_name:
+                record["Template"] = template_name
+            if config_set:
+                record["ConfigurationSetName"] = config_set
+            _sent_emails_list().append(record)
+            results.append({"Status": "SUCCESS", "MessageId": msg_id})
+
+        logger.info("SESv2 SendBulkEmail: %s | template=%s | %s entries",
+                    source, template_name or "<inline>", len(entries))
+        return json_response({"BulkEmailEntryResults": results})
 
     # POST /v2/email/identities  (CreateEmailIdentity)
     if sub == "/identities" and method == "POST":

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Elemental MediaConnect service emulator.
 REST/JSON protocol — /v1/flows/* and /tags/* paths.
@@ -61,6 +63,10 @@ def get_state():
         "flows": copy.deepcopy(_flows),
         "tags": copy.deepcopy(_tags),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

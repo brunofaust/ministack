@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """Amazon Bedrock AgentCore emulator.
 
 Covers the two AgentCore services, which both sign as ``bedrock-agentcore``:
@@ -54,6 +56,10 @@ _NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]{0,47}$")
 
 def get_state():
     return copy.deepcopy({"runtimes": _runtimes, "endpoints": _endpoints})
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

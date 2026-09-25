@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Cloud Control API Emulator.
 JSON-based API via X-Amz-Target (prefix: CloudApiService).
@@ -48,6 +50,10 @@ _requests = AccountRegionScopedDict()
 
 def get_state():
     return {"resources": _resources, "requests": _requests}
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

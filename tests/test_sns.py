@@ -304,6 +304,37 @@ def test_sns_tags(sns):
     assert tags["env"] == "staging"
 
 
+def test_sns_create_topic_tags_are_readable_and_survive_tag_crud(sns):
+    """BD-958: tags supplied to CreateTopic round-trip through later tag CRUD."""
+    topic_name = f"intg-sns-create-topic-tags-{_uuid_mod.uuid4().hex[:8]}"
+    topic_arn = sns.create_topic(
+        Name=topic_name,
+        Tags=[
+            {"Key": "environment", "Value": "terraform"},
+            {"Key": "managed-by", "Value": "terraform"},
+        ],
+    )["TopicArn"]
+
+    created_tags = {
+        tag["Key"]: tag["Value"]
+        for tag in sns.list_tags_for_resource(ResourceArn=topic_arn)["Tags"]
+    }
+
+    assert created_tags == {"environment": "terraform", "managed-by": "terraform"}
+
+    sns.tag_resource(
+        ResourceArn=topic_arn,
+        Tags=[{"Key": "team", "Value": "platform"}],
+    )
+    sns.untag_resource(ResourceArn=topic_arn, TagKeys=["managed-by"])
+    final_tags = {
+        tag["Key"]: tag["Value"]
+        for tag in sns.list_tags_for_resource(ResourceArn=topic_arn)["Tags"]
+    }
+
+    assert final_tags == {"environment": "terraform", "team": "platform"}
+
+
 def test_sns_tag_resource_accepts_empty_account_topic_arn(sns):
     arn = sns.create_topic(Name=f"intg-sns-empty-account-{_uuid_mod.uuid4().hex[:8]}")["TopicArn"]
     empty_account_arn = arn.replace(":000000000000:", "::")
@@ -377,6 +408,24 @@ def test_sns_subscribe_with_raw_message_delivery(sns):
     sub_arn = sub["SubscriptionArn"]
     attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
     assert attrs["RawMessageDelivery"] == "true"
+
+
+def test_sns_subscribe_with_subscription_role_arn(sns):
+    """SubscriptionRoleArn is a Subscribe and SetSubscriptionAttributes
+    attribute (the role Firehose subscriptions write with); both calls keep it."""
+    arn = sns.create_topic(Name="intg-sns-sub-role")["TopicArn"]
+    sub_arn = sns.subscribe(
+        TopicArn=arn, Protocol="email", Endpoint="role@example.com",
+        Attributes={"SubscriptionRoleArn": "arn:aws:iam::000000000000:role/sub-role-a"},
+    )["SubscriptionArn"]
+    attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert attrs["SubscriptionRoleArn"] == "arn:aws:iam::000000000000:role/sub-role-a"
+    sns.set_subscription_attributes(
+        SubscriptionArn=sub_arn, AttributeName="SubscriptionRoleArn",
+        AttributeValue="arn:aws:iam::000000000000:role/sub-role-b")
+    attrs = sns.get_subscription_attributes(SubscriptionArn=sub_arn)["Attributes"]
+    assert attrs["SubscriptionRoleArn"] == "arn:aws:iam::000000000000:role/sub-role-b"
+
 
 def test_sns_subscribe_with_filter_policy(sns):
     arn = sns.create_topic(Name="intg-sns-sub-filter")["TopicArn"]
@@ -2107,3 +2156,63 @@ def test_sns_publish_internal_rejections(sns_internal):
     with pytest.raises(sns_internal.SnsPublishError) as ei:
         sns_internal.publish_internal(standard, "x" * (256 * 1024 + 1))
     assert ei.value.code == "InvalidParameter"
+
+
+def test_sns_to_lambda_fanout_non_default_account(sqs):
+    """Regression: SNS→Lambda delivery ran on a bare thread whose empty
+    context read back the default account, so ``_get_func_record_for_ref``
+    rejected the subscriber's ARN for any 12-digit-key tenant and the
+    notification was silently dropped. The delivery thread now carries the
+    publisher's contextvars."""
+    account = "314159265358"
+
+    def _acct(service):
+        return boto3.client(
+            service,
+            endpoint_url=ENDPOINT,
+            region_name="us-east-1",
+            aws_access_key_id=account,
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    sns_c = _acct("sns")
+    lam_c = _acct("lambda")
+    sqs_c = _acct("sqs")
+    suffix = _uuid_mod.uuid4().hex[:8]
+
+    qname = f"sns-xacct-signal-{suffix}"
+    q_url = sqs_c.create_queue(QueueName=qname)["QueueUrl"]
+
+    fn = f"sns-xacct-{suffix}"
+    # The worker's env creds derive from the FunctionArn, so the inner SQS
+    # client resolves the queue in the function's own account.
+    code = (
+        "import os, boto3\n"
+        f"QNAME = {qname!r}\n"
+        "def handler(event, context):\n"
+        "    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+        "    url = sqs.get_queue_url(QueueName=QNAME)['QueueUrl']\n"
+        "    sqs.send_message(QueueUrl=url, MessageBody='delivered')\n"
+        "    return {'ok': True}\n"
+    )
+    lam_c.create_function(
+        FunctionName=fn,
+        Runtime="python3.12",
+        Role=f"arn:aws:iam::{account}:role/lambda-role",
+        Handler="index.handler",
+        Timeout=30,
+        Code={"ZipFile": _make_zip(code)},
+    )
+    func_arn = f"arn:aws:lambda:us-east-1:{account}:function:{fn}"
+
+    topic_arn = sns_c.create_topic(Name=f"sns-xacct-topic-{suffix}")["TopicArn"]
+    sns_c.subscribe(TopicArn=topic_arn, Protocol="lambda", Endpoint=func_arn)
+    sns_c.publish(TopicArn=topic_arn, Message="hello-cross-account")
+
+    deadline = time.time() + 30
+    got = []
+    while time.time() < deadline and not got:
+        msgs = sqs_c.receive_message(QueueUrl=q_url, MaxNumberOfMessages=1, WaitTimeSeconds=2)
+        got = msgs.get("Messages", [])
+    assert got, "SNS→Lambda delivery never arrived for a non-default account"

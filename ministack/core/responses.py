@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Response formatting utilities.
 Handles XML responses (S3, SQS, SNS, IAM, STS, CloudWatch) and
@@ -26,16 +28,49 @@ _request_account_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _12_DIGIT_RE = re.compile(r"^\d{12}$")
 
 
+def _account_from_sts_session(access_key_id: str):
+    """The account an STS session belongs to, or None if this is not a session key.
+
+    An assumed-role session's key is ``ASIA...``, not 12 digits, so without this it falls to the
+    default account and the session operates in the WRONG TENANT: it sees none of the resources in
+    the account whose role it assumed, and any write lands in the default account instead. That
+    makes cross-account access — the ordinary way one account reaches another's resources —
+    silently not work, while AssumeRole itself reports success.
+
+    Imported lazily because `services.sts` imports this module.
+    """
+    try:
+        from ministack.services import sts as sts_svc
+
+        session = sts_svc._sessions.get(access_key_id)
+        if not session:
+            return None
+        # arn:aws:sts::<account>:assumed-role/<role>/<session>
+        parts = str(session.get("Arn", "")).split(":")
+        if len(parts) > 4 and _12_DIGIT_RE.match(parts[4]):
+            return parts[4]
+    except Exception:
+        pass
+    return None
+
+
 def set_request_account_id(access_key_id: str) -> None:
     """Set the account ID for the current request from the access key.
     If the access key is a 12-digit number, use it as the account ID.
+    An STS session key resolves to the account of the role it assumed.
     Otherwise fall back to the MINISTACK_ACCOUNT_ID env var or 000000000000."""
     if access_key_id and _12_DIGIT_RE.match(access_key_id):
         _request_account_id.set(access_key_id)
-    else:
-        _request_account_id.set(
-            os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
-        )
+        return
+
+    assumed = _account_from_sts_session(access_key_id) if access_key_id else None
+    if assumed:
+        _request_account_id.set(assumed)
+        return
+
+    _request_account_id.set(
+        os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+    )
 
 
 def get_account_id() -> str:
@@ -404,10 +439,23 @@ def _dict_to_xml(parent: Element, data):
         parent.text = data
 
 
-def json_response(data: dict, status: int = 200) -> tuple:
-    """Build an AWS-style JSON response."""
+# Response/error body content types. The json protocol (awsJson1.0/1.1) answers
+# `application/x-amz-json-1.0`; a rest-json service answers `application/json`.
+JSON_1_0_CONTENT_TYPE = "application/x-amz-json-1.0"
+REST_JSON_CONTENT_TYPE = "application/json"
+
+
+def json_response(data: dict, status: int = 200, *,
+                  content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
+    """Build an AWS-style JSON response.
+
+    `content_type` follows the service's protocol: the json protocol answers
+    `application/x-amz-json-1.0` (the default here), while a rest-json service
+    answers `application/json`. SDKs pick their parser from the service model
+    rather than this header, so it is about matching the wire.
+    """
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    return status, {"Content-Type": "application/x-amz-json-1.0"}, body
+    return status, {"Content-Type": content_type}, body
 
 
 def error_response_xml(code: str, message: str, status: int, namespace: str = "http://s3.amazonaws.com/doc/2006-03-01/") -> tuple:
@@ -427,7 +475,9 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
     return status, {"Content-Type": "application/xml"}, body
 
 
-def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None) -> tuple:
+def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None,
+                        *, message_key: str = "message",
+                        content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
     """AWS-style JSON error response.
 
     Real AWS emits the error type in BOTH the body (`__type`) and the
@@ -437,16 +487,28 @@ def error_response_json(code: str, message: str, status: int = 400, extra: dict 
     `extra` carries the modeled members some exceptions add to the body (for
     example `resourceId` / `resourceArn` on `ResourceAlreadyExistsException`),
     so callers never have to rebuild the envelope themselves.
+
+    `message_key` is the wire name of the message member, which is NOT the same
+    across services: it is whatever the exception shape declares, after any
+    `locationName`. Most json-protocol services model `message`, which is why
+    that is the default, but for example iotwireless models `Message`. boto3
+    finds either; Java/Go SDK v2 unmarshal by the modeled name, so the wrong
+    casing loses the message there. Pull the shape before overriding this.
+
+    `content_type` likewise: `application/x-amz-json-1.0` suits the json
+    protocol, while a rest-json service answers `application/json`. Both SDK
+    and boto3 pick their parser from the service model rather than this header,
+    so it is about matching the wire, not about parsing.
     """
     data = {
         "__type": code,
-        "message": message,
+        message_key: message,
     }
     if extra:
         data.update(extra)
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return status, {
-        "Content-Type": "application/x-amz-json-1.0",
+        "Content-Type": content_type,
         "x-amzn-errortype": code,
     }, body
 

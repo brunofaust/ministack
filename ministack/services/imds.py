@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EC2 Instance Metadata Service (IMDS) emulator.
 
@@ -233,3 +235,11 @@ async def handle_request(method, path, headers, body, query_params):
             return _text(_META_FLAT[leaf])
 
     return _not_found()
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

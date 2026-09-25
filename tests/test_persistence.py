@@ -3,19 +3,14 @@ Regression tests for the persistence-symmetry architectural bug.
 
 Background
 ----------
-When PERSIST_STATE=1, every service that participates in `_state_map`
-(see `ministack/app.py`) is saved on shutdown via `save_all()`. State is
-restored on startup either by a service's own `load_state()` call at
-module import time, OR by `_load_persisted_state()` which calls a
-`load_persisted_state()` method on the service module.
+When PERSIST_STATE=1, the registry-derived `_state_map` in
+`ministack/app.py` supplies each loaded service's `get_state()` function
+to `save_all()` at shutdown. State is currently restored either by a
+service's import-time `load_state()` call or by `_load_persisted_state()`.
 
-For five services (autoscaling, backup, eks, scheduler, pipes), the
-shutdown path persists the state to disk but no restore path runs at
-startup, so the next boot starts with an empty store. `pipes` is
-additionally missing from `_state_map`, so its state is never even saved.
-
-These tests assert the round-trip works for every persisted service.
+These tests protect persistence round trips and the registry contract.
 """
+import ast
 import importlib
 from pathlib import Path
 
@@ -24,14 +19,72 @@ import pytest
 from ministack.app import _state_map  # noqa: E402  (intentional internal import)
 from ministack.core import persistence
 
-# Services that MUST be persistence-round-trippable. Every entry of
-# `_state_map` qualifies. The set is materialised here so an addition to
-# `_state_map` automatically gets coverage.
-ALL_PERSISTED_SERVICES = sorted(_state_map.items())
-
 
 def _module(mod_name):
     return importlib.import_module(f"ministack.services.{mod_name}")
+
+
+def _registered_service_modules():
+    """Return all modules that participate in the service-state contract.
+
+    The optional sub_modules registry field is included before Phase 2 adds
+    it, so adding one automatically extends this contract test.
+    """
+    from ministack.app import SERVICE_REGISTRY
+
+    return sorted(
+        {
+            module
+            for config in SERVICE_REGISTRY.values()
+            for module in (config["module"], *config.get("sub_modules", ()))
+        }
+    )
+
+
+@pytest.mark.parametrize("mod_name", _registered_service_modules())
+def test_registered_service_defines_state_contract(mod_name):
+    """Every registered service exposes the uniform persistence API."""
+    spec = importlib.util.find_spec(f"ministack.services.{mod_name}")
+    assert spec and spec.origin, f"Cannot find service module {mod_name}"
+    module_ast = ast.parse(Path(spec.origin).read_text())
+    functions = {
+        node.name
+        for node in module_ast.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert {"get_state", "load_persisted_state", "reset"} <= functions, (
+        f"Service module {mod_name} must define get_state(), "
+        "load_persisted_state(data), and reset()."
+    )
+
+
+@pytest.mark.parametrize("svc_key,mod_name", sorted(_state_map.items()))
+def test_service_has_restore_path(svc_key, mod_name):
+    """Every service in `_state_map` must expose a way to restore its own state.
+
+    Either the module calls `load_state()` itself at import time, or it exposes
+    `load_persisted_state(data)` and is wired into `_load_persisted_state()`.
+    Without one of the two its state is written on shutdown and dropped on the
+    next boot, silently.
+    """
+    mod = _module(mod_name)
+    if not mod.get_state():
+        pytest.skip(f"{mod_name} holds no state to restore")
+    src = Path(mod.__file__).read_text()
+
+    self_restoring = (
+        "from ministack.core.persistence import" in src
+        and "load_state(" in src
+    )
+    centrally_restored = hasattr(mod, "load_persisted_state") and svc_key in {
+        "apigateway", "apigateway_v1", "servicediscovery",
+    }
+
+    assert self_restoring or centrally_restored, (
+        f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and will "
+        f"be saved on shutdown, but has no restore path on startup."
+    )
 
 
 def test_account_region_scoped_dict_isolates_account_and_region():
@@ -416,45 +469,8 @@ def test_appsync_events_v2_region_scoped_state_round_trip(monkeypatch, tmp_path)
         set_request_region(original_region)
 
 
-@pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
-def test_service_has_restore_path(svc_key, mod_name):
-    """Every service in `_state_map` must expose a way to restore its own state.
-
-    Either:
-      (a) the module calls `load_state()` itself at import time, OR
-      (b) the module exposes `load_persisted_state(data)` AND is wired into
-          `_load_persisted_state()` in app.py.
-    """
-    mod = _module(mod_name)
-    src = Path(mod.__file__).read_text()
-
-    # (a) self-restore at import: must import load_state AND call it.
-    self_restoring = (
-        "from ministack.core.persistence import" in src
-        and "load_state" in src
-        and "load_state(" in src
-    )
-
-    # (b) centrally restored: must define load_persisted_state and be in
-    # the explicit allow-list in app.py's `_load_persisted_state()`.
-    has_central_method = hasattr(mod, "load_persisted_state")
-    centrally_restored = has_central_method and svc_key in {
-        "apigateway", "apigateway_v1", "servicediscovery",
-    }
-
-    assert self_restoring or centrally_restored, (
-        f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and "
-        f"will be saved on shutdown, but has no restore path on startup. "
-        f"Either add `load_state()` at module top, or define "
-        f"`load_persisted_state(data)` and add it to "
-        f"`_load_persisted_state()` in app.py."
-    )
-
-
 def test_pipes_is_in_state_map():
-    """`pipes` defines `get_state()` so it expects to be persisted, but it
-    is missing from `_state_map`. Without this, pipe definitions evaporate
-    on every restart even before considering restore-path coverage."""
+    """The registry-derived map includes the Pipes service contract."""
     pipes = _module("pipes")
     assert hasattr(pipes, "get_state"), "pipes module no longer has get_state — update this test"
     assert "pipes" in _state_map, (
@@ -463,44 +479,19 @@ def test_pipes_is_in_state_map():
     )
 
 
-def test_state_map_services_without_endpoint_are_eagerly_imported():
-    """Services in `_state_map` but NOT in `SERVICE_REGISTRY` have no
-    AWS endpoint, so the lazy router never imports them. Their
-    import-time `load_state()` block therefore never fires unless
-    `_load_persisted_state()` eagerly imports them at startup.
+def test_state_map_is_derived_from_service_registry():
+    """The registry is the only declaration point for persisted modules."""
+    from ministack.app import SERVICE_REGISTRY, _registry_module_names, _registry_state_map
 
-    Without this, persisted RUNNING pipes don't resume their poller
-    after warm-boot until something else happens to import the
-    module (e.g. a new CFN pipe registration) — silently breaking
-    event forwarding for the entire window between restart and the
-    next pipe-related API call."""
-    import inspect
+    expected = {}
+    for config in SERVICE_REGISTRY.values():
+        module = config["module"]
+        expected[config.get("state_key", module)] = module
+        expected.update({sub_module: sub_module for sub_module in config.get("sub_modules", ())})
 
-    from ministack.app import SERVICE_REGISTRY, _load_persisted_state
-
-    # Find services that need eager import.
-    routable_modules = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
-    needs_eager_import = [
-        mod_name for _, mod_name in _state_map.items()
-        if mod_name not in routable_modules
-    ]
-    assert needs_eager_import, (
-        "Test premise broken: every persisted module is now also routable, "
-        "so this test would never catch the bug it's guarding against. "
-        "Update it or delete it."
-    )
-
-    # The eager-import section in _load_persisted_state must reference each
-    # such module by name, otherwise it stays unimported and its restore
-    # never runs.
-    src = inspect.getsource(_load_persisted_state)
-    for mod_name in needs_eager_import:
-        assert f'"{mod_name}"' in src or f"'{mod_name}'" in src, (
-            f"Service `{mod_name}` is in `_state_map` but not in "
-            f"`SERVICE_REGISTRY`, and `_load_persisted_state()` doesn't "
-            f"eagerly import it. With PERSIST_STATE=1, its persisted "
-            f"state will be silently ignored on warm-boot."
-        )
+    assert _state_map == expected
+    assert _registry_state_map() == expected
+    assert _registry_module_names() == set(expected.values())
 
 
 def test_save_dict_includes_sibling_imported_modules():
@@ -548,27 +539,28 @@ def test_save_dict_includes_sibling_imported_modules():
             _loaded_modules["appsync_events"] = saved
 
 
-def test_save_dict_skips_modules_never_imported():
+def test_save_dict_skips_modules_never_imported(monkeypatch):
     """The sys.modules fallback must NOT save state for modules that
     were never imported at all — there's no state to capture and any
     `get_state()` call on a non-imported module would attribute-error.
     Defensive guard: ensure the fallback path's `hasattr` check works."""
 
-    from ministack.app import _build_persistence_save_dict, _state_map
+    import sys
 
-    # Pick any persisted module and ensure it's truly absent from both
-    # `_loaded_modules` and `sys.modules`. `cur` is an obscure one that
-    # most test sessions won't have touched.
-    target = "ecs_metadata"  # not in _state_map → guaranteed absent from save_dict
-    assert target not in {v for v in _state_map.values()}, (
-        "test premise broken — pick a module not in _state_map"
-    )
+    from ministack.app import _build_persistence_save_dict, _loaded_modules, _state_map
 
-    # Even after the fallback path runs, ecs_metadata must not appear.
+    # Every registered module is now represented in `_state_map`, so force a
+    # known entry absent from both sources instead of relying on an exclusion.
+    target = "account"
+    assert target in _state_map.values(), "test premise broken — account must be registry-derived"
+    monkeypatch.delitem(_loaded_modules, target, raising=False)
+    monkeypatch.delitem(sys.modules, f"ministack.services.{target}", raising=False)
+
+    # Even after the fallback path runs, an unloaded module must not appear.
     save_dict = _build_persistence_save_dict()
-    assert "ecs_metadata" not in save_dict, (
-        "save_dict picked up a module that isn't even in _state_map — "
-        "the loop's key-membership check is broken."
+    assert target not in save_dict, (
+        "save_dict picked up a module that was absent from both module caches — "
+        "the fallback's unloaded-module guard is broken."
     )
 
 
@@ -643,6 +635,256 @@ def test_backup_round_trip():
         assert "vault-test" in mod._vaults
 
     _round_trip("backup", "backup", populate, observe)
+
+
+def test_s3_mrap_round_trip():
+    """A multi-region access point outlives a restart. Its alias is baked into
+    client configuration, so member buckets coming back without the alias
+    fronting them fails where a missing bucket would not."""
+    def populate(mod):
+        mod._mraps["ea0672af90364.mrap"] = {
+            "Name": "app-release",
+            "Alias": "ea0672af90364.mrap",
+            "Regions": ["app-us-east-1-release", "app-eu-west-1-release"],
+            "CreatedAt": "2026-01-01T00:00:00Z",
+        }
+
+    def observe(mod):
+        mrap = mod._mraps["ea0672af90364.mrap"]
+        assert mrap["Name"] == "app-release"
+        assert mrap["Regions"] == ["app-us-east-1-release", "app-eu-west-1-release"]
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_transcribe_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["job-test"] = {
+            "TranscriptionJobName": "job-test",
+            "TranscriptionJobStatus": "COMPLETED",
+            "LanguageCode": "en-US",
+            "Media": {"MediaFileUri": "s3://media/call.mp3"},
+            "Transcript": {
+                "TranscriptFileUri": "http://localhost:4566/out/job-test.json"
+            },
+            "CreationTime": _time.time(),
+            "StartTime": _time.time(),
+            "CompletionTime": _time.time(),
+            "OutputLocationType": "SERVICE_BUCKET",
+            "_run_id": "run-1",
+            "_output_bucket": "out",
+            "_output_key": "job-test.json",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("job-test")
+        assert job is not None
+        assert job["TranscriptionJobStatus"] == "COMPLETED"
+        # A completed job's transcript pointer and media reference are what
+        # callers read after a warm boot; losing either leaves GetTranscriptionJob
+        # reporting COMPLETED with nothing to fetch.
+        assert job["Transcript"]["TranscriptFileUri"].endswith("job-test.json")
+        assert job["Media"]["MediaFileUri"] == "s3://media/call.mp3"
+        assert job["_output_bucket"] == "out"
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_transcribe_jobs_round_trip_outside_boot_region():
+    """Transcribe jobs are region-scoped. `AccountRegionScopedDict.__bool__`
+    is scope-relative, so a snapshot holding jobs only in regions other than
+    the one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "TranscriptionJobName": "eu-job",
+                "TranscriptionJobStatus": "COMPLETED",
+                "CreationTime": _time.time(),
+                "CompletionTime": _time.time(),
+                "Media": {"MediaFileUri": "s3://b/a.mp3"},
+                "OutputLocationType": "SERVICE_BUCKET",
+                "_output_bucket": "b",
+                "_output_key": "k.json",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["TranscriptionJobStatus"] == "COMPLETED"
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_transcribe_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as QUEUED or
+    IN_PROGRESS would strand every caller polling GetTranscriptionJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "TranscriptionJobName": "stuck-job",
+            "TranscriptionJobStatus": "IN_PROGRESS",
+            "CreationTime": _time.time(),
+            "Media": {"MediaFileUri": "s3://b/a.mp3"},
+            "OutputLocationType": "SERVICE_BUCKET",
+            "_output_bucket": "b",
+            "_output_key": "k.json",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["TranscriptionJobStatus"] == "FAILED"
+        assert job["CompletionTime"] is not None
+        assert "restart" in job["FailureReason"]
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_translate_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["1c1838f470806ab9c3e0057f14717bed"] = {
+            "JobId": "1c1838f470806ab9c3e0057f14717bed",
+            "JobName": "nightly-transcript-translation",
+            "JobStatus": "COMPLETED",
+            "JobDetails": {
+                "TranslatedDocumentsCount": 2,
+                "DocumentsWithErrorsCount": 0,
+                "InputDocumentsCount": 2,
+            },
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "EndTime": _time.time(),
+            "InputDataConfig": {
+                "S3Uri": "s3://corpus/input/",
+                "ContentType": "application/x-xliff+xml",
+            },
+            "OutputDataConfig": {
+                "S3Uri": (
+                    "s3://corpus/output/000000000000-TranslateText-"
+                    "1c1838f470806ab9c3e0057f14717bed/"
+                )
+            },
+            "DataAccessRoleArn": "arn:aws:iam::000000000000:role/TranslateBatchRole",
+            "_run_id": "run-1",
+            "_client_token": "token-1",
+            "_output_bucket": "corpus",
+            "_output_prefix": "output/000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/",
+        }
+        mod._client_tokens["token-1"] = "1c1838f470806ab9c3e0057f14717bed"
+
+    def observe(mod):
+        job = mod._jobs.get("1c1838f470806ab9c3e0057f14717bed")
+        assert job is not None
+        assert job["JobStatus"] == "COMPLETED"
+        # The rewritten output location is the only pointer a caller has to the
+        # translated documents; losing it leaves Describe reporting COMPLETED
+        # with nothing to fetch.
+        assert job["OutputDataConfig"]["S3Uri"].endswith(
+            "000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/"
+        )
+        assert job["JobDetails"]["TranslatedDocumentsCount"] == 2
+        # The idempotency map has to survive too, or a client retrying with the
+        # same token after a restart starts a duplicate job.
+        assert mod._client_tokens.get("token-1") == "1c1838f470806ab9c3e0057f14717bed"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_jobs_round_trip_outside_boot_region():
+    """Translate jobs are region-scoped. `AccountRegionScopedDict.__bool__` is
+    scope-relative, so a snapshot holding jobs only in regions other than the
+    one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "JobId": "eu-job",
+                "JobStatus": "COMPLETED",
+                "SourceLanguageCode": "en",
+                "TargetLanguageCodes": ["de"],
+                "SubmittedTime": _time.time(),
+                "EndTime": _time.time(),
+                "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+                "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+                "_output_bucket": "b",
+                "_output_prefix": "out/",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["JobStatus"] == "COMPLETED"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as SUBMITTED,
+    IN_PROGRESS or STOP_REQUESTED would strand every caller polling
+    DescribeTextTranslationJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "JobId": "stuck-job",
+            "JobStatus": "IN_PROGRESS",
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+            "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+            "_output_bucket": "b",
+            "_output_prefix": "out/",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["JobStatus"] == "FAILED"
+        assert job["EndTime"] is not None
+        assert "restart" in job["Message"]
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_location_round_trip():
+    def populate(mod):
+        mod._trackers["trk-test"] = {
+            "TrackerName": "trk-test",
+            "TrackerArn": "arn:aws:geo:us-east-1:000000000000:tracker/trk-test",
+            "CreateTime": 1000.0,
+            "UpdateTime": 1000.0,
+            "positions": {
+                "dev-1": {
+                    "latest": {"DeviceId": "dev-1", "SampleTime": 1000.0,
+                               "ReceivedTime": 1000.5, "Position": [11.0, 48.0]},
+                    "history": [{"DeviceId": "dev-1", "SampleTime": 1000.0,
+                                 "ReceivedTime": 1000.5, "Position": [11.0, 48.0]}],
+                },
+            },
+        }
+
+    def observe(mod):
+        rec = mod._trackers["trk-test"]
+        assert rec["TrackerArn"].endswith(":tracker/trk-test")
+        assert rec["positions"]["dev-1"]["latest"]["Position"] == [11.0, 48.0]
+
+    _round_trip("location", "location", populate, observe)
 
 
 def test_cloudformation_round_trip():
@@ -5407,3 +5649,66 @@ def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_pa
         assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
     finally:
         service.reset()
+
+
+# ── signer._jobs / signer._profiles / signer._tokens ───────────────────
+
+def test_signer_jobs_profiles_and_tokens_survive_warm_boot():
+    """A restored signer job must keep its signedObject reference: a caller
+    whose contract is the signed object at `prefix + jobId` reads that key,
+    and a job record that forgets where its marker lives can no longer
+    answer DescribeSigningJob for it after a restart. The idempotency map
+    must survive too, or a retried Start after a restart would sign twice."""
+    mod = _get_module("signer")
+    mod.reset()
+    job_id = "persisted-signing-job"
+    now = 1700000000
+    try:
+        mod._profiles["persisted_profile"] = {
+            "profileName": "persisted_profile",
+            "profileVersion": "abc123def4",
+            "profileVersionArn": (
+                "arn:aws:signer:us-east-1:000000000000:"
+                "/signing-profiles/persisted_profile/abc123def4"
+            ),
+            "arn": (
+                "arn:aws:signer:us-east-1:000000000000:"
+                "/signing-profiles/persisted_profile"
+            ),
+            "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+            "status": "Active",
+        }
+        mod._jobs[job_id] = {
+            "jobId": job_id,
+            "source": {"s3": {"bucketName": "src-bkt", "key": "fw.bin",
+                              "version": "null"}},
+            "signedObject": {"s3": {"bucketName": "dst-bkt",
+                                    "key": f"signed/{job_id}"}},
+            "profileName": "persisted_profile",
+            "profileVersion": "abc123def4",
+            "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+            "status": "Succeeded",
+            "createdAt": now,
+            "completedAt": now,
+            "requestedBy": "arn:aws:iam::000000000000:root",
+            "jobOwner": "000000000000",
+            "jobInvoker": "000000000000",
+        }
+        mod._tokens["token-1"] = {"jobId": job_id, "jobOwner": "000000000000"}
+
+        _round_trip_dict(mod, "signer")
+
+        job = mod._jobs.get(job_id)
+        assert job is not None, "_jobs lost across save_state -> load_state"
+        assert job["status"] == "Succeeded"
+        assert job["signedObject"]["s3"]["key"] == f"signed/{job_id}"
+        profile = mod._profiles.get("persisted_profile")
+        assert profile is not None, (
+            "_profiles lost across save_state -> load_state"
+        )
+        assert profile["profileVersion"] == "abc123def4"
+        assert mod._tokens.get("token-1") == {
+            "jobId": job_id, "jobOwner": "000000000000",
+        }
+    finally:
+        mod.reset()

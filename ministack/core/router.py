@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS API Request Router.
 Routes incoming requests to the correct service handler based on:
@@ -7,9 +9,11 @@ Routes incoming requests to the correct service handler based on:
   - URL path patterns (e.g., /2015-03-31/functions for Lambda)
 """
 
+import ipaddress
 import logging
 import os
 import re
+import socket
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
@@ -27,6 +31,11 @@ _LAMBDA_PATH_RE = re.compile(
     # Durable Functions (preview, Dec 2025).
     r"durable-executions|durable-execution-callbacks)(?:/|$)"
 )
+
+# Lambda Core (botocore `lambda-core`, apiVersion 2026-04-30) network
+# connectors. The request URIs ship under 2026-04-04, not the model's
+# apiVersion — `/2026-04-04/network-connectors[/{Identifier}]`.
+_LAMBDA_CORE_PATH_RE = re.compile(r"^/2026-04-04/network-connectors(?:/|$)")
 
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
 # url-safe base64, generated per-container in services/ecs.py.
@@ -63,6 +72,12 @@ SERVICE_PATTERNS = {
     "dynamodb": {
         "target_prefixes": ["DynamoDB_20120810"],
         "host_patterns": [r"dynamodb\."],
+    },
+    # Lambda Core (2026-04-04 URIs) shares Lambda's host and credential scope,
+    # so only the path distinguishes it. Listed before `lambda`; the patterns
+    # are disjoint, and the signed case is handled earlier in detect_service.
+    "lambda-core": {
+        "path_patterns": [r"^/2026-04-04/network-connectors"],
     },
     # Lambda MicroVMs (2025-09-09) sign with credential scope `lambda-microvms`
     # and use host `lambda-microvms.{region}.amazonaws.com` — distinct from
@@ -142,6 +157,14 @@ SERVICE_PATTERNS = {
     "athena": {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
+    },
+    "transcribe": {
+        "target_prefixes": ["Transcribe."],
+        "host_patterns": [r"transcribe\."],
+    },
+    "translate": {
+        "target_prefixes": ["AWSShineFrontendService_"],
+        "host_patterns": [r"translate\."],
     },
     "airflow": {
         "host_patterns": [r"airflow\."],
@@ -292,6 +315,19 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"transfer\."],
         "credential_scope": "transfer",
     },
+    # IoT Wireless (endpoint prefix `api.iotwireless.{region}`). The bare
+    # token is anchored at a label boundary, so it matches the `api.` host
+    # too. Kept above the iot family for reading order, but there is no
+    # actual overlap: the host never contains the literal `iot.` segment the
+    # control plane's `iot\.` regex needs (`iot` is followed by `w`) — a
+    # router test pins that anyway. The SDK signs with credential scope
+    # `iotwireless` (botocore signingName), which the scope early-return
+    # resolves via this key.
+    "iotwireless": {
+        "host_patterns": [r"iotwireless\."],
+        "credential_scope": "iotwireless",
+        "path_prefixes": ["/position-estimate"],
+    },
     # IoT Jobs data plane (iot-jobs-data API) MUST come before "iot-data" and
     # "iot": its host also matches the `iot\.` regex, so first-match-wins
     # routing would otherwise swallow it — and on the `iot` control plane
@@ -375,6 +411,15 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/schedules", "/schedule-groups"],
         "credential_scope": "scheduler",
     },
+    "lakeformation": {
+        "host_patterns": [r"lakeformation\."],
+        "path_prefixes": ["/GrantPermissions", "/RevokePermissions", "/ListPermissions",
+                          "/GetDataLakeSettings", "/PutDataLakeSettings", "/BatchGrantPermissions",
+                          "/BatchRevokePermissions", "/RegisterResource", "/DeregisterResource",
+                          "/DescribeResource", "/ListResources", "/CreateLFTag", "/GetLFTag",
+                          "/UpdateLFTag", "/DeleteLFTag", "/ListLFTags"],
+        "credential_scope": "lakeformation",
+    },
     "pipes": {
         "host_patterns": [r"pipes\."],
         "path_prefixes": ["/v1/pipes"],
@@ -398,6 +443,19 @@ SERVICE_PATTERNS = {
     "mediaconnect": {
         "host_patterns": [r"^mediaconnect\."],
         "credential_scope": "mediaconnect",
+    },
+    # Amazon Location: the client is named `location` but the endpoint prefix
+    # and credential scope are `geo` (botocore signingName), and the modeled
+    # per-operation host prefixes put `cp.tracking.` / `tracking.` in front of
+    # it — so the host reads `cp.tracking.geo.{region}.{host}`. `geo` starts
+    # its own label there, so the token still matches once
+    # `_anchored_host_pattern` anchors it at a label start; no other service's
+    # host carries a `geo` label, so ordering is not sensitive. Under an
+    # endpoint override the host carries no `geo.` at all and routing relies
+    # on the `"geo"` entry in the credential-scope map below.
+    "location": {
+        "host_patterns": [r"geo\."],
+        "credential_scope": "geo",
     },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
@@ -436,6 +494,14 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"inspector2\."],
         "credential_scope": "inspector2",
     },
+    # AWS Signer (REST-JSON, signing name `signer`). No other pattern
+    # contains "signer.", so placement in this dict is not order-sensitive;
+    # SDK requests resolve via the credential-scope early return, unsigned
+    # clients via the /signing-jobs + /signing-profiles path rules.
+    "signer": {
+        "host_patterns": [r"signer\."],
+        "credential_scope": "signer",
+    },
     "dsql": {
         "host_patterns": [r"dsql\."],
         "credential_scope": "dsql",
@@ -444,6 +510,24 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"s3tables\."],
         "credential_scope": "s3tables",
         "path_prefixes": ["/buckets", "/iceberg"],
+    },
+    # S3 Vectors is REST-POST-per-fixed-path (rest-json, signingName
+    # "s3vectors" — see services/s3vectors.py's module docstring), unlike
+    # s3tables' ARN-in-path scheme: every op is `POST /<OperationName>`, so
+    # `path_prefixes` lists the literal op paths rather than a resource
+    # prefix. Routing for a properly SigV4-signed client (boto3, the AWS
+    # Terraform provider) resolves via `credential_scope` below, matched at
+    # step 2 of `detect_service()` before path/host patterns are ever
+    # consulted — `host_patterns` only matters for host-header routing.
+    "s3vectors": {
+        "host_patterns": [r"s3vectors\."],
+        "credential_scope": "s3vectors",
+        "path_prefixes": [
+            "/CreateVectorBucket", "/GetVectorBucket", "/DeleteVectorBucket", "/ListVectorBuckets",
+            "/PutVectorBucketPolicy", "/GetVectorBucketPolicy", "/DeleteVectorBucketPolicy",
+            "/CreateIndex", "/GetIndex", "/DeleteIndex", "/ListIndexes",
+            "/PutVectors", "/GetVectors", "/DeleteVectors", "/ListVectors", "/QueryVectors",
+        ],
     },
     # NOTE: bedrock-runtime must be listed BEFORE bedrock because the host
     # `bedrock-runtime.{region}.amazonaws.com` matches both `bedrock-runtime\.`
@@ -469,6 +553,112 @@ SERVICE_PATTERNS = {
 _OPENSEARCH_PATH_PREFIXES = tuple(
     prefix.lower() for prefix in SERVICE_PATTERNS["opensearch"]["path_prefixes"]
 )
+
+
+# Host-header routing (step 5 of detect_service) is restricted to hosts the
+# stack is reachable under. Real AWS endpoints are ``<service>.<region>.
+# amazonaws.com``; local deployments answer under ``localhost`` /
+# ``*.localhost``, the bare container name, a two-label alias (``s3.dev``,
+# ``sqs.internal``), an IP literal, ``MINISTACK_HOST`` and the container
+# hostname. Anything else — a customer domain fronted by a proxy, a probe
+# with a made-up Host — is never an AWS endpoint, so its labels carry no
+# routing information. A deployment reachable under another name points
+# ``MINISTACK_HOST`` at it.
+_BUILTIN_HOST_SUFFIXES = (
+    "localhost",
+    "amazonaws.com",
+    "amazonaws.com.cn",
+)
+
+
+def _container_hostname() -> str:
+    try:
+        return socket.gethostname().lower()
+    except OSError:
+        return ""
+
+
+_CONTAINER_HOSTNAME = _container_hostname()
+
+
+def _served_host_suffixes() -> tuple:
+    """Suffixes (lower-case, no port) a Host header may end with to qualify for
+    host-pattern routing. Read per call so tests and init scripts can change the
+    environment without a restart; the work is a handful of dict lookups."""
+    suffixes = list(_BUILTIN_HOST_SUFFIXES)
+    for value in (
+        os.environ.get("MINISTACK_HOST", ""),
+        os.environ.get("HOSTNAME", ""),
+        _CONTAINER_HOSTNAME,
+    ):
+        value = _strip_host_port(value)
+        if value:
+            suffixes.append(value)
+    return tuple(suffixes)
+
+
+def _strip_host_port(host: str) -> str:
+    """``example.com:4566`` -> ``example.com``; ``[::1]:4566`` -> ``::1``.
+    Lower-cases and trims whitespace."""
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 0 else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host  # bare IPv6 without brackets, or no port
+
+
+def _host_served_by_stack(host: str) -> bool:
+    """True when ``host`` names this stack: no Host at all, a single label
+    (``ministack``, ``localhost``, a compose service name), a two-label alias
+    (``s3.dev``), an IPv4/IPv6 literal, or a name under one of the served
+    suffixes at a label boundary (``s3.us-east-1.localhost`` yes,
+    ``notlocalhost`` no). A customer domain has at least three labels."""
+    hostname = _strip_host_port(host)
+    if not hostname or "." not in hostname:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    hostname = hostname.rstrip(".")
+    if hostname.count(".") == 1:
+        return True  # ``<service>.<lan-suffix>`` alias, the LocalStack-era shape
+    for suffix in _served_host_suffixes():
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return True
+    return False
+
+
+_ANCHORED_HOST_PATTERNS: dict = {}
+
+
+def _anchored_host_pattern(pattern: str) -> "re.Pattern":
+    r"""Compile a ``host_patterns`` entry so a bare service token matches only at
+    the start of a label. ``iot\.`` becomes ``(^|\.)iot\.`` — it still matches
+    ``a1-ats.iot.us-east-1.amazonaws.com`` but no longer ``notiot.example``.
+    Entries that already anchor themselves (``^es\.``) or begin at a dot
+    (``\.s3\.``) are compiled as written."""
+    compiled = _ANCHORED_HOST_PATTERNS.get(pattern)
+    if compiled is None:
+        anchored = pattern
+        if pattern[:1].isalnum():
+            anchored = r"(^|\.)" + pattern
+        compiled = re.compile(anchored)
+        _ANCHORED_HOST_PATTERNS[pattern] = compiled
+    return compiled
+
+
+# The closed query-parameter set of ListSigningJobs, and the shape of a signing
+# job id. Both are used to keep the unsigned /signing-jobs path rules off
+# path-style S3 traffic for a bucket of that name.
+_LIST_SIGNING_JOBS_PARAMS = frozenset({
+    "status", "isRevoked", "platformId", "requestedBy", "jobInvoker",
+    "maxResults", "nextToken", "signatureExpiresBefore", "signatureExpiresAfter",
+})
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
@@ -560,6 +750,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or path.startswith("/async-invoke")):
                     return "bedrock-runtime"
                 return "bedrock"
+            # Lambda Core signs as `lambda`: its endpointPrefix AND signingName
+            # are both `lambda` (botocore lambda-core/2026-04-30), unlike
+            # lambda-microvms which has its own scope. So the credential scope
+            # cannot tell the two apart and the path has to. This must sit
+            # before the SERVICE_PATTERNS early-return below, or `lambda`
+            # matches there and the request reaches the function router, which
+            # reads `/2026-04-04/network-connectors` as a function name.
+            if svc_name == "lambda" and _LAMBDA_CORE_PATH_RE.match(path):
+                return "lambda-core"
             if svc_name in SERVICE_PATTERNS:
                 return svc_name
             # Map common credential scope names
@@ -613,7 +812,13 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfig": "appconfig",
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
+                "lakeformation": "lakeformation",
                 "eks": "eks",
+                # Amazon Location signs with scope `geo`, not `location`
+                # (botocore signingName). With an endpoint override the host
+                # has no `geo.` in it, so this entry is the primary routing
+                # signal for the location service.
+                "geo": "location",
                 "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",
@@ -953,6 +1158,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateTerminationProtection": "cloudformation",
             "SetStackPolicy": "cloudformation",
             "GetStackPolicy": "cloudformation",
+            "SignalResource": "cloudformation",
             # EBS Snapshots
             # Note: CreateSnapshot, DeleteSnapshot, DescribeSnapshots are intentionally
             # omitted here because they conflict with ElastiCache actions of the same
@@ -994,6 +1200,12 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "bedrock-runtime"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
+    # IoT Wireless GetPositionEstimate — boto3 signs (scope `iotwireless`)
+    # and the host pattern also matches, but an unsigned caller (curl) must
+    # still resolve by path. POST-only and exact, so an S3 object named
+    # `position-estimate` keeps routing to S3 on GET/PUT.
+    if method == "POST" and path_lower == "/position-estimate":
+        return "iotwireless"
     if path_lower.startswith("/key-value-stores/"):
         return "cloudfront-keyvaluestore"
     if path_lower.startswith("/2020-05-31/"):
@@ -1019,6 +1231,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         or path_lower.startswith("/domainnames")
     ):
         return "apigateway"
+    # Before the Lambda path check: both live on the Lambda endpoint, and an
+    # unsigned caller (curl) has no credential scope to disambiguate with.
+    if _LAMBDA_CORE_PATH_RE.match(path_lower):
+        return "lambda-core"
     if _LAMBDA_PATH_RE.match(path_lower):
         return "lambda"
     if path_lower.startswith(("/oauth2/", "/login", "/logout")):
@@ -1035,6 +1251,29 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # rule below.
     if path_lower.startswith("/oidc/"):
         return "eks"
+    # AWS Signer REST-JSON paths for unsigned clients (SigV4 requests route
+    # via the `signer` credential scope above). Segment-anchored, limited to
+    # the methods the signer surface serves, and further narrowed by the
+    # ListSigningJobs parameter set and the uuid shape of a job id, so
+    # path-style S3 traffic for a bucket like "signing-jobs-archive", and all
+    # but a bare unsigned GET or POST on a bucket named exactly
+    # "signing-jobs", still falls through to S3.
+    if path_lower == "/signing-jobs" and method in ("POST", "GET"):
+        # S3 marks its own listings and multipart/delete POSTs in the query,
+        # and ListSigningJobs has a closed parameter set, so a path-style S3
+        # request for a bucket named "signing-jobs" keeps its verbs.
+        if not (set(query_params) - _LIST_SIGNING_JOBS_PARAMS):
+            return "signer"
+    if method == "GET" and path_lower.startswith("/signing-jobs/"):
+        rest = path_lower[len("/signing-jobs/"):]
+        # A signing job id is a uuid, so an S3 object key that is not one
+        # falls through rather than being read as a DescribeSigningJob.
+        if rest and "/" not in rest and _UUID_RE.fullmatch(rest):
+            return "signer"
+    if method in ("PUT", "GET") and path_lower.startswith("/signing-profiles/"):
+        rest = path_lower[len("/signing-profiles/"):]
+        if rest and "/" not in rest:
+            return "signer"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName
@@ -1042,11 +1281,17 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         if "granite" in path_lower or "cloudwatch" in path_lower:
             return "monitoring"
 
-    # 5. Check host header patterns
-    for svc, patterns in SERVICE_PATTERNS.items():
-        for hp in patterns.get("host_patterns", []):
-            if re.search(hp, host):
-                return svc
+    # 5. Check host header patterns — only for hosts this stack actually
+    # serves. The patterns are service tokens (``iot\.``, ``logs\.``,
+    # ``email\.`` ...) and a customer domain that happens to contain one
+    # (``probe.iot.example.com``, ``logs.example.com``) must not be routed
+    # into that service; it falls through to the default like any other
+    # unclassified request. Each token is matched at a label boundary.
+    if _host_served_by_stack(host):
+        for svc, patterns in SERVICE_PATTERNS.items():
+            for hp in patterns.get("host_patterns", []):
+                if _anchored_host_pattern(hp).search(host):
+                    return svc
 
     # 6a. A Query-protocol call to a service we don't implement (redshift,
     # elasticbeanstalk, cloudsearch, sdb, importexport, ...) is a POST to the

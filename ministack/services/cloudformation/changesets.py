@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation change set handlers — Create, Describe, Execute, Delete, List change sets.
 """
@@ -13,8 +15,19 @@ from .engine import (
     _parse_template,
     _resolve_parameters,
     _resolve_refs,
+    validate_template_support,
 )
-from .helpers import _error, _esc, _extract_members, _p, _resolve_template, _xml
+from .helpers import (
+    _error,
+    _esc,
+    _extract_members,
+    _extract_string_members,
+    _p,
+    _page,
+    _request_problems,
+    _resolve_template,
+    _xml,
+)
 from .stacks import (
     _add_event,
     _create_stack_task_in_region,
@@ -74,6 +87,10 @@ def _resolve_props_for_diff(template, params, stack_name, stack_id):
 
 def _create_change_set(params):
     from ministack.services.cloudformation import _change_sets, _stack_events, _stacks
+    from ministack.services.cloudformation.handlers import (
+        _check_capabilities,
+        _resolve_stack,
+    )
     stack_name = _p(params, "StackName")
     cs_name = _p(params, "ChangeSetName")
     cs_type = _p(params, "ChangeSetType", "UPDATE")
@@ -92,14 +109,31 @@ def _create_change_set(params):
             return _error("AlreadyExistsException",
                           f"ChangeSet [{cs_name}] already exists")
 
+    if cs_type == "CREATE":
+        # The request-level constraints of a new stack, joined as the API does.
+        if request_error := _request_problems(params, stack_name):
+            return request_error
+
     template_body, resolve_err = _resolve_template(params)
     if resolve_err:
         return resolve_err
+    template_given = bool(template_body)
 
     provided_params = _extract_members(params, "Parameters")
     tags = _extract_members(params, "Tags")
+    # An empty Tags list arrives as ``Tags=``: given-empty clears the stack's
+    # tags on execute, an omitted Tags keeps them (as UpdateStack does).
+    tags_given = "Tags" in params or bool(tags)
+    from .helpers import _validate_stack_tags
+    tags_error = _validate_stack_tags(tags)
+    if tags_error:
+        return tags_error
 
-    stack = _stacks.get(stack_name)
+    stack = _resolve_stack(stack_name)
+    if stack is not None and cs_type != "CREATE":
+        # A change set is keyed by the stack's name; an UPDATE set addressed
+        # by stack id carries on under the name.
+        stack_name = stack.get("StackName", stack_name)
 
     if cs_type == "CREATE":
         if stack and stack.get("StackStatus") not in (
@@ -151,17 +185,44 @@ def _create_change_set(params):
         if not template_body:
             template_body = stack.get("_template_body", "{}")
 
+    def _rejected(reason):
+        # A rejected CreateChangeSet leaves no stack behind on AWS; drop the
+        # REVIEW_IN_PROGRESS placeholder created above for CREATE sets.
+        # ``reason`` is a ValidationError message or a ready error response.
+        if cs_type == "CREATE":
+            _stacks.pop(stack_name, None)
+            _stack_events.pop(stack_id, None)
+        if isinstance(reason, tuple):
+            return reason
+        return _error("ValidationError", reason)
+
     try:
-        template = _parse_template(template_body)
+        template = sent = _parse_template(template_body)
         template = _apply_sam_transform_if_applicable(template)
     except Exception as e:
-        return _error("ValidationError", f"Template format error: {e}")
+        return _rejected(f"Template format error: {e}")
+
+    # Checked after the transform, as CreateStack and UpdateStack do.
+    # CAPABILITY_AUTO_EXPAND does not apply to a change set
+    # (API_CreateChangeSet), so only the IAM rule runs here.
+    if caps_error := _check_capabilities(sent, template, params, macros=False):
+        return _rejected(caps_error)
 
     try:
         param_values = _resolve_parameters(
             template, provided_params, stack.get("_resolved_params", {}))
     except ValueError as exc:
-        return _error("ValidationError", str(exc))
+        return _rejected(str(exc))
+
+    if cs_type == "UPDATE" and not template_given and stack.get("_template"):
+        # As UpdateStack with UsePreviousTemplate: the stored processed
+        # template, so an AWS::Include snippet changed in S3 is not picked up.
+        template = copy.deepcopy(stack["_template"])
+    try:
+        validate_template_support(
+            template, _evaluate_conditions(template, param_values), params=param_values)
+    except ValueError as exc:
+        return _rejected(str(exc))
 
     # Compute changes — resolve parameters/intrinsics in BOTH templates first so
     # parameter-driven changes (the `aws cloudformation deploy
@@ -206,6 +267,8 @@ def _create_change_set(params):
             for k, v in param_values.items()
         ],
         "Tags": tags,
+        "Capabilities": _extract_string_members(params, "Capabilities"),
+        "_tags_given": tags_given,
         "_template": template,
         "_template_body": template_body,
         "_resolved_params": param_values,
@@ -241,12 +304,33 @@ def _describe_change_set(params):
     changes_xml = ""
     for ch in cs.get("Changes", []):
         rc = ch.get("ResourceChange", {})
+        scope_xml = "".join(f"<member>{_esc(a)}</member>" for a in rc.get("Scope", []))
+        details_xml = ""
+        for d in rc.get("Details", []):
+            target = d.get("Target", {})
+            target_xml = f"<Attribute>{_esc(target.get('Attribute', ''))}</Attribute>"
+            if target.get("Name"):
+                target_xml += f"<Name>{_esc(target['Name'])}</Name>"
+            if target.get("RequiresRecreation"):
+                target_xml += (
+                    f"<RequiresRecreation>{_esc(target['RequiresRecreation'])}"
+                    "</RequiresRecreation>"
+                )
+            details_xml += (
+                "<member>"
+                f"<Target>{target_xml}</Target>"
+                f"<Evaluation>{_esc(d.get('Evaluation', 'Static'))}</Evaluation>"
+                f"<ChangeSource>{_esc(d.get('ChangeSource', 'DirectModification'))}</ChangeSource>"
+                "</member>"
+            )
         changes_xml += (
             "<member><ResourceChange>"
             f"<Action>{rc.get('Action', '')}</Action>"
             f"<LogicalResourceId>{_esc(rc.get('LogicalResourceId', ''))}</LogicalResourceId>"
             f"<ResourceType>{_esc(rc.get('ResourceType', ''))}</ResourceType>"
             f"<Replacement>{rc.get('Replacement', '')}</Replacement>"
+            f"<Scope>{scope_xml}</Scope>"
+            f"<Details>{details_xml}</Details>"
             "</ResourceChange></member>"
         )
 
@@ -270,6 +354,9 @@ def _describe_change_set(params):
         f"<CreationTime>{cs['CreationTime']}</CreationTime>"
         f"<Description>{_esc(cs.get('Description', ''))}</Description>"
         f"<ChangeSetType>{cs.get('ChangeSetType', '')}</ChangeSetType>"
+        "<Capabilities>"
+        + "".join(f"<member>{_esc(c)}</member>" for c in cs.get("Capabilities", []))
+        + "</Capabilities>"
         f"<Parameters>{params_xml}</Parameters>"
         f"<Changes>{changes_xml}</Changes>"
         f"<Tags>{tags_xml}</Tags>"
@@ -333,16 +420,22 @@ def _execute_change_set(params):
             "_template": copy.deepcopy(stack.get("_template", {})),
             "_template_body": stack.get("_template_body", ""),
             "_resolved_params": copy.deepcopy(stack.get("_resolved_params", {})),
+            "_conditions": copy.deepcopy(stack.get("_conditions", {})),
+            "Tags": copy.deepcopy(stack.get("Tags", [])),
             "Outputs": copy.deepcopy(stack.get("Outputs", [])),
         }
     else:
         previous_stack = None
+    retain_except_on_create = _p(params, "RetainExceptOnCreate", "false").lower() == "true"
 
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack["StackStatus"] = f"{status_prefix}_IN_PROGRESS"
     stack["LastUpdatedTime"] = now_iso()
     stack["_template_body"] = template_body
-    if tags:
+    # The stack reports what the operation acknowledged, and for an executed
+    # change set that is what the change set was created with.
+    stack["Capabilities"] = list(cs.get("Capabilities", []))
+    if tags or cs.get("_tags_given"):
         stack["Tags"] = tags
     stack["Parameters"] = [
         {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": v["NoEcho"]}
@@ -362,7 +455,8 @@ def _execute_change_set(params):
                 _deploy_stack_async(real_stack_name, stack_id, template,
                                     param_values, False, tags,
                                     is_update=is_update,
-                                    previous_stack=previous_stack),
+                                    previous_stack=previous_stack,
+                                    retain_except_on_create=retain_except_on_create),
             ),
             stack,
             stack_id,
@@ -388,14 +482,28 @@ def _execute_change_set(params):
 
 def _delete_change_set(params):
     from ministack.services.cloudformation import _change_sets
+    from ministack.services.cloudformation.handlers import _resolve_stack
     cs_name = _p(params, "ChangeSetName")
     stack_name = _p(params, "StackName")
-    cs_id, cs = _find_change_set(cs_name, stack_name)
-    if not cs_id:
-        return _error("ChangeSetNotFound",
-                      f"ChangeSet [{cs_name}] does not exist", 404)
-    _change_sets.pop(cs_id, None)
-    return _xml(200, "DeleteChangeSetResponse", "")
+    # StackName is "the name or the unique stack ID", and the CDK addresses a
+    # stack it has already read by ARN, so resolve it first and look the change
+    # set up under the stack's name. A stack that does not exist is a
+    # ValidationError, as on AWS -- and a deleted stack counts as one, since it
+    # is addressable only by stack id.
+    stack = _resolve_stack(stack_name) if stack_name else None
+    if stack_name and (not stack or stack.get("StackStatus") == "DELETE_COMPLETE"):
+        return _error("ValidationError",
+                      f"Stack [{stack_name}] does not exist")
+    cs_id, _cs = _find_change_set(cs_name, stack["StackName"] if stack else stack_name)
+    # Real CloudFormation answers a delete of a change set that does not exist
+    # (on a stack that does) with a plain success, and the CDK relies on that:
+    # before every deploy of an existing stack it removes a possible leftover
+    # `cdk-deploy-change-set` and only tolerates a `ChangeSetNotFoundException`
+    # -- so the 404 answered here aborted every `cdk deploy` of an already
+    # deployed stack.
+    if cs_id:
+        _change_sets.pop(cs_id, None)
+    return _xml(200, "DeleteChangeSetResponse", "<DeleteChangeSetResult/>")
 
 
 # --- ListChangeSets ---
@@ -406,10 +514,12 @@ def _list_change_sets(params):
     if not stack_name:
         return _error("ValidationError", "StackName is required")
 
+    listed = [cs for cs in _change_sets.values() if cs["StackName"] == stack_name]
+    listed, next_token_xml, err = _page(listed, params, "ListChangeSets")
+    if err:
+        return err
     members = ""
-    for cs in _change_sets.values():
-        if cs["StackName"] != stack_name:
-            continue
+    for cs in listed:
         members += (
             "<member>"
             f"<ChangeSetId>{_esc(cs['ChangeSetId'])}</ChangeSetId>"
@@ -427,7 +537,7 @@ def _list_change_sets(params):
     return _xml(200, "ListChangeSetsResponse",
                 f"<ListChangeSetsResult>"
                 f"<Summaries>{members}</Summaries>"
-                f"</ListChangeSetsResult>")
+                f"{next_token_xml}</ListChangeSetsResult>")
 
 
 # --- GetTemplateSummary ---

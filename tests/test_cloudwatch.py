@@ -192,6 +192,87 @@ def test_cloudwatch_set_alarm_state_v2(cw):
     assert after["StateValue"] == "ALARM"
     assert after["StateReason"] == "Manual trigger for testing"
 
+def test_cloudwatch_put_metric_alarm_keeps_state_of_existing_alarm(cw):
+    """PutMetricAlarm on an existing alarm: "its state is left unchanged, but
+    the update completely overwrites the previous configuration of the alarm"
+    (https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricAlarm.html).
+    The state timestamp is part of the state: only the configuration timestamp
+    moves. Goes over the wire, which botocore sends as smithy-rpc-v2-cbor."""
+    name = f"cw-keep-state-{_uuid_mod.uuid4().hex[:8]}"
+
+    def put(threshold):
+        cw.put_metric_alarm(
+            AlarmName=name,
+            MetricName="Errors",
+            Namespace=f"CwKeepState/{name}",
+            Statistic="Sum",
+            Period=60,
+            EvaluationPeriods=1,
+            Threshold=threshold,
+            ComparisonOperator="GreaterThanThreshold",
+        )
+
+    put(1.0)
+    try:
+        cw.set_alarm_state(AlarmName=name, StateValue="ALARM", StateReason="seeded")
+        seeded = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+        time.sleep(1.1)  # timestamps are whole seconds; a reset must be visible
+
+        put(2.0)
+        after = cw.describe_alarms(AlarmNames=[name])["MetricAlarms"][0]
+        assert after["Threshold"] == 2.0
+        assert after["StateValue"] == "ALARM"
+        assert after["StateReason"] == "seeded"
+        assert after["StateUpdatedTimestamp"] == seeded["StateUpdatedTimestamp"]
+        assert after["AlarmConfigurationUpdatedTimestamp"] > seeded["AlarmConfigurationUpdatedTimestamp"]
+    finally:
+        cw.delete_alarms(AlarmNames=[name])
+
+
+def test_cloudwatch_put_metric_alarm_query_keeps_state_of_existing_alarm():
+    """The query-protocol branch of PutMetricAlarm (what the AWS CLI v1 and
+    older SDKs send) keeps the state of an existing alarm the same way:
+    "its state is left unchanged" per the PutMetricAlarm reference."""
+    from ministack.core import responses as _resp
+    from ministack.services import cloudwatch as _cw
+
+    acct_tok = _resp._request_account_id.set("000000000000")
+    region_tok = _resp._request_region.set("us-east-1")
+    name = f"query-keep-state-{_uuid_mod.uuid4().hex[:8]}"
+
+    def put(threshold):
+        status, _headers, _body = _cw._put_metric_alarm({
+            "AlarmName": [name],
+            "MetricName": ["Errors"],
+            "Namespace": [f"QueryKeepState/{name}"],
+            "Statistic": ["Sum"],
+            "Period": ["60"],
+            "EvaluationPeriods": ["1"],
+            "Threshold": [threshold],
+            "ComparisonOperator": ["GreaterThanThreshold"],
+        }, {}, is_cbor=False)
+        assert status == 200
+
+    try:
+        put("1")
+        _cw._alarms[name]["StateValue"] = "ALARM"
+        _cw._alarms[name]["StateReason"] = "seeded"
+        _cw._alarms[name]["StateUpdatedTimestamp"] = 1_000_000
+        _cw._alarms[name]["AlarmConfigurationUpdatedTimestamp"] = 1_000_000
+
+        put("2")
+        alarm = _cw._alarms[name]
+        assert alarm["Threshold"] == 2.0
+        assert alarm["StateValue"] == "ALARM"
+        assert alarm["StateReason"] == "seeded"
+        assert alarm["StateUpdatedTimestamp"] == 1_000_000
+        assert alarm["AlarmConfigurationUpdatedTimestamp"] > 1_000_000
+    finally:
+        _cw._alarms.pop_scoped("000000000000", "us-east-1", name, None)
+        _resp._request_region.reset(region_tok)
+        _resp._request_account_id.reset(acct_tok)
+
+
 def test_cloudwatch_get_metric_data_v2(cw):
     cw.put_metric_data(
         Namespace="CWData2",
@@ -317,6 +398,125 @@ def test_cloudwatch_tags_v2(cw):
     resp2 = cw.list_tags_for_resource(ResourceARN=arn)
     assert not any(t["Key"] == "env" for t in resp2["Tags"])
     assert any(t["Key"] == "team" for t in resp2["Tags"])
+
+
+@pytest.mark.serial
+def test_bd_958_metric_math_alarm_round_trips_terraform_readback(cw):
+    """BD-958: a metric-math alarm preserves Terraform's optional-field shape,
+    creation tags, and explicit DatapointsToAlarm through AWS SDK read-back.
+    """
+    alarm_name = f"bd-958-metric-math-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(
+            AlarmName=alarm_name,
+            ComparisonOperator="GreaterThanThreshold",
+            DatapointsToAlarm=1,
+            EvaluationPeriods=2,
+            Threshold=1.0,
+            Tags=[
+                {"Key": "managed-by", "Value": "terraform"},
+                {"Key": "ticket", "Value": "BD-958"},
+            ],
+            Metrics=[
+                {
+                    "Id": "errors",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/Lambda",
+                            "MetricName": "Errors",
+                        },
+                        "Period": 60,
+                        "Stat": "Sum",
+                    },
+                    "ReturnData": False,
+                },
+                {
+                    "Id": "error_rate",
+                    "Expression": "errors",
+                    "ReturnData": True,
+                },
+            ],
+        )
+
+        alarm = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        assert "MetricName" not in alarm
+        assert "Namespace" not in alarm
+        assert "Statistic" not in alarm
+        assert "Period" not in alarm
+        assert alarm["DatapointsToAlarm"] == 1
+        assert alarm["Metrics"] == [
+            {
+                "Id": "errors",
+                "MetricStat": {
+                    "Metric": {"Namespace": "AWS/Lambda", "MetricName": "Errors"},
+                    "Period": 60,
+                    "Stat": "Sum",
+                },
+                "ReturnData": False,
+            },
+            {"Id": "error_rate", "Expression": "errors", "ReturnData": True},
+        ]
+        tags = cw.list_tags_for_resource(ResourceARN=alarm["AlarmArn"])["Tags"]
+        assert {tag["Key"]: tag["Value"] for tag in tags} == {
+            "managed-by": "terraform",
+            "ticket": "BD-958",
+        }
+    finally:
+        cw.delete_alarms(AlarmNames=[alarm_name])
+
+
+@pytest.mark.serial
+def test_bd_958_anomaly_detection_alarm_omits_threshold_on_readback(cw):
+    """BD-958: anomaly alarms return ThresholdMetricId without inventing Threshold."""
+    alarm_name = f"bd-958-anomaly-{_uuid_mod.uuid4().hex[:8]}"
+    try:
+        cw.put_metric_alarm(
+            AlarmName=alarm_name,
+            ComparisonOperator="LessThanLowerOrGreaterThanUpperThreshold",
+            EvaluationPeriods=1,
+            ThresholdMetricId="anomaly_band",
+            Metrics=[
+                {
+                    "Id": "errors",
+                    "MetricStat": {
+                        "Metric": {
+                            "Namespace": "AWS/Lambda",
+                            "MetricName": "Errors",
+                        },
+                        "Period": 60,
+                        "Stat": "Sum",
+                    },
+                    "ReturnData": False,
+                },
+                {
+                    "Id": "anomaly_band",
+                    "Expression": "ANOMALY_DETECTION_BAND(errors, 2)",
+                    "ReturnData": True,
+                },
+            ],
+        )
+
+        alarm = cw.describe_alarms(AlarmNames=[alarm_name])["MetricAlarms"][0]
+        assert "Threshold" not in alarm
+        assert alarm["ThresholdMetricId"] == "anomaly_band"
+        assert alarm["Metrics"] == [
+            {
+                "Id": "errors",
+                "MetricStat": {
+                    "Metric": {"Namespace": "AWS/Lambda", "MetricName": "Errors"},
+                    "Period": 60,
+                    "Stat": "Sum",
+                },
+                "ReturnData": False,
+            },
+            {
+                "Id": "anomaly_band",
+                "Expression": "ANOMALY_DETECTION_BAND(errors, 2)",
+                "ReturnData": True,
+            },
+        ]
+    finally:
+        cw.delete_alarms(AlarmNames=[alarm_name])
 
 
 def test_cloudwatch_alarms_are_region_isolated(cw):
@@ -863,3 +1063,45 @@ def test_cloudwatch_percentile_alarm_reason_reports_statistic(cw):
     assert alarm["StateValue"] == "ALARM"
     assert "p90" in alarm["StateReason"]
     assert "Average" not in alarm["StateReason"]
+
+
+def test_cloudwatch_json_timestamps_are_epoch_numbers(cw):
+    """Over awsJson1_0 a smithy timestamp is epoch seconds; the JSON branches
+    used to leak the XML path's ISO strings, which every SDK's number parser
+    rejects. Raw HTTP because boto3 speaks Query here and would mask the shape.
+    Int (not float) epoch is the project convention for JSON bodies."""
+    import os
+    import urllib.request
+
+    ns = f"JsonTs{_uuid_mod.uuid4().hex[:8]}"
+    cw.put_metric_data(
+        Namespace=ns,
+        MetricData=[{"MetricName": "Latency", "Value": 42.0}],
+    )
+    now = int(time.time())
+    body = json.dumps({
+        "Namespace": ns,
+        "MetricName": "Latency",
+        "StartTime": now - 600,
+        "EndTime": now + 60,
+        "Period": 60,
+        "Statistics": ["Average"],
+    }).encode()
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    req = urllib.request.Request(
+        f"{endpoint}/",
+        data=body,
+        headers={
+            "Content-Type": "application/x-amz-json-1.0",
+            "X-Amz-Target": "GraniteServiceVersion20100801.GetMetricStatistics",
+            "x-amzn-query-mode": "true",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20200101/us-east-1/monitoring/aws4_request, SignedHeaders=host, Signature=00",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        payload = json.loads(resp.read())
+    datapoints = payload.get("Datapoints", [])
+    assert datapoints, "expected at least one datapoint"
+    for dp in datapoints:
+        assert isinstance(dp["Timestamp"], int), (
+            f"Timestamp must be int epoch over JSON, got {type(dp['Timestamp']).__name__}: {dp['Timestamp']}")

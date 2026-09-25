@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EventBridge Service Emulator.
 JSON-based API via X-Amz-Target (AmazonEventBridge / AWSEvents).
@@ -159,6 +161,10 @@ def get_state():
         "connections": copy.deepcopy(_connections),
         "api_destinations": copy.deepcopy(_api_destinations),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

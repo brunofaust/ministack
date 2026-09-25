@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 ACM (Certificate Manager) Service Emulator.
 JSON-based API via X-Amz-Target.
@@ -103,6 +105,10 @@ def _restore_certificates(restored):
         return
     for (account_id, arn), cert in entries:
         _certificates.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, cert)
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

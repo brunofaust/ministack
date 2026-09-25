@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """AWS IoT Core control plane emulator.
 
 Implements the JSON/REST APIs under ``iot.{region}.amazonaws.com``:
@@ -253,6 +255,10 @@ def get_state() -> dict:
     }
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data: dict | None) -> None:
     global _ca_cert_pem, _ca_key_pem
     global _mtls_server_cert_pem, _mtls_server_key_pem
@@ -481,6 +487,10 @@ async def handle_request(
     # Principal lives at /things/{name}/principals — must come BEFORE generic /things/{name}
     if path.startswith("/things/") and path.endswith("/principals"):
         return _handle_thing_principals(method, path, hdr, body, qp)
+    # Group membership lives at /things/{name}/thing-groups — like /principals,
+    # must come BEFORE the generic /things/{name} branch.
+    if path.startswith("/things/") and path.endswith("/thing-groups") and method == "GET":
+        return _list_thing_groups_for_thing(path)
     # Job executions live at /things/{name}/jobs[/{jobId}[/cancel]] — like
     # /principals, must come BEFORE the generic /things/{name} branch. The
     # `jobs` segment only counts when a thing name precedes it: `/things/jobs`
@@ -981,6 +991,9 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         )
     props = payload.get("thingGroupProperties") or {}
     attr_payload = props.get("attributePayload") or {}
+    parent = payload.get("parentGroupName")
+    if parent and parent not in _thing_groups:
+        return _error_not_found("ThingGroup", parent)
     record = {
         "thingGroupName": name,
         "thingGroupId": new_uuid(),
@@ -993,6 +1006,13 @@ def _create_thing_group(name: str, payload: dict) -> tuple:
         "things": [],
         "creationDate": _now_epoch(),
     }
+    if parent:
+        # DescribeThingGroup reports the parent under thingGroupMetadata, as
+        # the API reference documents it.
+        record["thingGroupMetadata"] = {
+            "parentGroupName": parent,
+            "creationDate": record["creationDate"],
+        }
     _thing_groups[name] = record
     return json_response({
         "thingGroupName": name,
@@ -1024,6 +1044,36 @@ def _list_things_in_thing_group(path: str) -> tuple:
     if g is None:
         return _error_not_found("ThingGroup", middle)
     return json_response({"things": list(g.get("things", []))})
+
+
+def _list_thing_groups_for_thing(path: str) -> tuple:
+    """``GET /things/{thingName}/thing-groups``.
+
+    The reverse of ``ListThingsInThingGroup``: the forward lookup existed, but
+    resolving which groups a *thing* belongs to meant scanning every group. The
+    membership store is bidirectional, so this reads the thing record's
+    ``thingGroupNames`` directly.
+
+    ``maxResults`` / ``nextToken`` are not honored — the full list is returned
+    in one page, like the other IoT list operations here.
+    """
+    middle = path[len("/things/"):-len("/thing-groups")]
+    if "/" in middle:
+        return error_response_json(
+            "InvalidRequestException", f"Unsupported IoT path: GET {path}", 400
+        )
+    thing = _things.get(middle)
+    if thing is None:
+        return _error_not_found("Thing", middle)
+    return json_response({
+        "thingGroups": [
+            {"groupName": g, "groupArn": _thing_group_arn(g)}
+            for g in thing.get("thingGroupNames", [])
+            # Membership is kept consistent on both sides, but a group deleted
+            # out from under a stale reference must not surface here.
+            if g in _thing_groups
+        ]
+    })
 
 
 def _update_thing_group(name: str, payload: dict) -> tuple:
@@ -1564,15 +1614,28 @@ def _handle_registration_code(method: str) -> tuple:
 def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
     """``POST /cacertificate`` (``RegisterCACertificate``).
 
-    Body members per the botocore model: ``caCertificate`` (required) and
+    Body members per the botocore model: ``caCertificate`` (required),
     ``verificationCertificate`` (accepted; the registration-code CN handshake
-    is not enforced locally). ``setAsActive`` / ``allowAutoRegistration`` ride
-    as query-string booleans, as on AWS.
+    is not enforced locally) and ``certificateMode`` (``DEFAULT`` when
+    omitted, as on AWS). ``setAsActive`` / ``allowAutoRegistration`` ride as
+    query-string booleans, as on AWS.
     """
     ca_pem = payload.get("caCertificate")
     if not ca_pem:
         return error_response_json(
             "InvalidRequestException", "caCertificate is required", 400
+        )
+    registration_config = payload.get("registrationConfig")
+    if registration_config is not None and not isinstance(registration_config, dict):
+        return error_response_json(
+            "InvalidRequestException", "registrationConfig must be an object", 400
+        )
+    certificate_mode = payload.get("certificateMode") or "DEFAULT"
+    if certificate_mode not in ("DEFAULT", "SNI_ONLY"):
+        return error_response_json(
+            "InvalidRequestException",
+            "certificateMode must be one of ['DEFAULT', 'SNI_ONLY']",
+            400,
         )
     try:
         ca_id = get_certificate_id(ca_pem)
@@ -1592,9 +1655,12 @@ def _register_ca_certificate(payload: dict, qp: dict) -> tuple:
         "certificatePem": ca_pem,  # verbatim
         "status": "ACTIVE" if set_active else "INACTIVE",
         "autoRegistrationStatus": "ENABLE" if allow_auto else "DISABLE",
+        "certificateMode": certificate_mode,
         "creationDate": _now_epoch(),
         "ownedBy": get_account_id(),
     }
+    if registration_config is not None:
+        record["registrationConfig"] = registration_config
     _ca_certificates[ca_id] = record
     return json_response({
         "certificateArn": record["certificateArn"],
@@ -1638,9 +1704,16 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
                 "status": record["status"],
                 "certificatePem": record["certificatePem"],
                 "autoRegistrationStatus": record["autoRegistrationStatus"],
+                # .get: a record restored from a snapshot taken before the
+                # field existed carries no mode; AWS's default stands in.
+                "certificateMode": record.get("certificateMode", "DEFAULT"),
                 "ownedBy": record["ownedBy"],
                 "creationDate": record.get("creationDate"),
-            }
+            },
+            # registrationConfig is a sibling of certificateDescription in
+            # DescribeCACertificateResponse, omitted when never configured.
+            **({"registrationConfig": record["registrationConfig"]}
+               if record.get("registrationConfig") is not None else {}),
         })
     if method == "PUT":
         # newStatus / newAutoRegistrationStatus are query-string params per the
@@ -1670,13 +1743,28 @@ def _handle_ca_certificate(method: str, path: str, body: bytes, qp: dict) -> tup
             record["status"] = new_status
         if new_auto is not None:
             record["autoRegistrationStatus"] = new_auto
+        # Body members per the model: registrationConfig replaces the stored
+        # JITR provisioning config; removeAutoRegistration, when true, turns
+        # auto-registration off.
+        registration_config = payload.get("registrationConfig")
+        if registration_config is not None:
+            if not isinstance(registration_config, dict):
+                return error_response_json(
+                    "InvalidRequestException",
+                    "registrationConfig must be an object", 400,
+                )
+            record["registrationConfig"] = registration_config
+        if payload.get("removeAutoRegistration"):
+            record["autoRegistrationStatus"] = "DISABLE"
         _ca_certificates[ca_id] = record
         return json_response({})
     if method == "DELETE":
         if record["status"] == "ACTIVE":
+            # Wording verified against real AWS (live probe 2026-08-26).
             return error_response_json(
                 "CertificateStateException",
-                "CA certificate is ACTIVE; deactivate before deletion",
+                "CA Certificate must be deactivated (not ACTIVE) before "
+                f"deletion. Id: {ca_id}",
                 406,
             )
         del _ca_certificates[ca_id]

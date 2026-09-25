@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 SNS Service Emulator — AWS-compatible.
 Supports: CreateTopic, DeleteTopic, ListTopics, GetTopicAttributes, SetTopicAttributes,
@@ -18,6 +20,7 @@ FIFO topics: .fifo naming validation, MessageGroupId/MessageDeduplicationId enfo
 """
 
 import asyncio
+import contextvars
 import copy
 import hashlib
 import json
@@ -136,6 +139,10 @@ def get_state():
         "platform_applications": copy.deepcopy(_platform_applications),
         "platform_endpoints": copy.deepcopy(_platform_endpoints),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -289,9 +296,9 @@ def _create_topic(params):
 
         # Store tags from CreateTopic
         i = 1
-        while _p(params, f"Tag.member.{i}.Key"):
-            key = _p(params, f"Tag.member.{i}.Key")
-            val = _p(params, f"Tag.member.{i}.Value")
+        while _p(params, f"Tags.member.{i}.Key"):
+            key = _p(params, f"Tags.member.{i}.Key")
+            val = _p(params, f"Tags.member.{i}.Value")
             topic["tags"][key] = val
             i += 1
 
@@ -405,7 +412,7 @@ def _subscribe(params):
     }
 
     allowed_attrs = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-                     "RawMessageDelivery", "RedrivePolicy"}
+                     "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
     i = 1
     while _p(params, f"Attributes.entry.{i}.key"):
         key = _p(params, f"Attributes.entry.{i}.key")
@@ -546,7 +553,7 @@ def _set_subscription_attributes(params):
     attr_val = _p(params, "AttributeValue")
 
     allowed = {"DeliveryPolicy", "FilterPolicy", "FilterPolicyScope",
-               "RawMessageDelivery", "RedrivePolicy"}
+               "RawMessageDelivery", "RedrivePolicy", "SubscriptionRoleArn"}
     if attr_name not in allowed:
         return _error("InvalidParameterException",
                       f"Invalid attribute name: {attr_name}", 400)
@@ -970,9 +977,15 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             # subscriber's execution. Deliver on a background thread, mirroring
             # the http(s) path above; a slow or failing subscriber Lambda no
             # longer stalls the Publish call (or its upstream caller).
+            # The publisher's account/region contextvars must travel into the
+            # thread: _get_func_record_for_ref rejects an ARN whose account
+            # differs from get_account_id(), and a fresh thread's empty context
+            # reads back the default account — dropping every delivery for a
+            # non-default tenant.
+            _sns_ctx = contextvars.copy_context()
             _threading.Thread(
-                target=_deliver_to_lambda,
-                args=(endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
+                target=_sns_ctx.run,
+                args=(_deliver_to_lambda, endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
                 daemon=True,
             ).start()
         elif protocol == "email" or protocol == "email-json":

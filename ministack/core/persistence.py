@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 State persistence for MiniStack services.
 When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown
@@ -197,9 +199,21 @@ def load_state(service: str) -> dict | None:
 
 
 def save_all(services: dict) -> None:
-    """Save all service states. services = {name: get_state_fn}"""
+    """Save all service states. services = {name: get_state_fn}
+
+    A service that returns None has nothing to save and is skipped. That is not
+    the same as returning empty state: a module that failed to import has no
+    state to report, and writing its empty dict would destroy whatever was
+    persisted from the last run that worked.
+    """
     for name, get_state in services.items():
         try:
-            save_state(name, get_state())
+            state = get_state()
         except Exception as e:
             logger.error("Persistence: error getting state for %s: %s", name, e)
+            continue
+        if state is None:
+            logger.debug("Persistence: %s reported no state; leaving %s.json alone",
+                         name, name)
+            continue
+        save_state(name, state)

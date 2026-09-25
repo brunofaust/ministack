@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EFS (Elastic File System) Service Emulator.
 REST/JSON protocol — /2015-02-01/* paths.
@@ -409,6 +411,10 @@ def get_state():
         "lifecycle_configs": _lifecycle_configs,
         "backup_policies": _backup_policies,
     })
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

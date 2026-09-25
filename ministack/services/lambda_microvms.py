@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """AWS Lambda MicroVMs emulation (REST-JSON, API version 2025-09-09).
 
 Control-plane emulation of the Lambda MicroVM API: build images, run MicroVMs,
@@ -47,6 +49,10 @@ _images = AccountRegionScopedDict()     # imageName -> record
 
 def get_state():
     return copy.deepcopy({"microvms": _microvms, "images": _images})
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -206,7 +212,7 @@ def _list_microvms(query_params):
         if version_filter and record.get("imageVersion") != version_filter:
             continue
         items.append(_microvm_item(record))
-    return json_response({"items": items, "nextToken": None})
+    return json_response({"items": items})
 
 
 def _suspend_microvm(microvm_id):

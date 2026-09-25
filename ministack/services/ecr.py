@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 ECR (Elastic Container Registry) Emulator.
 JSON-based API via X-Amz-Target (prefix: AmazonEC2ContainerRegistry_V20150921).
@@ -57,6 +59,10 @@ def get_state():
         # do not survive a restart, matching real registry behaviour where
         # the client retries the upload from scratch after a 404 on PATCH.
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

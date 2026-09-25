@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Athena Service Emulator.
 JSON-based API via X-Amz-Target (AmazonAthena).
@@ -15,6 +17,7 @@ Supports: StartQueryExecution, GetQueryExecution, GetQueryResults,
 import asyncio
 import copy
 import csv
+import datetime
 import io
 import json
 import logging
@@ -100,6 +103,10 @@ def get_state():
             "_tags": _tags,
         }
     )
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):
@@ -202,7 +209,7 @@ except Exception:
     )
 
 try:
-    import duckdb
+    import duckdb  # noqa: F401 — the import is the availability probe
 
     _duckdb_available = True
 except ImportError:
@@ -438,10 +445,16 @@ async def _run_duckdb(query, database):
     import duckdb
 
     rewritten = await _rewrite_data_paths(query, database)
+    prelude, rewritten = _s3tables_catalog_prelude(rewritten)
 
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            # Athena renders TIMESTAMP WITH TIME ZONE values in UTC; DuckDB
+            # defaults to the host's zone, which would leak into results.
+            conn.execute("SET TimeZone = 'UTC'")
+            for statement in prelude:
+                conn.execute(statement)
             result = conn.execute(rewritten)
             columns = []
             column_types = []
@@ -465,6 +478,77 @@ async def _run_duckdb(query, database):
             conn.close()
 
     return await asyncio.to_thread(_execute_blocking)
+
+
+# Athena's federated S3 Tables catalog: "s3tablescatalog/<bucket>"."<ns>"."<table>".
+_S3TABLES_CATALOG_RE = re.compile(r'"s3tablescatalog/([A-Za-z0-9._-]+)"\s*\.\s*"([^"]+)"\s*\.\s*"([^"]+)"')
+
+
+def _render_cell(value):
+    """Render one result cell the way Athena's GetQueryResults does.
+
+    Athena hands every value back as text: timestamps as
+    ``YYYY-MM-DD HH:MM:SS.mmm`` (millisecond precision), ``TIMESTAMP WITH
+    TIME ZONE`` values with a trailing `` UTC``, dates as ISO-8601, NULL as
+    an empty string. DuckDB's ``str(datetime)`` would give microseconds and
+    a ``+00:00`` offset, which Athena consumers do not parse.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, datetime.datetime):
+        zone = value.tzinfo
+        if zone is not None:
+            value = value.astimezone(datetime.timezone.utc)
+        text = value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        return f"{text} UTC" if zone is not None else text
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    return str(value)
+
+
+def _s3tables_catalog_prelude(query):
+    """Attach every S3 Tables bucket the query names as a DuckDB Iceberg catalog.
+
+    Returns ``(prelude_statements, rewritten_query)``. On AWS, Athena reaches an
+    S3 Tables bucket through the Glue-federated ``s3tablescatalog`` catalog; here
+    DuckDB attaches this emulator's own Iceberg REST endpoint (the same catalog a
+    writer such as ``duckdb`` or Spark used to commit the table) and reads the
+    data files back through the emulator's S3, so the rows are the committed ones.
+    """
+    from ministack.services import s3tables as s3tables_svc
+
+    aliases: dict[str, str] = {}
+
+    def _replace(match):
+        bucket, namespace, table = match.groups()
+        alias = aliases.setdefault(bucket, f"s3tablescatalog_{len(aliases)}")
+        return f'{alias}."{namespace}"."{table}"'
+
+    rewritten = _S3TABLES_CATALOG_RE.sub(_replace, query)
+    if not aliases:
+        return [], query
+    gateway = s3tables_svc._gateway_url()
+    parsed = urlparse(gateway)
+    # The image bakes both extensions into DUCKDB_EXTENSION_DIR (never a
+    # download at query time); a source checkout installs them on first use.
+    extension_dir = os.environ.get("DUCKDB_EXTENSION_DIR", "")
+    prelude = []
+    if extension_dir:
+        prelude.append(f"SET extension_directory = '{extension_dir}'")
+        prelude += ["LOAD httpfs", "LOAD iceberg"]
+    else:
+        prelude += ["INSTALL httpfs", "LOAD httpfs", "INSTALL iceberg", "LOAD iceberg"]
+    prelude += [
+        "CREATE SECRET ministack_s3 (TYPE s3, KEY_ID 'test', SECRET 'test', "
+        f"REGION '{get_region()}', ENDPOINT '{parsed.netloc}', URL_STYLE 'path', "
+        f"USE_SSL {'true' if parsed.scheme == 'https' else 'false'})",
+    ]
+    for bucket, alias in aliases.items():
+        arn = s3tables_svc._bucket_arn(bucket)
+        prelude.append(
+            f"ATTACH '{arn}' AS {alias} (TYPE iceberg, ENDPOINT '{gateway}/iceberg', AUTHORIZATION_TYPE 'none')"
+        )
+    return prelude, rewritten
 
 
 async def _rewrite_data_paths(query, database):
@@ -566,6 +650,12 @@ async def _save_query_results(query_id):
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
     bucket_name = p.netloc
+    # A workgroup with Athena-managed results (no OutputLocation) falls back to
+    # the default location; real Athena owns that storage, so nothing created
+    # the bucket here and every query failed "while writing to S3". _ensure_bucket
+    # only LOOKS UP a bucket, so create the default one on first use.
+    if s3_svc._ensure_bucket(bucket_name) is None:
+        s3_svc._create_bucket(bucket_name, b"")
     key_prefix = p.path.lstrip("/").rstrip("/")
     # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
     # prefix. If the prefix is empty (output_location == "s3://bucket/"),
@@ -690,9 +780,7 @@ def _get_query_results(data):
     result_rows = []
     result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
     for row in page_rows:
-        result_rows.append(
-            {"Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]}
-        )
+        result_rows.append({"Data": [{"VarCharValue": _render_cell(v)} for v in row]})
 
     column_info = []
     for i, col in enumerate(columns):

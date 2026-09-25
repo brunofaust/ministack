@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EventBridge Scheduler Service Emulator.
 REST/JSON protocol — /schedules/* and /schedule-groups/* paths.
@@ -60,6 +62,10 @@ def get_state():
         "schedule_groups": copy.deepcopy(_schedule_groups),
         "tags": copy.deepcopy(_tags),
     }
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

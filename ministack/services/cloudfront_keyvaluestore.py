@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFront KeyValueStore Data-Plane Service Emulator.
 JSON REST API — signing name: cloudfront-keyvaluestore.
@@ -43,6 +45,10 @@ def reset():
 
 def get_state():
     return copy.deepcopy({"stores": _stores})
+
+
+def load_persisted_state(data):
+    return restore_state(data)
 
 
 def restore_state(data):

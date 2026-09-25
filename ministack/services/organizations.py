@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Organizations stub.
 
@@ -17,6 +19,7 @@ import json
 import logging
 import time
 
+from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     error_response_json,
@@ -54,6 +57,10 @@ def get_state():
     }
 
 
+def load_persisted_state(data):
+    return restore_state(data)
+
+
 def restore_state(data):
     if not data:
         return
@@ -64,6 +71,16 @@ def restore_state(data):
         store.clear()
         for k, v in (data.get(key) or {}).items():
             store[k] = v
+
+
+try:
+    _restored = load_state("organizations")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logging.getLogger(__name__).exception(
+        "Failed to restore persisted state; continuing with fresh store"
+    )
 
 
 def _json(status, body):
@@ -123,14 +140,13 @@ def _describe_organization(_payload):
 
 def _list_roots(_payload):
     _ensure_org()
-    return _json(200, {"Roots": list(_roots.values()), "NextToken": None})
+    return _json(200, {"Roots": list(_roots.values())})
 
 
 def _list_accounts(_payload):
     _ensure_org()
     return _json(200, {
         "Accounts": [_public_account(a) for a in _accounts.values()],
-        "NextToken": None,
     })
 
 
@@ -150,7 +166,7 @@ def _list_organizational_units_for_parent(payload):
     _ensure_org()
     parent_id = payload.get("ParentId") or ""
     out = [_public_ou(o) for o in _ous.values() if o.get("_ParentId") == parent_id]
-    return _json(200, {"OrganizationalUnits": out, "NextToken": None})
+    return _json(200, {"OrganizationalUnits": out})
 
 
 def _list_accounts_for_parent(payload):
@@ -158,7 +174,7 @@ def _list_accounts_for_parent(payload):
     parent_id = payload.get("ParentId") or ""
     out = [_public_account(a) for a in _accounts.values()
            if a.get("_ParentId") == parent_id]
-    return _json(200, {"Accounts": out, "NextToken": None})
+    return _json(200, {"Accounts": out})
 
 
 def _list_parents(payload):
@@ -178,7 +194,7 @@ def _list_parents(payload):
         )
     parent_id = rec.get("_ParentId")
     parent_type = "ROOT" if str(parent_id).startswith("r-") else "ORGANIZATIONAL_UNIT"
-    return _json(200, {"Parents": [{"Id": parent_id, "Type": parent_type}], "NextToken": None})
+    return _json(200, {"Parents": [{"Id": parent_id, "Type": parent_type}]})
 
 
 def _create_organizational_unit(payload):
@@ -290,7 +306,7 @@ def _list_tags_for_resource(payload):
         return err
     # A consumer's Read of any taggable org resource calls ListTagsForResource on
     # create + refresh; without it the read-back fails and apply can't converge.
-    return _json(200, {"Tags": _tag_list(rid), "NextToken": None})
+    return _json(200, {"Tags": _tag_list(rid)})
 
 
 _DISPATCH = {
