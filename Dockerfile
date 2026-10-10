@@ -10,23 +10,23 @@ FROM python:3.13-slim-bookworm AS builder
 # so the CLI is installed without deps and runs on the botocore pinned here.
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
-        "duckdb>=1.4" \
-        "pytz>=2024.1" \
-        "cbor2>=5.4.0" \
+        "duckdb>=1.5.6" \
+        "pytz>=2026.4" \
+        "cbor2>=6.1.5" \
         "defusedxml>=0.7" \
-        "docker>=7.0.0" \
-        "pyyaml>=6.0" \
-        "cryptography>=41.0" \
-        "pymysql>=1.1" \
-        "asyncssh>=2.14" \
-        "boto3>=1.34" \
+        "docker>=7.2.0" \
+        "pyyaml>=6.0.3" \
+        "cryptography>=50.0.2" \
+        "pymysql>=1.2.3" \
+        "asyncssh>=2.24.0" \
+        "boto3>=1.43.108" \
         "jsonata-python>=0.7.0" \
-        "graphql-core==3.2.12" \
-        "botocore==1.43.106" \
+        "graphql-core==3.3.0" \
+        "botocore==1.43.108" \
         "docutils>=0.18.1,<=0.19" \
         "colorama>=0.2.5,<0.4.7" \
         "rsa>=3.1.2,<4.8" \
-    && pip install --no-cache-dir --no-compile --no-deps awscli==1.45.63
+    && pip install --no-cache-dir --no-compile --no-deps awscli==1.45.64
 
 # Bake the DuckDB extensions the Athena emulator loads at query time into a
 # fixed, root-owned directory; the runtime user never downloads anything.
