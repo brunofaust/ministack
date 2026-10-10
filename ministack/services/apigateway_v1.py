@@ -91,7 +91,11 @@ Custom domains:
 """
 
 import base64
+import copy
 import datetime
+import decimal
+import functools
+import ipaddress
 import json
 import logging
 import re
@@ -110,6 +114,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 from ministack.services.apigateway import (
     _b64url_decode,
@@ -159,7 +164,10 @@ _base_path_mappings = AccountRegionScopedDict()  # domain_name -> {base_path -> 
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
 _account_settings = AccountRegionScopedDict()    # singleton per account+region: stores fields set via UpdateAccount
 _gateway_responses = AccountRegionScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
+# rest_api_id -> {deployment_id -> customized gateway responses at CreateDeployment}
+_deployed_gateway_responses = AccountRegionScopedDict()
 _documentation_parts = AccountRegionScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
+_request_validators = AccountRegionScopedDict()   # rest_api_id -> {validator_id -> RequestValidator}
 
 
 _GATEWAY_RESPONSE_TYPES = (
@@ -209,6 +217,24 @@ _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES = {
 }
 
 _DEFAULT_GATEWAY_RESPONSE_TEMPLATE = '{"message":$context.error.messageString}'
+
+# x-amzn-ErrorType API Gateway stamps on the gateway errors it emits.
+_GATEWAY_RESPONSE_ERROR_TYPES = {
+    "MISSING_AUTHENTICATION_TOKEN": "MissingAuthenticationTokenException",
+    "UNAUTHORIZED": "UnauthorizedException",
+    "ACCESS_DENIED": "AccessDeniedException",
+    "AUTHORIZER_FAILURE": "AuthorizerConfigurationException",
+    "AUTHORIZER_CONFIGURATION_ERROR": "AuthorizerConfigurationException",
+    "API_CONFIGURATION_ERROR": "InternalServerErrorException",
+    "BAD_REQUEST_PARAMETERS": "BadRequestException",
+    "BAD_REQUEST_BODY": "BadRequestException",
+    "DEFAULT_5XX": "InternalServerErrorException",
+    "THROTTLED": "TooManyRequestsException",
+}
+
+_GATEWAY_TEMPLATE_VARIABLE = re.compile(
+    r"\$(?:\{(context(?:\.\w+)+)\}|(context(?:\.[A-Za-z]\w*)+))"
+)
 
 _DOCUMENTATION_LOCATION_TYPES = frozenset(
     {
@@ -716,8 +742,8 @@ async def _call_lambda_raw(function_ref, event, *, account_id=None, region=None)
     Routed through the central ``_execute_function`` dispatcher so CloudWatch
     Logs emission and Docker log output work for API Gateway invocations.
 
-    Non-proxy (custom) integrations need the raw payload; :func:`_call_lambda`
-    is this plus the AWS_PROXY response shaper, which would rewrite a handler's
+    Non-proxy (custom) integrations need the raw payload; AWS_PROXY passes it
+    through :func:`_lambda_proxy_response`, which would rewrite a handler's
     ``statusCode`` key into the HTTP status.
     """
     from ministack.services import lambda_svc
@@ -737,24 +763,17 @@ async def _call_lambda_raw(function_ref, event, *, account_id=None, region=None)
     return result, None
 
 
-async def _call_lambda(function_ref, event, *, account_id=None, region=None):
-    """Invoke a Lambda function and return the parsed AWS_PROXY response dict.
+def _lambda_proxy_response(result):
+    """Shape a :func:`_call_lambda_raw` result into the AWS_PROXY response dict.
 
-    :func:`_call_lambda_raw` plus the shared response shaper (throttle→429,
-    error→502, body→envelope), which is what keeps v1 and v2 consistent.
+    The shared response shaper (throttle→429, error→502, body→envelope) is what
+    keeps v1 and v2 consistent.
     """
     from ministack.services import lambda_svc
 
-    result, err = await _call_lambda_raw(
-        function_ref, event, account_id=account_id, region=region
-    )
-    if err:
-        return None, err
-
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
-    # On error the helper returns {statusCode: 502, body: <msg>}; preserve
-    # the _call_lambda contract of (None, error_msg) so callers that check
-    # for error strings keep working.
+    # On error the helper returns {statusCode: 502, body: <msg>}; return it as
+    # (None, error_msg) so the caller answers with the error string.
     if result.get("error") and lambda_response and lambda_response.get("statusCode") == 502:
         return None, str(lambda_response.get("body") or "Lambda invocation error")
     return lambda_response, None
@@ -785,7 +804,9 @@ def get_state():
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
+        "request_validators": copy.deepcopy(_request_validators),
         "gateway_responses": copy.deepcopy(_gateway_responses),
+        "deployed_gateway_responses": copy.deepcopy(_deployed_gateway_responses),
         "documentation_parts": copy.deepcopy(_documentation_parts),
     }
 
@@ -1000,7 +1021,11 @@ def load_persisted_state(data):
     _restore_child_store(_deployments_v1, data.get("deployments_v1", {}), api_regions)
     _restore_child_store(_authorizers_v1, data.get("authorizers_v1", {}), api_regions)
     _restore_child_store(_models, data.get("models", {}), api_regions)
+    _restore_child_store(_request_validators, data.get("request_validators", {}), api_regions)
     _restore_child_store(_gateway_responses, data.get("gateway_responses", {}), api_regions)
+    _restore_child_store(
+        _deployed_gateway_responses, data.get("deployed_gateway_responses", {}), api_regions
+    )
     _restore_child_store(_documentation_parts, data.get("documentation_parts", {}), api_regions)
     _restore_child_store(_usage_plan_keys, data.get("usage_plan_keys", {}), plan_regions)
     _restore_child_store(_base_path_mappings, data.get("base_path_mappings", {}), domain_regions)
@@ -1023,7 +1048,9 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _request_validators.clear()
     _gateway_responses.clear()
+    _deployed_gateway_responses.clear()
     _documentation_parts.clear()
 
 
@@ -1284,6 +1311,22 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "DELETE":
                     return _delete_authorizer(api_id, auth_id)
 
+        # /restapis/{id}/requestvalidators[/{validatorId}]
+        elif sub == "requestvalidators":
+            validator_id = parts[3] if len(parts) > 3 else None
+            if not validator_id:
+                if method == "POST":
+                    return _create_request_validator(api_id, data)
+                if method == "GET":
+                    return _get_request_validators(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_request_validator(api_id, validator_id)
+                if method == "PATCH":
+                    return _update_request_validator(api_id, validator_id, data)
+                if method == "DELETE":
+                    return _delete_request_validator(api_id, validator_id)
+
         # /restapis/{id}/models[/{modelName}]
         elif sub == "models":
             model_name = parts[3] if len(parts) > 3 else None
@@ -1368,32 +1411,117 @@ def _header_ci(headers, name):
     return ""
 
 
-def _gw_error(status, message):
-    """A REST API gateway error response. Uses the lowercase `message` key that
-    API Gateway's default UNAUTHORIZED / MISSING_AUTHENTICATION_TOKEN / 5XX
-    gateway responses carry."""
-    return (
-        status,
-        {"Content-Type": "application/json"},
-        json.dumps({"message": message}).encode(),
-    )
+class _GatewayError:
+    """An error API Gateway itself emits, answered through the gateway response
+    of ``response_type`` in the stage's deployment (see
+    :func:`_gateway_error_response`)."""
+
+    def __init__(self, response_type, message):
+        self.response_type = response_type
+        self.message = message
+
+
+def _gw_error(response_type, message):
+    return _GatewayError(response_type, message)
 
 
 def _deny_error(explicit):
-    """The 403 an authorizer denial produces. The execute-api authorization
-    layer answers with a capitalised `Message` key (distinct from the lowercase
-    gateway-response bodies) — explicit Deny vs. no-matching-Allow differ only in
-    the trailing clause."""
+    """The 403 an authorizer denial produces. Explicit Deny vs. no-matching-Allow
+    differ only in the trailing clause."""
     msg = (
-        "User is not authorized to access this resource with an explicit deny"
+        "User is not authorized to access this resource with an explicit deny in an identity-based policy"
         if explicit
         else "User is not authorized to access this resource"
     )
-    return (
-        403,
-        {"Content-Type": "application/json"},
-        json.dumps({"Message": msg}).encode(),
+    return _gw_error("ACCESS_DENIED", msg)
+
+
+def _gateway_request_value(source, request):
+    """Resolve a ``gatewayresponse.header.*`` mapping expression against the
+    request. None means the source is absent, which omits the header."""
+    if len(source) >= 2 and source[0] == source[-1] == "'":
+        return source[1:-1]
+    if source.startswith("method.request.header."):
+        target = source[len("method.request.header."):].lower()
+        for key, value in request["headers"].items():
+            if key.lower() == target:
+                return value if isinstance(value, str) else (value[-1] if value else "")
+        return None
+    if source.startswith("method.request.querystring."):
+        value = request["query_params"].get(source[len("method.request.querystring."):])
+        return value[0] if isinstance(value, list) and value else value
+    if source.startswith("method.request.path."):
+        return request["path_params"].get(source[len("method.request.path."):])
+    if source.startswith("stageVariables."):
+        return (request["stage"].get("variables") or {}).get(source[len("stageVariables."):])
+    if source == "context.requestId":
+        return request["request_id"]
+    return None
+
+
+def _gateway_error_response(error, request):
+    """Render a gateway error the way API Gateway does.
+
+    Precedence: the customized response for the type, else a customized
+    DEFAULT_4XX / DEFAULT_5XX (by the type's default status), else the built-in
+    default. The responses in effect are the ones captured by the stage's
+    deployment. The application/json template is used whatever the request
+    accepts.
+    """
+    api_id = request["api_id"]
+    customized = _deployed_gateway_responses.get(api_id, {}).get(request["stage"].get("deploymentId"))
+    if customized is None:
+        # A deployment restored from state written before snapshots existed.
+        customized = _gateway_responses.get(api_id, {})
+    if isinstance(error, _PlainGatewayError) and not customized.keys() & {
+        error.response_type, _gateway_response_family(error.response_type)
+    }:
+        return error.response
+    response_type = error.response_type
+    response = _gateway_response_for_type(customized, response_type)
+    template = (response.get("responseTemplates") or {}).get("application/json")
+    if response_type == "ACCESS_DENIED" and not customized.keys() & {response_type, "DEFAULT_4XX"}:
+        # The built-in ACCESS_DENIED body carries a capitalised `Message` key.
+        template = '{"Message":$context.error.messageString}'
+    if template is None:
+        template = _DEFAULT_GATEWAY_RESPONSE_TEMPLATE
+
+    headers = {"Content-Type": "application/json"}
+    for dest, source in (response.get("responseParameters") or {}).items():
+        if not dest.startswith("gatewayresponse.header.") or not isinstance(source, str):
+            continue
+        value = _gateway_request_value(source, request)
+        if value is not None:
+            headers[dest[len("gatewayresponse.header."):]] = value
+    error_type = _GATEWAY_RESPONSE_ERROR_TYPES.get(response_type)
+    if error_type:
+        headers["x-amzn-ErrorType"] = error_type
+    headers["x-amzn-requestid"] = request["request_id"]
+
+    message = error.message
+    message_string = "null" if message is None else json.dumps(message)
+    rendered_type = response_type
+    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR",
+                         "BAD_REQUEST_BODY", "BAD_REQUEST_PARAMETERS", "DEFAULT_5XX"):
+        # AWS renders the messageString of these types with a leading space (measured).
+        message_string = " " + message_string
+    if response_type == "AUTHORIZER_CONFIGURATION_ERROR":
+        # Rendered as API_CONFIGURATION_ERROR; entry, status and error type stay AUTHORIZER_* (measured).
+        rendered_type = "API_CONFIGURATION_ERROR"
+    variables = {
+        "context.error.message": "" if message is None else message,
+        "context.error.messageString": message_string,
+        "context.error.responseType": rendered_type,
+        "context.requestId": request["request_id"],
+        "context.resourcePath": request["resource_path"],
+        "context.stage": request["stage_name"],
+        # No integration answered, so the status variable renders empty (measured).
+        "context.status": "",
+    }
+    body = _GATEWAY_TEMPLATE_VARIABLE.sub(
+        lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), template
     )
+    return int(response.get("statusCode") or 500), headers, body.encode("utf-8")
 
 
 def _arn_matches(pattern, arn):
@@ -1642,6 +1770,16 @@ def _token_scopes(claims):
     return sorted(set(scopes))
 
 
+class _PlainGatewayError(_GatewayError):
+    """A gateway error whose built-in default was not measured against AWS: it
+    keeps the response it had before gateway responses were applied, while a
+    customized response for its type still takes over."""
+
+    def __init__(self, response_type, message, response):
+        super().__init__(response_type, message)
+        self.response = response
+
+
 async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_params, stage):
     """Verify a user-pool token for a COGNITO_USER_POOLS method.
 
@@ -1655,49 +1793,49 @@ async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_pa
     if not issuers:
         # An authorizer with no usable pool cannot authorize anything; AWS
         # reports this as a configuration error rather than letting it through.
-        return None, _gw_error(500, "Internal server error")
+        return None, _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error")
 
     token = _cognito_token_from_request(authorizer, headers, query_params, stage)
     if not token:
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
 
     parts = token.split(".")
     if len(parts) != 3:
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
     try:
         header = json.loads(_b64url_decode(parts[0]))
         claims = json.loads(_b64url_decode(parts[1]))
     except (ValueError, json.JSONDecodeError):
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
     if not isinstance(claims, dict) or not isinstance(header, dict):
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
 
     issuer = claims.get("iss")
     if issuer not in issuers:
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
 
     kid = header.get("kid")
     jwks_url = await _resolve_jwks_url({"jwtConfiguration": {"issuer": issuer}})
     if not kid or not jwks_url:
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
     try:
         keys = ((await _fetch_jwks(jwks_url)).get("keys") or [])
     except (OSError, ValueError, json.JSONDecodeError):
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
     jwk = next((k for k in keys if k.get("kid") == kid), None)
     if not jwk or not _verify_rs256_signature(token, jwk):
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
 
     now = int(time.time())
     try:
         if "exp" in claims and int(claims["exp"]) <= now:
-            return None, _gw_error(401, "Unauthorized")
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
         if "nbf" in claims and int(claims["nbf"]) > now:
-            return None, _gw_error(401, "Unauthorized")
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
         if "iat" in claims and int(claims["iat"]) > now:
-            return None, _gw_error(401, "Unauthorized")
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
     except (TypeError, ValueError):
-        return None, _gw_error(401, "Unauthorized")
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
 
     # authorizationScopes on the method turns the check into an OAuth one: the
     # token must carry at least one of the listed scopes, and a token without
@@ -1706,7 +1844,8 @@ async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_pa
     if required_scopes:
         granted = _token_scopes(claims)
         if not any(scope in granted for scope in required_scopes):
-            return None, _gw_error(403, "Forbidden")
+            forbidden = (403, {"Content-Type": "application/json"}, json.dumps({"message": "Forbidden"}).encode())
+            return None, _PlainGatewayError("ACCESS_DENIED", "Forbidden", forbidden)
 
     return claims, None
 
@@ -1729,13 +1868,13 @@ async def _authorize_request_v1(
         # We do not verify SigV4 signatures; match AWS only to the extent that a
         # request with no Authorization header is rejected as unauthenticated.
         if not _header_ci(headers, "authorization"):
-            return _gw_error(403, "Missing Authentication Token"), None
+            return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token"), None
         return None, None
     if auth_type == "COGNITO_USER_POOLS":
         authorizer_id = method_obj.get("authorizerId")
         authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
         if not authorizer:
-            return _gw_error(500, "Internal server error"), None
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
         claims, auth_error = await _validate_cognito_authorizer(
             authorizer, method_obj, headers, query_params, stage
         )
@@ -1749,7 +1888,7 @@ async def _authorize_request_v1(
     authorizer_id = method_obj.get("authorizerId")
     authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
     if not authorizer:
-        return _gw_error(500, "Internal server error"), None
+        return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
 
     method_arn = execute_api_arn(
         owner_region, owner_account_id, api_id, stage_name, method, request_path
@@ -1766,7 +1905,7 @@ async def _authorize_request_v1(
         )
         token = _header_ci(headers, header_name)
         if not token:
-            return _gw_error(401, "Unauthorized"), None
+            return _gw_error("UNAUTHORIZED", "Unauthorized"), None
         val_expr = authorizer.get("identityValidationExpression")
         if val_expr:
             try:
@@ -1776,9 +1915,9 @@ async def _authorize_request_v1(
                 # uncompilable one only surfaces here. That is a
                 # misconfiguration (AUTHORIZER_CONFIGURATION_ERROR), not an
                 # exception that should escape the request handler.
-                return _gw_error(500, "Internal server error"), None
+                return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
             if not token_matches:
-                return _gw_error(401, "Unauthorized"), None
+                return _gw_error("UNAUTHORIZED", "Unauthorized"), None
         identity_values = (token,)
         event = {"type": "TOKEN", "authorizationToken": token, "methodArn": method_arn}
     else:  # REQUEST
@@ -1789,7 +1928,7 @@ async def _authorize_request_v1(
         # With caching on and identity sources declared, a missing source is a
         # 401 without invoking the authorizer (matches AWS).
         if ttl > 0 and identity_source and not all_present:
-            return _gw_error(401, "Unauthorized"), None
+            return _gw_error("UNAUTHORIZED", "Unauthorized"), None
         identity_values = tuple(id_values)
         single_headers = {k: (v if isinstance(v, str) else v[-1]) for k, v in headers.items()}
         multi_headers = {k: ([v] if isinstance(v, str) else list(v)) for k, v in headers.items()}
@@ -1814,6 +1953,11 @@ async def _authorize_request_v1(
                 "httpMethod": method,
                 "apiId": api_id,
                 "accountId": owner_account_id,
+                # Same caller fields the AWS_PROXY event reports.
+                "identity": {
+                    "sourceIp": (_header_ci(headers, "x-forwarded-for") or "127.0.0.1").split(",")[0].strip(),
+                    "userAgent": _header_ci(headers, "user-agent") or "",
+                },
             },
         }
 
@@ -1835,15 +1979,15 @@ async def _authorize_request_v1(
         )
         if result is None:
             # Authorizer Lambda unresolved / not found → connection failure.
-            return _gw_error(500, "Internal server error"), None
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
         if result.get("error"):
             err_body = result.get("body") or {}
             msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
             # A function that raises exactly "Unauthorized" maps to 401; any other
-            # uncaught error is an authorizer failure → 500.
+            # uncaught error is an authorizer failure → 500 with a null message.
             if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
-                return _gw_error(401, "Unauthorized"), None
-            return _gw_error(500, "Internal server error"), None
+                return _gw_error("UNAUTHORIZED", "Unauthorized"), None
+            return _gw_error("AUTHORIZER_FAILURE", None), None
 
         policy = result.get("body")
         if isinstance(policy, (str, bytes)):
@@ -1854,24 +1998,23 @@ async def _authorize_request_v1(
             except json.JSONDecodeError:
                 policy = None
         if not isinstance(policy, dict):
-            return _gw_error(500, "Internal server error"), None
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
 
         principal_id = policy.get("principalId")
-        if principal_id is None or str(principal_id) == "":
-            # AWS demands a principal. Without one the response is an
-            # AUTHORIZER_CONFIGURATION_ERROR, not an Allow that reaches the
-            # backend carrying an empty principalId.
-            return _gw_error(500, "Internal server error"), None
+        has_principal = principal_id is not None and str(principal_id) != ""
+        # AWS evaluates the policy of a TOKEN and of a REQUEST authorizer that
+        # returns no principalId (measured for both); it is not a configuration error.
 
         policy_doc = policy.get("policyDocument")
         if not isinstance(policy_doc, dict):
             # Same AUTHORIZER_CONFIGURATION_ERROR shape: a response without a
             # policyDocument is a misconfigured authorizer, not an implicit
             # deny — and it must not be cached.
-            return _gw_error(500, "Internal server error"), None
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
 
         auth_ctx = _stringify_context(policy.get("context"))
-        auth_ctx["principalId"] = str(principal_id)
+        if has_principal:
+            auth_ctx["principalId"] = str(principal_id)
         # Only a well-formed response is cached; failures re-invoke next time.
         cached = (policy_doc, auth_ctx)
         if ttl > 0:
@@ -1884,8 +2027,466 @@ async def _authorize_request_v1(
     return None, auth_ctx
 
 
+# $context.error.message per gateway response type.
+_GATEWAY_ERROR_MESSAGES = {
+    "INVALID_API_KEY": "Forbidden",
+    "THROTTLED": "Too Many Requests",
+    "QUOTA_EXCEEDED": "Limit Exceeded",  # not captured
+    "UNSUPPORTED_MEDIA_TYPE": "Unsupported Media Type",
+    "BAD_REQUEST_BODY": "Invalid request body",
+    "DEFAULT_5XX": "Internal server error",
+}
+
+# In-process only; a restart forgets them.
+_throttle_state = {}
+_quota_state = {}
+_QUOTA_PERIOD_SECONDS = {"DAY": 86400, "WEEK": 7 * 86400, "MONTH": 30 * 86400}
+
+
+def _api_key_from_request(headers):
+    return _header_ci(headers, "x-api-key")
+
+
+def _resolve_api_key(value):
+    """The enabled ApiKey record whose value matches, or None."""
+    if not value:
+        return None
+    for _scope, key in _api_keys.all_items():
+        if key.get("value") == value and key.get("enabled", True):
+            return key
+    return None
+
+
+def _usage_plans_for_key(key_id, api_id, stage_name):
+    """Every usage plan that carries this key and covers this api+stage."""
+    plans = []
+    for (account, region, plan_id), plan in list(_usage_plans.all_items()):
+        keys = _usage_plan_keys.get(plan_id, {}) or {}
+        if key_id not in keys:
+            continue
+        for entry in plan.get("apiStages") or []:
+            if entry.get("apiId") == api_id and entry.get("stage") == stage_name:
+                plans.append((plan_id, plan, entry))
+                break
+    return plans
+
+
+def _check_api_key(method_obj, api_id, stage_name, headers):
+    """(error, key_record) for a method with apiKeyRequired."""
+    if not method_obj.get("apiKeyRequired"):
+        return None, None
+    key = _resolve_api_key(_api_key_from_request(headers))
+    if key is None:
+        return _gw_error("INVALID_API_KEY",
+                         _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
+    if not _usage_plans_for_key(key["id"], api_id, stage_name):
+        return _gw_error("INVALID_API_KEY",
+                         _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
+    return None, key
+
+
+def _method_throttle_settings(stage, resource_path, http_method):
+    """The method override, else the stage-wide "*/*" entry."""
+    settings = stage.get("methodSettings") or {}
+    stripped = resource_path.lstrip("/")
+    # UpdateStage keeps the path's leading slash; accept either spelling.
+    for key in (f"/{stripped}/{http_method}", f"{stripped}/{http_method}", "*/*"):
+        entry = settings.get(key)
+        if isinstance(entry, dict) and (
+                "throttlingRateLimit" in entry or "throttlingBurstLimit" in entry):
+            return entry
+    return None
+
+
+def _take_token(slot, limits):
+    """Token bucket per slot: rate refills, burst caps, 0/0 refuses all."""
+    rate = limits.get("rateLimit")
+    burst = limits.get("burstLimit")
+    if rate is None and burst is None:
+        return True
+    rate = float(rate or 0)
+    burst = float(burst or 0)
+    if rate <= 0 and burst <= 0:
+        return False
+    now = time.time()
+    tokens, last = _throttle_state.get(slot, (burst, now))
+    tokens = min(burst, tokens + (now - last) * rate)
+    if tokens < 1:
+        _throttle_state[slot] = (tokens, now)
+        return False
+    _throttle_state[slot] = (tokens - 1, now)
+    return True
+
+
+def _check_throttle(stage, api_id, stage_name, resource_path, http_method, key):
+    """Usage-plan limits for the caller's key, then the stage method limit."""
+    buckets = []
+    if key is not None:
+        for plan_id, plan, entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+            buckets.append((("plan", plan_id, key["id"]), plan.get("throttle") or {}))
+            method_limits = (entry.get("throttle") or {}).get(f"{resource_path}/{http_method}")
+            if method_limits:
+                buckets.append((("plan", plan_id, key["id"], api_id, stage_name, resource_path,
+                                 http_method), method_limits))
+    entry = _method_throttle_settings(stage, resource_path, http_method)
+    if entry is not None:
+        buckets.append((("stage", api_id, stage_name, resource_path, http_method), {
+            "rateLimit": entry.get("throttlingRateLimit"),
+            "burstLimit": entry.get("throttlingBurstLimit"),
+        }))
+    for slot, limits in buckets:
+        if not _take_token(slot, limits):
+            return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
+    return None
+
+
+def _check_quota(key, api_id, stage_name):
+    """Usage-plan quota, per key per plan period."""
+    if key is None:
+        return None
+    now = time.time()
+    for plan_id, plan, _entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+        quota = plan.get("quota") or {}
+        limit = quota.get("limit")
+        if limit is None:
+            continue
+        period = _QUOTA_PERIOD_SECONDS.get(quota.get("period", "DAY"), 86400)
+        slot = (plan_id, key["id"])
+        used, window_start = _quota_state.get(slot, (0, now))
+        if now - window_start >= period:
+            used, window_start = 0, now
+        if used >= int(limit):
+            _quota_state[slot] = (used, window_start)
+            return _gw_error("QUOTA_EXCEEDED",
+                             _GATEWAY_ERROR_MESSAGES["QUOTA_EXCEEDED"])
+        _quota_state[slot] = (used + 1, window_start)
+    return None
+
+
+def _missing_request_parameters(method_obj, request, headers, query_params):
+    """The absent required request parameters, in declaration order."""
+    missing = []
+    for name, required in (method_obj.get("requestParameters") or {}).items():
+        if not required:
+            continue
+        if name.startswith("method.request.querystring."):
+            key = name[len("method.request.querystring."):]
+            value = (query_params or {}).get(key)
+            if value in (None, "", []):
+                missing.append(key)
+        elif name.startswith("method.request.header."):
+            key = name[len("method.request.header."):]
+            if not _header_ci(headers, key):
+                missing.append(key)
+        elif name.startswith("method.request.path."):
+            key = name[len("method.request.path."):]
+            if not (request.get("path_params") or {}).get(key):
+                missing.append(key)
+    return missing
+
+
+_JSON_TYPES = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+}
+
+
+def _parse_date_time(value):
+    """Parse an RFC 3339 date-time, raising ValueError otherwise."""
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\d)[Tt](\d\d:\d\d:\d\d)(\.\d+)?([Zz]|[+-]\d\d:\d\d)", value)
+    if not match:
+        raise ValueError(value)
+    datetime.datetime.strptime(match[1] + match[2], "%Y-%m-%d%H:%M:%S")
+
+
+def _parses(parse):
+    """A format check that holds when parse accepts the value."""
+    def check(value):
+        try:
+            parse(value)
+        except ValueError:
+            return False
+        return True
+    return check
+
+
+_HOST_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_JSON_FORMATS = {
+    "date-time": _parses(_parse_date_time),
+    "email": lambda v: re.fullmatch(r"[^@\s]+@[^@\s]+", v) is not None,
+    "hostname": lambda v: re.fullmatch(rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*", v) is not None,
+    "ipv4": _parses(ipaddress.IPv4Address),
+    "ipv6": _parses(ipaddress.IPv6Address),
+    "uri": lambda v: re.search(r"[\s<>\"{}|\\^`]", v) is None,
+}
+
+
+def _regex_search(pattern, text):
+    """Whether pattern matches somewhere in text; None when Python cannot compile it."""
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
+        return None
+
+
+def _multiple_of(value, divisor):
+    """Exact multipleOf on the decimal representations."""
+    try:
+        return decimal.Decimal(str(value)) % decimal.Decimal(str(divisor)) == 0
+    except (decimal.DecimalException, ValueError):
+        return True
+
+
+def _json_equal(a, b):
+    """JSON equality: booleans are not numbers."""
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(map(_json_equal, a, b))
+    return a == b
+
+
+def _json_key(value):
+    """A hashable key, equal for two values exactly when _json_equal says so."""
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", decimal.Decimal(str(value)).normalize())
+    if isinstance(value, list):
+        return ("l", tuple(map(_json_key, value)))
+    if isinstance(value, dict):
+        return ("d", frozenset((k, _json_key(v)) for k, v in value.items()))
+    return ("v", value)
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_schema(text):
+    """A parsed schema, shared per text so it keeps its identity across $refs; None if not JSON."""
+    try:
+        return json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return None
+
+
+def _model_schema(api_id, model_name):
+    """The parsed schema of a model of the API, or None."""
+    schema = (_models.get(api_id, {}).get(model_name) or {}).get("schema")
+    return _parse_schema(schema) if isinstance(schema, str) else schema
+
+
+def _resolve_schema_ref(ref, root):
+    """The schema a $ref names, and the document its own refs resolve in."""
+    base, _, pointer = ref.partition("#")
+    if base:
+        match = re.search(r"/restapis/([^/]+)/models/([^/]+)$", base)
+        root = _model_schema(match[1], urllib.parse.unquote(match[2])) if match else None
+    target = root
+    for part in filter(None, pointer.split("/")):
+        part = urllib.parse.unquote(part).replace("~1", "/").replace("~0", "~")
+        if isinstance(target, list) and part.isdigit() and int(part) < len(target):
+            target = target[int(part)]
+        else:
+            target = target.get(part) if isinstance(target, dict) else None
+    return target, root
+
+
+# Bodies nested deeper than this are refused before the schema applies.
+_MAX_BODY_DEPTH = 1000
+
+
+def _json_depth(value):
+    """How deeply arrays and objects nest in a parsed JSON value."""
+    depth, level = 0, [value]
+    while level := [c for c in level if isinstance(c, (dict, list))]:
+        depth += 1
+        level = [v for c in level for v in (c.values() if isinstance(c, dict) else c)]
+    return depth
+
+
+class _SchemaLoop(Exception):
+    """A schema that applies itself to the same value again."""
+
+
+def _json_schema_valid(schema, value, root, seen=()):
+    """Whether value satisfies the JSON Schema draft 4 schema; _SchemaLoop on a validation loop."""
+    chain = set()
+    while isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
+        if id(schema) in chain:
+            return True
+        chain.add(id(schema))
+        schema, root = _resolve_schema_ref(schema["$ref"], root)
+    if not isinstance(schema, dict):
+        return True
+    if id(schema) in seen:
+        raise _SchemaLoop
+    seen += (id(schema),)
+
+    def valid(sub):
+        return _json_schema_valid(sub, value, root, seen)
+
+    # Every subschema that applies to the same value runs, so any loop among them is found.
+    all_of = [valid(sub) for sub in schema.get("allOf") or []]
+    any_of = [valid(sub) for sub in schema.get("anyOf") or []]
+    one_of = [valid(sub) for sub in schema.get("oneOf") or []]
+    negated = "not" in schema and valid(schema["not"])
+    depends = [all(n in value for n in needs) if isinstance(needs, list) else valid(needs)
+               for name, needs in (schema.get("dependencies") or {}).items()
+               if isinstance(value, dict) and name in value]
+    if (not all(all_of + depends) or "anyOf" in schema and not any(any_of)
+            or "oneOf" in schema and sum(one_of) != 1 or negated):
+        return False
+    types = schema.get("type")
+    if types is not None and not any(
+            _JSON_TYPES.get(t, lambda v: True)(value)
+            for t in (types if isinstance(types, list) else [types])):
+        return False
+    if "enum" in schema and not any(_json_equal(value, e) for e in schema["enum"]):
+        return False
+    if _JSON_TYPES["number"](value):
+        if "minimum" in schema and (value <= schema["minimum"] if schema.get(
+                "exclusiveMinimum") else value < schema["minimum"]):
+            return False
+        if "maximum" in schema and (value >= schema["maximum"] if schema.get(
+                "exclusiveMaximum") else value > schema["maximum"]):
+            return False
+        if "multipleOf" in schema and not _multiple_of(value, schema["multipleOf"]):
+            return False
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)):
+            return False
+        if "pattern" in schema and _regex_search(schema["pattern"], value) is False:
+            return False
+        if not _JSON_FORMATS.get(schema.get("format"), lambda v: True)(value):
+            return False
+    children = []
+    if isinstance(value, list):
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
+            return False
+        if schema.get("uniqueItems") and len({_json_key(v) for v in value}) != len(value):
+            return False
+        items = schema.get("items", {})
+        if isinstance(items, list):
+            extra = schema.get("additionalItems", True)
+            if extra is False and len(value) > len(items):
+                return False
+            subs = items + [extra if isinstance(extra, dict) else {}] * (len(value) - len(items))
+        else:
+            subs = [items] * len(value)
+        children = zip(subs, value)
+    if isinstance(value, dict):
+        if not schema.get("minProperties", 0) <= len(value) <= schema.get("maxProperties", len(value)):
+            return False
+        if any(name not in value for name in schema.get("required") or []):
+            return False
+        properties = schema.get("properties") or {}
+        patterns = schema.get("patternProperties") or {}
+        extra = schema.get("additionalProperties", True)
+        for name, item in value.items():
+            matched = [sub for pattern, sub in patterns.items() if _regex_search(pattern, name)]
+            if name in properties:
+                matched.append(properties[name])
+            elif not matched:
+                if extra is False:
+                    return False
+                matched.append(extra)
+            children += [(sub, item) for sub in matched]
+    # Once the value passes, every child runs, so a loop below a refused sibling is still found.
+    results = [_json_schema_valid(sub, item, root) for sub, item in children if sub]
+    return all(results)
+
+
+def _check_request_validation(method_obj, api_id, request, headers, body, query_params):
+    """The method's request validator: parameters first, then the body."""
+    validator_id = method_obj.get("requestValidatorId")
+    if not validator_id:
+        return None
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return None
+    if validator.get("validateRequestParameters"):
+        missing = _missing_request_parameters(method_obj, request, headers, query_params)
+        if missing:
+            return _gw_error(
+                "BAD_REQUEST_PARAMETERS",
+                "Missing required request parameters: [" + ", ".join(missing) + "]")
+    if not validator.get("validateRequestBody"):
+        return None
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    model_name = (method_obj.get("requestModels") or {}).get(
+        content_type.split(";", 1)[0].strip()) or (
+        method_obj.get("requestModels") or {}).get("application/json")
+    if not model_name:
+        return None
+    schema = _model_schema(api_id, model_name)
+    if schema is None:
+        return None
+    try:
+        document = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return _gw_error("BAD_REQUEST_BODY",
+                         _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
+    try:
+        valid = _json_depth(document) <= _MAX_BODY_DEPTH and _json_schema_valid(
+            schema, document, schema)
+    except _SchemaLoop:
+        return _gw_error("DEFAULT_5XX", _GATEWAY_ERROR_MESSAGES["DEFAULT_5XX"])
+    except (RecursionError, TypeError, AttributeError):
+        return None
+    if not valid:
+        return _gw_error("BAD_REQUEST_BODY",
+                         _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
+    return None
+
+
+def _check_passthrough_behavior(integration, headers):
+    """NEVER rejects a content type no request template matches."""
+    behavior = (integration.get("passthroughBehavior") or "WHEN_NO_MATCH").upper()
+    if behavior != "NEVER":
+        return None
+    templates = integration.get("requestTemplates") or {}
+    if not templates:
+        return None
+    content_type = (_header_ci(headers, "content-type")
+                    or "application/json").split(";", 1)[0].strip().lower()
+    if any(key.split(";", 1)[0].strip().lower() == content_type for key in templates):
+        return None
+    return _gw_error("UNSUPPORTED_MEDIA_TYPE",
+                     _GATEWAY_ERROR_MESSAGES["UNSUPPORTED_MEDIA_TYPE"])
+
+
 async def _handle_execute_in_scope(
     api_id, stage_name, method, path, headers, body, query_params,
+    owner_account_id, owner_region,
+):
+    # What a gateway response can map from; filled in as routing resolves it.
+    request = {
+        "api_id": api_id,
+        "stage_name": stage_name,
+        "stage": None,
+        "headers": headers or {},
+        "query_params": query_params or {},
+        "path_params": {},
+        "resource_path": "",
+        "request_id": new_uuid(),
+    }
+    response = await _execute_in_scope(
+        request, api_id, stage_name, method, path, headers, body, query_params,
+        owner_account_id, owner_region,
+    )
+    if isinstance(response, _GatewayError):
+        return _gateway_error_response(response, request)
+    return response
+
+
+async def _execute_in_scope(
+    request, api_id, stage_name, method, path, headers, body, query_params,
     owner_account_id, owner_region,
 ):
     api = _rest_apis.get(api_id)
@@ -1894,7 +2495,13 @@ async def _handle_execute_in_scope(
 
     stage = _stages_v1.get(api_id, {}).get(stage_name)
     if not stage:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage_name}' not found"}).encode()
+        # No gateway response applies: the request never reaches a deployment.
+        return (
+            403,
+            {"Content-Type": "application/json", "x-amzn-ErrorType": "ForbiddenException"},
+            b'{"message":"Forbidden"}',
+        )
+    request["stage"] = stage
 
     # Match path against resource tree
     segments = [s for s in path.strip("/").split("/") if s]
@@ -1903,7 +2510,7 @@ async def _handle_execute_in_scope(
     if not resource:
         # AWS returns 403 MISSING_AUTHENTICATION_TOKEN for an unsupported
         # resource (an unmatched path), not 404.
-        return _gw_error(403, "Missing Authentication Token")
+        return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token")
 
     # Look up method
     resource_methods = resource.get("resourceMethods", {})
@@ -1923,7 +2530,9 @@ async def _handle_execute_in_scope(
             method_obj = resource_methods.get(method) or resource_methods.get("ANY")
     if not method_obj:
         # Nothing in the tree serves this verb for this path.
-        return _gw_error(403, "Missing Authentication Token")
+        return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token")
+    request["resource_path"] = resource["path"]
+    request["path_params"] = path_params or {}
 
     integration = method_obj.get("methodIntegration")
     if not integration:
@@ -1939,17 +2548,45 @@ async def _handle_execute_in_scope(
     if auth_error is not None:
         return auth_error
 
+    # API Gateway's own checks, in the order it runs them.
+    key_error, api_key = _check_api_key(method_obj, api_id, stage_name, headers)
+    if key_error is not None:
+        return key_error
+    throttle_error = _check_throttle(
+        stage, api_id, stage_name, resource["path"], method,
+        api_key or _resolve_api_key(_api_key_from_request(headers)))
+    if throttle_error is not None:
+        return throttle_error
+    quota_error = _check_quota(api_key, api_id, stage_name)
+    if quota_error is not None:
+        return quota_error
+    validation_error = _check_request_validation(
+        method_obj, api_id, request, headers, body, query_params)
+    if validation_error is not None:
+        return validation_error
+    media_error = _check_passthrough_behavior(integration, headers)
+    if media_error is not None:
+        return media_error
+
     int_type = integration.get("type", "")
 
     if int_type in ("AWS_PROXY", "AWS"):
         # AWS_PROXY hands the function a response envelope to interpret; the
-        # non-proxy `AWS` (custom / "lambda") integration returns the handler's
-        # output as the body verbatim. Same event in, different response
-        # contract out.
+        # non-proxy `AWS` integration dispatches on the target service in the
+        # URI: `sqs:path/...` targets reach the SQS data plane, everything else
+        # takes the Lambda path (custom/"lambda" integrations return the
+        # handler's output as the body verbatim).
         caller_identity = None
         if (method_obj.get("authorizationType") or "").upper() == "AWS_IAM":
             caller_identity = _iam_caller_identity(headers, query_params)
-        invoke = _invoke_lambda_proxy_v1 if int_type == "AWS_PROXY" else _invoke_lambda_custom_v1
+        if int_type == "AWS_PROXY":
+            invoke = _invoke_lambda_proxy_v1
+        else:
+            spec = _parse_service_integration_uri(integration.get("uri", ""))
+            if spec and spec[1] == "sqs" and spec[2] == "path":
+                invoke = _invoke_sqs_v1
+            else:
+                invoke = _invoke_lambda_custom_v1
         return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
             headers, body, query_params, path_params,
@@ -2113,12 +2750,16 @@ async def _invoke_lambda_proxy_v1(
         caller_identity=caller_identity,
     )
 
-    lambda_response, err = await _call_lambda(
+    result, err = await _call_lambda_raw(
         lambda_ref,
         event,
         account_id=owner_account_id,
         region=owner_region,
     )
+    if err:
+        # The integration names a function that does not exist.
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
+    lambda_response, err = _lambda_proxy_response(result)
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
 
@@ -2258,6 +2899,492 @@ async def _invoke_lambda_custom_v1(
     return _default_integration_response_status_v1(integration), resp_headers, resp_body
 
 
+def _parse_service_integration_uri(uri: str):
+    """Split an ``arn:aws:apigateway:{region}:{service}:{verb}/{rest}`` URI.
+
+    Returns ``(region, service, verb, rest)`` — e.g. for
+    ``arn:aws:apigateway:us-east-1:sqs:path/123456789012/my-queue`` it returns
+    ``("us-east-1", "sqs", "path", "123456789012/my-queue")``. Returns ``None``
+    for URIs that are not service-integration ARNs (plain Lambda references,
+    HTTP endpoints); those keep their existing dispatch.
+    """
+    if not isinstance(uri, str):
+        return None
+    parts = uri.split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or parts[2] != "apigateway":
+        return None
+    region, service, remainder = parts[3], parts[4], parts[5]
+    if "/" not in remainder:
+        return None
+    verb, rest = remainder.split("/", 1)
+    return region, service, verb, rest
+
+
+# ── Request-template (VTL) subset ────────────────────────────────────────
+#
+# Non-proxy AWS service integrations shape the backend call through a
+# `requestTemplates` mapping template. Modeled: `$input.body`,
+# `$input.json('<json-path>')` / `$input.path(...)`, `$input.params('name')`
+# (path > querystring > header, the precedence AWS documents),
+# `$util.urlEncode(...)`, `$context.authorizer.*` (Cognito claims included),
+# `#set` with Velocity 1.x newline gobbling, `##` / `#* *#` comments, quiet
+# `$!` references, and string literals ("..." interpolated with `""` escapes,
+# '...' as-is with `''` escapes). An unmodeled `$input` / `$util` / `$context`
+# reference renders as an empty string; any other `$` text passes through.
+
+_VTL_ROOTS = ("input", "util", "context")
+_VTL_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_VTL_SET = re.compile(r"#\{?set\}?[ \t]*\(")
+_VTL_SET_LHS = re.compile(r"\s*\$!?\{?([A-Za-z][A-Za-z0-9_]*)\}?\s*=(.*)", re.DOTALL)
+
+
+def _vtl_json_path(body_str: str, path: str):
+    """Evaluate the small ``$input.json('<path>')`` subset: ``$``, ``$.a.b``,
+    numeric indices. Returns "" for unparseable bodies or missing nodes."""
+    try:
+        node = json.loads(body_str)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    path = path.strip()
+    if path in ("", "$", "'$'", '"$"'):
+        return node
+    for seg in path.lstrip("$").lstrip(".").split("."):
+        if not seg:
+            continue
+        if isinstance(node, dict):
+            node = node.get(seg)
+        elif isinstance(node, list) and seg.isdigit() and int(seg) < len(node):
+            node = node[int(seg)]
+        else:
+            return ""
+        if node is None:
+            return ""
+    return node
+
+
+def _vtl_close_paren(text: str, start: int):
+    """Index of the ``)`` matching the ``(`` at ``start``, skipping quoted
+    strings (a doubled quote pairs off as two adjacent strings); None if open."""
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch in ("'", '"'):
+            close = text.find(ch, i + 1)
+            if close < 0:
+                return None
+            i = close + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _vtl_split_args(src: str) -> list:
+    args, depth, quote, current = [], 0, None, []
+    for ch in src:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if "".join(current).strip():
+        args.append("".join(current))
+    return args
+
+
+def _vtl_parse_ref(text: str, i: int):
+    """Parse the reference starting at ``text[i] == "$"``.
+
+    Returns ``(end, quiet, root, steps)`` where each step is ``(name, args)``
+    and ``args`` is the raw argument source of a call or None for a property;
+    None when no identifier follows the ``$``.
+    """
+    j = i + 1
+    quiet = text.startswith("!", j)
+    if quiet:
+        j += 1
+    braced = text.startswith("{", j)
+    if braced:
+        j += 1
+    m = _VTL_IDENT.match(text, j)
+    if not m:
+        return None
+    root, j = m.group(0), m.end()
+    steps = []
+    while text.startswith(".", j):
+        m = _VTL_IDENT.match(text, j + 1)
+        if not m:
+            break
+        name, k = m.group(0), m.end()
+        if text.startswith("(", k):
+            close = _vtl_close_paren(text, k)
+            if close is None:
+                break
+            steps.append((name, text[k + 1:close]))
+            j = close + 1
+        else:
+            steps.append((name, None))
+            j = k
+    if braced:
+        if not text.startswith("}", j):
+            return None
+        j += 1
+    return j, quiet, root, steps
+
+
+def _vtl_str(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return str(value)
+
+
+def _vtl_value(expr: str, st: dict):
+    """Evaluate an argument or ``#set`` right-hand side."""
+    expr = expr.strip()
+    if len(expr) >= 2 and expr[0] == expr[-1] == '"':
+        gobbled = st["gobbled"]
+        value = _vtl_render(expr[1:-1].replace('""', '"'), st)
+        st["gobbled"] = gobbled
+        return value
+    if len(expr) >= 2 and expr[0] == expr[-1] == "'":
+        return expr[1:-1].replace("''", "'")
+    if re.fullmatch(r"-?\d+", expr):
+        return int(expr)
+    if expr in ("true", "false"):
+        return expr == "true"
+    if expr.startswith("$"):
+        ref = _vtl_parse_ref(expr, 0)
+        if ref is not None and ref[0] == len(expr):
+            return _vtl_resolve(ref, st)
+    return None
+
+
+def _vtl_walk(node, steps, st):
+    for name, args in steps:
+        if not isinstance(node, dict):
+            return None
+        if args is None:
+            node = node.get(name)
+        elif name == "get":
+            arg = _vtl_split_args(args)
+            key = _vtl_value(arg[0], st) if arg else None
+            node = node.get(key) if isinstance(key, str) else None
+        else:
+            return None
+        if node is None:
+            return None
+    return node
+
+
+def _vtl_input(steps, st):
+    if not steps:
+        return None
+    (name, args), rest = steps[0], steps[1:]
+    if name == "body" and args is None:
+        value = st["body"]
+    elif name in ("json", "path") and args is not None:
+        arg = _vtl_split_args(args)
+        node = _vtl_json_path(st["body"], str(_vtl_value(arg[0], st)) if arg else "$")
+        if name == "path":
+            value = node
+        elif isinstance(node, (dict, list)):
+            value = json.dumps(node, separators=(",", ":"), ensure_ascii=False)
+        else:
+            value = "" if node is None else str(node)
+    elif name == "params":
+        arg = _vtl_split_args(args) if args is not None else []
+        if not arg:
+            value = dict(st["params"])
+        else:
+            value = str(st["params"].get(_vtl_str(_vtl_value(arg[0], st)), ""))
+    else:
+        return None
+    return _vtl_walk(value, rest, st) if rest else value
+
+
+def _vtl_util(steps, st):
+    if not steps:
+        return None
+    name, args = steps[0]
+    if name == "urlEncode" and args is not None:
+        arg = _vtl_split_args(args)
+        text = _vtl_str(_vtl_value(arg[0], st)) if arg else ""
+        # java.net.URLEncoder: application/x-www-form-urlencoded, as AWS documents.
+        return urllib.parse.quote_plus(text, safe="*").replace("~", "%7E")
+    return None
+
+
+def _vtl_resolve(ref, st):
+    _end, _quiet, root, steps = ref
+    if root == "input":
+        return _vtl_input(steps, st)
+    if root == "util":
+        return _vtl_util(steps, st)
+    if root == "context":
+        value = _vtl_walk(st["context"], steps, st)
+        # AWS: "Calling $context.authorizer.claims returns null."
+        return None if isinstance(value, dict) else value
+    if root in st["vars"]:
+        return _vtl_walk(st["vars"][root], steps, st) if steps else st["vars"][root]
+    return None
+
+
+def _vtl_set(inner: str, st: dict) -> None:
+    m = _VTL_SET_LHS.fullmatch(inner)
+    if not m:
+        return
+    value = _vtl_value(m.group(2), st)
+    if value is not None:  # Velocity leaves the variable as it was on null
+        st["vars"][m.group(1)] = value
+
+
+def _vtl_render(text: str, st: dict) -> str:
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "#":
+            if text.startswith("##", i):
+                newline = text.find("\n", i)
+                i = len(text) if newline < 0 else newline + 1
+                continue
+            if text.startswith("#*", i):
+                close = text.find("*#", i + 2)
+                i = len(text) if close < 0 else close + 2
+                continue
+            m = _VTL_SET.match(text, i)
+            close = _vtl_close_paren(text, m.end() - 1) if m else None
+            if close is not None:
+                if st["gobbled"]:
+                    while out and out[-1] in (" ", "\t"):
+                        out.pop()
+                _vtl_set(text[m.end():close], st)
+                i = close + 1
+                k = i
+                while k < len(text) and text[k] in " \t":
+                    k += 1
+                if text.startswith("\r\n", k):
+                    i, st["gobbled"] = k + 2, True
+                elif text.startswith("\n", k):
+                    i, st["gobbled"] = k + 1, True
+                continue
+        elif ch == "$":
+            ref = _vtl_parse_ref(text, i)
+            if ref is not None and (ref[2] in _VTL_ROOTS or ref[2] in st["vars"]):
+                value = _vtl_str(_vtl_resolve(ref, st))
+                out.append(value)
+                if value:
+                    st["gobbled"] = False
+                i = ref[0]
+                continue
+            if ref is not None and ref[1]:
+                i = ref[0]
+                continue
+        out.append(ch)
+        if ch not in (" ", "\t"):
+            st["gobbled"] = False
+        i += 1
+    return "".join(out)
+
+
+def _render_request_template_v1(template: str, body_str: str,
+                                params_map: dict, context=None) -> str:
+    """Render the VTL subset; bare text passes through unchanged."""
+    st = {"vars": {}, "context": context or {}, "body": body_str,
+          "params": params_map, "gobbled": False}
+    return _vtl_render(template, st)
+
+
+def _select_service_integration_response(integration, backend_status: int):
+    """Pick the integration response for a non-proxy service call.
+
+    For AWS back ends other than Lambda, ``selectionPattern`` matches the HTTP
+    status code; the entry with no pattern is the default.
+    """
+    responses = integration.get("integrationResponses") or {}
+    for resp in responses.values():
+        pattern = (resp or {}).get("selectionPattern")
+        if not pattern:
+            continue
+        try:
+            if re.fullmatch(pattern, str(backend_status)):
+                return resp
+        except re.error:
+            continue
+    for resp in responses.values():
+        if not (resp or {}).get("selectionPattern"):
+            return resp
+    return None
+
+
+def _service_integration_response(integration, backend_status: int,
+                                  backend_text: str, accept: str,
+                                  request_params: dict, context=None):
+    """Map a backend service result through the integration responses."""
+    # No match and no default answers 500, configured responses or not.
+    selected = _select_service_integration_response(integration, backend_status)
+    if selected is None:
+        return (500, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    try:
+        status = int(selected.get("statusCode") or backend_status)
+    except (TypeError, ValueError):
+        status = backend_status
+    resp_headers = {"Content-Type": "application/json"}
+    for dest, src in (selected.get("responseParameters") or {}).items():
+        if not dest.startswith("method.response.header."):
+            continue
+        header = dest[len("method.response.header."):]
+        if isinstance(src, str) and len(src) >= 2 and src[0] == src[-1] == "'":
+            resp_headers[header] = src[1:-1]
+        else:
+            resp_headers[header] = src
+    templates = selected.get("responseTemplates") or {}
+    template = templates.get(accept) or templates.get("application/json")
+    if template is None and templates:
+        template = next(iter(templates.values()))
+    if template is not None:
+        body_out = _render_request_template_v1(
+            template, backend_text, request_params, context)
+        return status, resp_headers, body_out.encode()
+    return status, resp_headers, backend_text.encode()
+
+
+async def _invoke_sqs_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Dispatch a non-proxy ``AWS`` integration whose URI targets SQS.
+
+    ``arn:aws:apigateway:{region}:sqs:path/{account}/{queue}`` renders the
+    request template for the request's Content-Type (the raw body passes
+    through when none matches, per WHEN_NO_MATCH/WHEN_NO_TEMPLATES), parses the
+    result as a form-encoded SQS Query call, and runs it in the scope the URI
+    names — the queue's own account and region, like the integration's
+    ``credentials`` role would on AWS. Backend errors flow through the
+    integration responses like successes do; nothing is a 504 here because the
+    queue lookup itself is part of the modeled call.
+    """
+    from ministack.services import sqs as _sqs_svc
+
+    spec = _parse_service_integration_uri(integration.get("uri", ""))
+    region = (spec[0] if spec else "") or owner_region or get_region()
+    account, queue_name = None, None
+    if spec and spec[1] == "sqs" and spec[2] == "path":
+        tail = spec[3].strip("/").split("/")
+        if len(tail) == 2:
+            account, queue_name = tail
+        elif len(tail) == 1:
+            account, queue_name = (owner_account_id or get_account_id(),
+                                   tail[0])
+    if not queue_name:
+        # A malformed sqs:path URI means the integration has no reachable
+        # backend — same failure class as an unresolvable Lambda reference.
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+
+    body_str = body.decode("utf-8", errors="replace") if body else ""
+    params_map = {}
+    for k, v in (headers or {}).items():
+        if isinstance(v, str):
+            params_map[k] = v
+    for k, v in (query_params or {}).items():
+        params_map[k] = v[0] if isinstance(v, (list, tuple)) else v
+    params_map.update(path_params or {})
+
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    template = None
+    for key, value in (integration.get("requestTemplates") or {}).items():
+        if key.split(";", 1)[0].strip().lower() == content_type:
+            template = value
+            break
+    vtl_context = {"authorizer": authorizer_context} if authorizer_context else {}
+    rendered = (_render_request_template_v1(template, body_str, params_map, vtl_context)
+                if template is not None else body_str)
+    form = dict(urllib.parse.parse_qsl(rendered, keep_blank_values=True))
+    action = form.get("Action", "")
+
+    accept = (_header_ci(headers, "accept") or "application/json")
+    accept = accept.split(",", 1)[0].split(";", 1)[0].strip().lower()
+
+    if not action:
+        backend_status, _h, xbody = _sqs_svc._xml_err_resp(
+            "MissingAction", "Missing Action parameter", 400)
+        backend_text = xbody.decode("utf-8", errors="replace")
+        return _service_integration_response(
+            integration, backend_status, backend_text, accept, params_map,
+            vtl_context)
+
+    qurl = (_sqs_svc._queue_name_to_url.get_scoped(account, region, queue_name)
+            or _sqs_svc._queue_url_for_account(account, queue_name))
+    data = _sqs_svc._normalise(action, form)
+    data["QueueUrl"] = qurl
+    try:
+        with request_scope(account, region):
+            result = await _sqs_svc._dispatch(action, data, qurl)
+        if action == "SendMessage":
+            # API Gateway receives SQS's Query reply as JSON.
+            backend_status = 200
+            backend_text = json.dumps({"SendMessageResponse": {
+                "ResponseMetadata": {"RequestId": new_uuid()},
+                "SendMessageResult": {
+                    "MD5OfMessageAttributes": result.get("MD5OfMessageAttributes"),
+                    "MD5OfMessageBody": result.get("MD5OfMessageBody"),
+                    "MD5OfMessageSystemAttributes": result.get("MD5OfMessageSystemAttributes"),
+                    "MessageId": result.get("MessageId"),
+                    "SequenceNumber": result.get("SequenceNumber"),
+                },
+            }})
+        else:
+            backend_status, _h, xbody = _sqs_svc._to_xml(action, result)
+            backend_text = xbody.decode("utf-8", errors="replace")
+    except _sqs_svc._Err as e:
+        backend_status, _h, xbody = _sqs_svc._xml_err_resp(
+            e.code, e.message, e.status)
+        backend_text = xbody.decode("utf-8", errors="replace")
+    except Exception:
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    return _service_integration_response(
+        integration, backend_status, backend_text, accept, params_map,
+            vtl_context)
+
+
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
     """Forward a request to an HTTP backend."""
     uri = integration.get("uri", "")
@@ -2302,29 +3429,47 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
         return status, resp_headers, resp_body
     except urllib.error.HTTPError as e:
         return e.code, {"Content-Type": "application/json"}, e.read()
-    except Exception as ex:
-        return 502, {"Content-Type": "application/json"}, json.dumps({"message": str(ex)}).encode()
+    except Exception:
+        # An unresolvable or unreachable backend.
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
 
 
 def _invoke_mock_v1(integration):
     """Return a MOCK integration response.
 
-    Selection: iterate integrationResponses in status-code order; the first
-    entry whose selectionPattern is empty (default) or matches "200" is used,
-    matching AWS behaviour for MOCK where the input is always treated as
-    successful (statusCode 200).
+    The request template's ``statusCode`` (200 when absent) is the integration
+    status: the response whose selectionPattern matches it is used, else an
+    explicit "200" entry, else the entry with an empty (default) pattern.
     """
     int_responses = integration.get("integrationResponses", {})
     if not int_responses:
         return 200, {"Content-Type": "application/json"}, b"{}"
 
-    # AWS selects the response whose selectionPattern matches the integration
-    # status code.  For MOCK the "status" is always 200 (success path).
+    template = (integration.get("requestTemplates") or {}).get("application/json") or ""
+    match = re.search(r'"statusCode"\s*:\s*(\d{3})', template)
+    status_code = match.group(1) if match else "200"
     selected = None
-    # Prefer an explicit "200" entry first
-    if "200" in int_responses:
+    matches = []
+    for resp in int_responses.values():
+        pattern = resp.get("selectionPattern")
+        try:
+            if pattern and re.fullmatch(pattern, status_code):
+                matches.append(resp)
+        except re.error:
+            continue
+    # Several patterns can match; the entry whose own status code is the
+    # integration status wins, so a catch-all on another entry does not
+    # shadow the exact one.
+    for resp in matches:
+        if str(resp.get("statusCode")) == status_code:
+            selected = resp
+            break
+    if selected is None and matches:
+        selected = matches[0]
+    if selected is None and "200" in int_responses:
+        # Prefer an explicit "200" entry
         selected = int_responses["200"]
-    else:
+    elif selected is None:
         # Fall back to the entry with an empty / catch-all selectionPattern
         for resp in int_responses.values():
             pattern = resp.get("selectionPattern", "")
@@ -2457,6 +3602,7 @@ def _delete_rest_api(api_id):
     _authorizers_v1.pop(api_id, None)
     _models.pop(api_id, None)
     _gateway_responses.pop(api_id, None)
+    _deployed_gateway_responses.pop(api_id, None)
     _documentation_parts.pop(api_id, None)
     _v1_tags.pop(_rest_api_arn(api_id), None)
     return 202, {}, b""
@@ -2469,6 +3615,103 @@ _OPENAPI_HTTP_METHODS = {
 }
 
 
+def _security_schemes(spec):
+    """Security schemes, from swagger 2.0 or OAS 3.0."""
+    schemes = spec.get("securityDefinitions")
+    if not isinstance(schemes, dict):
+        schemes = (spec.get("components") or {}).get("securitySchemes")
+    return schemes if isinstance(schemes, dict) else {}
+
+
+def _import_identity_source(scheme, extension):
+    """The ``method.request.*`` identity source a security scheme names.
+
+    A ``request`` authorizer carries its own ``identitySource``; the others
+    derive it from the scheme's ``name`` and ``in``, which is how SAM and the
+    console spell the header carrying the token."""
+    if extension.get("identitySource"):
+        return extension["identitySource"]
+    name = scheme.get("name") or "Authorization"
+    location = (scheme.get("in") or "header").lower()
+    prefix = "method.request.querystring." if location == "query" else "method.request.header."
+    return prefix + name
+
+
+def _import_security_schemes(api_id, spec):
+    """Create an authorizer per ``x-amazon-apigateway-authorizer`` scheme.
+
+    Returns a scheme name -> method authorization mapping; this is the only
+    mechanism by which SAM's ``Auth`` property reaches a method, since the
+    translator emits no AWS::ApiGateway::Authorizer resource."""
+    mapping = {}
+    for scheme_name, scheme in _security_schemes(spec).items():
+        if not isinstance(scheme, dict):
+            continue
+        extension = scheme.get("x-amazon-apigateway-authorizer")
+        auth_type = str(scheme.get("x-amazon-apigateway-authtype") or "").lower()
+        if not isinstance(extension, dict):
+            if auth_type == "awssigv4":
+                mapping[scheme_name] = {"authorizationType": "AWS_IAM"}
+            elif scheme.get("type") == "apiKey" and (scheme.get("name") or "").lower() == "x-api-key":
+                mapping[scheme_name] = {"apiKeyRequired": True}
+            continue
+        kind = str(extension.get("type") or "").lower()
+        data = {
+            "name": scheme_name,
+            "identitySource": _import_identity_source(scheme, extension),
+            "authType": auth_type or kind,
+        }
+        if kind == "cognito_user_pools":
+            data["type"] = "COGNITO_USER_POOLS"
+            data["providerARNs"] = extension.get("providerARNs") or []
+            method_auth = "COGNITO_USER_POOLS"
+        elif kind in ("token", "request"):
+            data["type"] = kind.upper()
+            data["authorizerUri"] = extension.get("authorizerUri", "")
+            data["authorizerCredentials"] = extension.get("authorizerCredentials")
+            data["identityValidationExpression"] = extension.get(
+                "identityValidationExpression", ""
+            )
+            if extension.get("authorizerResultTtlInSeconds") is not None:
+                data["authorizerResultTtlInSeconds"] = extension[
+                    "authorizerResultTtlInSeconds"
+                ]
+            method_auth = "CUSTOM"
+        else:
+            continue
+        _status, _headers, body = _create_authorizer(api_id, data)
+        if _status >= 400:
+            continue
+        mapping[scheme_name] = {
+            "authorizationType": method_auth,
+            "authorizerId": json.loads(body)["id"],
+        }
+    return mapping
+
+
+def _method_security(security, scheme_map):
+    """Resolve an operation's ``security`` list against the scheme map."""
+    data = {"authorizationType": "NONE"}
+    for requirement in security or []:
+        if not isinstance(requirement, dict):
+            continue
+        for scheme_name, scopes in requirement.items():
+            mapped = scheme_map.get(scheme_name)
+            if not mapped:
+                continue
+            if mapped.get("apiKeyRequired"):
+                data["apiKeyRequired"] = True
+                continue
+            if data["authorizationType"] != "NONE":
+                continue
+            data["authorizationType"] = mapped["authorizationType"]
+            if mapped.get("authorizerId"):
+                data["authorizerId"] = mapped["authorizerId"]
+            if isinstance(scopes, list) and scopes:
+                data["authorizationScopes"] = list(scopes)
+    return data
+
+
 def _import_rest_api(spec, base_data=None):
     data = dict(base_data or {})
     info = spec.get("info") or {}
@@ -2479,12 +3722,14 @@ def _import_rest_api(spec, base_data=None):
 
     _status, _headers, body = _create_rest_api(data)
     api_id = json.loads(body)["id"]
+    scheme_map = _import_security_schemes(api_id, spec)
+    default_security = spec.get("security")
     for path, path_item in (spec.get("paths") or {}).items():
-        _import_path_item(api_id, path, path_item)
+        _import_path_item(api_id, path, path_item, scheme_map, default_security)
     return api_id
 
 
-def _import_path_item(api_id, path, path_item):
+def _import_path_item(api_id, path, path_item, scheme_map=None, default_security=None):
     resource_id = next(
         rid for rid, res in _resources.get(api_id, {}).items()
         if res.get("path") == "/"
@@ -2506,11 +3751,17 @@ def _import_path_item(api_id, path, path_item):
 
     for method, operation in path_item.items():
         if method.lower() in _OPENAPI_HTTP_METHODS:
-            _import_operation(api_id, resource_id, method.upper(), operation)
+            _import_operation(api_id, resource_id, method.upper(), operation,
+                              scheme_map, default_security)
 
 
-def _import_operation(api_id, resource_id, http_method, operation):
-    _put_method(api_id, resource_id, http_method, {"authorizationType": "NONE"})
+def _import_operation(api_id, resource_id, http_method, operation,
+                      scheme_map=None, default_security=None):
+    security = (operation or {}).get("security")
+    if security is None:
+        security = default_security
+    _put_method(api_id, resource_id, http_method,
+                _method_security(security, scheme_map or {}))
 
     integration = (operation or {}).get("x-amazon-apigateway-integration")
     if integration:
@@ -2874,6 +4125,7 @@ def _put_method(api_id, resource_id, http_method, data):
         "operationName": data.get("operationName", ""),
         "requestParameters": data.get("requestParameters", {}),
         "requestModels": data.get("requestModels", {}),
+        "requestValidatorId": data.get("requestValidatorId"),
         "methodResponses": {},
         "methodIntegration": None,
     }
@@ -3102,6 +4354,11 @@ def _create_deployment(api_id, data):
         "apiSummary": _build_api_summary(api_id),
     }
     _deployments_v1.setdefault(api_id, {})[deployment_id] = deployment
+    # The data plane answers with the gateway responses of the stage's
+    # deployment: a Put or Delete takes effect with the next deployment only.
+    _deployed_gateway_responses.setdefault(api_id, {})[deployment_id] = copy.deepcopy(
+        _gateway_responses.get(api_id, {})
+    )
 
     # If stageName is provided, create/update the stage automatically
     stage_name = data.get("stageName")
@@ -3166,6 +4423,7 @@ def _delete_deployment(api_id, deployment_id):
     if deployment_id not in _deployments_v1.get(api_id, {}):
         return _v1_error("NotFoundException", "Invalid Deployment identifier specified", 404)
     _deployments_v1[api_id].pop(deployment_id, None)
+    _deployed_gateway_responses.get(api_id, {}).pop(deployment_id, None)
     return 202, {}, b""
 
 
@@ -3283,6 +4541,60 @@ def _delete_authorizer(api_id, auth_id):
 
 
 # ---- Control plane: Models ----
+
+def _create_request_validator(api_id, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    validator = {
+        "id": _new_id()[:6],
+        "name": data.get("name", ""),
+        "validateRequestBody": bool(data.get("validateRequestBody", False)),
+        "validateRequestParameters": bool(data.get("validateRequestParameters", False)),
+    }
+    _request_validators.setdefault(api_id, {})[validator["id"]] = validator
+    return _v1_response(validator, 201)
+
+
+def _get_request_validators(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(
+        list(_request_validators.get(api_id, {}).values()), query_params)
+
+
+def _get_request_validator(api_id, validator_id):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    return _v1_response(validator)
+
+
+def _update_request_validator(api_id, validator_id, data):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    for op in data.get("patchOperations", []) or []:
+        if op.get("op") != "replace":
+            continue
+        path = (op.get("path") or "").lstrip("/")
+        value = op.get("value")
+        if path == "name":
+            validator["name"] = value
+        elif path in ("validateRequestBody", "validateRequestParameters"):
+            validator[path] = str(value).lower() == "true"
+    return _v1_response(validator)
+
+
+def _delete_request_validator(api_id, validator_id):
+    validators = _request_validators.get(api_id, {})
+    if validator_id not in validators:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    del validators[validator_id]
+    return 204, {}, b""
+
 
 def _create_model(api_id, data):
     if api_id not in _rest_apis:
@@ -3454,6 +4766,31 @@ def _default_gateway_response(response_type):
     return response
 
 
+def _gateway_response_family(response_type):
+    """DEFAULT_4XX or DEFAULT_5XX by the type's default status (None for those two)."""
+    status_code = _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES.get(response_type)
+    if status_code is None:
+        return None
+    return "DEFAULT_5XX" if status_code.startswith("5") else "DEFAULT_4XX"
+
+
+def _gateway_response_for_type(customized, response_type):
+    """The gateway response in effect for ``response_type``.
+
+    A customized entry wins. An uncustomized type inherits the parameters and
+    templates of a customized DEFAULT_4XX / DEFAULT_5XX, keeps its own status
+    code and still reports ``defaultResponse: true``.
+    """
+    if response_type in customized:
+        return customized[response_type]
+    response = _default_gateway_response(response_type)
+    inherited = customized.get(_gateway_response_family(response_type))
+    if inherited:
+        response["responseParameters"] = dict(inherited.get("responseParameters") or {})
+        response["responseTemplates"] = dict(inherited.get("responseTemplates") or {})
+    return response
+
+
 def _validate_gateway_response_target(api_id, response_type):
     if api_id not in _rest_apis:
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
@@ -3484,7 +4821,9 @@ def _put_gateway_response(api_id, response_type, data):
     if status_code is not None:
         response["statusCode"] = str(status_code)
     response["responseParameters"] = dict(data.get("responseParameters") or {})
-    response["responseTemplates"] = dict(data.get("responseTemplates") or {})
+    # Without responseTemplates AWS stores the default application/json template.
+    if data.get("responseTemplates"):
+        response["responseTemplates"] = dict(data["responseTemplates"])
     _gateway_responses.setdefault(api_id, {})[response_type] = response
     return _v1_response(response, 201)
 
@@ -3493,8 +4832,9 @@ def _get_gateway_response(api_id, response_type):
     error = _validate_gateway_response_target(api_id, response_type)
     if error is not None:
         return error
-    response = _gateway_responses.get(api_id, {}).get(response_type)
-    return _v1_response(response or _default_gateway_response(response_type))
+    return _v1_response(
+        _gateway_response_for_type(_gateway_responses.get(api_id, {}), response_type)
+    )
 
 
 def _get_gateway_responses(api_id):
@@ -3502,7 +4842,7 @@ def _get_gateway_responses(api_id):
         return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
     customized = _gateway_responses.get(api_id, {})
     responses = [
-        customized.get(response_type) or _default_gateway_response(response_type)
+        _gateway_response_for_type(customized, response_type)
         for response_type in _GATEWAY_RESPONSE_TYPES
     ]
     # AWS returns the complete GatewayResponses collection and ignores the
@@ -3521,8 +4861,13 @@ def _delete_gateway_response(api_id, response_type):
 # ---- Control plane: API Keys ----
 
 def _create_api_key(data):
+    key_value = data.get("value")
+    if key_value is None:
+        key_value = new_uuid().replace("-", "")
+    elif len(str(key_value)) < 20:
+        return _v1_error("BadRequestException",
+                         "API Key value should be at least 20 characters", 400)
     key_id = _new_id()[:8]
-    key_value = new_uuid().replace("-", "")
     api_key = {
         "id": key_id,
         "name": data.get("name", ""),
@@ -3534,12 +4879,19 @@ def _create_api_key(data):
         "stageKeys": data.get("stageKeys", []),
         "tags": data.get("tags", {}),
     }
+    if data.get("customerId"):
+        api_key["customerId"] = data["customerId"]
     _api_keys[key_id] = api_key
     return _v1_response(api_key, 201)
 
 
 def _get_api_keys(query_params):
-    return _v1_paginated_response(list(_api_keys.values()), query_params)
+    keys = list(_api_keys.values())
+    name_query = _qp(query_params, "name")
+    if name_query:
+        # AWS returns the keys whose names start with nameQuery.
+        keys = [key for key in keys if key["name"].startswith(name_query)]
+    return _v1_paginated_response(keys, query_params)
 
 
 def _get_api_key(key_id):
@@ -3713,17 +5065,23 @@ def _create_base_path_mapping(domain_name, data):
     return _v1_response(mapping, 201)
 
 
+def _public_mapping(mapping):
+    """A base path mapping without the API Gateway v2 mapping id."""
+    return {k: v for k, v in mapping.items() if not k.startswith("_")}
+
+
 def _get_base_path_mappings(domain_name, query_params):
     if domain_name not in _domain_names:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    return _v1_paginated_response(list(_base_path_mappings.get(domain_name, {}).values()), query_params)
+    return _v1_paginated_response(
+        [_public_mapping(m) for m in _base_path_mappings.get(domain_name, {}).values()], query_params)
 
 
 def _get_base_path_mapping(domain_name, base_path):
     mapping = _base_path_mappings.get(domain_name, {}).get(base_path)
     if not mapping:
         return _v1_error("NotFoundException", "Invalid base path mapping identifier specified", 404)
-    return _v1_response(mapping)
+    return _v1_response(_public_mapping(mapping))
 
 
 def _delete_base_path_mapping(domain_name, base_path):

@@ -13,10 +13,12 @@ Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           TagResource, UntagResource, ListTagsForResource,
           PutDestination, DeleteDestination, DescribeDestinations,
           PutDestinationPolicy,
+          PutResourcePolicy, DescribeResourcePolicies, DeleteResourcePolicy,
           PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters,
           StartQuery, GetQueryResults, StopQuery,
           PutDeliverySource, GetDeliverySource, DeleteDeliverySource, DescribeDeliverySources,
           PutDeliveryDestination, GetDeliveryDestination, DeleteDeliveryDestination, DescribeDeliveryDestinations,
+          PutDeliveryDestinationPolicy, GetDeliveryDestinationPolicy, DeleteDeliveryDestinationPolicy,
           CreateDelivery, GetDelivery, DeleteDelivery, DescribeDeliveries.
 """
 
@@ -48,7 +50,6 @@ logger = logging.getLogger("logs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state
 
 _log_groups = AccountRegionScopedDict()
 # group_name -> {
@@ -65,6 +66,12 @@ _log_groups = AccountRegionScopedDict()
 # carries an ARN, so legacy account-scoped state migrates to its ARN's region.
 _destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
+
+_resource_policies = AccountRegionScopedDict()
+# policy_name -> {policyName, policyDocument, policyScope, lastUpdatedTime, revisionId}
+_log_group_policies = AccountRegionScopedDict()
+# log_group_name -> the one RESOURCE-scoped policy a log group can have
+_MAX_ACCOUNT_RESOURCE_POLICIES = 10
 
 _metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
@@ -109,6 +116,8 @@ def get_state():
     return {
         "log_groups": copy.deepcopy(_log_groups),
         "destinations": copy.deepcopy(_destinations),
+        "resource_policies": copy.deepcopy(_resource_policies),
+        "log_group_policies": copy.deepcopy(_log_group_policies),
         "metric_filters": copy.deepcopy(_metric_filters),
         "queries": copy.deepcopy(_queries),
         "log_records": copy.deepcopy(_log_records),
@@ -192,13 +201,15 @@ def _restore_queries(queries):
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _log_groups.update(data.get("log_groups", {}))
         _destinations.update(data.get("destinations", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
+        _log_group_policies.update(data.get("log_group_policies", {}))
         _restore_metric_filters(data.get("metric_filters", {}))
         _restore_queries(data.get("queries", {}))
         _log_records.update(data.get("log_records", {}))
@@ -207,15 +218,6 @@ def restore_state(data):
         _deliveries.update(data.get("deliveries", {}))
 
 
-try:
-    _restored = load_state("cloudwatch_logs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +319,9 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteDestination": _delete_destination,
         "DescribeDestinations": _describe_destinations,
         "PutDestinationPolicy": _put_destination_policy,
+        "PutResourcePolicy": _put_resource_policy,
+        "DescribeResourcePolicies": _describe_resource_policies,
+        "DeleteResourcePolicy": _delete_resource_policy,
         "PutMetricFilter": _put_metric_filter,
         "DeleteMetricFilter": _delete_metric_filter,
         "DescribeMetricFilters": _describe_metric_filters,
@@ -331,6 +336,9 @@ async def handle_request(method, path, headers, body, query_params):
         "GetDeliveryDestination": _get_delivery_destination,
         "DeleteDeliveryDestination": _delete_delivery_destination,
         "DescribeDeliveryDestinations": _describe_delivery_destinations,
+        "PutDeliveryDestinationPolicy": _put_delivery_destination_policy,
+        "GetDeliveryDestinationPolicy": _get_delivery_destination_policy,
+        "DeleteDeliveryDestinationPolicy": _delete_delivery_destination_policy,
         "CreateDelivery": _create_delivery,
         "GetDelivery": _get_delivery,
         "DeleteDelivery": _delete_delivery,
@@ -340,6 +348,10 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidOperationException", f"Unknown action: {action}", 400)
+    if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+        invalid = validate_tag_resource_arn(data.get("resourceArn", ""))
+        if invalid is not None:
+            return invalid
     return handler(data)
 
 
@@ -392,6 +404,7 @@ def _delete_log_group(data):
         )
     _forget_log_records_for_group(name)
     del _log_groups[name]
+    _log_group_policies.pop(name, None)
     return json_response({})
 
 
@@ -1459,24 +1472,55 @@ def _list_tags_log_group(data):
 # Tags – modern ARN-based APIs
 # ---------------------------------------------------------------------------
 
-def _resolve_tag_record_by_arn(arn: str):
-    """Resolve a logs ARN to the mutable dict holding its ``tags``. The
-    ARN-based tag operations accept log groups AND the vended-delivery trio
-    (delivery sources, delivery destinations, deliveries) — the AWS provider
-    reads tags back on every one of them after create."""
-    group = _resolve_group_by_arn(arn)
-    if group:
-        return _log_groups[group].setdefault("tags", {})
-    for marker, store in (
-        (":delivery-source:", _delivery_sources),
-        (":delivery-destination:", _delivery_destinations),
-        (":delivery:", _deliveries),
-    ):
-        if marker in arn:
-            record = store.get(arn.rsplit(":", 1)[-1])
-            if record is not None:
-                return record.setdefault("tags", {})
+def _tag_resource_identity(arn: str, account_id: str, region: str):
+    parsed = parse_arn(arn)
+    resource_type, _, name = parsed.resource.partition(":")
+    stores = {
+        "log-group": _log_groups,
+        "delivery-source": _delivery_sources,
+        "delivery-destination": _delivery_destinations,
+        "delivery": _deliveries,
+    }
+    pattern = r"[\w./#-]+" if resource_type == "log-group" else r"[\w.-]+"
+    if (parsed.partition != "aws" or parsed.service != "logs"
+            or parsed.account_id != account_id or parsed.region != region
+            or resource_type not in stores or not re.fullmatch(pattern, name, flags=re.ASCII)):
+        raise ArnParseError("Invalid resourceArn")
+    return stores[resource_type], resource_type, name
+
+
+def validate_tag_resource_arn(arn: str, *, account_id: str | None = None,
+                              region: str | None = None):
+    """Modern tag APIs validate scope and ARN shape before IAM policy checks."""
+    try:
+        _tag_resource_identity(arn, account_id or get_account_id(), region or get_region())
+    except ArnParseError:
+        # Observed on live Logs: lowercase message, JSON 1.1, no error header.
+        return json_response({"__type": "ValidationException", "message": "Invalid resourceArn"},
+                             400, content_type="application/x-amz-json-1.1")
     return None
+
+
+def resolve_tag_resource(arn: str, *, account_id: str | None = None,
+                         region: str | None = None):
+    """Use the same validated, scoped resource for IAM context and tag dispatch."""
+    account_id, region = account_id or get_account_id(), region or get_region()
+    try:
+        store, resource_type, name = _tag_resource_identity(arn, account_id, region)
+    except ArnParseError:
+        return None
+    record = store.get_scoped(account_id, region, name)
+    if record is None:
+        return None
+    stored_arn = record.get("arn", "")
+    if resource_type == "log-group":
+        stored_arn = stored_arn.removesuffix(":*")
+    return record if stored_arn == arn else None
+
+
+def _resolve_tag_record_by_arn(arn: str):
+    record = resolve_tag_resource(arn)
+    return record.setdefault("tags", {}) if record is not None else None
 
 
 def _tag_resource(data):
@@ -1576,6 +1620,106 @@ def _put_destination_policy(data):
             f"The specified destination does not exist: {name}", 400,
         )
     _destinations[name]["accessPolicy"] = policy
+    return json_response({})
+
+
+def _format_resource_policy(policy):
+    return {
+        "policyName": policy["policyName"],
+        "policyDocument": policy["policyDocument"],
+        "lastUpdatedTime": policy["lastUpdatedTime"],
+        "policyScope": policy.get("policyScope", "ACCOUNT"),
+        "resourceArn": policy.get("resourceArn"),
+        "revisionId": policy["revisionId"],
+    }
+
+
+def _revision_mismatch():
+    return error_response_json(
+        "OperationAbortedException",
+        "The revision id does not match the latest revision id.", 400,
+    )
+
+
+def _put_resource_policy(data):
+    name = data.get("policyName")
+    document = data.get("policyDocument")
+    if not name or not document:
+        return error_response_json(
+            "InvalidParameterException",
+            "policyName and policyDocument are required.", 400,
+        )
+    resource_arn = data.get("resourceArn")
+    expected_revision = data.get("expectedRevisionId")
+    policy = {
+        "policyName": name,
+        "policyDocument": document,
+        "lastUpdatedTime": int(time.time() * 1000),
+        "revisionId": new_uuid(),
+    }
+    if resource_arn:
+        # RESOURCE scope: one policy per existing log group, guarded by its revision.
+        group = _resolve_group_by_arn(resource_arn)
+        if group is None:
+            return error_response_json(
+                "ResourceNotFoundException", "The specified log group does not exist.", 400)
+        existing = _log_group_policies.get(group)
+        if (existing["revisionId"] if existing else None) != expected_revision:
+            return _revision_mismatch()
+        policy.update(policyScope="RESOURCE", resourceArn=resource_arn)
+        _log_group_policies[group] = policy
+    else:
+        existing = _resource_policies.get(name)
+        if expected_revision is not None and (not existing or existing["revisionId"] != expected_revision):
+            return _revision_mismatch()
+        if existing is None and len(_resource_policies) >= _MAX_ACCOUNT_RESOURCE_POLICIES:
+            return error_response_json(
+                "LimitExceededException",
+                f"Resource limit exceeded. An account can have at most "
+                f"{_MAX_ACCOUNT_RESOURCE_POLICIES} resource policies.", 400)
+        policy["policyScope"] = "ACCOUNT"
+        _resource_policies[name] = policy
+    return json_response({"resourcePolicy": _format_resource_policy(policy),
+                          "revisionId": policy["revisionId"]})
+
+
+def _describe_resource_policies(data):
+    resource_arn = data.get("resourceArn")
+    scope = data.get("policyScope") or "ACCOUNT"
+    if scope not in ("ACCOUNT", "RESOURCE"):
+        return error_response_json(
+            "InvalidParameterException", f"Invalid policyScope: {scope}", 400)
+    if resource_arn:
+        group = _resolve_group_by_arn(resource_arn)
+        found = _log_group_policies.get(group) if group else None
+        policies = [found] if found else []
+    elif scope == "RESOURCE":
+        policies = list(_log_group_policies.values())
+    else:
+        policies = list(_resource_policies.values())
+    return json_response({"resourcePolicies": [_format_resource_policy(p) for p in policies]})
+
+
+def _delete_resource_policy(data):
+    name = data.get("policyName")
+    resource_arn = data.get("resourceArn")
+    if resource_arn:
+        group = _resolve_group_by_arn(resource_arn)
+        existing = _log_group_policies.get(group) if group else None
+        if existing is None:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified resource policy does not exist: {name}", 400)
+        if data.get("expectedRevisionId") != existing["revisionId"]:
+            return _revision_mismatch()
+        del _log_group_policies[group]
+        return json_response({})
+    if not name or name not in _resource_policies:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"The specified resource policy does not exist: {name}", 400,
+        )
+    del _resource_policies[name]
     return json_response({})
 
 
@@ -2029,6 +2173,8 @@ def _stop_query(data):
 def reset():
     _log_groups.clear()
     _destinations.clear()
+    _resource_policies.clear()
+    _log_group_policies.clear()
     _metric_filters.clear()
     _queries.clear()
     _log_records.clear()
@@ -2323,6 +2469,47 @@ def _delete_delivery_destination(data):
 def _describe_delivery_destinations(data):
     dests = [_format_delivery_destination(d) for d in _delivery_destinations.values()]
     return json_response({"deliveryDestinations": dests})
+
+
+def _put_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    policy = data.get("deliveryDestinationPolicy")
+    if not name or not policy:
+        return error_response_json(
+            "ValidationException",
+            "deliveryDestinationName and deliveryDestinationPolicy are required.", 400,
+        )
+    dest = _delivery_destinations.get(name)
+    if not dest:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination does not exist: {name}", 400,
+        )
+    dest["policy"] = policy
+    return json_response({"policy": {"deliveryDestinationPolicy": policy}})
+
+
+def _get_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    dest = _delivery_destinations.get(name)
+    if not dest or not dest.get("policy"):
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination policy does not exist: {name}", 400,
+        )
+    return json_response({"policy": {"deliveryDestinationPolicy": dest["policy"]}})
+
+
+def _delete_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    dest = _delivery_destinations.get(name)
+    if not dest or not dest.get("policy"):
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination policy does not exist: {name}", 400,
+        )
+    del dest["policy"]
+    return json_response({})
 
 
 def _create_delivery(data):

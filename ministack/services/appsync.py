@@ -30,7 +30,6 @@ import threading
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -66,19 +65,6 @@ _caches = AccountRegionScopedDict()           # apiId -> ApiCache record
 _cache_entries: dict = {}
 _cache_entries_lock = threading.Lock()
 _tags = AccountScopedDict()            # resource_arn -> {key: value}
-
-# ---------------------------------------------------------------------------
-# Persistence
-# ---------------------------------------------------------------------------
-
-def _load_persisted():
-    if not PERSIST_STATE:
-        return
-    data = load_state("appsync")
-    if data:
-        restore_state(data)
-        logger.info("Loaded persisted state for appsync")
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1258,10 +1244,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     """Restore state from persisted data."""
     reset()
     _apis.update(data.get("apis", {}))
@@ -2447,21 +2433,21 @@ def _ddb_put_item(table, table_name, args):
     if not isinstance(table["items"], defaultdict):
         table["items"] = defaultdict(dict, table["items"])
 
-    table["items"][pk_val][sk_val] = ddb_item
-    table["ItemCount"] = sum(len(v) for v in table["items"].values())
+    _ddb._set_item(table, pk_val, sk_val, ddb_item)
 
     return _strip_ddb_types(ddb_item, [])
 
 
 def _ddb_update_item(table, table_name, args):
     """Update an existing item — merge input fields."""
+    import ministack.services.dynamodb as _ddb
     input_data = args.get("input", args)
     pk_name = table["pk_name"]
     pk_val = str(input_data.get("id") or input_data.get(pk_name, ""))
 
     if pk_val in table["items"]:
         sk = next(iter(table["items"][pk_val]), "")
-        existing = table["items"][pk_val].get(sk, {})
+        existing = dict(table["items"][pk_val].get(sk, {}))
         for k, v in input_data.items():
             if isinstance(v, str):
                 existing[k] = {"S": v}
@@ -2469,21 +2455,22 @@ def _ddb_update_item(table, table_name, args):
                 existing[k] = {"N": str(v)}
             elif isinstance(v, bool):
                 existing[k] = {"BOOL": v}
+        if sk in table["items"][pk_val]:
+            _ddb._set_item(table, pk_val, sk, existing)
         return _strip_ddb_types(existing, [])
     return None
 
 
 def _ddb_delete_item(table, table_name, args):
     """Delete an item and return it."""
+    import ministack.services.dynamodb as _ddb
     input_data = args.get("input", args)
     pk_name = table["pk_name"]
     pk_val = str(input_data.get("id") or input_data.get(pk_name, ""))
 
     if pk_val in table["items"]:
         sk = next(iter(table["items"][pk_val]), "")
-        item = table["items"][pk_val].pop(sk, None)
-        if not table["items"][pk_val]:
-            table["items"].pop(pk_val, None)
+        item = _ddb._remove_item(table, pk_val, sk)
         if item:
             return _strip_ddb_types(item, [])
     return None
@@ -2579,6 +2566,3 @@ def _resolve_lambda(api_id, resolver, data_source, args,
             logger.error("Invalid JSON from Lambda %s", func_name)
             return {"errors": ["Invalid response format"]}
     return {"errors": ["Unexpected response type"]}
-
-# Load persisted state (must be after restore_state is defined)
-_load_persisted()

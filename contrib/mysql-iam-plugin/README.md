@@ -3,10 +3,21 @@
 This directory contains MiniStack's server-side compatibility plugin for
 Aurora MySQL users declared with `AWSAuthenticationPlugin`.
 
-The initial L0 implementation deliberately rejects every login, matching
-MySQL's `mysql_no_login` behavior. It supports provider workflows that create,
-alter, grant, revoke, inspect, and drop IAM-authenticated users without
-pretending that local IAM token validation exists.
+Like AWS's plugin, it asks the client for `mysql_clear_password` and reads the
+RDS IAM token as the password, so the `mysql` client needs
+`--enable-cleartext-plugin`. The plugin POSTs the user and token to MiniStack's
+broker (`/_ministack/rds/iam-auth`) using the address and per-resource
+capability MiniStack writes to `/etc/ministack/rds-iam.conf` when the container
+is ready. It accepts only an explicit allow; a missing config, a timeout or a
+malformed answer denies, and MySQL returns its own `1045 Access denied`.
+
+The broker always requires `IAMDatabaseAuthenticationEnabled` on the instance or
+cluster. With `AUTH=true` it also verifies the token and evaluates
+`rds-db:connect`. Password users, TLS (`REQUIRE SSL`), account locks and grants
+stay MySQL's own. The broker call is plain HTTP, so IAM logins fail closed when
+MiniStack serves HTTPS only (`USE_SSL=1`).
+
+## Bundled compatibility artifact
 
 The same C++ source is compiled separately against MySQL 8.0 and 8.4 headers.
 MySQL checks the authentication-plugin interface version when the library is

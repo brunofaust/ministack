@@ -6,12 +6,13 @@ import os
 import time
 import uuid as _uuid_mod
 import zipfile
+from contextlib import contextmanager
 
 import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from conftest import ENDPOINT, LoopProbe, concurrent_burst
+from conftest import ENDPOINT, LoopProbe, concurrent_burst, sqs_policy_allow_sns
 
 
 def _make_zip(code: str) -> bytes:
@@ -352,6 +353,10 @@ def test_sfn_stop_execution_v2(sfn):
     sfn.stop_execution(executionArn=ex["executionArn"], error="UserAbort", cause="test stop")
     desc = sfn.describe_execution(executionArn=ex["executionArn"])
     assert desc["status"] == "ABORTED"
+    assert (desc["error"], desc["cause"]) == ("UserAbort", "test stop")
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    aborted = next(e for e in events if e["type"] == "ExecutionAborted")
+    assert aborted["executionAbortedEventDetails"] == {"error": "UserAbort", "cause": "test stop"}
 
 def test_sfn_get_execution_history_v2(sfn):
     definition = json.dumps(
@@ -381,6 +386,125 @@ def test_sfn_get_execution_history_v2(sfn):
     assert "ExecutionStarted" in types
     assert "ExecutionSucceeded" in types
     assert any("Pass" in t for t in types)
+
+
+def test_sfn_get_execution_history_pagination(sfn):
+    states = {
+        f"P{i}": {"Type": "Pass", **({"End": True} if i == 14 else {"Next": f"P{i + 1}"})}
+        for i in range(15)
+    }
+    sm = sfn.create_state_machine(
+        name=f"sfn-history-pages-{_uuid_mod.uuid4().hex}",
+        definition=json.dumps({"StartAt": "P0", "States": states}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input='{"secret":"value"}')
+    assert _wait_sfn(sfn, ex["executionArn"])["status"] == "SUCCEEDED"
+
+    arn = ex["executionArn"]
+    full = sfn.get_execution_history(executionArn=arn)["events"]
+    assert len(full) > 25
+    assert full[-1]["type"] == "ExecutionSucceeded"
+
+    pages = []
+    token = None
+    while True:
+        request = {"executionArn": arn, "maxResults": 7}
+        if token is not None:
+            request["nextToken"] = token
+        page = sfn.get_execution_history(**request)
+        pages.append(page)
+        token = page.get("nextToken")
+        if token is None:
+            break
+    assert len(pages) > 2
+    assert all(len(page["events"]) == 7 for page in pages[:-1])
+    assert [event["id"] for page in pages for event in page["events"]] == [event["id"] for event in full]
+    assert "nextToken" not in pages[-1]
+
+    first_25 = sfn.get_execution_history(executionArn=arn, maxResults=25)
+    assert all(event["type"] != "ExecutionSucceeded" for event in first_25["events"])
+    assert "nextToken" in first_25
+    last = sfn.get_execution_history(executionArn=arn, maxResults=25, nextToken=first_25["nextToken"])
+    assert last["events"][-1]["type"] == "ExecutionSucceeded"
+    assert "nextToken" not in last
+
+    reverse = []
+    token = None
+    while True:
+        request = {"executionArn": arn, "maxResults": 7, "reverseOrder": True}
+        if token is not None:
+            request["nextToken"] = token
+        page = sfn.get_execution_history(**request)
+        reverse.extend(page["events"])
+        token = page.get("nextToken")
+        if token is None:
+            break
+    assert [event["id"] for event in reverse] == [event["id"] for event in reversed(full)]
+
+    without_data = sfn.get_execution_history(executionArn=arn, maxResults=7, includeExecutionData=False)
+    assert "nextToken" in without_data
+    without_data_next = sfn.get_execution_history(
+        executionArn=arn, maxResults=7, includeExecutionData=False, nextToken=without_data["nextToken"]
+    )
+    assert [event["id"] for event in without_data_next["events"]] == [event["id"] for event in pages[1]["events"]]
+    assert "input" not in without_data["events"][0]["executionStartedEventDetails"]
+    for event in without_data["events"]:
+        for key, details in event.items():
+            if key.endswith("EventDetails") and isinstance(details, dict):
+                assert "input" not in details
+                assert "output" not in details
+    assert full[0]["executionStartedEventDetails"]["input"] == '{"secret":"value"}'
+    assert sfn.get_execution_history(executionArn=arn, maxResults=0)["events"] == full
+
+
+def test_sfn_get_execution_history_rejects_unrelated_and_forged_tokens(sfn):
+    sm = sfn.create_state_machine(
+        name=f"sfn-history-token-{_uuid_mod.uuid4().hex}",
+        definition=_pass_definition(),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    first = sfn.start_execution(stateMachineArn=sm["stateMachineArn"])
+    second = sfn.start_execution(stateMachineArn=sm["stateMachineArn"])
+    assert _wait_sfn(sfn, first["executionArn"])["status"] == "SUCCEEDED"
+    assert _wait_sfn(sfn, second["executionArn"])["status"] == "SUCCEEDED"
+    page = sfn.get_execution_history(executionArn=first["executionArn"], maxResults=1)
+    token = page["nextToken"]
+
+    for request in (
+        {"executionArn": second["executionArn"], "maxResults": 1, "nextToken": token},
+        {"executionArn": first["executionArn"], "maxResults": 1, "nextToken": "1"},
+        {"executionArn": first["executionArn"], "maxResults": 2, "nextToken": token},
+        {"executionArn": first["executionArn"], "maxResults": 1, "reverseOrder": True, "nextToken": token},
+        {"executionArn": first["executionArn"], "maxResults": 1, "includeExecutionData": False, "nextToken": token},
+    ):
+        with pytest.raises(ClientError) as exc:
+            sfn.get_execution_history(**request)
+        assert exc.value.response["Error"]["Code"] == "InvalidToken"
+
+
+def test_sfn_get_execution_history_reverse_pages_ignore_new_events(sfn):
+    sm = sfn.create_state_machine(
+        name=f"sfn-history-running-{_uuid_mod.uuid4().hex}",
+        definition=json.dumps({"StartAt": "Wait", "States": {"Wait": {"Type": "Wait", "Seconds": 120, "End": True}}}),
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    arn = sfn.start_execution(stateMachineArn=sm["stateMachineArn"])["executionArn"]
+    for _ in range(50):
+        page = sfn.get_execution_history(executionArn=arn, reverseOrder=True, maxResults=1)
+        if page["events"][0]["type"] == "WaitStateEntered" and "nextToken" in page:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("running execution did not enter Wait state")
+
+    sfn.stop_execution(executionArn=arn)
+    next_page = sfn.get_execution_history(
+        executionArn=arn, reverseOrder=True, maxResults=1, nextToken=page["nextToken"]
+    )
+    assert [event["type"] for event in next_page["events"]] == ["ExecutionStarted"]
+    assert "nextToken" not in next_page
+
 
 def test_sfn_tags_v2(sfn):
     definition = json.dumps(
@@ -1356,6 +1480,9 @@ def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
         "SubnetIds": [f"subnet-{suffix}"],
         "SecurityGroupIds": [f"sg-{suffix}"],
     }
+    # This dispatch test uses an uncreated subnet. Lambda cannot resolve its
+    # VPC, so the response has the empty read-only VpcId field.
+    response_vpc_config = {**vpc_config, "VpcId": ""}
     create_zip = _make_zip_b64("def handler(e, c): return {'version': 1}")
     update_zip = _make_zip_b64("def handler(e, c): return {'version': 2}")
     sm_arn = None
@@ -1469,7 +1596,7 @@ def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
         assert output["createResult"]["FunctionArn"] == function_arn
         assert output["createResult"]["Version"] == "1"
         assert output["createResult"]["KmsKeyArn"] == kms_key_arn
-        assert output["createResult"]["VpcConfig"] == vpc_config
+        assert output["createResult"]["VpcConfig"] == response_vpc_config
         assert output["updateConfigurationResult"]["Timeout"] == 30
         assert output["publishedFunction"]["FunctionArn"] == function_arn
         assert output["publishedFunction"]["Version"] == "2"
@@ -1482,7 +1609,7 @@ def test_sfn_aws_sdk_lambda_write_actions_and_pascal_outputs(sfn_sync, lam):
         assert output["config"]["State"] == "Active"
         assert output["config"]["LastUpdateStatus"] == "Successful"
         assert output["config"]["KmsKeyArn"] == kms_key_arn
-        assert output["config"]["VpcConfig"] == vpc_config
+        assert output["config"]["VpcConfig"] == response_vpc_config
     finally:
         if sm_arn:
             sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
@@ -3302,6 +3429,141 @@ def test_sfn_integration_sqs_send_message_wait_for_task_token(sfn, sqs):
     desc = _wait_sfn(sfn, ex["executionArn"])
     assert desc["status"] == "SUCCEEDED"
 
+
+def test_sfn_task_timeout_seconds_applies_to_lambda_invoke(sfn, lam):
+    """A Lambda task that runs longer than TimeoutSeconds fails with States.Timeout."""
+    fn = f"sfn-task-timeout-{_uuid_mod.uuid4().hex[:8]}"
+    code = "import time\ndef handler(event, context):\n    time.sleep(3)\n    return 'done'\n"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)}, Timeout=10,
+    )
+    definition = json.dumps({
+        "StartAt": "Call",
+        "States": {
+            "Call": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": fn, "Payload": {}},
+                "TimeoutSeconds": 1,
+                "Catch": [{"ErrorEquals": ["States.Timeout"], "Next": "TimedOut"}],
+                "End": True,
+            },
+            "TimedOut": {"Type": "Pass", "Result": "timed-out", "End": True},
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=fn, definition=definition, roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == "timed-out"
+
+
+def test_sfn_task_failed_does_not_match_states_timeout(sfn, sqs):
+    """States.TaskFailed matches every error except States.Timeout, in Retry and in Catch."""
+    queue_url = sqs.create_queue(QueueName="sfn-taskfailed-timeout")["QueueUrl"]
+    definition = json.dumps({
+        "StartAt": "Wait",
+        "States": {
+            "Wait": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sqs:sendMessage.waitForTaskToken",
+                "Parameters": {"QueueUrl": queue_url, "MessageBody": {"token.$": "$$.Task.Token"}},
+                "TimeoutSeconds": 1,
+                "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 1, "MaxAttempts": 1}],
+                "Catch": [
+                    {"ErrorEquals": ["States.TaskFailed"], "Next": "CaughtAsTaskFailed"},
+                    {"ErrorEquals": ["States.Timeout"], "Next": "CaughtAsTimeout"},
+                ],
+                "End": True,
+            },
+            "CaughtAsTaskFailed": {"Type": "Pass", "Result": "task-failed", "End": True},
+            "CaughtAsTimeout": {"Type": "Pass", "Result": "timeout", "End": True},
+        },
+    })
+    sm = sfn.create_state_machine(
+        name="sfn-taskfailed-timeout", definition=definition, roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == "timeout"
+    events = sfn.get_execution_history(executionArn=ex["executionArn"])["events"]
+    assert [e["type"] for e in events].count("TaskScheduled") == 1
+
+
+def test_sfn_task_parameters_see_state_retry_count(sfn, lam):
+    """$$.State.RetryCount is 0 on a state's first attempt and counts its retries (a Task's or a Parallel's);
+    the next state starts at 0."""
+    fn = f"sfn-retry-count-{time.time_ns()}"
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip(
+            "def handler(e, c):\n"
+            "    if e['fail_until'] > e['retry_count']: raise Exception(str(e['retry_count']))\n"
+            "    return e['retry_count']\n")},
+    )
+    arn = lam.get_function(FunctionName=fn)["Configuration"]["FunctionArn"]
+
+    retry = [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 1, "MaxAttempts": 2}]
+
+    def task(fail_until, result_path, nxt):
+        return {"Type": "Task", "Resource": arn, "ResultPath": result_path,
+                "Parameters": {"fail_until": fail_until, "retry_count.$": "$$.State.RetryCount"}, "Retry": retry, **nxt}
+
+    sm = sfn.create_state_machine(
+        name=fn, roleArn="arn:aws:iam::000000000000:role/R",
+        definition=json.dumps({"StartAt": "Retried", "States": {
+            "Retried": task(1, "$.retried", {"Next": "Parallel"}),
+            "Parallel": {"Type": "Parallel", "ResultPath": "$.parallel", "Retry": retry, "Next": "Next",
+                         "Parameters": {"fail_until": 1, "retry_count.$": "$$.State.RetryCount"},
+                         "Branches": [{"StartAt": "Call", "States": {"Call": {"Type": "Task", "Resource": arn, "End": True}}}]},
+            "Next": task(0, "$.next", {"End": True}),
+        }}),
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input="{}")
+
+    desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+    assert desc["status"] == "SUCCEEDED", desc.get("cause")
+    assert json.loads(desc["output"]) == {"retried": 1, "parallel": [1], "next": 0}
+
+
+_SFN_FAIL_BRANCH = {"StartAt": "F", "States": {"F": {"Type": "Fail", "Error": "MyErr", "Cause": "c"}}}
+
+
+@pytest.mark.parametrize("state", [
+    {"Type": "Parallel", "Branches": [_SFN_FAIL_BRANCH]},
+    {"Type": "Map", "ItemsPath": "$.xs", "ItemProcessor": _SFN_FAIL_BRANCH},
+], ids=["parallel", "map"])
+def test_sfn_parallel_and_map_apply_retry_and_catch(sfn, state):
+    """A failed branch or iteration fails the state with its error, which the state's Retry and Catch handle."""
+    definition = json.dumps({
+        "StartAt": "S",
+        "States": {
+            "S": {
+                **state,
+                "Retry": [{"ErrorEquals": ["MyErr"], "IntervalSeconds": 1, "MaxAttempts": 1}],
+                "Catch": [{"ErrorEquals": ["MyErr"], "ResultPath": "$.err", "Next": "Caught"}],
+                "End": True,
+            },
+            "Caught": {"Type": "Pass", "End": True},
+        },
+    })
+    sm = sfn.create_state_machine(
+        name=f"sfn-{state['Type'].lower()}-catch-{_uuid_mod.uuid4().hex[:8]}", definition=definition,
+        roleArn="arn:aws:iam::000000000000:role/R",
+    )
+    ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"], input='{"xs": [1]}')
+
+    desc = _wait_sfn(sfn, ex["executionArn"])
+    assert desc["status"] == "SUCCEEDED"
+    assert json.loads(desc["output"]) == {"xs": [1], "err": {"Error": "MyErr", "Cause": "c"}}
+
+
 def test_sfn_integration_lambda_invoke_wait_for_task_token(sfn, lam):
     """lambda:invoke.waitForTaskToken must deliver the *unwrapped* Payload to
     the handler, exactly like the synchronous lambda:invoke path.
@@ -3427,6 +3689,9 @@ def test_sfn_integration_sns_publish_structured_payload(sfn, sns, sqs):
         QueueUrl=q_url,
         AttributeNames=["QueueArn"],
     )["Attributes"]["QueueArn"]
+    sqs.set_queue_attributes(
+        QueueUrl=q_url,
+        Attributes={"Policy": json.dumps(sqs_policy_allow_sns(q_arn, topic_arn))})
     sns.subscribe(TopicArn=topic_arn, Protocol="sqs", Endpoint=q_arn)
 
     definition = json.dumps(
@@ -3648,6 +3913,41 @@ def test_sfn_integration_lambda_invoke_failure_cause_is_json(sfn, lam):
     cause = json.loads(cause_raw)
     assert cause.get("errorType"), cause
     assert cause["errorMessage"] == "widget exploded", cause
+
+
+def test_sfn_lambda_task_returning_none_outputs_null(sfn, lam):
+    """A function that returns None yields the JSON text null, which is the
+    Task result: [null, null, null] out of a Map, and Payload null through the
+    optimized lambda:invoke integration."""
+    import uuid as _uuid
+
+    fn = f"sfn-returns-none-{_uuid.uuid4().hex[:8]}"
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler",
+                        Code={"ZipFile": _make_zip("def handler(event, context):\n    return None\n")})
+    func_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fn}"
+    definitions = {
+        "map": ({"StartAt": "Fanout", "States": {"Fanout": {
+            "Type": "Map", "ItemsPath": "$.items", "End": True,
+            "ItemProcessor": {"ProcessorConfig": {"Mode": "INLINE"}, "StartAt": "Call",
+                              "States": {"Call": {"Type": "Task", "Resource": func_arn, "End": True}}}}}},
+                [None, None, None]),
+        "invoke": ({"StartAt": "Call", "States": {"Call": {
+            "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {"FunctionName": func_arn, "Payload": {}},
+            "OutputPath": "$.Payload", "End": True}}},
+                   None),
+    }
+    for label, (definition, expected) in definitions.items():
+        sm = sfn.create_state_machine(name=f"sfn-null-{label}-{_uuid.uuid4().hex[:8]}",
+                                      definition=json.dumps(definition), roleArn=_LAMBDA_ROLE)
+        ex = sfn.start_execution(stateMachineArn=sm["stateMachineArn"],
+                                 input=json.dumps({"items": [1, 2, 3]}))
+        desc = _wait_sfn(sfn, ex["executionArn"], timeout=30)
+        assert desc["status"] == "SUCCEEDED", (label, desc)
+        assert json.loads(desc["output"]) == expected, label
+        sfn.delete_state_machine(stateMachineArn=sm["stateMachineArn"])
+    lam.delete_function(FunctionName=fn)
 
 
 def test_sfn_integration_ecs_run_task(sfn, ecs):
@@ -4351,6 +4651,35 @@ def test_sfn_stop_execution(sfn):
     sfn.stop_execution(executionArn=exec_arn, cause="test stop")
     desc = sfn.describe_execution(executionArn=exec_arn)
     assert desc["status"] == "ABORTED"
+
+def test_sfn_stop_execution_retry_preserves_abort(sfn):
+    """A retry after a lost StopExecution response must not rewrite the abort."""
+    name = f"stop-retry-{_uuid_mod.uuid4().hex[:12]}"
+    machine = sfn.create_state_machine(
+        name=name,
+        definition=json.dumps({"StartAt": "Wait", "States": {
+            "Wait": {"Type": "Wait", "Seconds": 3600, "End": True},
+        }}),
+        roleArn=_LAMBDA_ROLE,
+    )["stateMachineArn"]
+    try:
+        execution = sfn.start_execution(stateMachineArn=machine)["executionArn"]
+        first = sfn.stop_execution(executionArn=execution, error="FirstError", cause="first cause")
+        before = sfn.describe_execution(executionArn=execution)
+        before.pop("ResponseMetadata")
+        history = sfn.get_execution_history(executionArn=execution)["events"]
+        retry = sfn.stop_execution(executionArn=execution, error="RetryError", cause="retry cause")
+        assert retry["stopDate"] == first["stopDate"]
+        after = sfn.describe_execution(executionArn=execution)
+        after.pop("ResponseMetadata")
+        assert after == before
+        assert sfn.get_execution_history(executionArn=execution)["events"] == history
+        assert before["status"] == "ABORTED"
+        assert before["error"] == "FirstError"
+        assert before["cause"] == "first cause"
+    finally:
+        sfn.delete_state_machine(stateMachineArn=machine)
+
 
 def test_sfn_list_executions_filter(sfn):
     """ListExecutions with statusFilter returns only matching executions."""
@@ -5120,6 +5449,7 @@ def test_sfn_aws_sdk_query_pascal_case(sfn, sfn_sync, ssm):
     ssm.delete_parameter(Name="sfn-pascal-test-param")
 
 
+@pytest.mark.data_plane
 def test_sfn_aws_sdk_ssm_run_command_probe(sfn, sfn_sync, ec2):
     """The health-probe shape: sendCommand, then getCommandInvocation on the id it returned."""
     try:
@@ -8280,3 +8610,266 @@ def test_numeric_equals_path_still_works():
     data = {"value": 7, "expected": 7}
     assert _evaluate_rule({"Variable": "$.value", "NumericEqualsPath": "$.expected"}, data)
     assert not _evaluate_rule({"Variable": "$.value", "NumericEqualsPath": "$.other"}, {"value": 7, "other": 8})
+
+
+# --- Secrets Manager SecretBinary at the SDK integration boundary ---
+
+@contextmanager
+def _machine(sfn, start, states):
+    arn = sfn.create_state_machine(
+        name=f"sfn-binary-{_uuid_mod.uuid4().hex}",
+        roleArn="arn:aws:iam::000000000000:role/R",
+        type="STANDARD",
+        definition=json.dumps({"StartAt": start, "States": states}),
+        loggingConfiguration={"level": "OFF", "includeExecutionData": False},
+    )["stateMachineArn"]
+    try:
+        yield arn
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def _run(sfn, arn, data):
+    execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps(data))["executionArn"]
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            result = sfn.describe_execution(executionArn=execution)
+            if result["status"] != "RUNNING":
+                assert result["status"] == "SUCCEEDED", result
+                return json.loads(result["output"])
+            time.sleep(0.05)
+        pytest.fail("synthetic execution timed out")
+    finally:
+        if sfn.describe_execution(executionArn=execution)["status"] == "RUNNING":
+            sfn.stop_execution(executionArn=execution)
+
+
+_READ_STATES = {
+    "Read": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::aws-sdk:secretsmanager:getSecretValue",
+        "Parameters": {"SecretId.$": "$.secretId"},
+        "End": True,
+    },
+}
+_WRITE_STATES = {
+    "Create": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::aws-sdk:secretsmanager:createSecret",
+        "Parameters": {"Name.$": "$.secretId", "SecretBinary.$": "$.binary"},
+        "ResultPath": None,
+        "Next": "Put",
+    },
+    "Put": {
+        "Type": "Task",
+        "Resource": "arn:aws:states:::aws-sdk:secretsmanager:putSecretValue",
+        "Parameters": {
+            "SecretId.$": "$.secretId",
+            "SecretBinary.$": "$.updatedBinary",
+            "VersionStages": ["AWSPENDING"],
+        },
+        "End": True,
+    },
+}
+
+
+@pytest.mark.parametrize("value", [
+    pytest.param("abcdefghijklmnop", id="base64-invalid-utf8"),
+    pytest.param("cmF3cGFzc3dvcmQ=", id="base64-valid-utf8"),
+    pytest.param("not-base64!", id="non-base64"),
+    pytest.param("quote'and\\slash", id="sql-metacharacters"),
+])
+def test_sfn_secret_binary_read_is_raw_text(sfn, sm, value):
+    name = f"sfn-binary-{_uuid_mod.uuid4().hex}"
+    created = sm.create_secret(Name=name, SecretBinary=value.encode("utf-8"))
+    try:
+        before = sm.get_secret_value(SecretId=name)
+        assert before["SecretBinary"] == value.encode("utf-8")
+        with _machine(sfn, "Read", _READ_STATES) as arn:
+            result = _run(sfn, arn, {"secretId": name})
+        assert result["SecretBinary"] == value
+        assert result["SecretBinary"] != base64.b64encode(before["SecretBinary"]).decode("ascii")
+        assert result["VersionId"] == created["VersionId"]
+        assert "SecretString" not in result
+        after = sm.get_secret_value(SecretId=name)
+        assert after["SecretBinary"] == before["SecretBinary"]
+        assert after["VersionId"] == before["VersionId"]
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+@pytest.mark.parametrize("representation", ["raw", "base64"])
+def test_sfn_secret_binary_writes_store_supplied_text(sfn, sm, representation):
+    name = f"sfn-binary-{_uuid_mod.uuid4().hex}"
+    original, updated = "abcdefghijklmnop", "not-base64!-updated"
+    if representation == "base64":
+        supplied = base64.b64encode(original.encode()).decode("ascii")
+        supplied_update = base64.b64encode(updated.encode()).decode("ascii")
+    else:
+        supplied, supplied_update = original, updated
+    try:
+        with _machine(sfn, "Create", _WRITE_STATES) as arn:
+            result = _run(sfn, arn, {
+                "secretId": name, "binary": supplied, "updatedBinary": supplied_update,
+            })
+        current = sm.get_secret_value(SecretId=name, VersionStage="AWSCURRENT")
+        pending = sm.get_secret_value(SecretId=name, VersionStage="AWSPENDING")
+        assert current["SecretBinary"] == supplied.encode("utf-8")
+        assert pending["SecretBinary"] == supplied_update.encode("utf-8")
+        assert (current["SecretBinary"] == original.encode()) == (representation == "raw")
+        assert (pending["SecretBinary"] == updated.encode()) == (representation == "raw")
+        assert current["VersionId"] != pending["VersionId"]
+        assert pending["VersionId"] == result["VersionId"]
+        assert current["VersionStages"] == ["AWSCURRENT"]
+        assert pending["VersionStages"] == ["AWSPENDING"]
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_sfn_secret_string_is_not_transformed(sfn, sm):
+    name = f"sfn-binary-{_uuid_mod.uuid4().hex}"
+    value = '{"password":"cmF3cGFzc3dvcmQ="}'
+    sm.create_secret(Name=name, SecretString=value)
+    try:
+        with _machine(sfn, "Read", _READ_STATES) as arn:
+            result = _run(sfn, arn, {"secretId": name})
+        assert result["SecretString"] == value
+        assert "SecretBinary" not in result
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_direct_secret_binary_sdk_keeps_arbitrary_bytes(sm):
+    """The HTTP API must still base64-encode binary, including non-UTF-8 bytes."""
+    name = f"sfn-binary-{_uuid_mod.uuid4().hex}"
+    value = bytes(range(256))
+    sm.create_secret(Name=name, SecretBinary=value)
+    try:
+        assert sm.get_secret_value(SecretId=name)["SecretBinary"] == value
+        updated = sm.put_secret_value(SecretId=name, SecretBinary=value[::-1])
+        result = sm.get_secret_value(SecretId=name)
+        assert result["SecretBinary"] == value[::-1]
+        assert result["VersionId"] == updated["VersionId"]
+    finally:
+        sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+@pytest.mark.parametrize(
+    'rule',
+    [
+        {'Variable': '$$.Execution.Input.marker', 'IsPresent': True},
+        {'Variable': '$$.Execution.Input.missing', 'IsPresent': False},
+        {'Variable': '$$.Execution.Input.marker', 'StringEquals': 'keep'},
+        {'And': [
+            {'Variable': '$$.Execution.Input.marker', 'IsPresent': True},
+            {'Or': [
+                {'Variable': '$.marker', 'StringEquals': 'wrong'},
+                {'Not': {'Variable': '$$.Execution.Input.marker', 'StringEquals': 'wrong'}},
+            ]},
+        ]},
+        {'Variable': '$.marker', 'StringEqualsPath': '$$.Execution.Input.marker'},
+        {'Variable': '$$.Execution.Input.marker', 'StringEqualsPath': '$.marker'},
+        {'Variable': '$$.Execution.Input.marker', 'StringEqualsPath': '$$.Execution.Input.marker'},
+        {'Variable': '$.number', 'NumericEqualsPath': '$$.Execution.Input.number'},
+        {'Variable': '$.number', 'NumericLessThanPath': '$$.Execution.Input.higher'},
+        {'Variable': '$.number', 'NumericGreaterThanPath': '$$.Execution.Input.lower'},
+        {'Variable': '$.number', 'NumericLessThanEqualsPath': '$$.Execution.Input.number'},
+        {'Variable': '$.number', 'NumericGreaterThanEqualsPath': '$$.Execution.Input.number'},
+        {'Variable': '$.enabled', 'BooleanEqualsPath': '$$.Execution.Input.enabled'},
+    ],
+)
+def test_choice_context_rules(rule):
+    from ministack.services import stepfunctions
+
+    data = {'marker': 'keep', 'number': 5, 'enabled': True}
+    ctx = {'Execution': {'Input': {**data, 'lower': 4, 'higher': 6}}}
+    assert stepfunctions._evaluate_rule(rule, data, ctx)
+    assert stepfunctions._execute_choice(
+        {'InputPath': '$.projected', 'Choices': [{**rule, 'Next': 'Match'}], 'Default': 'Miss'},
+        {'projected': data, 'marker': 'wrong', 'number': 0, 'enabled': False},
+        ctx,
+    ) == (data, 'Match')
+
+
+def test_choice_context_missing_and_data_paths():
+    from ministack.services import stepfunctions
+
+    assert not stepfunctions._evaluate_rule({'Variable': '$$.Execution.Id', 'IsPresent': True}, {})
+    assert stepfunctions._evaluate_rule({'Variable': '$.value', 'NumericEqualsPath': '$.other'},
+                                       {'value': 5, 'other': 5})
+    assert not stepfunctions._evaluate_rule({'Variable': '$$.Execution.Input.marker', 'StringEquals': 'wrong'},
+                                           {}, {'Execution': {'Input': {'marker': 'keep'}}})
+
+
+def test_choice_context_survives_input_replacement(sfn):
+    definition = {
+        'StartAt': 'Replace',
+        'States': {
+            'Replace': {'Type': 'Pass', 'Result': {'projected': {'marker': 'keep'}}, 'Next': 'Check'},
+            'Check': {
+                'Type': 'Choice', 'InputPath': '$.projected',
+                'Choices': [{'And': [
+                    {'Variable': '$$.Execution.Input.marker', 'IsPresent': True},
+                    {'Variable': '$.marker', 'StringEqualsPath': '$$.Execution.Input.marker'},
+                    {'Variable': '$$.State.Name', 'StringEquals': 'Check'},
+                ], 'Next': 'Match'}],
+                'Default': 'Miss',
+            },
+            'Match': {'Type': 'Succeed'},
+            'Miss': {'Type': 'Fail', 'Error': 'ContextNotResolved'},
+        },
+    }
+    arn = sfn.create_state_machine(name=f'choice-context-{_uuid_mod.uuid4().hex}',
+                                  definition=json.dumps(definition),
+                                  roleArn='arn:aws:iam::000000000000:role/R')['stateMachineArn']
+    try:
+        execution = sfn.start_execution(stateMachineArn=arn, input=json.dumps({'marker': 'keep'}))['executionArn']
+        for _ in range(100):
+            result = sfn.describe_execution(executionArn=execution)
+            if result['status'] != 'RUNNING':
+                break
+            time.sleep(0.1)
+        assert result['status'] == 'SUCCEEDED', result
+        assert json.loads(result['output']) == {'marker': 'keep'}
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)
+
+
+def test_context_paths_in_input_output_and_items_path(sfn):
+    """InputPath, OutputPath and ItemsPath read `$$.` from the context object."""
+    definition = {
+        'StartAt': 'Replace',
+        'States': {
+            'Replace': {'Type': 'Pass', 'Result': {'replaced': True}, 'Next': 'FromContext'},
+            'FromContext': {'Type': 'Pass', 'InputPath': '$$.Execution.Input', 'Next': 'Each'},
+            'Each': {
+                'Type': 'Map', 'ItemsPath': '$$.Execution.Input.items',
+                'ItemProcessor': {'StartAt': 'Item', 'States': {'Item': {'Type': 'Pass', 'End': True}}},
+                'ResultPath': '$.mapped', 'Next': 'Out',
+            },
+            'Out': {'Type': 'Pass', 'OutputPath': '$$.State.Name', 'End': True},
+        },
+    }
+    arn = sfn.create_state_machine(name=f'ctx-paths-{_uuid_mod.uuid4().hex}',
+                                  definition=json.dumps(definition),
+                                  roleArn='arn:aws:iam::000000000000:role/R')['stateMachineArn']
+    try:
+        execution = sfn.start_execution(stateMachineArn=arn,
+                                        input=json.dumps({'items': [1, 2]}))['executionArn']
+        for _ in range(100):
+            result = sfn.describe_execution(executionArn=execution)
+            if result['status'] != 'RUNNING':
+                break
+            time.sleep(0.1)
+        assert result['status'] == 'SUCCEEDED', result
+        assert json.loads(result['output']) == 'Out'
+        history = sfn.get_execution_history(executionArn=execution)['events']
+        each_input = next(json.loads(e['stateEnteredEventDetails']['input']) for e in history
+                          if e.get('stateEnteredEventDetails', {}).get('name') == 'Each')
+        assert each_input == {'items': [1, 2]}
+        out_input = next(json.loads(e['stateEnteredEventDetails']['input']) for e in history
+                         if e.get('stateEnteredEventDetails', {}).get('name') == 'Out')
+        assert out_input['mapped'] == [1, 2]
+    finally:
+        sfn.delete_state_machine(stateMachineArn=arn)

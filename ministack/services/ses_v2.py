@@ -9,7 +9,11 @@ Supports: SendEmail, CreateEmailIdentity, GetEmailIdentity, DeleteEmailIdentity,
           GetEmailTemplate, UpdateEmailTemplate, DeleteEmailTemplate,
           ListEmailTemplates, GetAccount, ListSuppressedDestinations,
           PutAccountSuppressionAttributes, TagResource, UntagResource,
-          ListTagsForResource.
+          ListTagsForResource, CreateTenant, GetTenant, ListTenants, DeleteTenant,
+          CreateTenantResourceAssociation, DeleteTenantResourceAssociation,
+          ListTenantResources, ListResourceTenants, PutTenantSuppressionAttributes,
+          CreateDedicatedIpPool, GetDedicatedIpPool, ListDedicatedIpPools,
+          DeleteDedicatedIpPool.
 Email templates live in the v1 store, so either API version sees the other's.
 """
 
@@ -22,7 +26,6 @@ import re
 import time
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -33,13 +36,22 @@ from ministack.core.responses import (
     now_iso,
 )
 from ministack.services.ses import (
+    _account_details,
     _build_mime_message,
+    _dkim_tokens,
+    _message_rejection,
     _parse_raw_mime,
     _render_template,
     _restore_regional_store,
     _sent_emails_list,
     _smtp_relay,
     _templates,
+)
+from ministack.services.ses import (
+    _configuration_sets as _v1_config_sets,
+)
+from ministack.services.ses import (
+    _identities as _v1_identities,
 )
 
 logger = logging.getLogger("ses-v2")
@@ -50,6 +62,9 @@ TEMPLATE_PAGE_SIZE = 10  # ListEmailTemplates default per the AWS API reference
 _identities = AccountRegionScopedDict()  # identity -> dict
 _config_sets = AccountRegionScopedDict()  # name -> dict
 _ses_tags = AccountRegionScopedDict()  # resource_arn -> [tags]
+_tenants = AccountRegionScopedDict()
+_tenant_resources = AccountRegionScopedDict()  # tenant name -> {ARN: timestamp}
+_dedicated_ip_pools = AccountRegionScopedDict()  # pool name -> {PoolName, ScalingMode}
 
 
 def get_state() -> dict:
@@ -57,17 +72,23 @@ def get_state() -> dict:
         "_identities": _identities,
         "_config_sets": _config_sets,
         "_ses_tags": _ses_tags,
+        "_tenants": _tenants,
+        "_tenant_resources": _tenant_resources,
+        "_dedicated_ip_pools": _dedicated_ip_pools,
     })
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data: dict):
+def _restore_state(data: dict):
     _restore_regional_store(_identities, data.get("_identities", {}))
     _restore_regional_store(_config_sets, data.get("_config_sets", {}))
     _restore_tag_store(data.get("_ses_tags", {}))
+    _restore_regional_store(_tenants, data.get("_tenants", {}))
+    _restore_regional_store(_tenant_resources, data.get("_tenant_resources", {}))
+    _restore_regional_store(_dedicated_ip_pools, data.get("_dedicated_ip_pools", {}))
 
 
 def _restore_tag_store(restored):
@@ -102,15 +123,6 @@ def _legacy_resource_arn_for_region(resource_arn, account_id, region):
     return f"arn:aws:ses:{region}:{account_id}:{spec.resource}"
 
 
-try:
-    _restored = load_state("ses_v2")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _json_err(code, message, status=400):
@@ -121,6 +133,22 @@ def _json_err(code, message, status=400):
 
 def _resource_arn(kind, name):
     return f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
+
+
+def _easy_dkim_attributes(identity, identity_type, signing_attributes):
+    """A DOMAIN identity uses Easy DKIM unless DkimSigningAttributes brings its
+    own key (BYODKIM): three tokens for its CNAME records, verification
+    pending. An EMAIL_ADDRESS identity has no DKIM tokens."""
+    byodkim = any(signing_attributes.get(k) for k in ("DomainSigningPrivateKey", "DomainSigningSelector"))
+    if identity_type != "DOMAIN" or byodkim:
+        return {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []}
+    tokens = _dkim_tokens(identity)
+    return {
+        "SigningEnabled": False,
+        "SigningAttributesOrigin": "AWS_SES",
+        "Status": "PENDING",
+        "Tokens": tokens,
+    }
 
 
 def _invalid_resource_arn(arn):
@@ -172,15 +200,26 @@ def _page_size(query_params, default, maximum=100):
         size = int(raw)
     except (TypeError, ValueError):
         return default, _json_err("BadRequestException", f"Invalid PageSize: {raw}")
-    if size < 1 or size > maximum:
+    if size < 1:
         return default, _json_err(
-            "BadRequestException", f"PageSize must be between 1 and {maximum}"
+            "BadRequestException",
+            f"1 validation error detected: Value '{raw}' at 'pageSize' failed to satisfy constraint: Member must have value greater than or equal to 1",
+        )
+    if size > maximum:
+        return default, _json_err(
+            "BadRequestException",
+            f"1 validation error detected: Value '{raw}' at 'pageSize' failed to satisfy constraint: Member must have value less than or equal to {maximum}",
         )
     return size, None
 
 
-def _paginate(items, query_params, default_size):
-    size, err = _page_size(query_params, default_size)
+def _body_paging(data):
+    """NextToken / PageSize sent in a JSON body, in the query-parameter form."""
+    return {k: str(data[k]) for k in ("NextToken", "PageSize") if data.get(k) is not None}
+
+
+def _paginate(items, query_params, default_size, maximum=100):
+    size, err = _page_size(query_params, default_size, maximum)
     if err:
         return [], None, err
     start, err = _decode_page_token(_first_query_value(query_params, "NextToken"))
@@ -266,9 +305,10 @@ def _local_ses_v2_resource_arn(arn):
         or spec.region != get_region()
     ):
         return None, _invalid_resource_arn(arn)
+    canonical = str(spec)
 
     kind, sep, name = spec.resource.partition("/")
-    if sep != "/" or not name or "/" in name:
+    if sep != "/" or not name or ("/" in name and kind != "tenant"):
         return None, _invalid_resource_arn(arn)
 
     if kind == "identity":
@@ -277,10 +317,299 @@ def _local_ses_v2_resource_arn(arn):
     elif kind == "configuration-set":
         if name not in _config_sets:
             return None, _not_found_resource_arn(arn)
+    elif kind == "dedicated-ip-pool":
+        if name not in _dedicated_ip_pools:
+            return None, _not_found_resource_arn(arn)
+    elif kind == "tenant":
+        parts = name.split("/")
+        if len(parts) == 1:
+            return None, _json_err(
+                "NotFoundException",
+                f"No Tenant present with name: nullwith tenantId: {name}",
+                404,
+            )
+        if len(parts) != 2 or not all(parts):
+            return None, _invalid_resource_arn(arn)
+        tenant_name, tenant_id = parts
+        rec = _tenants.get(tenant_name)
+        if not rec or rec["TenantArn"] != canonical:
+            return None, _json_err(
+                "NotFoundException",
+                f"No Tenant present with name: {tenant_name}with tenantId: {tenant_id}",
+                404,
+            )
     else:
         return None, _invalid_resource_arn(arn)
 
-    return str(spec), None
+    return canonical, None
+
+
+# The ResourceType enum of a tenant's associated resources, by ARN resource kind.
+_TENANT_RESOURCE_TYPES = {
+    "identity": "EMAIL_IDENTITY", "configuration-set": "CONFIGURATION_SET", "template": "EMAIL_TEMPLATE",
+}
+
+
+def _missing_tenant(name):
+    return _json_err("NotFoundException", f"The requested tenant <{name}> does not exist.", 404)
+
+
+def _association_resource(arn):
+    """Validate an association ARN; returns (kind, canonical aws-partition ARN, error)."""
+    try:
+        spec = parse_arn(arn)
+    except (ArnParseError, TypeError):
+        return None, None, _json_err("BadRequestException", "Provided resource identifier is not an SES resource")
+    if spec.service != "ses":
+        return None, None, _json_err("BadRequestException", "Provided ARN is not in SES resource ARN format")
+    kind, _, name = spec.resource.partition("/")
+    if kind not in ("configuration-set", "identity", "template"):
+        return None, None, _json_err("BadRequestException", f"Unsupported resource type: {kind}")
+    if spec.region != get_region():
+        return None, None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same region")
+    if spec.account_id != get_account_id():
+        return None, None, _json_err("BadRequestException", f"Resource <{arn}> must be in the same account")
+    stores, label = {
+        "configuration-set": ((_v1_config_sets, _config_sets), "Configuration set"),
+        "identity": ((_v1_identities, _identities), "Identity"),
+        "template": ((_templates,), "Template"),
+    }[kind]
+    if not any(name in store for store in stores):
+        return None, None, _json_err("NotFoundException", f"{label} <{name}> does not exist:", 404)
+    canonical = f"arn:aws:{spec.service}:{spec.region}:{spec.account_id}:{spec.resource}"
+    return kind, canonical, None
+
+
+_SUPPRESSED_REASONS = ("BOUNCE", "COMPLAINT")
+_SUPPRESSION_SCOPES = ("TENANT", "ACCOUNT")
+
+
+def _suppression_enum_errors(prefix, reasons, reasons_present, scope, scope_present):
+    """Model-level enum errors for suppression attributes, in member order."""
+    errors = []
+    if reasons_present:
+        members = reasons if isinstance(reasons, list) else [reasons]
+        if any(m not in _SUPPRESSED_REASONS for m in members):
+            errors.append(
+                f"Value at '{prefix}suppressedReasons' failed to satisfy constraint: Member must satisfy constraint: [Member must satisfy enum value set: [BOUNCE, COMPLAINT]]"
+            )
+    if scope_present and scope not in _SUPPRESSION_SCOPES:
+        errors.append(
+            f"Value at '{prefix}suppressionScope' failed to satisfy constraint: Member must satisfy enum value set: [TENANT, ACCOUNT]"
+        )
+    return errors
+
+
+def _combined_validation_error(errors):
+    noun = "error" if len(errors) == 1 else "errors"
+    return _json_err("BadRequestException", f"{len(errors)} validation {noun} detected: {'; '.join(errors)}")
+
+
+def _create_suppression_pairing(attrs):
+    """Pairing/null rules for CreateTenant SuppressionAttributes; returns (value, error)."""
+    reasons_present = "SuppressedReasons" in attrs
+    scope_present = "SuppressionScope" in attrs
+    reasons = attrs.get("SuppressedReasons")
+    scope = attrs.get("SuppressionScope")
+    if bool(reasons) and not scope_present:
+        return None, _json_err("BadRequestException", "SuppressedReasons cannot be specified without SuppressionScope.")
+    if scope_present and not reasons_present:
+        return None, _json_err("BadRequestException", "SuppressionScope cannot be specified without SuppressedReasons.")
+    if not bool(reasons) and not scope_present:
+        nulls = []
+        if not reasons_present:
+            nulls.append("Value null at 'suppressionAttributes.suppressedReasons' failed to satisfy constraint: Member must not be null")
+        if not scope_present:
+            nulls.append("Value null at 'suppressionAttributes.suppressionScope' failed to satisfy constraint: Member must not be null")
+        return None, _combined_validation_error(nulls)
+    return {"SuppressedReasons": list(reasons) if isinstance(reasons, list) else reasons, "SuppressionScope": scope}, None
+
+
+def _put_suppression_pairing(data):
+    """Pairing rules for PutTenantSuppressionAttributes; returns (value, clear, error)."""
+    reasons_present = "SuppressedReasons" in data
+    scope_present = "SuppressionScope" in data
+    if not reasons_present and not scope_present:
+        return None, True, None
+    reasons = data.get("SuppressedReasons")
+    scope = data.get("SuppressionScope")
+    if bool(reasons) and not scope_present:
+        return None, False, _json_err("BadRequestException", "SuppressedReasons cannot be specified without SuppressionScope.")
+    if reasons_present and not scope_present:
+        return None, False, _json_err("BadRequestException", "SuppressionScope is required when SuppressedReasons are provided. Valid values are: TENANT, ACCOUNT")
+    if scope_present and not reasons_present:
+        return None, False, _json_err("BadRequestException", "SuppressionScope cannot be specified without SuppressedReasons.")
+    return {"SuppressedReasons": list(reasons) if isinstance(reasons, list) else reasons, "SuppressionScope": scope}, False, None
+
+
+def _tenant_delete_block(arn):
+    if any(arn in resources for resources in _tenant_resources.values()):
+        return _json_err(
+            "BadRequestException",
+            f"Cannot delete <{arn}> because it has tenant associations. Remove all tenant associations and try again.",
+        )
+    return None
+
+
+def _tenant_request(method, sub, data):
+    if method == "POST" and sub == "/resources/tenants/list":
+        arn = data.get("ResourceArn", "")
+        _, canonical, err = _association_resource(arn)
+        if err:
+            return err
+        items = [
+            {
+                "TenantName": name,
+                "TenantId": _tenants[name]["TenantId"],
+                "ResourceArn": canonical,
+                "AssociatedTimestamp": resources[canonical],
+            }
+            for name, resources in _tenant_resources.items()
+            if canonical in resources
+        ]
+        page, token, err = _paginate(items, _body_paging(data), 100)
+        return err or json_response({"ResourceTenants": page, **({"NextToken": token} if token else {})})
+    if method == "POST" and sub == "/tenant/suppression":
+        enum_errors = _suppression_enum_errors(
+            "",
+            data.get("SuppressedReasons"), "SuppressedReasons" in data,
+            data.get("SuppressionScope"), "SuppressionScope" in data,
+        )
+        if enum_errors:
+            return _combined_validation_error(enum_errors)
+        value, clear, err = _put_suppression_pairing(data)
+        if err:
+            return err
+        rec = _tenants.get(data.get("TenantName", ""))
+        if rec is None:
+            return _missing_tenant(data.get("TenantName", ""))
+        if clear:
+            rec.pop("SuppressionAttributes", None)
+        else:
+            rec["SuppressionAttributes"] = value
+        return json_response({})
+    if method != "POST" or not sub.startswith("/tenants"):
+        return None
+    name = data.get("TenantName", "")
+    if sub == "/tenants":
+        attrs = data.get("SuppressionAttributes")
+        if attrs is not None:
+            if not isinstance(attrs, dict):
+                attrs = {}
+            enum_errors = _suppression_enum_errors(
+                "suppressionAttributes.",
+                attrs.get("SuppressedReasons"), "SuppressedReasons" in attrs,
+                attrs.get("SuppressionScope"), "SuppressionScope" in attrs,
+            )
+            if enum_errors:
+                return _combined_validation_error(enum_errors)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            return _json_err(
+                "BadRequestException",
+                f"Invalid tenant name <{name}>: only alphanumeric ASCII characters, '_', and '-' are allowed.",
+            )
+        suppression = None
+        if attrs is not None:
+            suppression, err = _create_suppression_pairing(attrs)
+            if err:
+                return err
+        if name in _tenants:
+            return _json_err(
+                "AlreadyExistsException", f"Tenant with name {name} already exists in account {get_account_id()}"
+            )
+        tenant_id = "tn-" + new_uuid().replace("-", "")[:29]
+        arn = _resource_arn("tenant", f"{name}/{tenant_id}")
+        rec = {
+            "TenantName": name,
+            "TenantId": tenant_id,
+            "TenantArn": arn,
+            "CreatedTimestamp": int(time.time()),
+            "Tags": copy.deepcopy(data.get("Tags", [])),
+            "SendingStatus": "ENABLED",
+        }
+        if suppression is not None:
+            rec["SuppressionAttributes"] = suppression
+        _tenants[name] = rec
+        _tenant_resources[name] = {}
+        _ses_tags[arn] = copy.deepcopy(rec["Tags"])
+        return json_response(rec)
+    if sub == "/tenants/list":
+        filters = data.get("Filter") or {}
+        if filters.keys() - {"SENDING_STATUS", "TENANT_NAME_CONTAINS"}:
+            return _json_err(
+                "BadRequestException",
+                "1 validation error detected: Value at 'filter' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy enum value set: [SENDING_STATUS, TENANT_NAME_CONTAINS]]",
+            )
+        status = filters.get("SENDING_STATUS")
+        if status is not None and status not in ("ENABLED", "REINSTATED", "DISABLED"):
+            return _json_err("BadRequestException", f"Invalid sending status <{status}>.")
+        items = sorted(
+            (
+                {k: v for k, v in rec.items() if k not in ("Tags", "SuppressionAttributes")}
+                for rec in _tenants.values()
+                if filters.get("TENANT_NAME_CONTAINS", "") in rec["TenantName"]
+                and (not filters.get("SENDING_STATUS") or filters["SENDING_STATUS"] == rec["SendingStatus"])
+            ),
+            key=lambda item: item["TenantName"],
+        )
+        page, token, err = _paginate(items, _body_paging(data), 100)
+        return err or json_response({"Tenants": page, **({"NextToken": token} if token else {})})
+    if sub not in (
+        "/tenants/get",
+        "/tenants/delete",
+        "/tenants/resources",
+        "/tenants/resources/delete",
+        "/tenants/resources/list",
+    ):
+        return None
+    rec = _tenants.get(name)
+    if rec is None:
+        return _missing_tenant(name)
+    if sub == "/tenants/get":
+        out = copy.deepcopy(rec)
+        out["Tags"] = _ses_tags.get(rec["TenantArn"], [])
+        return json_response({"Tenant": out})
+    if sub == "/tenants/delete":
+        _tenants.pop(name)
+        _tenant_resources.pop(name, None)
+        _ses_tags.pop(rec["TenantArn"], None)
+        return json_response({})
+    resources = _tenant_resources[name]
+    if sub == "/tenants/resources/list":
+        items = [{"ResourceType": _TENANT_RESOURCE_TYPES[parse_arn(arn).resource.split("/")[0]], "ResourceArn": arn}
+                 for arn in resources]
+        filters = data.get("Filter") or {}
+        if filters.keys() - {"RESOURCE_TYPE"}:
+            return _json_err(
+                "BadRequestException",
+                "1 validation error detected: Value at 'filter' failed to satisfy constraint: Map keys must satisfy constraint: [Member must satisfy enum value set: [RESOURCE_TYPE]]",
+            )
+        resource_type = filters.get("RESOURCE_TYPE")
+        if resource_type is not None and resource_type not in _TENANT_RESOURCE_TYPES.values():
+            return _json_err("BadRequestException", f"Invalid resource type {resource_type} specified.")
+        items = sorted(
+            (
+                item
+                for item in items
+                if not filters.get("RESOURCE_TYPE") or item["ResourceType"] == filters["RESOURCE_TYPE"]
+            ),
+            key=lambda item: item["ResourceArn"],
+        )
+        page, token, err = _paginate(items, _body_paging(data), 100)
+        return err or json_response({"TenantResources": page, **({"NextToken": token} if token else {})})
+    arn = data.get("ResourceArn", "")
+    _, canonical, err = _association_resource(arn)
+    if err:
+        return err
+    if sub.endswith("/delete"):
+        resources.pop(canonical, None)
+    else:
+        if canonical in resources:
+            return _json_err(
+                "AlreadyExistsException", f"Resources {arn} has already been associated with tenant {name}"
+            )
+        resources[canonical] = int(time.time())
+    return json_response({})
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -296,19 +625,42 @@ async def handle_request(method, path, headers, body, query_params):
     except json.JSONDecodeError:
         data = {}
 
+    result = _tenant_request(method, sub, data)
+    if result is not None:
+        return result
+
     # GET /v2/email/account
     if sub == "/account" and method == "GET":
         cutoff = time.time() - 86400
         sent_list = _sent_emails_list()
         sent_24h = sum(1 for e in sent_list if e["Timestamp"] >= cutoff)
-        return json_response({
+        account = _account_details.get("account") or {}
+        out = {
             "DedicatedIpAutoWarmupEnabled": False,
             "EnforcementStatus": "HEALTHY",
-            "ProductionAccessEnabled": True,
+            "ProductionAccessEnabled": account.get("ProductionAccessEnabled", True),
             "SendQuota": {"Max24HourSend": 50000.0, "MaxSendRate": 14.0, "SentLast24Hours": float(sent_24h)},
             "SendingEnabled": True,
             "SuppressionAttributes": {"SuppressedReasons": []},
-        })
+        }
+        if account.get("Details"):
+            out["Details"] = account["Details"]
+        return json_response(out)
+
+    # POST /v2/email/account/details  (PutAccountDetails)
+    if sub == "/account/details" and method == "POST":
+        if data.get("MailType") not in ("MARKETING", "TRANSACTIONAL"):
+            return _json_err("BadRequestException", "MailType must be MARKETING or TRANSACTIONAL")
+        if not data.get("WebsiteURL"):
+            return _json_err("BadRequestException", "WebsiteURL is required")
+        account = dict(_account_details.get("account") or {})
+        account["Details"] = {k: data[k] for k in (
+            "MailType", "WebsiteURL", "ContactLanguage", "UseCaseDescription",
+            "AdditionalContactEmailAddresses") if k in data}
+        if "ProductionAccessEnabled" in data:
+            account["ProductionAccessEnabled"] = bool(data["ProductionAccessEnabled"])
+        _account_details["account"] = account
+        return json_response({})
 
     # PUT /v2/email/account/suppression
     if sub == "/account/suppression" and method == "PUT":
@@ -365,6 +717,9 @@ async def handle_request(method, path, headers, body, query_params):
             body_html = rendered.get("Html", "")
 
         all_addrs = to_addrs + cc_addrs + bcc_addrs
+        rejected = _message_rejection(source or (parsed.get("From", "") if raw else ""), all_addrs)
+        if rejected:
+            return _json_err("MessageRejected", rejected)
         if source and all_addrs:
             mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                            subj, body_text, body_html, msg_id)
@@ -408,6 +763,9 @@ async def handle_request(method, path, headers, body, query_params):
         if not entries:
             return _json_err("BadRequestException", "BulkEmailEntries is required")
 
+        rejected = _message_rejection(source)
+        if rejected:
+            return _json_err("MessageRejected", rejected)
         results = []
         for entry in entries:
             dest = entry.get("Destination", {})
@@ -419,6 +777,10 @@ async def handle_request(method, path, headers, body, query_params):
                      .get("ReplacementTemplate", {})
                      .get("ReplacementTemplateData", default_data)
             )
+            rejected = _message_rejection(None, to_addrs + cc_addrs + bcc_addrs)
+            if rejected:
+                results.append({"Status": "MESSAGE_REJECTED", "Error": rejected})
+                continue
             rendered = _render_template(stored, template_data)
             subj = rendered.get("Subject", "")
             body_text = rendered.get("Text", "")
@@ -461,11 +823,13 @@ async def handle_request(method, path, headers, body, query_params):
         if not identity:
             return _json_err("BadRequestException", "EmailIdentity is required")
         identity_type = "DOMAIN" if "." in identity and "@" not in identity else "EMAIL_ADDRESS"
+        dkim_attributes = _easy_dkim_attributes(
+            identity, identity_type, data.get("DkimSigningAttributes") or {})
         _identities[identity] = {
             "EmailIdentity": identity,
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
-            "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+            "DkimAttributes": dkim_attributes,
             "MailFromAttributes": {"BehaviorOnMxFailure": "USE_DEFAULT_VALUE"},
             "Tags": data.get("Tags", []),
             "CreatedTimestamp": now_iso(),
@@ -474,17 +838,30 @@ async def handle_request(method, path, headers, body, query_params):
         return json_response({
             "IdentityType": identity_type,
             "VerifiedForSendingStatus": True,
-            "DkimAttributes": {"SigningEnabled": False, "Status": "NOT_STARTED", "Tokens": []},
+            "DkimAttributes": dkim_attributes,
         })
 
-    # GET /v2/email/identities  (ListEmailIdentities)
-    if sub == "/identities" and method == "GET":
-        return json_response({
-            "EmailIdentities": [
-                {"IdentityType": v["IdentityType"], "IdentityName": k, "SendingEnabled": True}
-                for k, v in _identities.items()
-            ],
-        })
+    # ListEmailIdentities: GET /v2/email/identities, or POST /v2/email/list-identities
+    # with paging and Filter in the body (newer SDKs)
+    if (sub == "/identities" and method == "GET") or (sub == "/list-identities" and method == "POST"):
+        params = query_params if method == "GET" else _body_paging(data)
+        wanted = (data.get("Filter") or {}) if method == "POST" else {}
+        items = [
+            {"IdentityType": v["IdentityType"], "IdentityName": k, "SendingEnabled": True,
+             "VerificationStatus": "SUCCESS"}
+            for k, v in _identities.items()
+        ]
+        items = [i for i in items
+                 if wanted.get("IDENTITY_NAME_CONTAINS", "") in i["IdentityName"]
+                 and wanted.get("IDENTITY_TYPE", i["IdentityType"]) == i["IdentityType"]
+                 and wanted.get("VERIFICATION_STATUS", "SUCCESS") == "SUCCESS"]
+        page, next_token, err = _paginate(items, params, 1000, maximum=1000)
+        if err:
+            return err
+        out = {"EmailIdentities": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
 
     # GET /v2/email/identities/{identity}
     m = re.match(r"^/identities/(.+)$", sub)
@@ -496,8 +873,43 @@ async def handle_request(method, path, headers, body, query_params):
                 return _json_err("NotFoundException", f"Identity {identity} not found", 404)
             return json_response(rec)
         if method == "DELETE":
+            blocked = _tenant_delete_block(_resource_arn("identity", identity))
+            if blocked:
+                return blocked
             _identities.pop(identity, None)
             return json_response({})
+
+    # /v2/email/dedicated-ip-pools  (Create/Get/List/DeleteDedicatedIpPool)
+    if sub == "/dedicated-ip-pools" and method == "POST":
+        name = data.get("PoolName", "")
+        if not name:
+            return _json_err("BadRequestException", "PoolName is required")
+        if name in _dedicated_ip_pools:
+            return _json_err("AlreadyExistsException", f"Pool {name} already exists")
+        _dedicated_ip_pools[name] = {"PoolName": name, "ScalingMode": data.get("ScalingMode") or "STANDARD"}
+        _ses_tags[_resource_arn("dedicated-ip-pool", name)] = list(data.get("Tags", []))
+        return json_response({})
+
+    if sub == "/dedicated-ip-pools" and method == "GET":
+        page, next_token, err = _paginate(list(_dedicated_ip_pools.keys()), query_params, 100, maximum=1000)
+        if err:
+            return err
+        out = {"DedicatedIpPools": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
+
+    m = re.match(r"^/dedicated-ip-pools/([^/]+)$", sub)
+    if m and method in ("GET", "DELETE"):
+        name = m.group(1)
+        pool = _dedicated_ip_pools.get(name)
+        if pool is None:
+            return _json_err("NotFoundException", f"Pool {name} does not exist", 404)
+        if method == "GET":
+            return json_response({"DedicatedIpPool": dict(pool)})
+        _dedicated_ip_pools.pop(name, None)
+        _ses_tags.pop(_resource_arn("dedicated-ip-pool", name), None)
+        return json_response({})
 
     # POST /v2/email/configuration-sets  (CreateConfigurationSet)
     if sub == "/configuration-sets" and method == "POST":
@@ -508,9 +920,21 @@ async def handle_request(method, path, headers, body, query_params):
         _ses_tags[_resource_arn("configuration-set", name)] = list(data.get("Tags", []))
         return json_response({})
 
-    # GET /v2/email/configuration-sets  (ListConfigurationSets)
-    if sub == "/configuration-sets" and method == "GET":
-        return json_response({"ConfigurationSets": list(_config_sets.keys())})
+    # ListConfigurationSets: GET /v2/email/configuration-sets, or
+    # POST /v2/email/list-configuration-sets with paging and Filter in the body
+    if ((sub == "/configuration-sets" and method == "GET")
+            or (sub == "/list-configuration-sets" and method == "POST")):
+        params = query_params if method == "GET" else _body_paging(data)
+        contains = ((data.get("Filter") or {}).get("CONFIGURATION_SET_NAME_CONTAINS", "")
+                    if method == "POST" else "")
+        page, next_token, err = _paginate(
+            [n for n in _config_sets if contains in n], params, 1000, maximum=1000)
+        if err:
+            return err
+        out = {"ConfigurationSets": page}
+        if next_token:
+            out["NextToken"] = next_token
+        return json_response(out)
 
     # GET/DELETE /v2/email/configuration-sets/{name}
     m = re.match(r"^/configuration-sets/([^/]+)$", sub)
@@ -522,7 +946,12 @@ async def handle_request(method, path, headers, body, query_params):
                 return _json_err("NotFoundException", f"ConfigurationSet {name} not found", 404)
             return json_response(rec)
         if method == "DELETE":
+            arn = _resource_arn("configuration-set", name)
+            blocked = _tenant_delete_block(arn)
+            if blocked:
+                return blocked
             _config_sets.pop(name, None)
+            _ses_tags.pop(arn, None)
             return json_response({})
 
     # POST /v2/email/templates  (CreateEmailTemplate)
@@ -583,6 +1012,9 @@ async def handle_request(method, path, headers, body, query_params):
             stored.update(_template_parts(template_content))
             return json_response({})
         if method == "DELETE":
+            blocked = _tenant_delete_block(_resource_arn("template", name))
+            if blocked:
+                return blocked
             _templates.pop(name, None)
             return json_response({})
 
@@ -622,3 +1054,6 @@ def reset():
     _identities.clear()
     _config_sets.clear()
     _ses_tags.clear()
+    _tenants.clear()
+    _tenant_resources.clear()
+    _dedicated_ip_pools.clear()

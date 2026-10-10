@@ -27,6 +27,7 @@ SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 
 import ast
 import asyncio
+import base64
 import contextvars
 import copy
 import json
@@ -37,6 +38,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
 from datetime import datetime, timezone
 
@@ -47,7 +49,6 @@ except ImportError:  # the wheel is optional at runtime: JSONata states refuse
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -131,6 +132,11 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
 
 _state_machines = AccountRegionScopedDict()
 _executions = AccountRegionScopedDict()
+# Continuation tokens are ephemeral, like AWS's 24-hour history tokens. Each
+# token fixes the history length so new events cannot shift reverse-order pages.
+_HISTORY_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_history_page_tokens = {}
+_history_page_tokens_lock = threading.Lock()
 _task_tokens = AccountRegionScopedDict()
 _tags = AccountRegionScopedDict()
 _activities = AccountRegionScopedDict()
@@ -162,10 +168,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     _state_machines.update(data.get("state_machines", {}))
@@ -184,15 +190,6 @@ def restore_state(data):
             exc["cause"] = "Execution was running when service restarted"
 
 
-try:
-    _restored = load_state("stepfunctions")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 _TIMESTAMP_RESPONSE_FIELDS = {
@@ -702,6 +699,11 @@ def _stop_execution(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    # A client may retry after the abort was applied but its response was lost.
+    # Return the original result without rewriting the cause or emitting a
+    # second ExecutionAborted event.
+    if execution["status"] == "ABORTED":
+        return json_response({"stopDate": execution["stopDate"]})
     if execution["status"] != "RUNNING":
         return error_response_json(
             "ValidationException", "Execution is not running", 400)
@@ -709,6 +711,8 @@ def _stop_execution(data):
     stop_date = now_iso()
     execution["status"] = "ABORTED"
     execution["stopDate"] = stop_date
+    execution["error"] = data.get("error")
+    execution["cause"] = data.get("cause")
     _add_event(execution, "ExecutionAborted", {
         "executionAbortedEventDetails": {
             "error": data.get("error", ""),
@@ -784,11 +788,67 @@ def _get_execution_history(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    max_results = data.get("maxResults", 100)
+    if max_results == 0 and not isinstance(max_results, bool):
+        max_results = 100
+    if not isinstance(max_results, int) or isinstance(max_results, bool) or not 0 < max_results <= 1000:
+        return error_response_json("ValidationException", "maxResults must be between 0 and 1000", 400)
+
+    reverse_order = data.get("reverseOrder", False)
+    include_data = data.get("includeExecutionData", True)
     events = list(execution["events"])
-    if data.get("reverseOrder", False):
-        events = list(reversed(events))
-    max_results = data.get("maxResults", 1000)
-    return json_response({"events": events[:max_results]})
+    token = data.get("nextToken")
+    if token is None:
+        start, snapshot_size = 0, len(events)
+    else:
+        with _history_page_tokens_lock:
+            page_state = _history_page_tokens.get(token) if isinstance(token, str) else None
+        if (page_state is None or page_state["expires"] <= time.time()
+                or page_state["executionArn"] != exec_arn
+                or page_state["maxResults"] != max_results
+                or page_state["reverseOrder"] != reverse_order
+                or page_state["includeExecutionData"] != include_data
+                or page_state["snapshotSize"] > len(events)):
+            return error_response_json("InvalidToken", "Invalid pagination token", 400)
+        start, snapshot_size = page_state["start"], page_state["snapshotSize"]
+
+    events = events[:snapshot_size]
+    if reverse_order:
+        events.reverse()
+
+    page = events[start:start + max_results]
+    if include_data is False:
+        page = [copy.deepcopy(event) for event in page]
+        for event in page:
+            for key, details in event.items():
+                if key.endswith("EventDetails") and isinstance(details, dict):
+                    for payload in ("input", "output"):
+                        if payload in details:
+                            del details[payload]
+
+    response = {"events": page}
+    if start + max_results < snapshot_size:
+        now = time.time()
+        with _history_page_tokens_lock:
+            # Dict insertion order is creation order, so expired tokens are
+            # removed from the front without scanning live continuations.
+            while _history_page_tokens:
+                oldest = next(iter(_history_page_tokens))
+                if _history_page_tokens[oldest]["expires"] > now:
+                    break
+                del _history_page_tokens[oldest]
+            next_token = new_uuid()
+            _history_page_tokens[next_token] = {
+                "executionArn": exec_arn,
+                "maxResults": max_results,
+                "reverseOrder": reverse_order,
+                "includeExecutionData": include_data,
+                "start": start + max_results,
+                "snapshotSize": snapshot_size,
+                "expires": now + _HISTORY_TOKEN_TTL_SECONDS,
+            }
+        response["nextToken"] = next_token
+    return json_response(response)
 
 
 def _start_sync_execution(data):
@@ -1187,8 +1247,8 @@ def _test_state(data):
                 result["nextState"] = next_state
 
         elif state_type == "Succeed":
-            output = _apply_input_path(state_def, input_data)
-            output = _apply_output_path(state_def, output)
+            output = _apply_input_path(state_def, input_data, ctx)
+            output = _apply_output_path(state_def, output, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
 
         elif state_type == "Fail":
@@ -1199,11 +1259,11 @@ def _test_state(data):
             }
 
         elif state_type == "Task":
-            effective = _apply_input_path(state_def, input_data)
+            effective = _apply_input_path(state_def, input_data, ctx)
             effective = _apply_parameters(state_def, effective, ctx)
 
             if inspection_level in ("DEBUG", "TRACE"):
-                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data))
+                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data, ctx))
                 inspection_data["afterParameters"] = json.dumps(effective)
 
             # Mock support
@@ -1258,7 +1318,7 @@ def _test_state(data):
                         mock_result = mock["result"]
                     task_result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, input_data, task_result)
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1279,7 +1339,7 @@ def _test_state(data):
                     if inspection_level in ("DEBUG", "TRACE"):
                         inspection_data["afterResultPath"] = json.dumps(output)
 
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1403,7 +1463,7 @@ def _emit_execution_status_event(execution) -> None:
                 "Detail": json.dumps(detail),
                 "Resources": [execution["executionArn"]],
             }]
-        })
+        }, allow_aws_source=True)
     except Exception:
         logger.warning("Failed to publish execution status event for %s",
                        execution["executionArn"], exc_info=True)
@@ -1469,7 +1529,7 @@ def _run_execution(exec_arn):
                     "States.Runtime",
                     f"State '{current_name}' not found in definition")
 
-            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
             _add_event(execution, f"{state_type}StateEntered", {
@@ -1480,8 +1540,8 @@ def _run_execution(exec_arn):
             })
 
             if state_type == "Succeed":
-                current_input = _apply_input_path(state_def, current_input)
-                current_input = _apply_output_path(state_def, current_input)
+                current_input = _apply_input_path(state_def, current_input, ctx)
+                current_input = _apply_output_path(state_def, current_input, ctx)
                 _add_event(execution, "SucceedStateExited", {
                     "stateExitedEventDetails": {
                         "name": current_name,
@@ -1568,13 +1628,13 @@ def _execute_pass(state_def, raw_input, ctx=None):
         _apply_state_assign(state_def, raw_input, ctx, result=output)
         return output, _next_or_end(state_def)
 
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
     result = state_def.get("Result", effective)
     result = _apply_result_selector(state_def, result)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -1618,16 +1678,11 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 else:
                     result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, raw_input, result)
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                 return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
-
-    effective = None
-    if query_language != "JSONata":
-        effective = _apply_input_path(state_def, raw_input)
-        effective = _apply_parameters(state_def, effective, ctx)
 
     retriers = state_def.get("Retry", [])
     catchers = state_def.get("Catch", [])
@@ -1635,6 +1690,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
     last_error: _ExecutionError | None = None
 
     while True:
+        # Each attempt sees its own $$.State.RetryCount.
+        ctx["State"]["RetryCount"] = sum(retry_counts.values())
+        if query_language != "JSONata":
+            effective = _apply_parameters(state_def, _apply_input_path(state_def, raw_input, ctx), ctx)
         try:
             if query_language == "JSONata":
                 effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
@@ -1652,6 +1711,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
             if is_callback:
                 task_result = _invoke_with_callback(
                     resource, effective, ctx["Task"]["Token"], state_def)
+            # Skip activities: their timeout starts when a worker gets the task, not here
+            elif "TimeoutSeconds" in state_def and ":activity:" not in resource:
+                task_result = _invoke_resource_with_timeout(
+                    resource, effective, state_def["TimeoutSeconds"])
             else:
                 task_result = _invoke_resource(resource, effective)
 
@@ -1676,7 +1739,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
             else:
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
-                output = _apply_output_path(state_def, output)
+                output = _apply_output_path(state_def, output, ctx)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -1772,6 +1835,21 @@ def _invoke_resource(resource, input_data):
         )
 
     return input_data
+
+
+def _invoke_resource_with_timeout(resource, input_data, timeout):
+    """Run the task, and raise States.Timeout when it runs longer than TimeoutSeconds.
+
+    This function does not stop the task thread. The task continues to run, but the state ignores its result.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    # Workers do not inherit contextvars, so copy them to keep the account and region scope (#639).
+    future = pool.submit(contextvars.copy_context().run, _invoke_resource, resource, input_data)
+    pool.shutdown(wait=False)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        raise _ExecutionError("States.Timeout", f"Task timed out after {timeout} seconds") from None
 
 
 def _invoke_activity(resource, input_data):
@@ -1918,7 +1996,7 @@ def _call_lambda(func_ref, event):
 
     body = result.get("body")
     if body is None:
-        return {}
+        return None
     if isinstance(body, (dict, list)):
         return body
     try:
@@ -1951,15 +2029,15 @@ def _execute_choice(state_def, raw_input, ctx=None):
         raise _ExecutionError("States.NoChoiceMatched",
                               "No choice rule matched and no Default")
 
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     for choice in state_def.get("Choices", []):
-        if _evaluate_rule(choice, effective):
-            return _apply_output_path(state_def, effective), choice["Next"]
+        if _evaluate_rule(choice, effective, ctx):
+            return _apply_output_path(state_def, effective, ctx), choice["Next"]
 
     default = state_def.get("Default")
     if default:
-        return _apply_output_path(state_def, effective), default
+        return _apply_output_path(state_def, effective, ctx), default
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
@@ -1979,18 +2057,24 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
     return _truthy(condition)
 
 
-def _evaluate_rule(rule, data):
+def _resolve_path_or_ctx(path, data, ctx):
+    if path.startswith("$$."):
+        return _resolve_ctx_path(path, ctx or {})
+    return _resolve_path(path, data)
+
+
+def _evaluate_rule(rule, data, ctx=None):
     if "And" in rule:
-        return all(_evaluate_rule(r, data) for r in rule["And"])
+        return all(_evaluate_rule(r, data, ctx) for r in rule["And"])
     if "Or" in rule:
-        return any(_evaluate_rule(r, data) for r in rule["Or"])
+        return any(_evaluate_rule(r, data, ctx) for r in rule["Or"])
     if "Not" in rule:
-        return not _evaluate_rule(rule["Not"], data)
+        return not _evaluate_rule(rule["Not"], data, ctx)
 
     variable = rule.get("Variable")
     if not variable:
         return False
-    value = _resolve_path(variable, data)
+    value = _resolve_path_or_ctx(variable, data, ctx)
 
     # --- type checks ---
     if "IsPresent" in rule:
@@ -2010,7 +2094,7 @@ def _evaluate_rule(rule, data):
     if "StringEquals" in rule:
         return value == rule["StringEquals"]
     if "StringEqualsPath" in rule:
-        return value == _resolve_path(rule["StringEqualsPath"], data)
+        return value == _resolve_path_or_ctx(rule["StringEqualsPath"], data, ctx)
     if "StringLessThan" in rule:
         return isinstance(value, str) and value < rule["StringLessThan"]
     if "StringGreaterThan" in rule:
@@ -2027,7 +2111,7 @@ def _evaluate_rule(rule, data):
     if "NumericEquals" in rule:
         return _is_num(value) and value == rule["NumericEquals"]
     if "NumericEqualsPath" in rule:
-        return _is_num(value) and value == _resolve_path(rule["NumericEqualsPath"], data)
+        return _is_num(value) and value == _resolve_path_or_ctx(rule["NumericEqualsPath"], data, ctx)
     if "NumericLessThan" in rule:
         return _is_num(value) and value < rule["NumericLessThan"]
     if "NumericGreaterThan" in rule:
@@ -2037,23 +2121,23 @@ def _evaluate_rule(rule, data):
     if "NumericGreaterThanEquals" in rule:
         return _is_num(value) and value >= rule["NumericGreaterThanEquals"]
     if "NumericLessThanPath" in rule:
-        rhs = _resolve_path(rule["NumericLessThanPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericLessThanPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value < rhs
     if "NumericGreaterThanPath" in rule:
-        rhs = _resolve_path(rule["NumericGreaterThanPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericGreaterThanPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value > rhs
     if "NumericLessThanEqualsPath" in rule:
-        rhs = _resolve_path(rule["NumericLessThanEqualsPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericLessThanEqualsPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value <= rhs
     if "NumericGreaterThanEqualsPath" in rule:
-        rhs = _resolve_path(rule["NumericGreaterThanEqualsPath"], data)
+        rhs = _resolve_path_or_ctx(rule["NumericGreaterThanEqualsPath"], data, ctx)
         return _is_num(value) and _is_num(rhs) and value >= rhs
 
     # --- boolean ---
     if "BooleanEquals" in rule:
         return value is rule["BooleanEquals"] or value == rule["BooleanEquals"]
     if "BooleanEqualsPath" in rule:
-        return value == _resolve_path(rule["BooleanEqualsPath"], data)
+        return value == _resolve_path_or_ctx(rule["BooleanEqualsPath"], data, ctx)
 
     # --- timestamp ---
     for op, cmp_fn in [("TimestampEquals", lambda a, b: a == b),
@@ -2073,7 +2157,7 @@ def _evaluate_rule(rule, data):
 # ---------------------------------------------------------------------------
 
 def _execute_wait(state_def, raw_input, ctx=None):
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
         _scaled_sleep(state_def["Seconds"])
@@ -2088,7 +2172,7 @@ def _execute_wait(state_def, raw_input, ctx=None):
         if isinstance(ts_str, str):
             _sleep_until(ts_str)
 
-    output = _apply_output_path(state_def, effective)
+    output = _apply_output_path(state_def, effective, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2112,8 +2196,40 @@ def _sleep_until(iso_ts):
 # Parallel state
 # ---------------------------------------------------------------------------
 
+def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
+    """Run a Parallel or Map attempt under the state's Retry and Catch fields."""
+    state = ctx["State"]
+    retry_counts: dict = {}
+    while True:
+        # Branches share ctx and leave their own State in it; each attempt starts from this state's, counted.
+        ctx["State"] = {**state, "RetryCount": sum(retry_counts.values())}
+        try:
+            return attempt()
+        except _ExecutionError as err:
+            retrier, retrier_idx = _find_matching_retrier(
+                state_def.get("Retry", []), err.error, retry_counts)
+            if retrier is not None:
+                count = retry_counts.get(retrier_idx, 0)
+                interval = retrier.get("IntervalSeconds", 1)
+                _scaled_sleep(min(interval * (retrier.get("BackoffRate", 2.0) ** count), 60))
+                retry_counts[retrier_idx] = count + 1
+                continue
+            catcher = _find_matching_catcher(state_def.get("Catch", []), err.error)
+            if catcher is None:
+                raise
+            error_output = {"Error": err.error, "Cause": err.cause}
+            output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+            return output, catcher["Next"]
+
+
 def _execute_parallel(state_def, raw_input, execution, ctx):
-    effective = _apply_input_path(state_def, raw_input)
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_parallel_branches(state_def, raw_input, execution, ctx))
+
+
+def _run_parallel_branches(state_def, raw_input, execution, ctx):
+    effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
     branches = state_def.get("Branches", [])
@@ -2154,7 +2270,7 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2163,12 +2279,18 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 # ---------------------------------------------------------------------------
 
 def _execute_map(state_def, raw_input, execution, ctx):
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_map_items(state_def, raw_input, execution, ctx))
+
+
+def _run_map_items(state_def, raw_input, execution, ctx):
     # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
     # is applied per item below -- and ItemsPath must resolve against the untransformed input
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     items_path = state_def.get("ItemsPath", "$")
-    items = _resolve_path(items_path, effective)
+    items = _resolve_path_or_ctx(items_path, effective, ctx)
     if not isinstance(items, list):
         items = [items]
 
@@ -2214,7 +2336,7 @@ def _execute_map(state_def, raw_input, execution, ctx):
 
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
     return output, _next_or_end(state_def)
 
 
@@ -2233,11 +2355,11 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"State '{current_name}' not found")
 
         state_type = state_def.get("Type")
-        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
 
         if state_type == "Succeed":
             return _apply_output_path(state_def,
-                                      _apply_input_path(state_def, current_input))
+                                      _apply_input_path(state_def, current_input, ctx), ctx)
         if state_type == "Fail":
             raise _ExecutionError(
                 state_def.get("Error", "States.Fail"),
@@ -2270,18 +2392,18 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
 # Path / Parameter processing
 # ===================================================================
 
-def _apply_input_path(state_def, data):
+def _apply_input_path(state_def, data, ctx=None):
     ip = state_def.get("InputPath", "$")
     if ip is None:
         return {}
-    return _resolve_path(ip, data)
+    return _resolve_path_or_ctx(ip, data, ctx)
 
 
-def _apply_output_path(state_def, data):
+def _apply_output_path(state_def, data, ctx=None):
     op = state_def.get("OutputPath", "$")
     if op is None:
         return {}
-    return _resolve_path(op, data)
+    return _resolve_path_or_ctx(op, data, ctx)
 
 
 def _apply_parameters(state_def, data, ctx=None):
@@ -2963,21 +3085,30 @@ def _resolve_ctx_path(path, ctx):
 # Retry / Catch helpers
 # ===================================================================
 
+def _error_matches(error_equals, error):
+    """Return True when a retrier's or catcher's ErrorEquals list matches this error name.
+
+    States.TaskFailed matches every error name except States.Timeout, as the
+    AWS Step Functions error handling guide describes.
+    """
+    if "States.ALL" in error_equals or error in error_equals:
+        return True
+    return "States.TaskFailed" in error_equals and error != "States.Timeout"
+
+
 def _find_matching_retrier(retriers, error, retry_counts):
+    """The first retrier matching the error decides; once it has used its MaxAttempts there is no retry."""
     for idx, retrier in enumerate(retriers):
-        equals = retrier.get("ErrorEquals", [])
-        max_attempts = retrier.get("MaxAttempts", 3)
-        if retry_counts.get(idx, 0) >= max_attempts:
-            continue
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(retrier.get("ErrorEquals", []), error):
+            if retry_counts.get(idx, 0) >= retrier.get("MaxAttempts", 3):
+                return None, -1
             return retrier, idx
     return None, -1
 
 
 def _find_matching_catcher(catchers, error):
     for catcher in catchers:
-        equals = catcher.get("ErrorEquals", [])
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
 
@@ -3560,6 +3691,15 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         wire_data = _convert_keys_to_camel(input_data or {})
     else:
         wire_data = input_data
+    # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
+    # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
+    # without changing the state input or guessing whether the text is base64.
+    if (service_name == "secretsmanager"
+            and pascal_action in {"CreateSecret", "PutSecretValue"}
+            and isinstance(wire_data, dict)
+            and isinstance(wire_data.get("SecretBinary"), str)):
+        wire_data = dict(wire_data)
+        wire_data["SecretBinary"] = base64.b64encode(wire_data["SecretBinary"].encode("utf-8")).decode("ascii")
     body = json.dumps(wire_data)
     headers = {
         "x-amz-target": target,
@@ -3586,6 +3726,10 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         error_type = result.get("__type", result.get("Error", {}).get("Code", "ServiceException"))
         error_msg = result.get("message", result.get("Message", str(result)))
         raise _ExecutionError(_prefix_sdk_error(service_name, error_type), error_msg)
+
+    if (service_name == "secretsmanager" and pascal_action == "GetSecretValue"
+            and isinstance(result, dict) and "SecretBinary" in result):
+        result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
 
     # For JSON-protocol services, only convert top-level keys to avoid
     # mangling user-defined data (e.g. DynamoDB attribute names).
@@ -3730,7 +3874,7 @@ _XML_LIST_WRAPPER_TAGS = frozenset({
     "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
     "OptionGroupMemberships", "OptionGroupsList", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
-    "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
+    "EnabledCloudwatchLogsExports", "GlobalClusterMembers", "GlobalClusters",
     "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
     "Roles", "Users", "Groups", "Policies", "AttachedPolicies", "PolicyNames",
@@ -4868,6 +5012,8 @@ _SERVICE_DISPATCH = {
 def reset():
     _state_machines.clear()
     _executions.clear()
+    with _history_page_tokens_lock:
+        _history_page_tokens.clear()
     _task_tokens.clear()
     _tags.clear()
     _activities.clear()

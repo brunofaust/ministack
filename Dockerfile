@@ -6,6 +6,8 @@ ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
 # through "s3tablescatalog/<bucket>" the way Athena does on AWS.
 FROM python:3.13-slim-bookworm AS builder
 
+# awscli 1.45.x pins botocore exactly and 1.46 bundles its own copy (~120 MB),
+# so the CLI is installed without deps and runs on the botocore pinned here.
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
         "duckdb>=1.4" \
@@ -20,7 +22,11 @@ RUN pip install --no-cache-dir --no-compile \
         "boto3>=1.34" \
         "jsonata-python>=0.7.0" \
         "graphql-core==3.2.12" \
-        "awscli==1.45.63"
+        "botocore==1.43.106" \
+        "docutils>=0.18.1,<=0.19" \
+        "colorama>=0.2.5,<0.4.7" \
+        "rsa>=3.1.2,<4.8" \
+    && pip install --no-cache-dir --no-compile --no-deps awscli==1.45.63
 
 # Bake the DuckDB extensions the Athena emulator loads at query time into a
 # fixed, root-owned directory; the runtime user never downloads anything.
@@ -97,6 +103,6 @@ EXPOSE 4566 2222
 
 # Pure Python healthcheck — no curl dependency; USE_SSL for HTTP/HTTPS.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); r.urlopen(('https' if t else 'http')+'://localhost:4566/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
+    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); p=os.environ.get('GATEWAY_PORT') or os.environ.get('EDGE_PORT') or '4566'; r.urlopen(('https' if t else 'http')+'://localhost:'+p+'/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
 
 ENTRYPOINT ["python", "-m", "ministack"]

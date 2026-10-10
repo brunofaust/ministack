@@ -109,6 +109,17 @@ def _live_ids() -> tuple[set, set]:
     return live, known
 
 
+def _labels(container) -> dict:
+    """Labels of a listed container; a sparse listing carries them top-level."""
+    attrs = getattr(container, "attrs", None) or {}
+    if "Labels" in attrs:
+        return attrs.get("Labels") or {}
+    try:
+        return container.labels or {}
+    except Exception:
+        return {}
+
+
 def reap_abandoned(docker_client) -> int:
     """Remove abandoned containers. Returns how many were reclaimed."""
     if docker_client is None:
@@ -121,16 +132,18 @@ def reap_abandoned(docker_client) -> int:
         # containers are not merely skipped later — they are never listed, so no
         # amount of downstream logic can reclaim them. Containers predating the
         # labels are likewise invisible here; the boot sweep still gets them.
-        containers = docker_client.containers.list(all=True, filters={"label": [
+        # Sparse: a full listing inspects every container and fails whole on one bad inspect.
+        containers = docker_client.containers.list(all=True, sparse=True, filters={"label": [
             f"{INSTANCE_LABEL}={instance_id()}",
             f"{BOOT_LABEL}={_boot_nonce}",
         ]})
     except Exception as exc:
-        logger.debug("reaper: listing containers failed: %s", exc)
+        logger.warning("reaper: listing containers failed: %s", exc)
         return 0
 
     for c in containers:
         try:
+            c.reload()                # this container's state; a failure skips only it
             label = (c.labels or {}).get("ministack", "")
             status = c.status
             if status not in ("created", "dead", "exited"):
@@ -235,9 +248,10 @@ def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = Fa
 
     def _collect(selector, accept):
         try:
-            found = docker_client.containers.list(all=True, filters={"label": selector})
+            # Sparse: one container whose inspect fails must not cost the whole sweep.
+            found = docker_client.containers.list(all=True, sparse=True, filters={"label": selector})
         except Exception as exc:
-            logger.debug("reap_all: listing %s failed: %s", selector, exc)
+            logger.warning("reap_all: listing %s failed: %s", selector, exc)
             return
         for c in found:
             if c.id in seen or not accept(c):
@@ -250,7 +264,7 @@ def reap_all(docker_client, stop_timeout: int = 2, include_unlabelled: bool = Fa
         for service_label in SERVICE_LABELS:
             # Only ownerless leftovers. A container carrying someone else's
             # instance label is off limits however it was found.
-            _collect([service_label], lambda c: not (c.labels or {}).get(INSTANCE_LABEL))
+            _collect([service_label], lambda c: not _labels(c).get(INSTANCE_LABEL))
     return drop_containers(targets, stop_timeout=stop_timeout)
 
 
@@ -274,10 +288,16 @@ def drop_containers(containers, stop_timeout: int = 2, force: bool = False) -> i
             c.stop(timeout=stop_timeout)
             c.remove(v=True, force=force)   # v=True: reclaim the anonymous volume too
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug("container_reaper: could not remove %s: %s", getattr(c, "id", "?"), e)
             return False
 
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=min(16, len(targets)), thread_name_prefix="ministack-reap") as pool:
-        return sum(1 for ok in pool.map(_drop, targets) if ok)
+        results = list(pool.map(_drop, targets))
+    left = [getattr(c, "id", "?")[:12] for c, ok in zip(targets, results) if not ok]
+    if left:
+        logger.warning("container_reaper: %d container(s) could not be removed: %s",
+                       len(left), ", ".join(left))
+    return len(targets) - len(left)
 

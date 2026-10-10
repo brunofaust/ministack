@@ -1,4 +1,8 @@
+import datetime
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
 
 import boto3
@@ -152,7 +156,7 @@ def test_restore_legacy_child_state_uses_parent_asg_region():
 
     service.reset()
     try:
-        service.restore_state(
+        service.load_persisted_state(
             {
                 "asgs": asgs,
                 "policies": policies,
@@ -437,6 +441,235 @@ def test_put_and_describe_scaling_policy(autoscaling):
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
 
 
+def test_put_scaling_policy_target_tracking_and_step_read_back(autoscaling):
+    """Target-tracking and step policies read back with only their type's members."""
+    asg = _uid("asg-ttpol")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
+        AvailabilityZones=["us-east-1a"], LaunchConfigurationName="dummy-lc",
+    )
+    tracking = {
+        "CustomizedMetricSpecification": {
+            "MetricName": "CPUUtilization", "Namespace": "AWS/EC2",
+            "Dimensions": [{"Name": "AutoScalingGroupName", "Value": asg}],
+            "Statistic": "Average", "Unit": "Percent",
+        },
+        "TargetValue": 50.5,
+        "DisableScaleIn": True,
+    }
+    steps = [
+        {"MetricIntervalLowerBound": 0.0, "MetricIntervalUpperBound": 10.0, "ScalingAdjustment": 10},
+        {"MetricIntervalLowerBound": 10.0, "ScalingAdjustment": 20},
+    ]
+    try:
+        autoscaling.put_scaling_policy(
+            AutoScalingGroupName=asg, PolicyName="tt", PolicyType="TargetTrackingScaling",
+            TargetTrackingConfiguration=tracking, EstimatedInstanceWarmup=120,
+        )
+        autoscaling.put_scaling_policy(
+            AutoScalingGroupName=asg, PolicyName="step", PolicyType="StepScaling",
+            AdjustmentType="PercentChangeInCapacity", MinAdjustmentMagnitude=1,
+            MetricAggregationType="Average", StepAdjustments=steps,
+        )
+        policies = {p["PolicyName"]: p for p in autoscaling.describe_policies(
+            AutoScalingGroupName=asg)["ScalingPolicies"]}
+        tt, step = policies["tt"], policies["step"]
+        assert tt["TargetTrackingConfiguration"] == tracking
+        assert tt["EstimatedInstanceWarmup"] == 120
+        assert tt["Enabled"] is True and tt["StepAdjustments"] == []
+        assert not {"AdjustmentType", "ScalingAdjustment", "Cooldown"} & set(tt)
+        assert step["StepAdjustments"] == steps
+        assert step["AdjustmentType"] == "PercentChangeInCapacity"
+        assert step["MinAdjustmentMagnitude"] == 1
+        assert step["MetricAggregationType"] == "Average"
+        assert not {"ScalingAdjustment", "Cooldown"} & set(step)
+    finally:
+        for name in ("tt", "step"):
+            autoscaling.delete_policy(AutoScalingGroupName=asg, PolicyName=name)
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+def test_put_scaling_policy_predictive_read_back(autoscaling):
+    """PredictiveScalingConfiguration reads back with MaxCapacityBreachBehavior defaulted."""
+    asg = _uid("asg-pred")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
+        AvailabilityZones=["us-east-1a"], LaunchConfigurationName="dummy-lc",
+    )
+    config = {"Mode": "ForecastOnly", "MetricSpecifications": [{
+        "TargetValue": 40.0,
+        "PredefinedMetricPairSpecification": {"PredefinedMetricType": "ASGCPUUtilization"}}]}
+    try:
+        autoscaling.put_scaling_policy(
+            AutoScalingGroupName=asg, PolicyName="pred", PolicyType="PredictiveScaling",
+            PredictiveScalingConfiguration=config)
+        policy = autoscaling.describe_policies(AutoScalingGroupName=asg)["ScalingPolicies"][0]
+        assert policy["PredictiveScalingConfiguration"] == {
+            **config, "MaxCapacityBreachBehavior": "HonorMaxCapacity"}
+        assert not {"AdjustmentType", "ScalingAdjustment", "Cooldown"} & set(policy)
+    finally:
+        autoscaling.delete_policy(AutoScalingGroupName=asg, PolicyName="pred")
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+_CPU_TRACKING = {"PredefinedMetricSpecification": {"PredefinedMetricType": "ASGAverageCPUUtilization"},
+                 "TargetValue": 50.0}
+
+
+def _tracking_group(autoscaling):
+    asg = _uid("asg-ttalarm")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
+        AvailabilityZones=["us-east-1a"], LaunchConfigurationName="dummy-lc",
+    )
+    return asg
+
+
+def _put_tracking(autoscaling, asg, name, tracking):
+    return autoscaling.put_scaling_policy(
+        AutoScalingGroupName=asg, PolicyName=name, PolicyType="TargetTrackingScaling",
+        TargetTrackingConfiguration=tracking)
+
+
+def test_target_tracking_policy_creates_alarms(autoscaling, cw):
+    """A target tracking policy creates an AlarmHigh and an AlarmLow alarm and lists them."""
+    asg = _tracking_group(autoscaling)
+    try:
+        put = _put_tracking(autoscaling, asg, "cpu", _CPU_TRACKING)
+        arn = put["PolicyARN"]
+        names = [a["AlarmName"] for a in put["Alarms"]]
+        assert [n.rsplit("-", 5)[0] for n in names] == [
+            f"TargetTracking-{asg}-AlarmHigh", f"TargetTracking-{asg}-AlarmLow"]
+        assert autoscaling.describe_policies(
+            AutoScalingGroupName=asg)["ScalingPolicies"][0]["Alarms"] == put["Alarms"]
+        alarms = {a["AlarmName"]: a for a in cw.describe_alarms(AlarmNames=names)["MetricAlarms"]}
+        dims = [{"Name": "AutoScalingGroupName", "Value": asg}]
+        assert [(a["AlarmArn"], a["Namespace"], a["MetricName"], a["Statistic"], a["Dimensions"],
+                 a["Period"], a["EvaluationPeriods"], a["Threshold"], a["ComparisonOperator"],
+                 a["AlarmActions"]) for a in (alarms[n] for n in names)] == [
+            (put["Alarms"][0]["AlarmARN"], "AWS/EC2", "CPUUtilization", "Average", dims,
+             60, 3, 50.0, "GreaterThanThreshold", [arn]),
+            (put["Alarms"][1]["AlarmARN"], "AWS/EC2", "CPUUtilization", "Average", dims,
+             60, 15, 45.0, "LessThanThreshold", [arn]),
+        ]
+        for alarm in alarms.values():
+            assert alarm["AlarmDescription"] == (
+                f"DO NOT EDIT OR DELETE. For TargetTrackingScaling policy {arn}.")
+            assert not {"Unit", "DatapointsToAlarm", "TreatMissingData"} & set(alarm)
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+@pytest.mark.parametrize("tracking,metric,thresholds", [
+    ({"PredefinedMetricSpecification": {"PredefinedMetricType": "ASGAverageNetworkIn"},
+      "TargetValue": 1000000.0},
+     ("AWS/EC2", "NetworkIn", "Average", "Bytes"), [1000000.0, 900000.0]),
+    ({"PredefinedMetricSpecification": {"PredefinedMetricType": "ASGAverageNetworkOut"},
+      "TargetValue": 1000000.0},
+     ("AWS/EC2", "NetworkOut", "Average", "Bytes"), [1000000.0, 900000.0]),
+    ({"CustomizedMetricSpecification": {"MetricName": "Depth", "Namespace": "Test/App",
+                                        "Dimensions": [{"Name": "Q", "Value": "q1"}],
+                                        "Statistic": "Sum", "Unit": "Count"},
+      "TargetValue": 0.1},
+     ("Test/App", "Depth", "Sum", "Count"), [0.1, 0.09]),
+    ({**_CPU_TRACKING, "DisableScaleIn": True},
+     ("AWS/EC2", "CPUUtilization", "Average", None), [50.0]),
+], ids=["network-in", "network-out", "customized", "disable-scale-in"])
+def test_target_tracking_alarm_metric_and_thresholds(autoscaling, cw, tracking, metric, thresholds):
+    """The alarms follow the tracked metric and target; DisableScaleIn leaves only AlarmHigh."""
+    asg = _tracking_group(autoscaling)
+    try:
+        names = [a["AlarmName"] for a in _put_tracking(autoscaling, asg, "p", tracking)["Alarms"]]
+        alarms = {a["AlarmName"]: a for a in cw.describe_alarms(AlarmNames=names)["MetricAlarms"]}
+        assert [(a["Namespace"], a["MetricName"], a["Statistic"], a.get("Unit"))
+                for a in (alarms[n] for n in names)] == [metric] * len(thresholds)
+        assert [alarms[n]["Threshold"] for n in names] == thresholds
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+def test_target_tracking_alarms_follow_policy_lifecycle(autoscaling, cw):
+    """Updating a policy replaces its alarms; deleting the policy or the group deletes them."""
+    asg = _tracking_group(autoscaling)
+
+    def existing(put):
+        names = [a["AlarmName"] for a in put["Alarms"]]
+        return [a["AlarmName"] for a in cw.describe_alarms(AlarmNames=names)["MetricAlarms"]]
+
+    try:
+        first = _put_tracking(autoscaling, asg, "cpu", _CPU_TRACKING)
+        second = _put_tracking(autoscaling, asg, "cpu", {**_CPU_TRACKING, "TargetValue": 60.0})
+        assert existing(first) == []
+        assert len(existing(second)) == 2
+        autoscaling.delete_policy(AutoScalingGroupName=asg, PolicyName="cpu")
+        assert existing(second) == []
+        kept = [_put_tracking(autoscaling, asg, name, _CPU_TRACKING) for name in ("a", "b")]
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+    assert [existing(put) for put in kept] == [[], []]
+    assert cw.describe_alarms(AlarmNamePrefix=f"TargetTracking-{asg}-")["MetricAlarms"] == []
+
+
+def test_group_delete_keeps_the_alarms_of_a_group_with_a_longer_name(autoscaling, cw):
+    """Deleting a group leaves the policies and alarms of a group whose name starts with it."""
+    asg = _tracking_group(autoscaling)
+    other = f"{asg}/blue"
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=other, MinSize=0, MaxSize=2,
+        AvailabilityZones=["us-east-1a"], LaunchConfigurationName="dummy-lc",
+    )
+    try:
+        _put_tracking(autoscaling, asg, "cpu", _CPU_TRACKING)
+        kept = _put_tracking(autoscaling, other, "cpu", _CPU_TRACKING)
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        names = [a["AlarmName"] for a in kept["Alarms"]]
+        assert len(cw.describe_alarms(AlarmNames=names)["MetricAlarms"]) == 2
+        assert [p["PolicyName"] for p in autoscaling.describe_policies(
+            AutoScalingGroupName=other)["ScalingPolicies"]] == ["cpu"]
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=other)
+    assert cw.describe_alarms(AlarmNamePrefix=f"TargetTracking-{other}-")["MetricAlarms"] == []
+
+
+@pytest.mark.parametrize("members", [
+    {"PolicyType": "TargetTrackingScaling",
+     "TargetTrackingConfiguration.PredefinedMetricSpecification.PredefinedMetricType":
+         "ASGAverageCPUUtilization",
+     "TargetTrackingConfiguration.TargetValue": "fifty"},
+    {"PolicyType": "StepScaling", "AdjustmentType": "ChangeInCapacity",
+     "StepAdjustments.member.1.MetricIntervalLowerBound": "zero",
+     "StepAdjustments.member.1.ScalingAdjustment": "1"},
+    {"PolicyType": "SimpleScaling", "ScalingAdjustment": "one"},
+], ids=["target-value", "step-bound", "scaling-adjustment"])
+def test_put_scaling_policy_non_numeric_member_is_a_validation_error(autoscaling, members):
+    """A non-numeric number member is a ValidationError, not a 500."""
+    asg = _uid("asg-badnum")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
+        AvailabilityZones=["us-east-1a"], LaunchConfigurationName="dummy-lc",
+    )
+    body = urllib.parse.urlencode({
+        "Action": "PutScalingPolicy", "Version": "2011-01-01",
+        "AutoScalingGroupName": asg, "PolicyName": "bad", **members,
+    }).encode()
+    req = urllib.request.Request(
+        os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566") + "/",
+        data=body, method="POST",
+        headers={"Content-Type": "application/x-www-form-urlencoded",
+                 "Authorization": ("AWS4-HMAC-SHA256 Credential=test/20260921/"
+                                   "us-east-1/autoscaling/aws4_request, "
+                                   "SignedHeaders=, Signature=x")},
+    )
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=10)
+        assert exc.value.code == 400
+        assert b"<Code>ValidationError</Code>" in exc.value.read()
+        assert autoscaling.describe_policies(AutoScalingGroupName=asg)["ScalingPolicies"] == []
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
 def test_describe_policies_empty(autoscaling):
     resp = autoscaling.describe_policies(AutoScalingGroupName=_uid("no-asg"))
     assert resp["ScalingPolicies"] == []
@@ -667,6 +900,29 @@ def test_put_and_describe_scheduled_action(autoscaling):
         autoscaling.delete_scheduled_action(
             AutoScalingGroupName=asg, ScheduledActionName=action
         )
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+
+
+def test_scheduled_action_times_read_back(autoscaling):
+    """StartTime (also as Time), EndTime and TimeZone read back."""
+    asg = _uid("asg-stimes")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=2,
+        AvailabilityZones=["us-east-1a"], LaunchConfigurationName="dummy-lc",
+    )
+    start = datetime.datetime(2027, 1, 4, 9, tzinfo=datetime.timezone.utc)
+    end = datetime.datetime(2027, 6, 1, tzinfo=datetime.timezone.utc)
+    try:
+        autoscaling.put_scheduled_update_group_action(
+            AutoScalingGroupName=asg, ScheduledActionName="times",
+            Recurrence="0 9 * * *", StartTime=start, EndTime=end,
+            TimeZone="Europe/Berlin", MinSize=0, MaxSize=1)
+        action = autoscaling.describe_scheduled_actions(
+            AutoScalingGroupName=asg)["ScheduledUpdateGroupActions"][0]
+        assert (action["StartTime"], action["Time"], action["EndTime"], action["TimeZone"]) == (
+            start, start, end, "Europe/Berlin")
+    finally:
+        autoscaling.delete_scheduled_action(AutoScalingGroupName=asg, ScheduledActionName="times")
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
 
 

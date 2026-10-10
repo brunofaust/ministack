@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import re
 import time
+import uuid
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
@@ -10,6 +12,13 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import REGION, sqs_policy_allow_s3, sqs_policy_allow_sns
+
+from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+from ministack.core.responses import request_scope
+from ministack.services import s3 as s3_svc
+from ministack.services import sns as sns_svc
+from ministack.services import sqs as sqs_svc
 
 
 def _make_zip(code: str) -> bytes:
@@ -656,7 +665,7 @@ def test_sqs_send_message_batch_rejects_oversized_aggregate(sqs):
     """
     url = sqs.create_queue(
         QueueName="intg-sqs-batch-too-long",
-        Attributes={"MaximumMessageSize": "262144"},  # default
+        Attributes={"MaximumMessageSize": "262144"},  # below the 1 MiB default
     )["QueueUrl"]
 
     # 10 × 150 KiB → 1.5 MiB total. Each individual entry is within the queue's
@@ -767,14 +776,6 @@ def test_sqs_change_message_visibility_invalid_receipt_handle(sqs):
     assert exc_info.value.response["Error"]["Code"] == "ReceiptHandleIsInvalid"
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
-
-def test_sqs_receive_max_10(sqs):
-    """ReceiveMessage with MaxNumberOfMessages > 10 is capped at 10."""
-    url = sqs.create_queue(QueueName="qa-sqs-max10")["QueueUrl"]
-    for i in range(15):
-        sqs.send_message(QueueUrl=url, MessageBody=f"msg{i}")
-    msgs = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=15)
-    assert len(msgs.get("Messages", [])) <= 10
 
 def test_sqs_visibility_timeout_zero_makes_visible(sqs):
     """ChangeMessageVisibility to 0 makes message immediately visible again."""
@@ -1060,12 +1061,13 @@ def test_sqs_localstack_queue_path_alias(sqs):
 def test_sqs_send_message_rejects_oversized_body(sqs):
     """SendMessage must reject bodies exceeding the queue's MaximumMessageSize
     attribute with InvalidParameterValue (400). MaximumMessageSize defaults to
-    262144 (256 KiB) per AWS. Before this fix MS silently accepted oversized
-    messages locally while real AWS rejected — masking client bugs."""
+    1048576 (1 MiB) — captured eu-north-1 2026-09-19; AWS raised it from 256 KiB.
+    Before this fix MS silently accepted oversized messages locally while real
+    AWS rejected — masking client bugs."""
     import pytest as _pytest
 
     q = sqs.create_queue(QueueName="intg-sqs-size-default")["QueueUrl"]
-    body = "x" * (262144 + 1)
+    body = "x" * (1048576 + 1)
     with _pytest.raises(ClientError) as exc:
         sqs.send_message(QueueUrl=q, MessageBody=body)
     assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
@@ -1073,7 +1075,7 @@ def test_sqs_send_message_rejects_oversized_body(sqs):
 
 def test_sqs_send_message_respects_configured_maximum_message_size(sqs):
     """A queue with a tighter MaximumMessageSize must reject bodies that fit
-    in the default 262144 but exceed the configured value."""
+    in the default 1048576 but exceed the configured value."""
     import pytest as _pytest
 
     q = sqs.create_queue(
@@ -1423,7 +1425,7 @@ def test_sqs_restore_rebuilds_legacy_name_index_from_queue_arn():
         }
         legacy_names[queue_name] = queue_url
 
-        _sqs.restore_state({"queues": legacy_queues, "queue_name_to_url": legacy_names})
+        _sqs.load_persisted_state({"queues": legacy_queues, "queue_name_to_url": legacy_names})
 
         assert _sqs._queue_name_to_url.get(queue_name) is None
         set_request_region("us-west-2")
@@ -1626,3 +1628,770 @@ def test_unicode_sqs_message(sqs):
     sqs.send_message(QueueUrl=url, MessageBody=msg)
     resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=1)
     assert resp["Messages"][0]["Body"] == msg
+
+
+# --- Queue and topic resource policies (in-process, AUTH toggled) ---
+
+ACCT_A = "111111111111"
+ACCT_B = "222222222222"
+
+
+def _reset_messaging_state():
+    from ministack.core.iam_evaluator import _request_caller_arn
+
+    sqs_svc.reset()
+    sns_svc.reset()
+    s3_svc.reset()
+    _request_caller_arn.set("")
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    """AUTH=true with clean in-process SQS/SNS/S3 state."""
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    _reset_messaging_state()
+    yield
+    _reset_messaging_state()
+
+
+@pytest.fixture
+def noauth(monkeypatch):
+    """AUTH=false with clean in-process SQS/SNS/S3 state."""
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", False)
+    _reset_messaging_state()
+    yield
+    _reset_messaging_state()
+
+
+def _uniq(prefix):
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def _as(account, fn, *args, **kwargs):
+    """Call an in-process service function as *account* in the test region."""
+    with request_scope(account, REGION):
+        return fn(*args, **kwargs)
+
+
+def _resp_detail(resp):
+    """``(status, code, message)`` of an in-process SNS/S3 response tuple."""
+    status, _headers, body = resp
+    text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    code = re.search(r"<Code>([^<]*)</Code>", text)
+    msg = re.search(r"<Message>([^<]*)</Message>", text)
+    return (status, code.group(1) if code else "",
+            msg.group(1) if msg else "")
+
+
+def _resp_code(resp):
+    """``(status, code)`` of an in-process SNS/S3 response tuple."""
+    status, code, _ = _resp_detail(resp)
+    return status, code
+
+
+def _qarn(account, name):
+    return f"arn:aws:sqs:{REGION}:{account}:{name}"
+
+
+def _tarn(account, name):
+    return f"arn:aws:sns:{REGION}:{account}:{name}"
+
+
+def _make_queue(account, name, policy=None):
+    url = _as(account, sqs_svc._act_create_queue,
+              {"QueueName": name}, "")["QueueUrl"]
+    if policy is not None:
+        _as(account, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": url,
+             "Attributes": {"Policy": json.dumps(policy)}}, url)
+    return url
+
+
+def _queue_bodies(arn):
+    q = sqs_svc._queue_by_arn(arn)
+    assert q is not None
+    return [m["body"] for m in q["messages"]]
+
+
+def _deny_all(arn, action):
+    return {"Version": "2012-10-17", "Statement": [{
+        "Sid": "deny", "Effect": "Deny", "Principal": {"AWS": "*"},
+        "Action": action, "Resource": arn}]}
+
+
+def _allow_account(arn, account, action):
+    return {"Version": "2012-10-17", "Statement": [{
+        "Sid": "x", "Effect": "Allow", "Principal": {"AWS": account},
+        "Action": action, "Resource": arn}]}
+
+
+def _make_topic(account, name):
+    assert _resp_code(_as(account, sns_svc._create_topic,
+                           {"Name": name})) == (200, "")
+    return _tarn(account, name)
+
+
+def _set_topic_policy(account, arn, policy):
+    assert _resp_code(_as(account, sns_svc._set_topic_attributes, {
+        "TopicArn": arn, "AttributeName": "Policy",
+        "AttributeValue": json.dumps(policy)})) == (200, "")
+
+
+def _topic_policy(arn):
+    topic = sns_svc._topic_by_arn_any_scope(arn)
+    assert topic is not None
+    return json.loads(topic["attributes"]["Policy"])
+
+
+def _make_bucket(account, name):
+    assert _resp_code(_as(account, s3_svc._create_bucket,
+                           name, b"", {})) == (200, "")
+
+
+def _notif_xml(kind, arn):
+    tag = "Queue" if kind == "sqs" else "Topic"
+    return (
+        "<NotificationConfiguration>"
+        f"<{tag}Configuration><{tag}>{arn}</{tag}>"
+        "<Event>s3:ObjectCreated:*</Event>"
+        f"</{tag}Configuration>"
+        "</NotificationConfiguration>"
+    ).encode()
+
+
+def _put_notif(account, bucket, kind, arn, skip=False):
+    headers = {"x-amz-skip-destination-validation": "true"} if skip else {}
+    return _as(account, s3_svc._put_bucket_notification,
+               bucket, _notif_xml(kind, arn), headers)
+
+
+# ---------------------------------------------------------------------------
+# Unit: evaluate_resource_policy Service principals
+# ---------------------------------------------------------------------------
+
+def _ctx(action="sqs:SendMessage", resource="arn:aws:sqs:us-east-1:1:q",
+         source_arn="", source_account="", principal="arn:aws:iam::1:root"):
+    return EvalContext(
+        principal_arn=principal,
+        principal_type="Service",
+        principal_account="1",
+        action=action,
+        resource_arn=resource,
+        region="us-east-1",
+        service_context={"aws:sourcearn": source_arn,
+                         "aws:sourceaccount": source_account,
+                         "aws:sourceowner": source_account},
+    )
+
+
+def _svc_policy():
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage",
+            "Resource": "arn:aws:sqs:us-east-1:1:q",
+            "Condition": {"ArnLike": {"aws:SourceArn": "arn:aws:s3:*:*:bkt"}},
+        }],
+    }
+
+
+class TestEvaluateResourcePolicyService:
+    def test_service_principal_allows_matching_service(self):
+        assert evaluate_resource_policy(
+            _svc_policy(), _ctx(source_arn="arn:aws:s3:::bkt"),
+            service="s3.amazonaws.com").decision == "Allow"
+
+    def test_service_principal_ignores_other_service(self):
+        assert evaluate_resource_policy(
+            _svc_policy(), _ctx(source_arn="arn:aws:s3:::bkt"),
+            service="sns.amazonaws.com").decision == "ImplicitDeny"
+
+    def test_service_principal_ignored_without_service_arg(self):
+        # Legacy callers (Lambda layer policies, S3 bucket policies) keep the
+        # old behaviour: Service entries never match.
+        assert evaluate_resource_policy(
+            _svc_policy(), _ctx(source_arn="arn:aws:s3:::bkt")).decision == "ImplicitDeny"
+
+    def test_wrong_source_arn_denies(self):
+        assert evaluate_resource_policy(
+            _svc_policy(), _ctx(source_arn="arn:aws:s3:::other"),
+            service="s3.amazonaws.com").decision == "ImplicitDeny"
+
+    def test_aws_principal_still_matches(self):
+        doc = {"Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": "222222222222"},
+            "Action": "sqs:SendMessage", "Resource": "*"}]}
+        ctx = _ctx(principal="arn:aws:iam::222222222222:root")
+        assert evaluate_resource_policy(doc, ctx).decision == "Allow"
+
+    def test_star_principal_matches(self):
+        doc = {"Statement": [{
+            "Effect": "Allow", "Principal": "*",
+            "Action": "sqs:SendMessage", "Resource": "*"}]}
+        assert evaluate_resource_policy(doc, _ctx()).decision == "Allow"
+
+
+# ---------------------------------------------------------------------------
+# Cross-account SQS
+# ---------------------------------------------------------------------------
+
+class TestCrossAccountSqs:
+    def test_send_denied_without_policy(self, auth):
+        url = _make_queue(ACCT_A, _uniq("xpol-q"))
+        with pytest.raises(sqs_svc._Err) as exc:
+            _as(ACCT_B, sqs_svc._act_send_message,
+                {"QueueUrl": url, "MessageBody": "no-policy"}, url)
+        assert exc.value.code == "AccessDenied"
+        assert exc.value.status == 403
+
+    def test_send_allowed_with_policy(self, auth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name, _allow_account(
+            _qarn(ACCT_A, name), ACCT_B, "sqs:SendMessage"))
+        _as(ACCT_B, sqs_svc._act_send_message,
+            {"QueueUrl": url, "MessageBody": "with-policy"}, url)
+        assert _queue_bodies(_qarn(ACCT_A, name)) == ["with-policy"]
+
+    def test_send_allowed_via_add_permission(self, auth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name)
+        _as(ACCT_A, sqs_svc._act_add_permission,
+            {"QueueUrl": url, "Label": "xacct",
+             "AWSAccountIds": [ACCT_B], "Actions": ["SendMessage"]}, url)
+        _as(ACCT_B, sqs_svc._act_send_message,
+            {"QueueUrl": url, "MessageBody": "via-add-permission"}, url)
+        assert _queue_bodies(_qarn(ACCT_A, name)) == ["via-add-permission"]
+
+    def test_explicit_deny_blocks_same_account(self, auth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name, _deny_all(
+            _qarn(ACCT_A, name), "sqs:SendMessage"))
+        with pytest.raises(sqs_svc._Err) as exc:
+            _as(ACCT_A, sqs_svc._act_send_message,
+                {"QueueUrl": url, "MessageBody": "deny-me"}, url)
+        assert exc.value.code == "AccessDenied"
+
+    def test_get_queue_url_with_owner_account(self, auth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name, _allow_account(
+            _qarn(ACCT_A, name), ACCT_B, "sqs:GetQueueUrl"))
+        found = _as(ACCT_B, sqs_svc._act_get_queue_url,
+                    {"QueueName": name,
+                     "QueueOwnerAWSAccountId": ACCT_A}, "")["QueueUrl"]
+        assert found == url
+
+    def test_get_queue_url_cross_account_denied_without_policy(self, auth):
+        name = _uniq("xpol-q")
+        _make_queue(ACCT_A, name)
+        with pytest.raises(sqs_svc._Err) as exc:
+            _as(ACCT_B, sqs_svc._act_get_queue_url,
+                {"QueueName": name,
+                 "QueueOwnerAWSAccountId": ACCT_A}, "")
+        assert exc.value.code == "AccessDenied"
+        assert exc.value.status == 403
+
+    def test_get_queue_url_same_account_denied_by_explicit_deny(self, auth):
+        name = _uniq("xpol-q")
+        _make_queue(ACCT_A, name, _deny_all(
+            _qarn(ACCT_A, name), "sqs:GetQueueUrl"))
+        with pytest.raises(sqs_svc._Err) as exc:
+            _as(ACCT_A, sqs_svc._act_get_queue_url,
+                {"QueueName": name}, "")
+        assert exc.value.code == "AccessDenied"
+        assert exc.value.status == 403
+
+    def test_get_queue_url_same_account_passes_without_policy(self, auth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name)
+        assert _as(ACCT_A, sqs_svc._act_get_queue_url,
+                   {"QueueName": name}, "") == {"QueueUrl": url}
+
+
+# ---------------------------------------------------------------------------
+# Cross-account SNS (+ AddPermission/RemovePermission)
+# ---------------------------------------------------------------------------
+
+class TestCrossAccountSns:
+    def test_publish_denied_by_default(self, auth):
+        arn = _make_topic(ACCT_A, _uniq("xpol-t"))
+        assert _resp_code(_as(ACCT_B, sns_svc._publish, {
+            "TopicArn": arn, "Message": "no-grant"})) == (403, "AuthorizationError")
+
+    def test_publish_allowed_with_policy(self, auth):
+        name = _uniq("xpol-t")
+        arn = _make_topic(ACCT_A, name)
+        _set_topic_policy(ACCT_A, arn, _allow_account(
+            arn, ACCT_B, "sns:Publish"))
+        assert _resp_code(_as(ACCT_B, sns_svc._publish, {
+            "TopicArn": arn, "Message": "granted"})) == (200, "")
+
+    def test_explicit_deny_blocks_same_account(self, auth):
+        name = _uniq("xpol-t")
+        arn = _make_topic(ACCT_A, name)
+        _set_topic_policy(ACCT_A, arn, _deny_all(arn, "sns:Publish"))
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": arn, "Message": "deny-me"})) == (403, "AuthorizationError")
+
+    def test_add_permission_grants_cross_account_publish(self, auth):
+        arn = _make_topic(ACCT_A, _uniq("xpol-t"))
+        assert _resp_code(_as(ACCT_A, sns_svc._add_permission, {
+            "TopicArn": arn, "Label": "perm-1",
+            "AWSAccountId.member.1": ACCT_B,
+            "ActionName.member.1": "Publish"})) == (200, "")
+        stmt = next(s for s in _topic_policy(arn)["Statement"]
+                    if s.get("Sid") == "perm-1")
+        assert ACCT_B in stmt["Principal"]["AWS"]
+        assert "sns:Publish" in stmt["Action"]
+        assert _resp_code(_as(ACCT_B, sns_svc._publish, {
+            "TopicArn": arn,
+            "Message": "via-add-permission"})) == (200, "")
+
+    def test_add_permission_rejects_duplicate_label(self, auth):
+        arn = _make_topic(ACCT_A, _uniq("xpol-t"))
+        params = {"TopicArn": arn, "Label": "dup",
+                  "AWSAccountId.member.1": ACCT_B,
+                  "ActionName.member.1": "Publish"}
+        assert _resp_code(_as(ACCT_A, sns_svc._add_permission, params)) == (200, "")
+        assert _resp_code(
+            _as(ACCT_A, sns_svc._add_permission, params)) == (
+                400, "InvalidParameter")
+
+    def test_cross_account_tag_access_needs_grant(self, auth):
+        name = _uniq("xpol-t")
+        arn = _make_topic(ACCT_A, name)
+        assert _resp_code(_as(ACCT_B, sns_svc._list_tags_for_resource, {
+            "ResourceArn": arn})) == (403, "AuthorizationError")
+        _set_topic_policy(ACCT_A, arn, _allow_account(
+            arn, ACCT_B, ["sns:TagResource", "sns:ListTagsForResource"]))
+        assert _resp_code(_as(ACCT_B, sns_svc._tag_resource, {
+            "ResourceArn": arn, "Tags.member.1.Key": "k",
+            "Tags.member.1.Value": "v"})) == (200, "")
+        assert _resp_code(_as(ACCT_B, sns_svc._list_tags_for_resource, {
+            "ResourceArn": arn})) == (200, "")
+        assert sns_svc._topic_by_arn_any_scope(arn)["tags"] == {"k": "v"}
+
+    def test_remove_permission_drops_statement(self, auth):
+        arn = _make_topic(ACCT_A, _uniq("xpol-t"))
+        _as(ACCT_A, sns_svc._add_permission, {
+            "TopicArn": arn, "Label": "drop",
+            "AWSAccountId.member.1": ACCT_B,
+            "ActionName.member.1": "Publish"})
+        assert _resp_code(_as(ACCT_B, sns_svc._publish, {
+            "TopicArn": arn, "Message": "before"})) == (200, "")
+        assert _resp_code(_as(ACCT_A, sns_svc._remove_permission, {
+            "TopicArn": arn, "Label": "drop"})) == (200, "")
+        assert all(s.get("Sid") != "drop"
+                   for s in _topic_policy(arn)["Statement"])
+        assert _resp_code(_as(ACCT_B, sns_svc._publish, {
+            "TopicArn": arn, "Message": "after"})) == (403, "AuthorizationError")
+
+
+# ---------------------------------------------------------------------------
+# S3 notifications gated on the destination policy
+# ---------------------------------------------------------------------------
+
+def _bucket_and_queue(tag):
+    bucket, qname = _uniq(f"{tag}-bkt"), _uniq(f"{tag}-q")
+    _make_bucket(ACCT_A, bucket)
+    url = _make_queue(ACCT_A, qname)
+    return bucket, url, _qarn(ACCT_A, qname)
+
+
+def _assert_put_rejected(bucket, kind, arn):
+    status, code, msg = _resp_detail(_put_notif(ACCT_A, bucket, kind, arn))
+    assert status == 400
+    assert code == "InvalidArgument"
+    assert "Unable to validate the following destination configurations" in msg
+
+
+def _bucket_topic_queue(tag):
+    bucket = _uniq(f"{tag}-bkt")
+    _make_bucket(ACCT_A, bucket)
+    topic = _make_topic(ACCT_A, _uniq(f"{tag}-t"))
+    qname = _uniq(f"{tag}-q")
+    qurl = _make_queue(ACCT_A, qname,
+                       sqs_policy_allow_sns(_qarn(ACCT_A, qname), topic))
+    assert _resp_code(_as(ACCT_A, sns_svc._subscribe, {
+        "TopicArn": topic, "Protocol": "sqs",
+        "Endpoint": _qarn(ACCT_A, qname)})) == (200, "")
+    return bucket, topic, qurl, _qarn(ACCT_A, qname)
+
+
+class TestS3NotificationPolicies:
+    def test_s3_put_rejected_without_queue_policy(self, auth):
+        bucket, _url, arn = _bucket_and_queue("xpol")
+        _assert_put_rejected(bucket, "sqs", arn)
+
+    def test_s3_put_rejected_by_unrelated_policy(self, auth):
+        bucket, url, arn = _bucket_and_queue("xpol")
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": url, "Attributes": {"Policy": json.dumps(
+                _allow_account(arn, ACCT_B, "sqs:SendMessage"))}}, url)
+        _assert_put_rejected(bucket, "sqs", arn)
+
+    def test_s3_put_rejected_by_wrong_source_arn(self, auth):
+        bucket, url, arn = _bucket_and_queue("xpol")
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": url, "Attributes": {"Policy": json.dumps(
+                sqs_policy_allow_s3(arn, "no-such-bucket", ACCT_A))}}, url)
+        _assert_put_rejected(bucket, "sqs", arn)
+
+    def test_s3_to_sqs_delivered_with_policy(self, auth):
+        bucket, url, arn = _bucket_and_queue("xpol")
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": url, "Attributes": {"Policy": json.dumps(
+                sqs_policy_allow_s3(arn, bucket, ACCT_A))}}, url)
+        assert _resp_code(_put_notif(ACCT_A, bucket, "sqs", arn)) == (200, "")
+        bodies = _queue_bodies(arn)
+        assert len(bodies) == 1
+        assert "s3:TestEvent" in bodies[0]
+
+    def test_s3_skip_validation_stores_but_delivery_blocked(self, auth):
+        bucket, _url, arn = _bucket_and_queue("xpol")
+        assert _resp_code(
+            _put_notif(ACCT_A, bucket, "sqs", arn, skip=True)) == (200, "")
+        assert _queue_bodies(arn) == []
+        _as(ACCT_A, s3_svc._deliver_event_to_sqs,
+            arn, {"Records": []}, REGION, bucket_name=bucket)
+        assert _queue_bodies(arn) == []
+
+    def test_s3_to_sns_default_policy_delivers(self, auth):
+        bucket, topic, _qurl, qarn = _bucket_topic_queue("xpol")
+        assert _resp_code(_put_notif(ACCT_A, bucket, "sns", topic)) == (200, "")
+        bodies = _queue_bodies(qarn)
+        assert len(bodies) == 1
+        assert "s3:TestEvent" in bodies[0]
+
+    def test_s3_put_rejected_by_topic_policy_without_s3(self, auth):
+        bucket, topic, _qurl, _qarn = _bucket_topic_queue("xpol")
+        _set_topic_policy(ACCT_A, topic, _allow_account(
+            topic, ACCT_A, "sns:Publish"))
+        _assert_put_rejected(bucket, "sns", topic)
+
+    def test_s3_to_sns_skip_validation_delivery_blocked(self, auth):
+        bucket, topic, _qurl, qarn = _bucket_topic_queue("xpol")
+        _set_topic_policy(ACCT_A, topic, _allow_account(
+            topic, ACCT_A, "sns:Publish"))
+        assert _resp_code(
+            _put_notif(ACCT_A, bucket, "sns", topic, skip=True)) == (200, "")
+        _as(ACCT_A, s3_svc._deliver_event_to_sns,
+            topic, {"Records": []}, REGION, bucket_name=bucket)
+        assert _queue_bodies(qarn) == []
+
+    def test_s3_to_cross_account_sns_topic_delivered_with_policy(self, auth):
+        bucket = _uniq("xpol-xbkt")
+        _make_bucket(ACCT_A, bucket)
+        topic = _make_topic(ACCT_B, _uniq("xpol-xt"))
+        _set_topic_policy(ACCT_B, topic, {
+            "Version": "2012-10-17", "Statement": [{
+                "Sid": "s3-xacct", "Effect": "Allow",
+                "Principal": {"Service": "s3.amazonaws.com"},
+                "Action": "sns:Publish", "Resource": topic,
+                "Condition": {
+                    "ArnLike": {"aws:SourceArn": f"arn:aws:s3:::{bucket}"},
+                    "StringEquals": {"aws:SourceAccount": ACCT_A}}}]})
+        qname = _uniq("xpol-xq")
+        _make_queue(ACCT_B, qname, sqs_policy_allow_sns(
+            _qarn(ACCT_B, qname), topic))
+        assert _resp_code(_as(ACCT_B, sns_svc._subscribe, {
+            "TopicArn": topic, "Protocol": "sqs",
+            "Endpoint": _qarn(ACCT_B, qname)})) == (200, "")
+        # The topic lives in another account, but its policy allows this
+        # bucket's deliveries, so the PUT validates instead of failing.
+        assert _resp_code(_put_notif(ACCT_A, bucket, "sns", topic)) == (200, "")
+        bodies = _queue_bodies(_qarn(ACCT_B, qname))
+        assert len(bodies) == 1
+        assert "s3:TestEvent" in bodies[0]
+
+    def test_s3_to_cross_account_sqs_queue_delivered_with_policy(self, auth):
+        bucket = _uniq("xpol-xbkt")
+        _make_bucket(ACCT_A, bucket)
+        qname = _uniq("xpol-xq")
+        _make_queue(ACCT_B, qname, sqs_policy_allow_s3(
+            _qarn(ACCT_B, qname), bucket, ACCT_A))
+        assert _resp_code(
+            _put_notif(ACCT_A, bucket, "sqs", _qarn(ACCT_B, qname))) == (200, "")
+        bodies = _queue_bodies(_qarn(ACCT_B, qname))
+        assert len(bodies) == 1
+        assert "s3:TestEvent" in bodies[0]
+
+    def test_s3_to_cross_account_topic_rejected_without_policy(self, auth):
+        bucket = _uniq("xpol-xbkt")
+        _make_bucket(ACCT_A, bucket)
+        topic = _make_topic(ACCT_B, _uniq("xpol-xt"))
+        _assert_put_rejected(bucket, "sns", topic)
+
+
+# ---------------------------------------------------------------------------
+# SNS→SQS fanout gated on the queue policy
+# ---------------------------------------------------------------------------
+
+def _topic_and_queue(tag):
+    topic = _make_topic(ACCT_A, _uniq(f"{tag}-t"))
+    qname = _uniq(f"{tag}-q")
+    qurl = _make_queue(ACCT_A, qname)
+    assert _resp_code(_as(ACCT_A, sns_svc._subscribe, {
+        "TopicArn": topic, "Protocol": "sqs",
+        "Endpoint": _qarn(ACCT_A, qname)})) == (200, "")
+    return topic, qurl, _qarn(ACCT_A, qname)
+
+
+class TestSnsFanoutPolicies:
+    def test_fanout_blocked_without_policy(self, auth):
+        topic, _qurl, qarn = _topic_and_queue("xpol-fan")
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": topic, "Message": "no-policy"})) == (200, "")
+        assert _queue_bodies(qarn) == []
+
+    def test_fanout_blocked_by_wrong_source_arn(self, auth):
+        topic, qurl, qarn = _topic_and_queue("xpol-fan")
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": qurl, "Attributes": {"Policy": json.dumps(
+                sqs_policy_allow_sns(
+                    qarn, f"arn:aws:sns:{REGION}:{ACCT_A}:wrong-topic"))}},
+            qurl)
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": topic, "Message": "wrong-source"})) == (200, "")
+        assert _queue_bodies(qarn) == []
+
+    def test_fanout_delivered_with_policy(self, auth):
+        topic, qurl, qarn = _topic_and_queue("xpol-fan")
+        _as(ACCT_A, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": qurl, "Attributes": {"Policy": json.dumps(
+                sqs_policy_allow_sns(qarn, topic))}}, qurl)
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": topic, "Message": "with-policy"})) == (200, "")
+        bodies = _queue_bodies(qarn)
+        assert len(bodies) == 1
+        assert "with-policy" in bodies[0]
+
+    def test_cross_account_fanout_needs_queue_policy(self, auth):
+        topic = _make_topic(ACCT_A, _uniq("xpol-xfan"))
+        _set_topic_policy(ACCT_A, topic, _allow_account(
+            topic, ACCT_B, "sns:Subscribe"))
+        qname = _uniq("xpol-xfanq")
+        qurl = _make_queue(ACCT_B, qname)
+        assert _resp_code(_as(ACCT_B, sns_svc._subscribe, {
+            "TopicArn": topic, "Protocol": "sqs",
+            "Endpoint": _qarn(ACCT_B, qname)})) == (200, "")
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": topic, "Message": "no-queue-policy"})) == (200, "")
+        assert _queue_bodies(_qarn(ACCT_B, qname)) == []
+
+        _as(ACCT_B, sqs_svc._act_set_queue_attributes,
+            {"QueueUrl": qurl, "Attributes": {"Policy": json.dumps(
+                sqs_policy_allow_sns(_qarn(ACCT_B, qname), topic))}}, qurl)
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": topic, "Message": "with-queue-policy"})) == (200, "")
+        bodies = _queue_bodies(_qarn(ACCT_B, qname))
+        assert len(bodies) == 1
+        assert "with-queue-policy" in bodies[0]
+
+    def test_cross_account_subscribe_denied_without_policy(self, auth):
+        topic = _make_topic(ACCT_A, _uniq("xpol-xfan"))
+        assert _resp_code(_as(ACCT_B, sns_svc._subscribe, {
+            "TopicArn": topic, "Protocol": "email",
+            "Endpoint": "x@example.com"})) == (403, "AuthorizationError")
+
+
+# ---------------------------------------------------------------------------
+# AUTH=false stays permissive
+# ---------------------------------------------------------------------------
+
+class TestAuthDisabledIsPermissive:
+    def test_cross_account_send_passes_without_policy(self, noauth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name)
+        _as(ACCT_B, sqs_svc._act_send_message,
+            {"QueueUrl": url, "MessageBody": "open"}, url)
+        assert _queue_bodies(_qarn(ACCT_A, name)) == ["open"]
+
+    def test_cross_account_publish_passes_without_policy(self, noauth):
+        arn = _make_topic(ACCT_A, _uniq("xpol-t"))
+        assert _resp_code(_as(ACCT_B, sns_svc._publish, {
+            "TopicArn": arn, "Message": "open"})) == (200, "")
+
+    def test_explicit_deny_ignored(self, noauth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name, _deny_all(
+            _qarn(ACCT_A, name), "sqs:SendMessage"))
+        _as(ACCT_A, sqs_svc._act_send_message,
+            {"QueueUrl": url, "MessageBody": "deny-ignored"}, url)
+        assert _queue_bodies(_qarn(ACCT_A, name)) == ["deny-ignored"]
+
+    def test_get_queue_url_ignores_deny(self, noauth):
+        name = _uniq("xpol-q")
+        url = _make_queue(ACCT_A, name, _deny_all(
+            _qarn(ACCT_A, name), "sqs:GetQueueUrl"))
+        assert _as(ACCT_A, sqs_svc._act_get_queue_url,
+                   {"QueueName": name}, "") == {"QueueUrl": url}
+
+    def test_s3_put_and_delivery_without_policy(self, noauth):
+        bucket, _url, arn = _bucket_and_queue("xpol")
+        assert _resp_code(_put_notif(ACCT_A, bucket, "sqs", arn)) == (200, "")
+        bodies = _queue_bodies(arn)
+        assert len(bodies) == 1
+        assert "s3:TestEvent" in bodies[0]
+
+    def test_fanout_without_policy(self, noauth):
+        topic, _qurl, qarn = _topic_and_queue("xpol-fan")
+        assert _resp_code(_as(ACCT_A, sns_svc._publish, {
+            "TopicArn": topic, "Message": "open"})) == (200, "")
+        assert len(_queue_bodies(qarn)) == 1
+
+
+def test_queue_url_scheme_https_when_tls(monkeypatch):
+    """With USE_SSL=1 the gateway serves TLS, so QueueUrl must be https —
+    the AWS SDK v3 uses the QueueUrl itself as the request endpoint
+    (useQueueUrlAsEndpoint defaults true), so an http:// QueueUrl would
+    leave the TLS-only gateway."""
+    monkeypatch.setenv("USE_SSL", "1")
+    name = _uniq("tls-scheme")
+    created = _as(ACCT_A, sqs_svc._act_create_queue, {"QueueName": name}, "")["QueueUrl"]
+    assert created.startswith("https://"), created
+
+    looked_up = _as(ACCT_A, sqs_svc._act_get_queue_url, {"QueueName": name}, "")["QueueUrl"]
+    assert looked_up.startswith("https://"), looked_up
+
+    # A request using the returned https URL resolves the same queue.
+    q = _as(ACCT_A, sqs_svc._get_q, created)
+    assert q["name"] == name
+
+
+def test_cfn_sqs_queue_url_scheme_https_when_tls(monkeypatch):
+    """The AWS::SQS::Queue provisioner builds the same QueueUrl as CreateQueue."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setenv("USE_SSL", "1")
+    name = _uniq("cfn-tls-scheme")
+    url, _attrs = provisioners._sqs_create("Queue", {"QueueName": name}, "stack")
+    assert url.startswith("https://"), url
+
+
+def test_queue_url_scheme_http_without_tls(monkeypatch):
+    """Without TLS the QueueUrl keeps http (existing behaviour)."""
+    monkeypatch.delenv("USE_SSL", raising=False)
+    name = _uniq("plain-scheme")
+    created = _as(ACCT_A, sqs_svc._act_create_queue, {"QueueName": name}, "")["QueueUrl"]
+    assert created.startswith("http://"), created
+
+
+def test_sqs_fifo_queue_delay_and_per_message_delay(sqs):
+    name = f"delay-{_uuid_mod.uuid4().hex[:8]}"
+    fifo = sqs.create_queue(QueueName=f"{name}.fifo", Attributes={
+        "FifoQueue": "true", "ContentBasedDeduplication": "true", "DelaySeconds": "2"})["QueueUrl"]
+    std = sqs.create_queue(QueueName=name, Attributes={"DelaySeconds": "2"})["QueueUrl"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sqs.send_message(QueueUrl=fifo, MessageBody="n", MessageGroupId="g", DelaySeconds=1)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            "Value 1 for parameter DelaySeconds is invalid. "
+            "Reason: The request include parameter that is not valid for this queue type.")
+        sqs.send_message(QueueUrl=fifo, MessageBody="m", MessageGroupId="g", DelaySeconds=0)
+        sqs.send_message(QueueUrl=std, MessageBody="now", DelaySeconds=0)
+        assert "Messages" not in sqs.receive_message(QueueUrl=fifo)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=std)["Messages"]] == ["now"]
+        time.sleep(2.2)
+        assert [m["Body"] for m in sqs.receive_message(QueueUrl=fifo)["Messages"]] == ["m"]
+    finally:
+        sqs.delete_queue(QueueUrl=fifo)
+        sqs.delete_queue(QueueUrl=std)
+
+
+@pytest.mark.parametrize("value", [0, 11])
+def test_sqs_receive_max_number_of_messages_out_of_range(sqs, value):
+    url = sqs.create_queue(QueueName=f"maxn-{_uuid_mod.uuid4().hex[:8]}")["QueueUrl"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=value)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+        assert exc.value.response["Error"]["Message"] == (
+            f"Value {value} for parameter MaxNumberOfMessages is invalid. "
+            "Reason: Must be between 1 and 10, if provided.")
+    finally:
+        sqs.delete_queue(QueueUrl=url)
+
+
+class _SqsClock:
+    def __init__(self, start):
+        self.now = start
+
+    def time(self):
+        return self.now
+
+
+def _sqs_inproc(monkeypatch):
+    import asyncio
+    import time as _time
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    clock = _SqsClock(_time.time())
+    monkeypatch.setattr(sqs_svc.time, "time", clock.time)
+
+    def create(name, **attrs):
+        return sqs_svc._act_create_queue(
+            {"QueueName": name, "Attributes": {k: str(v) for k, v in attrs.items()}}, "")["QueueUrl"]
+
+    def counts(url):
+        a = sqs_svc._act_get_queue_attributes({"QueueUrl": url, "AttributeNames": ["All"]}, url)["Attributes"]
+        return int(a["ApproximateNumberOfMessages"]), int(a["ApproximateNumberOfMessagesNotVisible"])
+
+    def receive(url, **kw):
+        return asyncio.run(sqs_svc._act_receive_message({"QueueUrl": url, "WaitTimeSeconds": 0, **kw}, url))
+
+    return clock, create, counts, receive
+
+
+def test_sqs_retention_expires_messages(monkeypatch):
+    clock, create, counts, receive = _sqs_inproc(monkeypatch)
+    url = create(f"ret-{_uuid_mod.uuid4().hex[:8]}", MessageRetentionPeriod=60, VisibilityTimeout=120)
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "a"}, url)
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "b"}, url)
+    receive(url, MaxNumberOfMessages=1)          # one message in flight
+    clock.now += 59
+    assert counts(url) == (1, 1)
+    clock.now += 1
+    assert counts(url) == (0, 0)
+    # Lowering the period expires messages already in the queue.
+    sqs_svc._act_send_message({"QueueUrl": url, "MessageBody": "c"}, url)
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": {"MessageRetentionPeriod": "120"}}, url)
+    clock.now += 70
+    assert counts(url) == (1, 0)
+    sqs_svc._act_set_queue_attributes({"QueueUrl": url, "Attributes": {"MessageRetentionPeriod": "60"}}, url)
+    assert counts(url) == (0, 0)
+
+
+@pytest.mark.parametrize("fifo", [False, True])
+def test_sqs_dlq_move_enqueue_time_and_source_arn(monkeypatch, fifo):
+    clock, create, counts, receive = _sqs_inproc(monkeypatch)
+    sfx = ".fifo" if fifo else ""
+    extra = {"FifoQueue": "true", "ContentBasedDeduplication": "true"} if fifo else {}
+    dlq = create(f"dlq-{_uuid_mod.uuid4().hex[:8]}{sfx}", MessageRetentionPeriod=120, **extra)
+    dlq_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": dlq, "AttributeNames": ["QueueArn"]}, dlq)["Attributes"]["QueueArn"]
+    src = create(f"src-{_uuid_mod.uuid4().hex[:8]}{sfx}", VisibilityTimeout=30, **extra,
+                 RedrivePolicy=json.dumps({"maxReceiveCount": 1, "deadLetterTargetArn": dlq_arn}))
+    src_arn = sqs_svc._act_get_queue_attributes({"QueueUrl": src, "AttributeNames": ["QueueArn"]}, src)["Attributes"]["QueueArn"]
+    send = {"QueueUrl": src, "MessageBody": "x"}
+    if fifo:
+        send["MessageGroupId"] = "g"
+    sent = sqs_svc._act_send_message(send, src)
+    sent_at = clock.now
+    receive(src)                                  # receive count 1
+    clock.now += 31                               # visibility timeout over
+    assert receive(src).get("Messages", []) == []  # the sweep moves it to the DLQ
+    got = receive(dlq, AttributeNames=["All"])["Messages"][0]
+    assert got["MessageId"] == sent["MessageId"]
+    assert got["Attributes"]["DeadLetterQueueSourceArn"] == src_arn
+    clock.now = sent_at + 120                     # 120 s after the original send
+    remaining = sum(counts(dlq))
+    # Standard keeps the original enqueue time (expired); FIFO reset it on the move (still there).
+    assert remaining == (1 if fifo else 0)

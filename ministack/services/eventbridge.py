@@ -40,6 +40,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -99,7 +100,6 @@ def _coerce_timestamp(value):
     return value
 
 
-from ministack.core.persistence import load_state
 
 # Per-account and per-region registries. The "default" bus is lazily created
 # per account/region on first access so every tenant has its own default bus
@@ -164,10 +164,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _event_buses.update(data.get("buses", {}))
         _rules.update(data.get("rules", {}))
@@ -262,15 +262,6 @@ def _restore_targets_store(data) -> None:
             _targets.set_scoped(account_id, region, rule_key, copy.deepcopy(targets))
 
 
-try:
-    _restored = load_state("eventbridge")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -470,10 +461,11 @@ def _update_event_bus(data):
 
     bus["LastModifiedTime"] = now
 
-    return json_response({
-        "EventBusArn": bus["Arn"],
-        "LastModifiedTime": bus["LastModifiedTime"],
-    })
+    out = {"Arn": bus["Arn"], "Name": bus["Name"]}
+    for k in ("Description", "KmsKeyIdentifier", "DeadLetterConfig", "LogConfig"):
+        if k in bus:
+            out[k] = bus[k]
+    return json_response(out)
 
 
 # ---------------------------------------------------------------------------
@@ -986,7 +978,8 @@ def _resolve_taggable_events_arn(arn):
     return arn, None
 
 
-def _put_events(data):
+def _put_events(data, allow_aws_source=False):
+    """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -1005,6 +998,14 @@ def _put_events(data):
         if bus_error:
             code, message = bus_error
             results.append({"ErrorCode": code, "ErrorMessage": message})
+            failed += 1
+            continue
+        source = entry.get("Source")
+        if not allow_aws_source and isinstance(source, str) and source.startswith("aws."):
+            results.append({
+                "ErrorCode": "NotAuthorizedForSourceException",
+                "ErrorMessage": "Not authorized for the source.",
+            })
             failed += 1
             continue
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds
@@ -2268,7 +2269,10 @@ def _invoke_target(target, event, rule, view=None):
             return
 
         if spec.service == "events" and spec.resource.startswith("api-destination/"):
-            _dispatch_to_api_destination(spec, event_payload, target)
+            http_parameters = _resolve_http_parameters(
+                target.get("HttpParameters") or {}, view.event_with_detail()
+            )
+            _dispatch_to_api_destination(spec, event_payload, {**target, "HttpParameters": http_parameters})
         elif spec.service == "events":
             _dispatch_to_event_bus(spec, event, rule, event_path, target_input_payload)
         elif spec.service == "states":
@@ -2465,7 +2469,7 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
         "md5_body": md5,
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
         "attributes": {},
         "message_attributes": {},
@@ -2494,25 +2498,21 @@ def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     queue["messages"].append(msg)
     if hasattr(_sqs, "_ensure_msg_fields"):
         _sqs._ensure_msg_fields(queue["messages"][-1])
+    esm_wake.set()
     logger.info("EventBridge → SQS %s", queue_name)
 
 
 def _dispatch_to_sns(arn, payload):
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(arn)
-    if not topic:
+    try:
+        result = _sns.publish_internal(arn, payload, "EventBridge Notification")
+    except _sns.SnsPublishError as exc:
+        logger.warning("EventBridge → SNS %s refused: %s", arn, exc)
+        return
+    if result is None:
         logger.warning("EventBridge → SNS: topic %s not found", arn)
         return
-
-    msg_id = new_uuid()
-    topic["messages"].append({
-        "id": msg_id,
-        "message": payload,
-        "subject": "EventBridge Notification",
-        "timestamp": int(time.time()),
-    })
-    _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)
 
 
@@ -2613,6 +2613,58 @@ def _connection_params_map(params) -> dict:
         if key:
             out[key] = item.get("Value", "")
     return out
+
+
+_HTTP_JSON_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_/*-]+|\[(?:[0-9]+|\*)\])*")
+_HTTP_JSON_PATH_TOKEN = re.compile(r"\.([A-Za-z0-9_/*-]+)|\[([0-9]+|\*)\]")
+
+
+def _resolve_http_parameter(value, event):
+    """Resolve a whole JSON path; literal strings are not interpolated.
+
+    AWS uses the original event, renders missing matches as an empty string,
+    and strips JSON quotes from structured values in HTTP parameters.
+    """
+    if not _HTTP_JSON_PATH.fullmatch(value):
+        return value
+    nodes = [event]
+    multiple = False
+    for field, index in _HTTP_JSON_PATH_TOKEN.findall(value):
+        selected = []
+        wildcard = field == "*" or index == "*"
+        multiple = multiple or wildcard
+        for node in nodes:
+            if wildcard:
+                if isinstance(node, dict):
+                    selected.extend(node.values())
+                elif isinstance(node, list):
+                    selected.extend(node)
+            elif field and isinstance(node, dict) and field in node:
+                selected.append(node[field])
+            elif index and isinstance(node, list) and int(index) < len(node):
+                selected.append(node[int(index)])
+        nodes = selected
+    if not nodes:
+        return ""
+    result = nodes if multiple else nodes[0]
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, separators=(",", ":"), ensure_ascii=False).replace('"', "")
+
+
+def _resolve_http_parameters(parameters, event):
+    # Construct fresh containers: targets are reused by subsequent events and
+    # concurrent deliveries. Header/query names are always literal.
+    result = dict(parameters)
+    for field in ("HeaderParameters", "QueryStringParameters"):
+        if field in parameters:
+            result[field] = {key: _resolve_http_parameter(value, event)
+                             for key, value in parameters[field].items()}
+    if "PathParameterValues" in parameters:
+        result["PathParameterValues"] = [
+            _resolve_http_parameter(value, event) for value in parameters["PathParameterValues"]
+        ]
+    return result
 
 
 def _apply_path_parameters(url: str, values) -> str:

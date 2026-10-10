@@ -38,7 +38,6 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     error_response_json,
@@ -90,10 +89,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _table_buckets.update(data.get("table_buckets", {}))
     _namespaces.update(data.get("namespaces", {}))
     _tables.update(data.get("tables", {}))
@@ -113,10 +112,6 @@ def reset():
     _resource_tags.clear()
 
 
-if PERSIST_STATE:
-    _saved = load_state("s3tables")
-    if _saved:
-        restore_state(_saved)
 
 
 # ── Helpers ────────────────────────────────────────────────
@@ -771,13 +766,33 @@ def _iceberg_error(message, exc_type, code):
     return code, {"Content-Type": "application/json"}, body
 
 
+def _bucket_scope_from_prefix(prefix: str):
+    """The table bucket a REST {prefix} names. "For S3 Tables the REST path
+    {prefix} is always your url-encoded table bucket ARN"; the Glue form is
+    ``{account}:s3tablescatalog/{bucket}``. Anything else is unscoped."""
+    if prefix.startswith("arn:") and ":bucket/" in prefix:
+        return prefix
+    if ":s3tablescatalog/" in prefix:
+        return prefix.split(":s3tablescatalog/", 1)[1]
+    return None
+
+
+def _in_bucket(bucket_arn: str, bucket_filter) -> bool:
+    if not bucket_filter:
+        return True
+    if bucket_filter.startswith("arn:"):
+        return bucket_arn == bucket_filter
+    return bucket_arn.endswith("/" + bucket_filter)
+
+
 def _iceberg_allows_cross_region(headers):
     return _SIGV4_CREDENTIAL_REGION_RE.search(headers.get("authorization", "")) is None
 
 
-def _iceberg_list_namespaces(allow_cross_region):
+def _iceberg_list_namespaces(allow_cross_region, bucket_filter=None):
     result = []
-    for ns in _iceberg_values(_namespaces, lambda _ns: True, allow_cross_region):
+    for ns in _iceberg_values(
+            _namespaces, lambda ns: _in_bucket(ns.get("tableBucketARN", ""), bucket_filter), allow_cross_region):
         result.append(ns.get("namespace", []))
     return json_response({"namespaces": result})
 
@@ -796,19 +811,17 @@ def _iceberg_create_namespace(data, allow_cross_region, bucket_filter=None):
     # Find the table bucket to create the namespace in. When the prefix
     # carries a bucket filter (from the /v1/config warehouse), use that;
     # otherwise fall back to the first visible bucket.
-    if bucket_filter:
-        buckets = _iceberg_values(
-            _table_buckets, lambda b: b.get("arn", "").endswith("/" + bucket_filter),
-            allow_cross_region)
-    else:
-        buckets = _iceberg_values(_table_buckets, lambda _b: True, allow_cross_region)
+    buckets = _iceberg_values(
+        _table_buckets, lambda b: _in_bucket(b.get("arn", ""), bucket_filter), allow_cross_region)
     if not buckets:
         return _iceberg_error("No table bucket found", "NoSuchNamespaceException", 404)
     bucket = buckets[0]
     bucket_arn = bucket.get("arn", "")
     # Check if namespace already exists.
     existing = _iceberg_values(
-        _namespaces, lambda ns: _namespace_name(ns) == ns_name, allow_cross_region)
+        _namespaces,
+        lambda ns: _namespace_name(ns) == ns_name and ns.get("tableBucketARN") == bucket_arn,
+        allow_cross_region)
     if existing:
         return _iceberg_error(
             f"Namespace already exists: {ns_name}", "AlreadyExistsException", 409)
@@ -816,8 +829,11 @@ def _iceberg_create_namespace(data, allow_cross_region, bucket_filter=None):
     return json_response({"namespace": [ns_name], "properties": data.get("properties", {})})
 
 
-def _iceberg_get_namespace(namespace, allow_cross_region):
-    if _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region):
+def _iceberg_get_namespace(namespace, allow_cross_region, bucket_filter=None):
+    if _iceberg_values(
+            _namespaces,
+            lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+            allow_cross_region):
         return json_response({"namespace": [namespace], "properties": {}})
     return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
 
@@ -826,9 +842,7 @@ def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
     def _pred(table):
         if _namespace_name(table) != namespace:
             return False
-        if bucket_filter:
-            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
-        return True
+        return _in_bucket(table.get("tableBucketARN", ""), bucket_filter)
 
     result = []
     for table in _iceberg_values(_tables, _pred, allow_cross_region):
@@ -836,53 +850,112 @@ def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
     return json_response({"identifiers": result})
 
 
+def _current_iceberg_metadata(table):
+    """(metadata, location) as a reader sees it: the newest metadata.json in
+    the table's metadata directory on S3, else the in-memory copy. Writers
+    like DuckDB commit by writing metadata.json straight to S3, so both
+    LoadTable and a REST commit must start from this, or a commit lands on a
+    stale base."""
+    metadata = table.get("_iceberg_metadata", {})
+    meta_loc = table.get("metadataLocation", "")
+    if meta_loc and meta_loc.startswith("s3://"):
+        try:
+            import ministack.services.s3 as _s3
+
+            rest = meta_loc[len("s3://") :]
+            bkt, key = rest.split("/", 1)
+            meta_dir = "/".join(key.split("/")[:-1]) + "/"
+            bucket_data = _s3._ensure_bucket(bkt)
+            if bucket_data:
+                meta_files = [
+                    k for k in bucket_data.get("objects", {})
+                    if k.startswith(meta_dir) and k.endswith(".metadata.json")
+                ]
+                if meta_files:
+                    # Order vN.metadata.json numerically: lexically v10 sorts
+                    # before v2. Spark-style zero-padded names all map to -1
+                    # and keep their lexical order.
+                    from ministack.services.glue import _metadata_version_from_location
+
+                    meta_files.sort()
+                    meta_files.sort(key=_metadata_version_from_location)
+                    latest_key = meta_files[-1]
+                    raw = _s3._get_object_data(bkt, latest_key)
+                    if raw:
+                        return json.loads(raw), f"s3://{bkt}/{latest_key}"
+        except Exception:
+            pass  # fall back to in-memory
+    return metadata, meta_loc
+
+
+class IcebergCommitFailed(Exception):
+    """An Iceberg REST commit requirement did not hold (HTTP 409)."""
+
+
+def _iceberg_main_ref(metadata, name):
+    refs = metadata.get("refs") or {}
+    if name in refs:
+        return refs[name]
+    current = metadata.get("current-snapshot-id")
+    if name == "main" and current not in (None, -1):
+        return {"snapshot-id": current, "type": "branch"}
+    return None
+
+
+def _check_iceberg_requirements(metadata, requirements, staged=False):
+    """Iceberg UpdateRequirement semantics; messages as in the reference
+    implementation (org.apache.iceberg.UpdateRequirement)."""
+    def check(actual, expected, what):
+        if expected != actual:
+            raise IcebergCommitFailed(f"Requirement failed: {what} changed: expected id {expected} != {actual}")
+
+    for req in requirements or []:
+        kind = req.get("type", "")
+        if kind == "assert-create":
+            if not staged:
+                raise IcebergCommitFailed("Requirement failed: table already exists")
+        if kind == "assert-table-uuid":
+            uuid = req.get("uuid", "")
+            if uuid.lower() != str(metadata.get("table-uuid", "")).lower():
+                raise IcebergCommitFailed(
+                    f"Requirement failed: UUID does not match: expected {metadata.get('table-uuid')} != {uuid}")
+        elif kind == "assert-ref-snapshot-id":
+            name, expected = req.get("ref", "main"), req.get("snapshot-id")
+            ref = _iceberg_main_ref(metadata, name)
+            if ref is not None:
+                kind_name = "tag" if ref.get("type") == "tag" else "branch"
+                if expected is None:
+                    raise IcebergCommitFailed(f"Requirement failed: {kind_name} {name} was created concurrently")
+                if expected != ref.get("snapshot-id"):
+                    raise IcebergCommitFailed(
+                        f"Requirement failed: {kind_name} {name} has changed: "
+                        f"expected id {expected} != {ref.get('snapshot-id')}")
+            elif expected is not None:
+                raise IcebergCommitFailed(
+                    f"Requirement failed: branch or tag {name} is missing, expected {expected}")
+        elif kind == "assert-last-assigned-field-id":
+            check(metadata.get("last-column-id"), req.get("last-assigned-field-id"), "last assigned field id")
+        elif kind == "assert-current-schema-id":
+            check(metadata.get("current-schema-id"), req.get("current-schema-id"), "current schema")
+        elif kind == "assert-last-assigned-partition-id":
+            check(metadata.get("last-partition-id"), req.get("last-assigned-partition-id"),
+                  "last assigned partition id")
+        elif kind == "assert-default-spec-id":
+            check(metadata.get("default-spec-id"), req.get("default-spec-id"), "default partition spec")
+        elif kind == "assert-default-sort-order-id":
+            check(metadata.get("default-sort-order-id"), req.get("default-sort-order-id"), "default sort order")
+
+
 def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter=None, headers=None):
     def _pred(table):
         if _namespace_name(table) != namespace or table["name"] != table_name:
             return False
-        if bucket_filter:
-            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
-        return True
+        return _in_bucket(table.get("tableBucketARN", ""), bucket_filter)
 
     matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
-        # Try to read the latest metadata from S3 (source of truth). Writers
-        # like DuckDB commit by writing metadata.json directly to S3 without
-        # going through the REST commit endpoint, so the in-memory metadata
-        # can be stale. Fall back to in-memory if S3 read fails.
-        metadata = table.get("_iceberg_metadata", {})
-        meta_loc = table.get("metadataLocation", "")
-        if meta_loc and meta_loc.startswith("s3://"):
-            try:
-                import ministack.services.s3 as _s3
-
-                rest = meta_loc[len("s3://") :]
-                bkt, key = rest.split("/", 1)
-                # Find the latest metadata file in the metadata directory
-                meta_dir = "/".join(key.split("/")[:-1]) + "/"
-                bucket_data = _s3._ensure_bucket(bkt)
-                if bucket_data:
-                    meta_files = sorted(
-                        k
-                        for k in bucket_data.get("objects", {})
-                        if k.startswith(meta_dir) and k.endswith(".metadata.json")
-                    )
-                    if meta_files:
-                        # Order vN.metadata.json numerically: lexically v10
-                        # sorts before v2, so from the 10th commit on the scan
-                        # would serve v9 forever. Spark-style zero-padded
-                        # names all map to -1 and keep their lexical order.
-                        from ministack.services.glue import _metadata_version_from_location
-
-                        meta_files.sort(key=_metadata_version_from_location)
-                        latest_key = meta_files[-1]
-                        raw = _s3._get_object_data(bkt, latest_key)
-                        if raw:
-                            metadata = json.loads(raw)
-                            meta_loc = f"s3://{bkt}/{latest_key}"
-            except Exception:
-                pass  # fall back to in-memory
+        metadata, meta_loc = _current_iceberg_metadata(table)
         return json_response(
             {
                 "metadata-location": meta_loc,
@@ -908,10 +981,22 @@ def _apply_iceberg_updates(metadata, updates):
         action = update.get("action", "")
         if action == "add-snapshot":
             snapshot = update.get("snapshot", {})
-            metadata.setdefault("snapshots", []).append(snapshot)
+            snapshots = metadata.setdefault("snapshots", [])
+            if any(s.get("snapshot-id") == snapshot.get("snapshot-id") for s in snapshots):
+                raise ValueError(f"Snapshot already exists for id: {snapshot.get('snapshot-id')}")
+            last = metadata.get("last-sequence-number", 0)
+            seq = snapshot.get("sequence-number")
+            # Iceberg TableMetadata.addSnapshot: on v2+ a snapshot with a
+            # parent must be newer than the table, and the table's
+            # last-sequence-number becomes the snapshot's own number.
+            if (int(metadata.get("format-version", 2)) > 1 and seq is not None
+                    and seq <= last and snapshot.get("parent-snapshot-id") is not None):
+                raise ValueError(
+                    f"Cannot add snapshot with sequence number {seq} older than last sequence number {last}")
+            snapshots.append(snapshot)
             metadata["current-snapshot-id"] = snapshot.get("snapshot-id", -1)
             metadata["last-updated-ms"] = int(time.time() * 1000)
-            metadata["last-sequence-number"] = metadata.get("last-sequence-number", 0) + 1
+            metadata["last-sequence-number"] = seq if seq is not None else last + 1
         elif action == "set-snapshot-ref":
             metadata.setdefault("refs", {})[update.get("ref-name", "main")] = {
                 "snapshot-id": update.get("snapshot-id", -1),
@@ -988,67 +1073,29 @@ def _apply_iceberg_updates(metadata, updates):
             metadata["location"] = update.get("location", "")
 
 
-def _iceberg_requirement_failure(metadata, requirements):
-    """Return the message of the first violated Iceberg REST commit ``requirement``,
-    or None when the commit may proceed. Without this check two writers that both
-    read snapshot S0 could each append a snapshot whose manifest list omits the
-    other's data files, and the second commit silently discarded the first's rows
-    (last-writer-wins). Real S3 Tables answers a stale ``assert-ref-snapshot-id``
-    with 409 CommitFailedException so the client refreshes and retries."""
-    refs = metadata.get("refs") or {}
-    for requirement in requirements or []:
-        kind = requirement.get("type", "")
-        if kind == "assert-ref-snapshot-id":
-            ref = requirement.get("ref", "main")
-            expected = requirement.get("snapshot-id")
-            actual = refs.get(ref, {}).get("snapshot-id")
-            if actual is None and ref == "main" and metadata.get("current-snapshot-id", -1) not in (-1, None):
-                actual = metadata["current-snapshot-id"]
-            if expected != actual:
-                return f"Requirement failed: branch {ref} has changed: expected id {expected} != {actual}"
-        elif kind == "assert-table-uuid":
-            if requirement.get("uuid") != metadata.get("table-uuid"):
-                return (
-                    "Requirement failed: table UUID does not match: expected "
-                    f"{requirement.get('uuid')} != {metadata.get('table-uuid')}"
-                )
-        elif kind == "assert-current-schema-id":
-            if requirement.get("current-schema-id") != metadata.get("current-schema-id"):
-                return (
-                    "Requirement failed: current schema changed: expected id "
-                    f"{requirement.get('current-schema-id')} != {metadata.get('current-schema-id')}"
-                )
-        elif kind == "assert-create":
-            # The first commit of a staged create (DuckDB's CREATE TABLE + INSERT)
-            # asserts the table did not exist before it; a table nobody has
-            # committed a snapshot to yet is exactly that table.
-            if refs or metadata.get("current-snapshot-id", -1) not in (-1, None):
-                return "Requirement failed: table already exists"
-    return None
-
-
 def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter=None):
     def _pred(table):
         if _namespace_name(table) != namespace or table["name"] != table_name:
             return False
-        if bucket_filter:
-            return table.get("tableBucketARN", "").endswith("/" + bucket_filter)
-        return True
+        return _in_bucket(table.get("tableBucketARN", ""), bucket_filter)
 
     matches = _iceberg_values(_tables, _pred, allow_cross_region)
     if matches:
         table = matches[0]
-        metadata = copy.deepcopy(table.get("_iceberg_metadata", {}))
-        failure = _iceberg_requirement_failure(metadata, data.get("requirements", []))
-        if failure:
-            return _iceberg_error(failure, "CommitFailedException", 409)
-        # Stage the commit on a copy: a refused update (an illegal
-        # format-version change) must not leave the earlier updates of the
-        # same commit applied — an Iceberg commit is atomic.
+        # Stage the commit on a copy of the metadata a reader sees: a refused
+        # update must not leave the earlier updates applied (an Iceberg
+        # commit is atomic), and a stale base would desynchronize sequence
+        # numbers from what LoadTable served.
+        base, _ = _current_iceberg_metadata(table)
+        metadata = copy.deepcopy(base)
         try:
+            _check_iceberg_requirements(metadata, data.get("requirements", []), staged=table.get("_staged", False))
             _apply_iceberg_updates(metadata, data.get("updates", []))
+        except IcebergCommitFailed as exc:
+            return _iceberg_error(str(exc), "CommitFailedException", 409)
         except ValueError as exc:
             return _iceberg_error(str(exc), "BadRequestException", 400)
+        table["_staged"] = False
         table["_iceberg_metadata"] = metadata
 
         table["_metadata_version"] = table.get("_metadata_version", 0) + 1
@@ -1074,11 +1121,14 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
     return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
 
 
-def _iceberg_create_table(namespace, data, allow_cross_region):
+def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=None):
     table_name = data.get("name", "")
     schema = data.get("schema", {})
     bucket_arn = None
-    matches = _iceberg_values(_namespaces, lambda ns: _namespace_name(ns) == namespace, allow_cross_region)
+    matches = _iceberg_values(
+        _namespaces,
+        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+        allow_cross_region)
     if matches:
         bucket_arn = matches[0].get("tableBucketARN")
     if not bucket_arn:
@@ -1133,6 +1183,9 @@ def _iceberg_create_table(namespace, data, allow_cross_region):
         "_iceberg_metadata": iceberg_metadata,
         "_metadata_version": 0,
         "_schema_fields": schema_fields,
+        # A staged create (stage-create) exists only once its first commit,
+        # which carries assert-create, lands.
+        "_staged": bool(data.get("stage-create")),
     }
     _set_bucket_region_value(_tables, bucket_arn, key, table)
     # Same auto-provisioned maintenance defaults as the control-plane CreateTable
@@ -1162,12 +1215,14 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     # a prefixed commit is silently dropped and the delivery writes nothing.
     if parts[1] == "v1" and method == "POST" and "transactions" in parts[2:]:
         data = json.loads(body) if body else {}
+        tx_idx = parts.index("transactions", 2)
+        tx_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:tx_idx]))) if tx_idx > 2 else None
         for change in data.get("table-changes", []):
             ident = change.get("identifier", {})
             ns = ident.get("namespace", [""])
             ns = ns[0] if isinstance(ns, list) else ns
             tbl = ident.get("name", "")
-            result = _iceberg_commit_table(ns, tbl, change, allow_cross_region)
+            result = _iceberg_commit_table(ns, tbl, change, allow_cross_region, tx_filter)
             if result and result[0] not in (200, 204):
                 return result
         return json_response({})
@@ -1196,19 +1251,17 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
     if ns_idx is None:
         return None
     if ns_idx > 2:
-        prefix = unquote("/".join(parts[2:ns_idx]))
-        if ":s3tablescatalog/" in prefix:
-            bucket_filter = prefix.split(":s3tablescatalog/", 1)[1]
+        bucket_filter = _bucket_scope_from_prefix(unquote("/".join(parts[2:ns_idx])))
 
     rest = parts[ns_idx + 1 :]  # segments after "namespaces"
 
     if len(rest) == 0 and method == "GET":
-        return _iceberg_list_namespaces(allow_cross_region)
+        return _iceberg_list_namespaces(allow_cross_region, bucket_filter)
     if len(rest) == 0 and method == "POST":
         data = json.loads(body) if body else {}
         return _iceberg_create_namespace(data, allow_cross_region, bucket_filter)
     if len(rest) == 1 and method == "GET":
-        return _iceberg_get_namespace(rest[0], allow_cross_region)
+        return _iceberg_get_namespace(rest[0], allow_cross_region, bucket_filter)
     if len(rest) >= 2 and rest[1] == "tables":
         namespace = rest[0]
         table_rest = rest[2:]
@@ -1217,7 +1270,7 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
                 return _iceberg_list_tables(namespace, allow_cross_region, bucket_filter)
             if method == "POST":
                 data = json.loads(body) if body else {}
-                return _iceberg_create_table(namespace, data, allow_cross_region)
+                return _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter)
         if len(table_rest) == 1:
             table_name = table_rest[0]
             if method == "GET":
@@ -1228,7 +1281,8 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
             if method == "HEAD":
                 if _iceberg_values(
                     _tables,
-                    lambda table: _namespace_name(table) == namespace and table["name"] == table_name,
+                    lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
+                                   and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
                     allow_cross_region,
                 ):
                     return 200, {}, b""

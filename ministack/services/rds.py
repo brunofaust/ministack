@@ -14,7 +14,8 @@ Supports: CreateDBInstance, DeleteDBInstance, DescribeDBInstances, ModifyDBInsta
           DeleteDBClusterParameterGroup, DescribeDBClusterParameters,
           ModifyDBClusterParameterGroup, ResetDBClusterParameterGroup,
           CreateDBSnapshot, DeleteDBSnapshot, DescribeDBSnapshots,
-          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DeleteDBClusterSnapshot,
+          CreateDBClusterSnapshot, DescribeDBClusterSnapshots, DescribeDBClusterSnapshotAttributes,
+          DeleteDBClusterSnapshot,
           CreateOptionGroup, DeleteOptionGroup, DescribeOptionGroups, DescribeOptionGroupOptions,
           CreateDBInstanceReadReplica (stub), RestoreDBInstanceFromDBSnapshot (stub),
           ListTagsForResource, AddTagsToResource, RemoveTagsFromResource,
@@ -44,6 +45,7 @@ import contextvars
 import copy
 import datetime
 import hashlib
+import io
 import json
 import logging
 import math
@@ -51,6 +53,7 @@ import os
 import re
 import secrets as stdlib_secrets
 import socket
+import tarfile
 import threading
 import time
 from urllib.parse import parse_qs
@@ -59,7 +62,6 @@ from xml.sax.saxutils import escape as _esc
 from ministack.core import container_reaper, persistence
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -70,6 +72,7 @@ from ministack.core.responses import (
 )
 from ministack.services import secretsmanager
 from ministack.services.rds_iam_plugin import (
+    configure_iam_auth_broker,
     ensure_iam_auth_plugin,
     iam_auth_plugin_enabled,
 )
@@ -90,11 +93,10 @@ BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
-# When set, skip ministack's own Docker network auto-detect so DescribeDBInstances
-# returns {MINISTACK_HOST, host_port} — the address that's actually reachable
-# from outside the Docker network (remote ministack deployments, host-side
-# clients of a containerised ministack). Off by default: existing in-network
-# behavior unchanged.
+# When set, DescribeDBInstances returns {MINISTACK_HOST, host_port} — the
+# address that's actually reachable from outside the Docker network (remote
+# ministack deployments, host-side clients of a containerised ministack).
+# Off by default: existing in-network behavior unchanged.
 RDS_PUBLIC_ENDPOINT = os.environ.get("MINISTACK_RDS_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 # Opt-in: per-instance Aurora PostgreSQL reader containers backed by real
 # streaming replication (#1325). Scoped to aurora-postgresql by name and by
@@ -365,11 +367,11 @@ def get_state():
     return state
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data, resume_runtime=True)
 
 
-def restore_state(data):
+def _restore_state(data, *, resume_runtime=False):
     if not data:
         return
     _clusters.update(data.get("clusters", {}))
@@ -457,6 +459,9 @@ def restore_state(data):
             _instances.set_scoped(get_account_id(), region, name, inst)
             to_respawn.append((None, region, name, inst))
 
+    if not resume_runtime:
+        return
+
     # Re-spin backing containers for persisted instances. Mirrors the MWAA
     # restore pattern: persistence saves the instance metadata but the Docker
     # container itself is killed by the host restart, so the restore path has
@@ -529,7 +534,7 @@ def restore_state(data):
         )
         if cluster and members:
             # Publish the restore/migration gate before the daemon starts. A
-            # create arriving immediately after restore_state() must not start
+            # create arriving immediately after _restore_state() must not start
             # fresh cluster storage before the writer volume is adopted.
             cluster["_shared_legacy_migration_in_progress"] = True
             cluster.pop("_shared_legacy_migration_blocked", None)
@@ -890,6 +895,7 @@ def restore_state(data):
                             cluster.get("MasterUsername", "admin"),
                             cluster.get("_MasterUserPassword", "password"),
                             cluster_id,
+                            cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
@@ -1047,6 +1053,156 @@ def _rds_container_is_owned_by(
     return labels.get("region") in (None, region or get_region())
 
 
+# ---------------------------------------------------------------------------
+# PostgreSQL server TLS. AWS installs the DB server certificate itself and
+# rotates it; there is no way to supply your own ("The CA signs the DB server
+# certificate, which is installed on each DB instance", UsingWithRDS.SSL), and
+# every instance we report already carries CACertificateIdentifier
+# rds-ca-rsa2048-g1. So MiniStack mints its own CA and signs a per-container
+# server certificate, and TLS is always on. The stock postgres image ships no
+# key material and dies with `ssl=on` alone, unlike MySQL, which
+# auto-generates (measured: `auto-generate-certs TRUE`).
+# ---------------------------------------------------------------------------
+
+_PG_TLS_DIR = "/ministack-rds-tls"
+_pg_ca_lock = threading.Lock()
+_pg_ca: tuple[str, str] | None = None
+
+
+def pg_ca_cert_pem() -> str:
+    """The RDS CA certificate, minted on first use. Clients verifying a
+    MiniStack database trust this one file, as they would AWS's bundle."""
+    return _ensure_pg_ca()[0]
+
+
+def _ensure_pg_ca() -> tuple[str, str]:
+    global _pg_ca
+    if _pg_ca is not None:
+        return _pg_ca
+    with _pg_ca_lock:
+        if _pg_ca is None:
+            from ministack.core.x509_utils import generate_ca
+
+            region = os.environ.get("MINISTACK_REGION", "us-east-1")
+            _pg_ca = generate_ca(
+                org_name="Amazon Web Services, Inc.",
+                common_name=f"Amazon RDS {region} Root CA RSA2048 G1",
+            )
+            logger.info("RDS: generated the server-certificate CA")
+        return _pg_ca
+
+
+def _pg_server_material(names, ips) -> tuple[str, str]:
+    """A server certificate for the names a client may connect to."""
+    from ministack.core.x509_utils import sign_leaf_certificate
+
+    ca_cert, ca_key = _ensure_pg_ca()
+    cert_pem, key_pem, _public = sign_leaf_certificate(
+        ca_cert, ca_key,
+        common_name=(names[0] if names else "localhost"),
+        san_dns=names, san_ips=ips,
+        subject_rdns=[("OU", "RDS"), ("O", "Amazon.com"), ("L", "Seattle"),
+                      ("ST", "Washington"), ("C", "US")],
+    )
+    return cert_pem, key_pem
+
+
+def _pg_tls_archive(cert_pem: str, key_pem: str) -> bytes:
+    """The cert and key as a tar for put_archive: no host path is shared with
+    the daemon, and the key lands outside every PGDATA mount at 0600."""
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as bundle:
+        entry = tarfile.TarInfo(_PG_TLS_DIR.lstrip("/"))
+        entry.type = tarfile.DIRTYPE
+        entry.mode = 0o700
+        bundle.addfile(entry)
+        for filename, content in (("server.crt", cert_pem), ("server.key", key_pem)):
+            data = content.encode()
+            entry = tarfile.TarInfo(f"{_PG_TLS_DIR.lstrip('/')}/{filename}")
+            entry.mode = 0o600
+            entry.size = len(data)
+            bundle.addfile(entry, io.BytesIO(data))
+    return archive.getvalue()
+
+
+def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tls_ips=()):
+    """Start a backing container, with PostgreSQL TLS enabled.
+
+    MySQL needs nothing: its image generates its own material and defaults to
+    ssl=ON. PostgreSQL gets a certificate copied in before it starts, so a
+    client using sslmode=verify-full with our CA connects. Plaintext clients
+    keep working, as they do on AWS without rds.force_ssl.
+    """
+    if engine not in ("postgres", "aurora-postgresql"):
+        if _is_mysql_engine(engine):
+            # The IAM auth plugin calls back to a host-run MiniStack.
+            container_kwargs.setdefault("extra_hosts", {}).setdefault(
+                "host.docker.internal", "host-gateway")
+        return docker_client.containers.run(**container_kwargs)
+    # Injecting the certificate needs create -> put_archive -> start, so a
+    # client that cannot do that keeps the plain launch and serves plaintext.
+    if not hasattr(docker_client.containers, "create"):
+        return docker_client.containers.run(**container_kwargs)
+
+    container = None
+    try:
+        names = [n for n in dict.fromkeys(tls_names) if n and not _is_ip_address(n)]
+        names += [n for n in ("localhost", _MINISTACK_HOST) if n and n not in names]
+        ips = [i for i in dict.fromkeys(tuple(tls_ips) + ("127.0.0.1", "::1")) if i]
+        cert_pem, key_pem = _pg_server_material(names, ips)
+        archive = _pg_tls_archive(cert_pem, key_pem)
+
+        kwargs = dict(container_kwargs)
+        command = list(kwargs.get("command") or ["postgres"])
+        if command[:2] == ["sh", "-c"]:
+            # `sh -c SCRIPT` takes the next argument as $0, so the flags land
+            # in "$@" for the script's own exec.
+            command.append("ministack-pg")
+        command += ["-c", "ssl=on",
+                    "-c", f"ssl_cert_file={_PG_TLS_DIR}/server.crt",
+                    "-c", f"ssl_key_file={_PG_TLS_DIR}/server.key"]
+        entrypoint = kwargs.get("entrypoint") or ["docker-entrypoint.sh"]
+        if isinstance(entrypoint, str):
+            entrypoint = [entrypoint]
+        # Archive members arrive root-owned; chown before the image's own
+        # entrypoint drops privileges. postgres refuses a group/world-readable
+        # key, so the mode matters as much as the owner.
+        kwargs["user"] = "0:0"
+        kwargs["entrypoint"] = [
+            "sh", "-c",
+            f"chown -R postgres:postgres {_PG_TLS_DIR} && exec \"$@\"",
+            "ministack-pg-tls",
+        ]
+        kwargs["command"] = list(entrypoint) + command
+
+        from docker.errors import ImageNotFound
+        try:
+            container = docker_client.containers.create(**kwargs)
+        except ImageNotFound:
+            docker_client.images.pull(kwargs["image"])
+            container = docker_client.containers.create(**kwargs)
+        if not container.put_archive("/", archive):
+            raise RuntimeError("Docker rejected the PostgreSQL TLS archive")
+        container.start()
+        return container
+    except Exception:
+        if container is not None:
+            try:
+                container.remove(force=True, v=False)
+            except Exception:
+                logger.warning("RDS: could not remove a failed TLS container")
+        raise
+
+
+def _is_ip_address(value: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     """Start the single backing container owned by an Aurora cluster.
 
@@ -1196,7 +1352,10 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
         }
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=list(endpoint_aliases) + [container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         cluster["_shared_container_ready"] = False
         logger.warning("RDS: failed to start shared container for cluster %s: %s", cluster_id, e)
@@ -1214,13 +1373,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(ms_network, {}).get("IPAddress", "")
             if container_ip:
-                # Report the alias, not the address behind it. An address changes
+                # Report the alias (or, under MINISTACK_RDS_PUBLIC_ENDPOINT, the
+                # published port), not the address behind it. An address changes
                 # when the container is replaced, and every consumer holding the
                 # old one is then pointing at whatever took over that IP. Internal
                 # wiring and the readiness probe keep using the address.
-                endpoint_host = (endpoint_aliases[0] if endpoint_aliases
-                                 else container_ip)
-                endpoint_port = container_port
+                endpoint_host, endpoint_port = _reported_endpoint(
+                    endpoint_aliases[0] if endpoint_aliases else container_ip,
+                    container_port, host_port)
                 internal_host = container_ip
                 internal_port = container_port
                 readiness_host = container_ip
@@ -1239,6 +1399,14 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         },
         "_shared_internal_address": internal_host,
         "_shared_internal_port": internal_port,
+        # The reader alias this container actually carries. Only a name
+        # registered as a network alias may be published as the reader
+        # endpoint; PG clusters launched with replication on carry the
+        # writer name only, and a later demotion must not invent a
+        # reader name nothing resolves.
+        "_shared_reader_alias": (
+            endpoint_aliases[1] if len(endpoint_aliases) > 1 else None
+        ),
         "_shared_container_ready": False,
         "_shared_container_epoch": container_epoch,
     })
@@ -1421,7 +1589,11 @@ def _start_pg_reader_container(db_id, cluster):
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=_cluster_endpoint_aliases(cluster)
+            + [container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         logger.warning(
             "RDS: failed to start reader container for %s: %s", db_id, e,
@@ -1444,8 +1616,8 @@ def _start_pg_reader_container(db_id, cluster):
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            endpoint_host = container_ip
-            endpoint_port = container_port
+            endpoint_host, endpoint_port = _reported_endpoint(
+                container_ip, container_port, host_port)
             internal_host = container_ip
             internal_port = container_port
     except Exception:
@@ -2111,11 +2283,17 @@ def _restart_cluster_shared_container(cluster_id, cluster):
     readiness_host = "127.0.0.1"
     readiness_port = host_port
     if ms_network:
+        endpoint_aliases = _cluster_endpoint_aliases(cluster)
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(ms_network, {}).get("IPAddress", "")
         if container_ip:
-            endpoint_host = container_ip
-            endpoint_port = container_port
+            # Report the alias (or the published port), not the address behind
+            # it — same rule as first launch. StopDBCluster/StartDBCluster must not rewrite a stored
+            # DNS name into a raw address: the name keeps resolving to the
+            # restarted container, while the address may not survive.
+            endpoint_host, endpoint_port = _reported_endpoint(
+                endpoint_aliases[0] if endpoint_aliases else container_ip,
+                container_port, host_port)
             internal_host = container_ip
             internal_port = container_port
             readiness_host = container_ip
@@ -2201,16 +2379,6 @@ def _start_rds_container_for_instance(db_id, instance):
     # Legacy instances persisted before `_HostPort` was stored fall back to a
     # fresh free port from `_next_port()`.
     host_port = instance.get("_HostPort") or _next_port()
-    # If the stored host port was claimed by something else between
-    # restarts (another ministack, another db instance, a user app),
-    # docker bind would fail with "port is already allocated". Fall
-    # back to a fresh free port and persist it so subsequent restarts
-    # converge on a stable mapping again.
-    if not _is_host_port_free(host_port):
-        logger.info("RDS: persisted host port %d for %s is in use; "
-                    "allocating fresh free port", host_port, db_id)
-        host_port = _next_port()
-    instance["_HostPort"] = host_port
 
     image, env_vars, container_port, data_path = _docker_image_for_engine(
         engine, engine_version, master_user, master_pass, db_name,
@@ -2253,6 +2421,18 @@ def _start_rds_container_for_instance(db_id, instance):
         except Exception:
             pass  # No existing container with that name — fine
 
+    # Checked after our own stale container is gone. If the port is still
+    # taken, move and republish it so the endpoint stays reachable.
+    if not _is_host_port_free(host_port):
+        logger.info("RDS: persisted host port %d for %s is in use; "
+                    "allocating fresh free port", host_port, db_id)
+        if endpoint.get("Port") == host_port:
+            endpoint["Port"] = _next_port()
+            host_port = endpoint["Port"]
+        else:
+            host_port = _next_port()
+    instance["_HostPort"] = host_port
+
     ms_network = _get_ministack_network(docker_client)
     container_kwargs = dict(
         image=image, detach=True,
@@ -2278,9 +2458,20 @@ def _start_rds_container_for_instance(db_id, instance):
         container_kwargs["tmpfs"] = {
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
+    groups = instance.get("DBParameterGroups") or [{}]
+    if _is_mysql_engine(engine) and (options := _mysql_server_options(
+        instance.get("BackupRetentionPeriod", 1), groups[0].get("DBParameterGroupName"),
+    )):
+        container_kwargs["command"] = options
+    if groups[0].get("ParameterApplyStatus") in ("pending-reboot", "applying"):
+        groups[0]["ParameterApplyStatus"] = "in-sync"
 
     try:
-        container = docker_client.containers.run(**container_kwargs)
+        container = _run_rds_container(
+            docker_client, engine, container_kwargs,
+            tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
+                       container_kwargs.get("name") or ""],
+        )
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
@@ -2319,8 +2510,9 @@ def _start_rds_container_for_instance(db_id, instance):
             if container_ip:
                 internal_host = container_ip
                 internal_port = container_port
-                instance.setdefault("Endpoint", {})["Address"] = container_ip
-                instance["Endpoint"]["Port"] = container_port
+                endpoint = instance.setdefault("Endpoint", {})
+                endpoint["Address"], endpoint["Port"] = _reported_endpoint(
+                    container_ip, container_port, host_port)
         except Exception:
             pass
     instance["_internal_address"] = internal_host
@@ -2351,6 +2543,10 @@ def _start_rds_container_for_instance(db_id, instance):
             except Exception:
                 pass
             return
+        _grant_mysql_master_user_privileges(
+            internal_host or "127.0.0.1", internal_port or host_port,
+            master_user, master_pass, db_id, engine,
+        )
     _instance_available_unless_stopped(instance)
     logger.info("RDS: respawned container %s for instance %s",
                 container_name, db_id)
@@ -2367,19 +2563,26 @@ def _get_docker():
     return _docker
 
 
+def _in_container():
+    from ministack.services.lambda_svc import _running_in_container
+    return _running_in_container()
+
+
 def _get_ministack_network(docker_client):
     """Detect the Docker network MiniStack is running on (if containerised).
 
-    Honors MINISTACK_RDS_PUBLIC_ENDPOINT — when set, returns None so the
-    DescribeDBInstances endpoint resolves to {MINISTACK_HOST, host_port}
-    instead of the container-internal address (useful for remote-ministack
-    deployments where external clients can't reach the Docker network).
+    Under MINISTACK_RDS_PUBLIC_ENDPOINT a host-run MiniStack keeps its
+    database containers off the network, since it cannot reach their
+    addresses; a containerised one detects its network as usual, so
+    readiness and internal wiring reach them while _reported_endpoint
+    reports the published port.
     """
     global _ministack_network
-    if RDS_PUBLIC_ENDPOINT:
-        return None
     if _ministack_network is not None:
         return _ministack_network or None
+    if RDS_PUBLIC_ENDPOINT and not _in_container():
+        _ministack_network = ""
+        return None
     if DOCKER_NETWORK:
         _ministack_network = DOCKER_NETWORK
         logger.debug("RDS: using DOCKER_NETWORK=%s", DOCKER_NETWORK)
@@ -2401,6 +2604,13 @@ def _get_ministack_network(docker_client):
     return None
 
 
+def _reported_endpoint(host, port, host_port):
+    """The endpoint DescribeDB* report for a container on MiniStack's network."""
+    if RDS_PUBLIC_ENDPOINT:
+        return _MINISTACK_HOST, host_port
+    return host, port
+
+
 def _wait_for_port(host, port, timeout=60):
     """Block until a TCP connection to host:port succeeds."""
     deadline = time.time() + timeout
@@ -2415,6 +2625,84 @@ def _wait_for_port(host, port, timeout=60):
 
 def _is_mysql_engine(engine):
     return any(e in engine for e in ("mysql", "aurora-mysql", "mariadb"))
+
+
+# Excludes RDS-only names such as `rds.force_ssl`.
+_MYSQL_SERVER_PARAMETER = re.compile(r"[A-Za-z0-9_]+")
+
+
+def _mysql_server_options(backup_retention_period, param_group_name=None):
+    """Startup options: retention 0 disables the binlog; group values go as `--loose-` options."""
+    options = [] if int(backup_retention_period) > 0 else ["--skip-log-bin"]
+    group = _param_groups.get(param_group_name) if param_group_name else None
+    for name, param in ((group or {}).get("Parameters") or {}).items():
+        value = param.get("ParameterValue")
+        if _MYSQL_SERVER_PARAMETER.fullmatch(name) and value is not None and not value.startswith("{"):
+            options.append(f"--loose-{name}={value}")
+    return options
+
+
+def _mysql_parameter_value(value):
+    """A parameter value as SET GLOBAL takes it: numeric variables refuse a string."""
+    for parse in (int, float):
+        try:
+            return parse(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _apply_parameter_group_changes(group_name, changes, refuse_static=True):
+    """Apply `(name, value, apply_method)` changes to the group's running MySQL instances; returns a refusal or None."""
+    for instance in list(_instances.values()):
+        groups = instance.get("DBParameterGroups") or []
+        if not (
+            groups and groups[0].get("DBParameterGroupName") == group_name
+            and _is_mysql_engine(instance.get("Engine", ""))
+            and instance.get("_docker_container_id")
+            and not instance.get("DBClusterIdentifier")
+        ):
+            continue
+        pending = any(method != "immediate" for _name, _value, method in changes)
+        immediate = [(name, value) for name, value, method in changes
+                     if method == "immediate" and _MYSQL_SERVER_PARAMETER.fullmatch(name)]
+        if immediate:
+            try:
+                conn = _mysql_endpoint_admin_connection(
+                    instance.get("_internal_address") or "127.0.0.1",
+                    instance.get("_internal_port") or instance.get("_HostPort"),
+                    instance.get("_MasterUserPassword", "password"),
+                )
+            except Exception as e:
+                logger.warning("RDS: cannot apply parameter group %s to %s: %s",
+                               group_name, instance.get("DBInstanceIdentifier"), e)
+                pending = True
+            else:
+                try:
+                    with conn.cursor() as cur:
+                        for name, _value in immediate if refuse_static else ():
+                            try:
+                                cur.execute(f"SET GLOBAL {name} = @@GLOBAL.{name}")
+                            except Exception as e:
+                                if e.args and e.args[0] == 1238:  # ER_INCORRECT_GLOBAL_LOCAL_VAR: read-only
+                                    return _error("InvalidParameterCombination",
+                                                  "cannot use immediate apply method for static parameter", 400)
+                        for name, value in immediate:
+                            try:
+                                if value is None:
+                                    cur.execute(f"SET GLOBAL {name} = DEFAULT")
+                                else:
+                                    cur.execute(f"SET GLOBAL {name} = %s", (_mysql_parameter_value(value),))
+                            except Exception as e:
+                                # A static (read-only) variable takes effect at the next start.
+                                logger.info("RDS: parameter %s for %s applies at the next start: %s",
+                                            name, instance.get("DBInstanceIdentifier"), e)
+                                pending = True
+                finally:
+                    conn.close()
+        if pending:
+            groups[0]["ParameterApplyStatus"] = "pending-reboot"
+    return None
 
 
 def _is_postgres_engine(engine):
@@ -2666,7 +2954,31 @@ def _ensure_mysql_compatibility(
             engine_series,
             resource_id,
         )
+        if plugin_ready:
+            configure_iam_auth_broker(
+                container,
+                "cluster" if engine.startswith("aurora") else "instance",
+                resource_id,
+                _iam_broker_host(),
+                os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566",
+            )
     return procedures_ready, plugin_ready
+
+
+def _iam_broker_host():
+    """The address a MySQL container reaches this server's IAM broker on."""
+    docker_client = _get_docker()
+    ms_network = _get_ministack_network(docker_client) if docker_client else None
+    if ms_network:
+        try:
+            me = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+            address = me.attrs["NetworkSettings"]["Networks"][ms_network]["IPAddress"]
+            if address:
+                return address
+        except Exception:
+            pass
+    # Mapped to host-gateway on every MySQL container (_run_rds_container).
+    return "host.docker.internal"
 
 
 def _mysql_replication_connection(cluster, *, timeout=None):
@@ -3543,8 +3855,39 @@ def _configure_or_defer_mysql_replication(cluster_id, cluster):
         _schedule_mysql_replication_retry(cluster_id, cluster)
 
 
-def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id):
-    """Grant the emulated MySQL master user AWS/RDS-like admin privileges."""
+_MYSQL_MASTER_PRIVILEGES = (
+    "SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, PROCESS, REFERENCES, "
+    "INDEX, ALTER, SHOW DATABASES, CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, "
+    "REPLICATION SLAVE, REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE, "
+    "ALTER ROUTINE, CREATE USER, EVENT, TRIGGER"
+)
+_AURORA_MYSQL_3_MASTER_PRIVILEGES = (
+    "CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "CONNECTION_ADMIN",
+    "ROLE_ADMIN", "XA_RECOVER_ADMIN", "SHOW_ROUTINE", "FLUSH_OPTIMIZER_COSTS",
+    "FLUSH_STATUS", "FLUSH_TABLES", "FLUSH_USER_RESOURCES",
+)
+
+
+def _mysql_master_extra_privileges(engine, server_version):
+    """Master-user privileges beyond _MYSQL_MASTER_PRIVILEGES, per the RDS and Aurora master user tables."""
+    version = tuple(int(n) for n in re.findall(r"\d+", server_version)[:3])
+    if "mariadb" in server_version.lower():
+        return ("SHOW CREATE ROUTINE",) if version >= (11, 4) else ()
+    if engine.startswith("aurora"):
+        if version < (8,):
+            return ("LOAD FROM S3", "SELECT INTO S3")
+        if version >= (8, 4):
+            return _AURORA_MYSQL_3_MASTER_PRIVILEGES + (
+                "ALLOW_NONEXISTENT_DEFINER", "FLUSH_PRIVILEGES", "OPTIMIZE_LOCAL_TABLE", "SET_ANY_DEFINER")
+        return _AURORA_MYSQL_3_MASTER_PRIVILEGES + ("SET_USER_ID",)
+    if version >= (8, 0, 36):
+        return ("CREATE ROLE", "DROP ROLE", "APPLICATION_PASSWORD_ADMIN", "ROLE_ADMIN",
+                "SET_USER_ID", "XA_RECOVER_ADMIN")
+    return ()
+
+
+def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db_id, engine=""):
+    """Grant the emulated MySQL master user the privileges AWS gives it, and no others."""
     try:
         import pymysql
         conn = pymysql.connect(
@@ -3555,13 +3898,17 @@ def _grant_mysql_master_user_privileges(host, port, master_user, master_pass, db
             "CREATE USER IF NOT EXISTS %s@'%%' IDENTIFIED BY %s",
             (master_user, master_pass),
         )
+        if master_user != "root":
+            cur.execute("REVOKE ALL PRIVILEGES, GRANT OPTION FROM %s@'%%'", (master_user,))
         cur.execute(
-            "GRANT ALL PRIVILEGES ON *.* TO %s@'%%' WITH GRANT OPTION",
+            f"GRANT {_MYSQL_MASTER_PRIVILEGES} ON *.* TO %s@'%%' WITH GRANT OPTION",
             (master_user,),
         )
-        for privilege in ("APPLICATION_PASSWORD_ADMIN",):
+        cur.execute("SELECT VERSION()")
+        server_version = cur.fetchone()[0]
+        for privilege in _mysql_master_extra_privileges(engine or "", server_version):
             try:
-                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%'", (master_user,))
+                cur.execute(f"GRANT {privilege} ON *.* TO %s@'%%' WITH GRANT OPTION", (master_user,))
             except Exception as e:
                 logger.debug(
                     "RDS: MySQL privilege %s unsupported for %s: %s",
@@ -4221,7 +4568,26 @@ def _sync_cluster_endpoints(cluster):
         # so the address is published as before.
         if (isinstance(writer_address, str) and ".cluster-" in writer_address
                 and not _pg_cluster_replication_enabled(cluster)):
-            reader_address = writer_address.replace(".cluster-", ".cluster-ro-", 1)
+            # Derive the ro- name only when it was registered as an alias on
+            # the backing container (recorded at launch). A cluster launched
+            # with PG replication on carries the writer name alone, so after
+            # a demotion nothing resolves the derived reader name — publish
+            # the address behind the writer instead. Clusters persisted
+            # before the field existed keep the derived-name behavior.
+            if "_shared_reader_alias" in cluster:
+                reader_address = (
+                    cluster.get("_shared_reader_alias")
+                    or cluster.get("_shared_internal_address")
+                    or endpoint.get("Address", cluster.get("ReaderEndpoint", ""))
+                )
+            else:
+                reader_address = writer_address.replace(
+                    ".cluster-", ".cluster-ro-", 1,
+                )
+        elif RDS_PUBLIC_ENDPOINT:
+            # The internal address is not reachable by the clients the
+            # published endpoint is reported to.
+            reader_address = writer_address
         else:
             reader_address = (
                 cluster.get("_shared_internal_address")
@@ -4613,7 +4979,15 @@ def _create_db_instance_impl(p):
                     container_kwargs["tmpfs"] = {
                         data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
                     }
-                container = docker_client.containers.run(**container_kwargs)
+                if _is_mysql_engine(engine) and (options := _mysql_server_options(
+                    _p(p, "BackupRetentionPeriod") or "1", param_group_name,
+                )):
+                    container_kwargs["command"] = options
+                container = _run_rds_container(
+                    docker_client, engine, container_kwargs,
+                    tls_names=[endpoint_host or "",
+                               container_kwargs.get("name") or ""],
+                )
                 docker_container_id = container.id
                 real_container_started = True
                 if ms_network:
@@ -4625,8 +4999,8 @@ def _create_db_instance_impl(p):
                     if container_ip:
                         internal_host = container_ip
                         internal_port = container_port
-                        endpoint_host = container_ip
-                        endpoint_port = container_port
+                        endpoint_host, endpoint_port = _reported_endpoint(
+                            container_ip, container_port, host_port)
                         readiness_host = container_ip
                         readiness_port = container_port
                     else:
@@ -4919,7 +5293,7 @@ def _create_db_instance_impl(p):
                         _grant_mysql_master_user_privileges(
                             ready_host, ready_port, master_user,
                             cluster.get("_MasterUserPassword", master_pass),
-                            cluster_id,
+                            cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
                     if _aurora_mysql_8_replication_enabled(cluster):
@@ -4960,7 +5334,7 @@ def _create_db_instance_impl(p):
             if _is_mysql_engine(engine):
                 _grant_mysql_master_user_privileges(
                     ready_host, ready_port, master_user, master_pass,
-                    cluster_id or db_id,
+                    cluster_id or db_id, engine,
                 )
             inst = _instances.get(db_id)
             if inst is not None:
@@ -5178,6 +5552,12 @@ def _rotate_instance_password(instance, old_pass, new_pass):
                          db_id, e)
 
 
+_IMMEDIATE_INSTANCE_SETTINGS = frozenset({
+    "DeletionProtection", "CopyTagsToSnapshot", "PreferredBackupWindow", "PreferredMaintenanceWindow",
+    "PubliclyAccessible", "MaxAllocatedStorage", "MonitoringInterval", "MonitoringRoleArn",
+})
+
+
 def _modify_db_instance(p):
     db_id = _p(p, "DBInstanceIdentifier")
     instance = _resolve_instance(db_id)
@@ -5229,6 +5609,10 @@ def _modify_db_instance(p):
         "MonitoringInterval": "MonitoringInterval",
         "MonitoringRoleArn": "MonitoringRoleArn",
         "CopyTagsToSnapshot": "CopyTagsToSnapshot",
+        # Aurora members take it from the DB cluster.
+        "EnableIAMDatabaseAuthentication": (
+            None if instance.get("DBClusterIdentifier") else "IAMDatabaseAuthenticationEnabled"
+        ),
     }
 
     pending = {}
@@ -5241,11 +5625,12 @@ def _modify_db_instance(p):
         if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
                          "MonitoringInterval", "Iops", "MaxAllocatedStorage"):
             val = int(val)
-        elif param_key in ("MultiAZ", "PubliclyAccessible",
-                           "DeletionProtection", "CopyTagsToSnapshot"):
+        elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection",
+                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
             val = val == "true"
 
-        if apply_immediately:
+        # Not PendingModifiedValues members: AWS applies these whatever ApplyImmediately says.
+        if apply_immediately or param_key in _IMMEDIATE_INSTANCE_SETTINGS:
             instance[instance_key] = val
         else:
             pending[instance_key] = val
@@ -5675,6 +6060,7 @@ def _create_db_cluster_impl(p):
         "Capacity": 0,
         "ClusterScalabilityType": "standard",
         "_shared_container_id": None,
+        "_shared_reader_alias": None,
         "_shared_host_port": None,
         "_shared_endpoint": None,
         "_shared_volume_name": None,
@@ -6271,6 +6657,8 @@ def _create_param_group(p):
     name = _p(p, "DBParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBParameterGroupName is required", 400)
+    if name in _param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "postgres15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:pg:{name}"
@@ -6350,13 +6738,19 @@ def _modify_param_group(p):
 
     params = pg.setdefault("Parameters", {})
     prefix = _parameter_member_prefix(p)
+    changes = []
     idx = 1
     while _p(p, f"{prefix}.{idx}.ParameterName"):
         pname = _p(p, f"{prefix}.{idx}.ParameterName")
         pvalue = _p(p, f"{prefix}.{idx}.ParameterValue")
         apply_method = _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"
-        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
+        changes.append((pname, pvalue, apply_method))
         idx += 1
+    refusal = _apply_parameter_group_changes(name, changes)
+    if refusal:
+        return refusal
+    for pname, pvalue, apply_method in changes:
+        params[pname] = {"ParameterValue": pvalue, "ApplyMethod": apply_method}
 
     return _xml(200, "ModifyDBParameterGroupResponse",
         f"<ModifyDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ModifyDBParameterGroupResult>")
@@ -6380,12 +6774,17 @@ def _reset_param_group(p):
         )
 
     if reset_all or not has_explicit_parameters:
+        reset = [(pname, None, "immediate") for pname in params]
         params.clear()
     else:
+        reset = []
         idx = 1
         while _p(p, f"{prefix}.{idx}.ParameterName"):
-            params.pop(_p(p, f"{prefix}.{idx}.ParameterName"), None)
+            pname = _p(p, f"{prefix}.{idx}.ParameterName")
+            if params.pop(pname, None) is not None:
+                reset.append((pname, None, _p(p, f"{prefix}.{idx}.ApplyMethod") or "immediate"))
             idx += 1
+    _apply_parameter_group_changes(name, reset, refuse_static=False)
 
     return _xml(200, "ResetDBParameterGroupResponse",
         f"<ResetDBParameterGroupResult><DBParameterGroupName>{name}</DBParameterGroupName></ResetDBParameterGroupResult>")
@@ -6399,6 +6798,8 @@ def _create_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
     if not name:
         return _error("MissingParameter", "DBClusterParameterGroupName is required", 400)
+    if name in _db_cluster_param_groups:
+        return _error("DBParameterGroupAlreadyExists", f"Parameter group {name} already exists", 400)
     family = _p(p, "DBParameterGroupFamily") or "aurora-postgresql15"
     desc = _p(p, "Description") or name
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}"
@@ -6522,28 +6923,14 @@ def _reset_db_cluster_param_group(p):
 # DB Cluster Snapshots
 # ---------------------------------------------------------------------------
 
-def _create_db_cluster_snapshot(p):
-    snap_id = _p(p, "DBClusterSnapshotIdentifier")
-    cluster_id = _p(p, "DBClusterIdentifier")
-    if not snap_id:
-        return _error("MissingParameter", "DBClusterSnapshotIdentifier is required", 400)
-    if snap_id in _db_cluster_snapshots:
-        return _error("DBClusterSnapshotAlreadyExistsFault",
-            f"DB cluster snapshot {snap_id} already exists.", 400)
-
-    cluster = _resolve_cluster_in_request_region(cluster_id)
-    if not cluster:
-        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
-        if wrong_region:
-            return wrong_region
-        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
-    cluster_id = cluster["DBClusterIdentifier"]
-
+def _create_cluster_snapshot_internal(snap_id, cluster):
+    """The snapshot record for one cluster. Shared with the CloudFormation
+    ``DeletionPolicy: Snapshot`` path, which has no request to parse."""
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-snapshot:{snap_id}"
     now_ts = time.time()
     snap = {
         "DBClusterSnapshotIdentifier": snap_id,
-        "DBClusterIdentifier": cluster_id,
+        "DBClusterIdentifier": cluster["DBClusterIdentifier"],
         "DBClusterSnapshotArn": arn,
         "Engine": cluster["Engine"],
         "EngineVersion": cluster["EngineVersion"],
@@ -6566,6 +6953,28 @@ def _create_db_cluster_snapshot(p):
     }
     _db_cluster_snapshots[snap_id] = snap
 
+    return snap
+
+
+def _create_db_cluster_snapshot(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    cluster_id = _p(p, "DBClusterIdentifier")
+    if not snap_id:
+        return _error("MissingParameter", "DBClusterSnapshotIdentifier is required", 400)
+    if snap_id in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotAlreadyExistsFault",
+            f"DB cluster snapshot {snap_id} already exists.", 400)
+
+    cluster = _resolve_cluster_in_request_region(cluster_id)
+    if not cluster:
+        wrong_region = _invalid_region_arn_error(cluster_id, "DBClusterIdentifier")
+        if wrong_region:
+            return wrong_region
+        return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
+    cluster_id = cluster["DBClusterIdentifier"]
+
+    snap = _create_cluster_snapshot_internal(snap_id, cluster)
+    arn = snap["DBClusterSnapshotArn"]
     req_tags = _parse_tags(p)
     if req_tags:
         _tags[arn] = req_tags
@@ -6607,6 +7016,24 @@ def _describe_db_cluster_snapshots(p):
         f"<DBClusterSnapshot>{_cluster_snapshot_xml(s)}</DBClusterSnapshot>" for s in snaps)
     return _xml(200, "DescribeDBClusterSnapshotsResponse",
         f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
+
+
+def _describe_db_cluster_snapshot_attributes(p):
+    snap_id = _p(p, "DBClusterSnapshotIdentifier")
+    if not snap_id or snap_id not in _db_cluster_snapshots:
+        return _error("DBClusterSnapshotNotFoundFault",
+            f"DB cluster snapshot {snap_id} not found.", 404)
+    # Never shared: ModifyDBClusterSnapshotAttribute is not implemented.
+    result = (
+        f"<DBClusterSnapshotAttributesResult>"
+        f"<DBClusterSnapshotIdentifier>{_esc(snap_id)}</DBClusterSnapshotIdentifier>"
+        f"<DBClusterSnapshotAttributes>"
+        f"<DBClusterSnapshotAttribute><AttributeName>restore</AttributeName><AttributeValues></AttributeValues></DBClusterSnapshotAttribute>"
+        f"</DBClusterSnapshotAttributes>"
+        f"</DBClusterSnapshotAttributesResult>"
+    )
+    return _xml(200, "DescribeDBClusterSnapshotAttributesResponse",
+        f"<DescribeDBClusterSnapshotAttributesResult>{result}</DescribeDBClusterSnapshotAttributesResult>")
 
 
 def _delete_db_cluster_snapshot(p):
@@ -6951,7 +7378,7 @@ def _start_db_cluster(p):
                     _grant_mysql_master_user_privileges(
                         ready_host, ready_port, master_user,
                         cluster.get("_MasterUserPassword", master_pass),
-                        cluster_id,
+                        cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
                 if _aurora_mysql_8_replication_enabled(cluster):
@@ -7219,7 +7646,7 @@ def _failover_db_cluster_impl(p):
     if cluster.get("_shared_legacy_migration_in_progress") or cluster.get(
         "_shared_legacy_migration_blocked",
     ):
-        # restore_state's one-time legacy-storage migration reads
+        # _restore_state's one-time legacy-storage migration reads
         # IsClusterWriter to pick which member's volume becomes the
         # cluster's adopted shared state; flipping the flag mid-migration
         # could make it adopt a reader's volume. Same gate as
@@ -7501,6 +7928,10 @@ def _sync_tag_list_to_resource(arn):
         if cl.get("DBClusterArn") == arn:
             cl["TagList"] = list(tag_list)
             return
+    for gc in _global_clusters.values():
+        if gc.get("GlobalClusterArn") == arn:
+            gc["TagList"] = list(tag_list)
+            return
     for snap in _snapshots.values():
         if snap.get("DBSnapshotArn") == arn:
             snap["TagList"] = list(tag_list)
@@ -7597,10 +8028,12 @@ def _create_global_cluster(p):
         "DeletionProtection": deletion_protection,
         "GlobalClusterMembers": [],
         "DatabaseName": _p(p, "DatabaseName") or "",
+        "TagList": _parse_tags(p),
     }
     if source_cluster:
         _attach_cluster_to_global(gc, source_cluster, is_writer=True)
     _global_clusters[gc_id] = gc
+    _tags[arn] = list(gc["TagList"])
     return _xml(200, "CreateGlobalClusterResponse",
         f"<CreateGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></CreateGlobalClusterResult>")
 
@@ -7629,7 +8062,7 @@ def _describe_global_clusters(p):
         gcs = snapshots
 
     members_xml = "".join(
-        f"<GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster>" for gc in gcs
+        f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
         f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")
@@ -7655,6 +8088,7 @@ def _delete_global_cluster(p):
 
     gc["Status"] = "deleting"
     del _global_clusters[gc["GlobalClusterIdentifier"]]
+    _tags.pop(gc["GlobalClusterArn"], None)
     return _xml(200, "DeleteGlobalClusterResponse",
         f"<DeleteGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></DeleteGlobalClusterResult>")
 
@@ -7758,9 +8192,11 @@ def _modify_global_cluster_impl(p):
             return _error("GlobalClusterAlreadyExistsFault",
                 f"Global cluster {new_id} already exists.", 400)
         old_id = gc["GlobalClusterIdentifier"]
+        old_arn = gc["GlobalClusterArn"]
         gc["GlobalClusterIdentifier"] = new_id
         gc["GlobalClusterArn"] = f"arn:aws:rds::{get_account_id()}:global-cluster:{new_id}"
         _global_clusters[new_id] = gc
+        _tags[gc["GlobalClusterArn"]] = _tags.pop(old_arn, [])
         del _global_clusters[old_id]
         for member in gc.get("GlobalClusterMembers", []):
             cluster = _resolve_cluster(member["DBClusterArn"])
@@ -8816,6 +9252,10 @@ def _disable_http_endpoint(p):
 
 def _global_cluster_xml(gc):
     _refresh_global_cluster_readers(gc)
+    tag_xml = "".join(
+        f"<Tag><Key>{_esc(t['Key'])}</Key><Value>{_esc(t['Value'])}</Value></Tag>"
+        for t in gc.get("TagList", [])
+    )
     member_xml = ""
     for m in gc.get("GlobalClusterMembers", []):
         readers_xml = "".join(f"<member>{_esc(reader)}</member>" for reader in m.get("Readers", []))
@@ -8845,7 +9285,8 @@ def _global_cluster_xml(gc):
         <StorageEncrypted>{str(gc.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
         {failover_state_xml}
-        <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>"""
+        <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>
+        <TagList>{tag_xml}</TagList>"""
 
 
 # ---------------------------------------------------------------------------
@@ -9020,6 +9461,7 @@ def _instance_xml(i):
 
     pending_xml = ""
     for pk, pv in i.get("PendingModifiedValues", {}).items():
+        pv = str(pv).lower() if isinstance(pv, bool) else pv
         pending_xml += f"<{pk}>{pv}</{pk}>"
 
     iops_xml = ""
@@ -10926,6 +11368,7 @@ _ACTION_MAP = {
     "DescribeDBSnapshots": _describe_db_snapshots,
     "CreateDBClusterSnapshot": _create_db_cluster_snapshot,
     "DescribeDBClusterSnapshots": _describe_db_cluster_snapshots,
+    "DescribeDBClusterSnapshotAttributes": _describe_db_cluster_snapshot_attributes,
     "DeleteDBClusterSnapshot": _delete_db_cluster_snapshot,
     "CreateDBSubnetGroup": _create_subnet_group,
     "DeleteDBSubnetGroup": _delete_subnet_group,
@@ -10979,6 +11422,9 @@ _ACTION_MAP = {
 
 
 def reset():
+    from ministack.core import rds_iam
+
+    rds_iam.reset()
     # Serialize teardown with warm-boot shared-container startup. Otherwise a
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
@@ -11044,20 +11490,6 @@ def reset():
         _port_counter[0] = BASE_PORT
 
 
-# Load persisted state at module import. Must run AFTER every helper this
-# code path may touch (notably `_get_docker`, `_docker_image_for_engine`,
-# `_get_ministack_network`) is defined — `restore_state` spawns daemon threads
-# that race against the rest of module parsing, and a thread reaching an
-# undefined name raises NameError mid-restore (issue #692 follow-up).
-try:
-    _restored = load_state("rds")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method, path, headers, body, query_params):

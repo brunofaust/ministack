@@ -35,7 +35,8 @@ _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 import ministack.services.lambda_svc as _lambda_svc
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.concurrency import esm_wake
+from ministack.core.responses import AccountRegionScopedDict, get_account_id, get_region, new_uuid, request_scope
 from ministack.services import sqs as _sqs
 
 logger = logging.getLogger("sns")
@@ -54,6 +55,132 @@ def _normalize_arn(arn: str) -> str:
     if arn and _re.match(r"arn:aws:sns:[^:]+::[^:]+", arn):
         return _re.sub(r"(arn:aws:sns:[^:]+)::", rf"\1:{get_account_id()}:", arn)
     return arn
+
+
+def _topic_by_arn_any_scope(topic_arn: str) -> dict | None:
+    """Fetch a topic by ARN, reaching into its owner's scope when foreign.
+
+    Only the account may differ: like real SNS, a topic in another region is
+    invisible no matter who asks.
+    """
+    topic = _topics.get(topic_arn)
+    if topic is not None:
+        return topic
+    try:
+        spec = parse_arn(topic_arn)
+    except ArnParseError:
+        return None
+    if not spec.account_id or not spec.region or spec.service != "sns":
+        return None
+    if spec.region != get_region() or spec.account_id == get_account_id():
+        return None
+    return _topics.get_scoped(spec.account_id, spec.region, topic_arn)
+
+
+def _topic_owner(topic: dict) -> str:
+    try:
+        return parse_arn(topic.get("arn", "")).account_id or get_account_id()
+    except ArnParseError:
+        return get_account_id()
+
+
+def _enforce_topic_policy(topic: dict, iam_action: str):
+    """Gate one topic API call on the topic's resource policy.
+
+    Returns an ``AuthorizationError`` (403) response tuple when denied, else
+    ``None``. Only under AUTH=true is anything denied; with auth disabled
+    every call passes, like the rest of the identity layer. Same-account
+    callers then pass unless the Policy carries an explicit Deny for them;
+    cross-account callers need an explicit Allow, like real SNS.
+
+    Known boundary under AUTH=true: a caller with no identity Allow whose
+    access comes from this Policy alone is denied by the app-level identity
+    check before this resource check runs, where real SNS would allow the
+    union (same caveat as the queue check).
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        caller_arn,
+        resource_policy_allows,
+    )
+
+    topic_arn = topic.get("arn", "")
+    ctx = EvalContext(
+        principal_arn=caller_arn(),
+        principal_type="Root",
+        principal_account=get_account_id(),
+        action=iam_action,
+        resource_arn=topic_arn or "*",
+        region=get_region(),
+    )
+    if resource_policy_allows(topic.get("attributes", {}).get("Policy") or "", ctx,
+                              _topic_owner(topic) == get_account_id()):
+        return None
+    return _error("AuthorizationError",
+                  f"User: {ctx.principal_arn} is not authorized to perform: "
+                  f"{iam_action} on resource: {topic_arn}", 403)
+
+
+def _get_topic(topic_arn: str, action: str | None = None):
+    """Resolve a topic by ARN, enforcing its Policy when *action* is given.
+
+    Returns ``(topic, None)`` on success or ``(None, error_tuple)`` with a
+    ``NotFound`` (404) or ``AuthorizationError`` (403) response.
+    """
+    arn = _normalize_arn(topic_arn)
+    topic = _topic_by_arn_any_scope(arn)
+    if topic is None:
+        return None, _error("NotFound", f"Topic does not exist: {arn}", 404)
+    if action is not None:
+        denied = _enforce_topic_policy(topic, action)
+        if denied is not None:
+            return None, denied
+    return topic, None
+
+
+def topic_policy_allows(topic_arn: str, service: str,
+                        source_arn: str, source_account: str) -> bool:
+    """Whether the topic's Policy lets an AWS service publish to it.
+
+    Used by S3 notifications, which publish as the ``s3.amazonaws.com``
+    service principal with the bucket as ``aws:SourceArn``/``aws:SourceAccount``
+    (plus ``aws:SourceOwner`` for older policy samples). Only under AUTH=true
+    is the Policy consulted; with auth disabled every delivery passes. Every
+    topic carries the default policy, whose ``AWS:SourceOwner`` condition then
+    admits same-account service deliveries; a custom Policy without an S3
+    statement — or no Policy at all — blocks them, like real SNS.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    topic = _topic_by_arn_any_scope(topic_arn)
+    if topic is None:
+        return False
+    raw_policy = topic.get("attributes", {}).get("Policy") or ""
+    if not raw_policy:
+        return False
+    # The caller is the service itself, not an IAM principal in the source
+    # account: an account-ID grant must not authorize it (real AWS keeps the
+    # service principal distinct), while Principal "*" legitimately matches.
+    ctx = EvalContext(
+        principal_arn="*",
+        principal_type="Service",
+        principal_account="",
+        action="sns:Publish",
+        resource_arn=topic_arn,
+        region=get_region(),
+        service_context={
+            "aws:sourcearn": source_arn,
+            "aws:sourceaccount": source_account,
+            "aws:sourceowner": source_account,
+        },
+    )
+    return evaluate_resource_policy(raw_policy, ctx, service=service).decision == "Allow"
 
 
 def _sqs_queue_name_from_arn_spec(spec) -> str | None:
@@ -96,7 +223,7 @@ def _validate_subscription_endpoint(protocol: str, endpoint: str):
     return None
 
 
-def _resolve_topic_tag_arn(arn: str):
+def _resolve_topic_tag_arn(arn: str, action: str):
     arn = _normalize_arn(arn)
     try:
         spec = parse_arn(arn)
@@ -114,20 +241,34 @@ def _resolve_topic_tag_arn(arn: str):
     ):
         return arn, None, _error("InvalidParameterException", f"Invalid SNS topic ARN: {arn}", 400)
 
-    if spec.region != get_region() or spec.account_id != get_account_id():
+    if spec.region != get_region():
         return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
 
-    topic = _topics.get(arn)
+    topic = _topic_by_arn_any_scope(arn)
     if not topic:
         return arn, None, _error("ResourceNotFoundException", "Resource not found", 404)
+    denied = _enforce_topic_policy(topic, action)
+    if denied is not None:
+        return arn, None, denied
     return arn, topic, None
 
-from ministack.core.persistence import load_state
 
 _topics = AccountRegionScopedDict()
 _sub_arn_to_topic = AccountRegionScopedDict()
 _platform_applications = AccountRegionScopedDict()
 _platform_endpoints = AccountRegionScopedDict()
+
+# Direct-to-phone publishes by recipient, served at /_ministack/sns/sms-messages.
+_sms_messages = AccountRegionScopedDict()
+
+
+def _sms_log_for(phone_number: str) -> list:
+    """The record list for one phone number in the current account and region."""
+    records = _sms_messages.get(phone_number)
+    if records is None:
+        records = []
+        _sms_messages[phone_number] = records
+    return records
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -136,32 +277,27 @@ def get_state():
     return {
         "topics": copy.deepcopy(_topics),
         "sub_arn_to_topic": copy.deepcopy(_sub_arn_to_topic),
+        "sms_messages": copy.deepcopy(_sms_messages),
         "platform_applications": copy.deepcopy(_platform_applications),
         "platform_endpoints": copy.deepcopy(_platform_endpoints),
     }
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _topics.update(data.get("topics", {}))
+        for topic in _topics.all_values():
+            topic.pop("messages", None)  # publish history is no longer kept
         _sub_arn_to_topic.update(data.get("sub_arn_to_topic", {}))
+        _sms_messages.update(data.get("sms_messages", {}))
         _platform_applications.update(data.get("platform_applications", {}))
         _platform_endpoints.update(data.get("platform_endpoints", {}))
 
 
-try:
-    _restored = load_state("sns")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 async def handle_request(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
@@ -171,6 +307,9 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         for k, v in form_params.items():
             params[k] = v
 
+    from ministack.core.iam_evaluator import pin_request_caller
+    pin_request_caller(headers, query_params)
+
     action = _p(params, "Action")
     handlers = {
         "CreateTopic": _create_topic,
@@ -178,6 +317,8 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
         "ListTopics": _list_topics,
         "GetTopicAttributes": _get_topic_attributes,
         "SetTopicAttributes": _set_topic_attributes,
+        "AddPermission": _add_permission,
+        "RemovePermission": _remove_permission,
         "Subscribe": _subscribe,
         "ConfirmSubscription": _confirm_subscription,
         "Unsubscribe": _unsubscribe,
@@ -282,7 +423,6 @@ def _create_topic(params):
                 }),
             },
             "subscriptions": [],
-            "messages": [],
             "tags": {},
         }
 
@@ -294,13 +434,7 @@ def _create_topic(params):
             topic["dedup_cache"] = {}
             topic["fifo_seq"] = 0
 
-        # Store tags from CreateTopic
-        i = 1
-        while _p(params, f"Tags.member.{i}.Key"):
-            key = _p(params, f"Tags.member.{i}.Key")
-            val = _p(params, f"Tags.member.{i}.Value")
-            topic["tags"][key] = val
-            i += 1
+        topic["tags"].update(_param_tags(params))
 
         _topics[arn] = topic
         logger.info("SNS topic created: %s%s", name, " (FIFO)" if is_fifo else "")
@@ -311,10 +445,21 @@ def _create_topic(params):
 
 def _delete_topic(params):
     arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.pop(arn, None)
-    if topic:
-        for sub in topic.get("subscriptions", []):
-            _sub_arn_to_topic.pop(sub["arn"], None)
+    topic = _topic_by_arn_any_scope(arn)
+    if topic is None:
+        # Idempotent like real SNS: deleting a missing topic still answers 200.
+        return _xml(200, "DeleteTopicResponse", "")
+    denied = _enforce_topic_policy(topic, "sns:DeleteTopic")
+    if denied is not None:
+        return denied
+    owner = _topic_owner(topic)
+    try:
+        region = parse_arn(arn).region or get_region()
+    except ArnParseError:
+        region = get_region()
+    _topics.pop_scoped(owner, region, arn, None)
+    for sub in topic.get("subscriptions", []):
+        _sub_arn_to_topic.pop(sub["arn"], None)
     return _xml(200, "DeleteTopicResponse", "")
 
 
@@ -339,10 +484,9 @@ def _list_topics(params):
 
 
 def _get_topic_attributes(params):
-    arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.get(arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:GetTopicAttributes")
+    if err is not None:
+        return err
     _refresh_subscription_counts(topic)
     attrs = "".join(
         f"<entry><key>{k}</key><value>{_xml_escape(v)}</value></entry>"
@@ -353,10 +497,9 @@ def _get_topic_attributes(params):
 
 
 def _set_topic_attributes(params):
-    arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.get(arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:SetTopicAttributes")
+    if err is not None:
+        return err
     attr_name = _p(params, "AttributeName")
     attr_val = _p(params, "AttributeValue")
     if attr_name:
@@ -364,18 +507,104 @@ def _set_topic_attributes(params):
     return _xml(200, "SetTopicAttributesResponse", "")
 
 
+def _member_list(params, key: str) -> list:
+    """Collect a query-protocol ``<Key>.member.N`` list."""
+    out = []
+    i = 1
+    while True:
+        v = _p(params, f"{key}.member.{i}")
+        if not v:
+            break
+        out.append(v)
+        i += 1
+    return out
+
+
+def _add_permission(params):
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:AddPermission")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
+    label = _p(params, "Label")
+    if not label:
+        return _error("InvalidParameter",
+                      "Label is required", 400)
+    account_ids = _member_list(params, "AWSAccountId")
+    actions = _member_list(params, "ActionName")
+    if not account_ids:
+        return _error("InvalidParameter",
+                      "AWSAccountId is required", 400)
+    if not actions:
+        return _error("InvalidParameter",
+                      "ActionName is required", 400)
+
+    raw = topic["attributes"].get("Policy") or ""
+    try:
+        policy = json.loads(raw) if raw else {}
+    except (TypeError, json.JSONDecodeError):
+        policy = {}
+    policy.setdefault("Version", "2012-10-17")
+    policy.setdefault("Id", f"{topic_arn}/SNSDefaultPolicy")
+    statements = policy.setdefault("Statement", [])
+    if isinstance(statements, dict):
+        statements = [statements]
+        policy["Statement"] = statements
+
+    if any(s.get("Sid") == label for s in statements):
+        return _error("InvalidParameter",
+                      f"Value {label} for parameter Label is invalid. "
+                      f"Reason: Already exists.", 400)
+
+    statements.append({
+        "Sid": label,
+        "Effect": "Allow",
+        "Principal": {"AWS": list(account_ids)},
+        "Action": [a if a.startswith("sns:") else f"sns:{a[4:]}" if a.startswith("SNS:") else f"sns:{a}" for a in actions],
+        "Resource": topic_arn,
+    })
+    topic["attributes"]["Policy"] = json.dumps(policy)
+    return _xml(200, "AddPermissionResponse", "")
+
+
+def _remove_permission(params):
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:RemovePermission")
+    if err is not None:
+        return err
+    label = _p(params, "Label")
+    if not label:
+        return _error("InvalidParameter",
+                      "Label is required", 400)
+
+    raw = topic["attributes"].get("Policy") or ""
+    if raw:
+        try:
+            policy = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            policy = {}
+        statements = policy.get("Statement") or []
+        if isinstance(statements, dict):
+            statements = [statements]
+        remaining = [s for s in statements if s.get("Sid") != label]
+        if remaining:
+            policy["Statement"] = remaining
+            topic["attributes"]["Policy"] = json.dumps(policy)
+        else:
+            topic["attributes"].pop("Policy", None)
+    return _xml(200, "RemovePermissionResponse", "")
+
+
 # ---------------------------------------------------------------------------
 # Subscriptions
 # ---------------------------------------------------------------------------
 
 def _subscribe(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     protocol = _p(params, "Protocol")
     endpoint = _p(params, "Endpoint")
 
-    topic = _topics.get(topic_arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:Subscribe")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
 
     if not protocol:
         return _error("InvalidParameterException", "Protocol is required", 400)
@@ -436,12 +665,15 @@ def _subscribe(params):
 
 
 def _confirm_subscription(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
     token = _p(params, "Token")
 
-    topic = _topics.get(topic_arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    # Gated on the confirmation secret, not the topic policy: the
+    # SubscribeURL GET carries no SigV4 identity, so the topic must resolve
+    # outside the caller's scope.
+    topic, err = _get_topic(_p(params, "TopicArn"))
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
 
     if not token:
         return _error("InvalidParameterException", "Token is required", 400)
@@ -462,8 +694,8 @@ def _confirm_subscription(params):
 def _unsubscribe(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
-    if topic_arn and topic_arn in _topics:
-        topic = _topics[topic_arn]
+    topic = _topic_by_arn_any_scope(topic_arn) if topic_arn else None
+    if topic is not None:
         topic["subscriptions"] = [s for s in topic["subscriptions"] if s["arn"] != sub_arn]
         _refresh_subscription_counts(topic)
     _sub_arn_to_topic.pop(sub_arn, None)
@@ -502,10 +734,10 @@ def _list_subscriptions(params):
 
 
 def _list_subscriptions_by_topic(params):
-    topic_arn = _normalize_arn(_p(params, "TopicArn"))
-    topic = _topics.get(topic_arn)
-    if not topic:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    topic, err = _get_topic(_p(params, "TopicArn"), "sns:ListSubscriptionsByTopic")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
     members = ""
     for sub in topic["subscriptions"]:
         members += (
@@ -524,7 +756,7 @@ def _list_subscriptions_by_topic(params):
 def _get_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
-    if not topic_arn or topic_arn not in _topics:
+    if not topic_arn or _topic_by_arn_any_scope(topic_arn) is None:
         return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
@@ -542,7 +774,7 @@ def _get_subscription_attributes(params):
 def _set_subscription_attributes(params):
     sub_arn = _p(params, "SubscriptionArn")
     topic_arn = _sub_arn_to_topic.get(sub_arn)
-    if not topic_arn or topic_arn not in _topics:
+    if not topic_arn or _topic_by_arn_any_scope(topic_arn) is None:
         return _error("NotFound", f"Subscription does not exist: {sub_arn}", 404)
 
     sub = _find_subscription(topic_arn, sub_arn)
@@ -651,7 +883,7 @@ def publish_internal(
     the topic does not exist. Raises `SnsPublishError` for a publish AWS would
     reject — notably a FIFO topic addressed without a MessageGroupId.
     """
-    topic = _topics.get(topic_arn)
+    topic = _topic_by_arn_any_scope(topic_arn)
     if topic is None:
         return None
 
@@ -712,14 +944,6 @@ def publish_internal(
     else:
         msg_id = new_uuid()
 
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": message_structure,
-        "message_attributes": msg_attrs,
-        "timestamp": int(time.time()),
-    })
     _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
             message_group_id=message_group_id, message_dedup_id=dedup_id)
     logger.info(
@@ -740,7 +964,17 @@ def _publish(params):
 
     if phone_number and not topic_arn:
         msg_id = new_uuid()
-        logger.info("SNS SMS stub to %s: %s", phone_number, message[:80])
+        _sms_log_for(phone_number).append({
+            "PhoneNumber": phone_number,
+            "TopicArn": None,
+            "SubscriptionArn": None,
+            "MessageId": msg_id,
+            "Message": message,
+            "MessageAttributes": _parse_message_attributes(params),
+            "MessageStructure": message_structure or None,
+            "Subject": subject or None,
+        })
+        logger.info("SNS SMS to %s: %s", phone_number, message[:80])
         return _xml(200, "PublishResponse",
                     f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
 
@@ -748,7 +982,8 @@ def _publish(params):
         return _error("InvalidParameterException",
                       "TopicArn, TargetArn, or PhoneNumber is required", 400)
 
-    if topic_arn not in _topics:
+    topic, err = _get_topic(topic_arn, "sns:Publish")
+    if err is not None:
         # Publishing directly to a mobile-push platform endpoint (TargetArn) is
         # valid in AWS — https://docs.aws.amazon.com/sns/latest/api/API_Publish.html
         # We don't deliver anything, but the call must succeed.
@@ -757,7 +992,8 @@ def _publish(params):
             logger.info("SNS platform-endpoint publish stub to %s", topic_arn)
             return _xml(200, "PublishResponse",
                         f"<PublishResult><MessageId>{msg_id}</MessageId></PublishResult>")
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+        return err
+    topic_arn = topic["arn"]
 
     try:
         result = publish_internal(
@@ -782,8 +1018,10 @@ def _publish_batch(params):
     topic_arn = _normalize_arn(_p(params, "TopicArn"))
     if not topic_arn:
         return _error("InvalidParameterException", "TopicArn is required", 400)
-    if topic_arn not in _topics:
-        return _error("NotFound", f"Topic does not exist: {topic_arn}", 404)
+    topic, err = _get_topic(topic_arn, "sns:Publish")
+    if err is not None:
+        return err
+    topic_arn = topic["arn"]
 
     entries = _parse_batch_entries(params)
     if not entries:
@@ -801,7 +1039,6 @@ def _publish_batch(params):
                           "Batch entry ids must be distinct", 400)
         ids_seen.add(eid)
 
-    topic = _topics[topic_arn]
     fifo = _is_fifo_topic(topic)
 
     successful = ""
@@ -884,15 +1121,6 @@ def _publish_batch(params):
                     "sequence_number": seq_number,
                 }
 
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
-
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs,
                     message_group_id=group_id, message_dedup_id=dedup_id)
 
@@ -906,14 +1134,6 @@ def _publish_batch(params):
         else:
             # ── Standard (non-FIFO) batch entry ──
             msg_id = new_uuid()
-            topic["messages"].append({
-                "id": msg_id,
-                "message": message,
-                "subject": subject,
-                "message_structure": message_structure,
-                "message_attributes": msg_attrs,
-                "timestamp": int(time.time()),
-            })
             _fanout(topic_arn, msg_id, message, subject, message_structure, msg_attrs)
 
             successful += (
@@ -937,9 +1157,14 @@ def _publish_batch(params):
 def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             message_structure: str = "", message_attributes: dict | None = None,
             message_group_id: str = "", message_dedup_id: str = ""):
-    topic = _topics.get(topic_arn)
+    topic = _topic_by_arn_any_scope(topic_arn)
     if not topic:
         return
+    try:
+        _spec = parse_arn(topic_arn)
+        _owner, _region = _spec.account_id, _spec.region
+    except ArnParseError:
+        _owner, _region = get_account_id(), get_region()
 
     for sub in topic["subscriptions"]:
         if not sub.get("confirmed"):
@@ -948,12 +1173,11 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         protocol = sub.get("protocol", "")
         endpoint = sub.get("endpoint", "")
 
-        if not _matches_filter_policy(sub, message_attributes or {}):
-            continue
-
         effective_message = _resolve_message_for_protocol(
             message, message_structure, protocol
         )
+        if not _matches_filter_policy(sub, message_attributes or {}, effective_message):
+            continue
 
         raw = sub.get("attributes", {}).get("RawMessageDelivery", "false") == "true"
         envelope = _build_envelope(
@@ -964,7 +1188,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
         if protocol == "sqs":
             _deliver_to_sqs(endpoint, envelope, raw, effective_message,
                            message_group_id=message_group_id, message_dedup_id=message_dedup_id,
-                           message_attributes=message_attributes or {})
+                           message_attributes=message_attributes or {},
+                           topic_arn=topic_arn)
         elif protocol in ("http", "https"):
             _threading.Thread(
                 target=asyncio.run,
@@ -977,12 +1202,14 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
             # subscriber's execution. Deliver on a background thread, mirroring
             # the http(s) path above; a slow or failing subscriber Lambda no
             # longer stalls the Publish call (or its upstream caller).
-            # The publisher's account/region contextvars must travel into the
+            # The topic owner's account/region contextvars must travel into the
             # thread: _get_func_record_for_ref rejects an ARN whose account
             # differs from get_account_id(), and a fresh thread's empty context
             # reads back the default account — dropping every delivery for a
-            # non-default tenant.
-            _sns_ctx = contextvars.copy_context()
+            # non-default tenant. After a cross-account publish the publisher's
+            # scope would hide the owner's function, so the owner's is pinned.
+            with request_scope(_owner or get_account_id(), _region or get_region()):
+                _sns_ctx = contextvars.copy_context()
             _threading.Thread(
                 target=_sns_ctx.run,
                 args=(_deliver_to_lambda, endpoint, envelope, topic_arn, sub["arn"], msg_id, effective_message, message_attributes or {}),
@@ -998,7 +1225,8 @@ def _fanout(topic_arn: str, msg_id: str, message: str, subject: str,
 
 def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
                     message_group_id: str = "", message_dedup_id: str = "",
-                    message_attributes: dict | None = None):
+                    message_attributes: dict | None = None,
+                    topic_arn: str = ""):
     try:
         spec = parse_arn(endpoint)
     except ArnParseError:
@@ -1008,12 +1236,18 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
     if not queue_name:
         logger.warning("SNS fanout: invalid SQS endpoint ARN %s", endpoint)
         return
-    if spec.account_id != get_account_id():
-        logger.warning("SNS fanout: SQS queue %s is outside the current account scope", queue_name)
-        return
     queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("SNS fanout: SQS queue %s not found", queue_name)
+        return
+    try:
+        source_account = parse_arn(topic_arn).account_id if topic_arn else ""
+    except ArnParseError:
+        source_account = ""
+    if not _sqs.queue_policy_allows(str(spec), "sns.amazonaws.com", topic_arn,
+                                    source_account or get_account_id()):
+        logger.warning("SNS fanout: queue policy denies delivery from %s to %s",
+                       topic_arn, queue_name)
         return
 
     body = raw_message if raw else envelope
@@ -1031,7 +1265,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         "md5_attrs": _sqs._md5_msg_attrs(sqs_attrs),
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
     }
     if message_group_id:
@@ -1040,6 +1274,7 @@ def _deliver_to_sqs(endpoint: str, envelope: str, raw: bool, raw_message: str,
         msg["dedup_id"] = message_dedup_id
     _sqs._ensure_msg_fields(msg)
     queue["messages"].append(msg)
+    esm_wake.set()
     logger.info("SNS fanout → SQS %s", queue_name)
 
 
@@ -1142,7 +1377,8 @@ async def _send_subscription_confirmation(topic_arn: str, sub: dict):
 # ---------------------------------------------------------------------------
 
 def _list_tags_for_resource(params):
-    arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
+                                             "sns:ListTagsForResource")
     if err:
         return err
     tags_xml = ""
@@ -1152,21 +1388,28 @@ def _list_tags_for_resource(params):
                 f"<ListTagsForResourceResult><Tags>{tags_xml}</Tags></ListTagsForResourceResult>")
 
 
-def _tag_resource(params):
-    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
-    if err:
-        return err
+def _param_tags(params) -> dict:
+    """The Tags.member.N pairs of a CreateTopic or TagResource request."""
+    tags = {}
     i = 1
     while _p(params, f"Tags.member.{i}.Key"):
-        key = _p(params, f"Tags.member.{i}.Key")
-        val = _p(params, f"Tags.member.{i}.Value")
-        topic["tags"][key] = val
+        tags[_p(params, f"Tags.member.{i}.Key")] = _p(params, f"Tags.member.{i}.Value")
         i += 1
+    return tags
+
+
+def _tag_resource(params):
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
+                                              "sns:TagResource")
+    if err:
+        return err
+    topic["tags"].update(_param_tags(params))
     return _xml(200, "TagResourceResponse", "<TagResourceResult/>")
 
 
 def _untag_resource(params):
-    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"))
+    _arn, topic, err = _resolve_topic_tag_arn(_p(params, "ResourceArn"),
+                                              "sns:UntagResource")
     if err:
         return err
     i = 1
@@ -1451,7 +1694,7 @@ def _xml_escape(text: str) -> str:
 
 
 def _find_subscription(topic_arn: str, sub_arn: str) -> dict | None:
-    topic = _topics.get(topic_arn)
+    topic = _topic_by_arn_any_scope(topic_arn)
     if not topic:
         return None
     for sub in topic["subscriptions"]:
@@ -1557,7 +1800,7 @@ def _resolve_message_for_protocol(message: str, message_structure: str,
     return parsed.get(protocol, parsed.get("default", message))
 
 
-def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
+def _matches_filter_policy(sub: dict, message_attributes: dict, message: str = "") -> bool:
     policy_json = sub.get("attributes", {}).get("FilterPolicy", "")
     if not policy_json:
         return True
@@ -1569,16 +1812,20 @@ def _matches_filter_policy(sub: dict, message_attributes: dict) -> bool:
         return True
 
     scope = sub.get("attributes", {}).get("FilterPolicyScope", "MessageAttributes")
-
     if scope == "MessageBody":
-        return True
-
-    return _policy_matches(policy, message_attributes)
+        # "Filter policies for the message body assume that the message payload
+        # is a well-formed JSON object"; anything else is filtered out.
+        try:
+            body = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(body, dict) and _policy_matches(policy, _body_lookup(body), nested=True)
+    return _policy_matches(policy, _attribute_lookup(message_attributes))
 
 
 _OR_RESERVED_MEMBER_KEYS = frozenset({
     "anything-but", "prefix", "suffix", "equals-ignore-case",
-    "numeric", "exists", "cidr",
+    "numeric", "exists", "cidr", "wildcard",
 })
 
 
@@ -1597,27 +1844,62 @@ def _is_or_operator(value) -> bool:
     return True
 
 
-def _policy_matches(policy: dict, message_attributes: dict) -> bool:
-    """Match one filter-policy object against the message attributes. Sibling
-    keys are AND-ed; a recognized ``$or`` matches when any of its member
-    policies matches (evaluated recursively, so nested ``$or`` works)."""
-    for key, allowed_values in policy.items():
-        if key == "$or" and _is_or_operator(allowed_values):
-            if not any(_policy_matches(member, message_attributes)
-                       for member in allowed_values):
-                return False
-            continue
+def _attribute_lookup(message_attributes: dict):
+    """Lookup over message attributes: key -> (present, values, nonempty)."""
+    def lookup(key):
         attr = message_attributes.get(key)
         if attr is None:
-            return False
-        if not isinstance(allowed_values, list):
-            allowed_values = [allowed_values]
-        # A String.Array attribute carries a JSON array of values; AWS evaluates
-        # each element separately and the attribute matches if any element does.
-        candidates = _attr_candidate_values(attr)
-        if not any(_attr_matches_any(value, allowed_values) for value in candidates):
+            return False, [], bool(message_attributes)
+        return True, _attr_candidate_values(attr), True
+    lookup.child = None
+    return lookup
+
+
+def _body_lookup(body: dict):
+    """Lookup over a JSON body; an array value matches if any element does."""
+    def lookup(key):
+        if key not in body or body[key] is None:
+            return False, [], bool(body)
+        value = body[key]
+        return True, (value if isinstance(value, list) else [value]), True
+    lookup.child = lambda key: _body_lookup(body[key]) if isinstance(body.get(key), dict) else None
+    return lookup
+
+
+def _policy_matches(policy: dict, lookup, nested: bool = False) -> bool:
+    """Match one filter-policy object. Sibling keys are AND-ed; a recognized
+    ``$or`` matches when any member policy matches; on a message body a nested
+    policy object matches the nested property."""
+    for key, rules in policy.items():
+        if key == "$or" and _is_or_operator(rules):
+            if not any(_policy_matches(member, lookup, nested) for member in rules):
+                return False
+            continue
+        if nested and isinstance(rules, dict):
+            child = lookup.child(key)
+            if child is None or not _policy_matches(rules, child, nested):
+                return False
+            continue
+        if not isinstance(rules, list):
+            rules = [rules]
+        present, values, nonempty = lookup(key)
+        if not _key_matches(rules, present, values, nonempty):
             return False
     return True
+
+
+def _key_matches(rules: list, present: bool, values: list, nonempty: bool) -> bool:
+    for rule in rules:
+        if isinstance(rule, dict) and "exists" in rule:
+            # "exists": false "only matches if at least one attribute is present".
+            if rule["exists"] is True and present and any(v not in ("", None) for v in values):
+                return True
+            if rule["exists"] is False and not present and nonempty:
+                return True
+            continue
+        if present and any(_value_matches(value, rule) for value in values):
+            return True
+    return False
 
 
 def _attr_candidate_values(attr: dict) -> list:
@@ -1644,40 +1926,67 @@ def _attr_candidate_values(attr: dict) -> list:
     return values or [raw]
 
 
-def _attr_matches_any(attr_value: str, rules: list) -> bool:
-    for rule in rules:
-        if isinstance(rule, str):
-            if attr_value == rule:
-                return True
-        elif isinstance(rule, (int, float)):
-            try:
-                if float(attr_value) == float(rule):
-                    return True
-            except (ValueError, TypeError):
-                pass
-        elif isinstance(rule, dict):
-            if "exists" in rule:
-                if rule["exists"] is True:
-                    return True
-                continue
-            if "prefix" in rule:
-                if attr_value.startswith(rule["prefix"]):
-                    return True
-            if "anything-but" in rule:
-                excluded = rule["anything-but"]
-                if isinstance(excluded, list):
-                    if attr_value not in excluded:
-                        return True
-                elif attr_value != str(excluded):
-                    return True
-            if "numeric" in rule:
-                try:
-                    num = float(attr_value)
-                    conditions = rule["numeric"]
-                    if _check_numeric(num, conditions):
-                        return True
-                except (ValueError, TypeError):
-                    pass
+def _as_number(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _wildcard_matches(value: str, pattern: str) -> bool:
+    """`*` matches any run of characters; everything else is literal."""
+    return _re.fullmatch(".*".join(_re.escape(part) for part in pattern.split("*")), value, _re.S) is not None
+
+
+def _cidr_matches(value: str, cidr: str) -> bool:
+    import ipaddress
+    try:
+        return ipaddress.ip_address(value) in ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+
+
+def _string_rule_matches(value, rule: dict) -> bool:
+    if not isinstance(value, str):
+        return False
+    if "wildcard" in rule:
+        return isinstance(rule["wildcard"], str) and _wildcard_matches(value, rule["wildcard"])
+    if "cidr" in rule:
+        return isinstance(rule["cidr"], str) and _cidr_matches(value, rule["cidr"])
+    if "prefix" in rule:
+        return isinstance(rule["prefix"], str) and value.startswith(rule["prefix"])
+    if "suffix" in rule:
+        return isinstance(rule["suffix"], str) and value.endswith(rule["suffix"])
+    if "equals-ignore-case" in rule:
+        return isinstance(rule["equals-ignore-case"], str) and value.lower() == rule["equals-ignore-case"].lower()
+    return False
+
+
+def _value_matches(value, rule) -> bool:
+    if isinstance(rule, bool) or rule is None:
+        return value is rule or (isinstance(value, str) and value == json.dumps(rule))
+    if isinstance(rule, str):
+        return isinstance(value, str) and value == rule
+    if isinstance(rule, (int, float)):
+        num = _as_number(value)
+        return num is not None and num == float(rule)
+    if not isinstance(rule, dict):
+        return False
+    if any(k in rule for k in ("prefix", "suffix", "equals-ignore-case", "wildcard", "cidr")):
+        return _string_rule_matches(value, rule)
+    if "anything-but" in rule:
+        excluded = rule["anything-but"]
+        if isinstance(excluded, dict):
+            return isinstance(value, str) and not _string_rule_matches(value, excluded)
+        excluded = excluded if isinstance(excluded, list) else [excluded]
+        return not any(_value_matches(value, e) for e in excluded)
+    if "numeric" in rule:
+        num = _as_number(value)
+        return num is not None and _check_numeric(num, rule["numeric"])
     return False
 
 
@@ -1731,5 +2040,6 @@ def _build_envelope(topic_arn: str, msg_id: str, message: str, subject: str,
 def reset():
     _topics.clear()
     _sub_arn_to_topic.clear()
+    _sms_messages.clear()
     _platform_applications.clear()
     _platform_endpoints.clear()

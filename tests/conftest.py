@@ -66,9 +66,56 @@ def make_client(service, additional_config_kwargs=None):
     return boto3.client(service, **_default_kwargs, config=Config(**_default_config_kwargs, **additional_config_kwargs))
 
 
+def sqs_policy_allow_s3(queue_arn, bucket, account):
+    """Queue policy document letting one S3 bucket notify the queue.
+
+    The AWS shape (service principal + SourceArn/SourceAccount conditions);
+    real S3 refuses a notification config whose queue lacks it.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "s3-notify", "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage", "Resource": queue_arn,
+            "Condition": {
+                "ArnLike": {"aws:SourceArn": f"arn:aws:s3:*:*:{bucket}"},
+                "StringEquals": {"aws:SourceAccount": account}}}]}
+
+
+def sqs_policy_allow_sns(queue_arn, topic_arn):
+    """Queue policy document letting one SNS topic fan out to the queue.
+
+    The AWS shape (service principal + SourceArn condition); without it SNS
+    cannot deliver, even in the same account.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "sns-fanout", "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage", "Resource": queue_arn,
+            "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}}}]}
+
+
+def iot_test_ca(registration_code, common_name="ministack-test-ca"):
+    """A fresh CA as ``(ca_pem, ca_key_pem, verification_pem)``, the verification certificate carrying ``registration_code`` as its CN."""
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    ca_pem, ca_key_pem = generate_ca(common_name=common_name)
+    verification_pem = sign_leaf_certificate(ca_pem, ca_key_pem, common_name=registration_code)[0]
+    return ca_pem, ca_key_pem, verification_pem
+
+
 _SERIAL_TESTS = {
+    "tests/test_athena.py::test_athena_queries_glue_backed_parquet",
+    "tests/test_rds.py::test_rds_pg_two_replicating_readers_provision_source_once",
     "tests/test_athena.py::test_athena_engine_mock_via_config",
     "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",
+    "tests/test_athena.py::test_athena_resolves_quoted_and_catalog_qualified_tables",
+    "tests/test_athena.py::test_athena_header_row_only_on_first_page",
+    "tests/test_athena.py::test_athena_create_and_drop_table_apply_to_glue",
+    "tests/test_athena.py::test_athena_reads_a_parquet_table_created_without_classification",
     "tests/test_ec2.py::test_ec2_create_default_vpc",
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
@@ -191,11 +238,10 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_iot_rule_where_clause_gates_dispatch",
     "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
     "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
-    "tests/test_iot_data.py::test_iot_jitr_registration_event_drives_a_topic_rule",
     # IoT Jobs data-plane routing test: a raw urllib GET with the advertised
     # `{prefix}.jobs.iot.{region}` Host and a tight 5s timeout, so cross-file
     # xdist pressure on the shared event loop makes it time out at random.
-    "tests/test_iot_jobs.py::test_iot_jobs_advertised_endpoint_host_reaches_the_data_plane",
+    "tests/test_iot_jobs_data.py::test_iot_jobs_endpoint_host_reaches_the_data_plane",
     # ECS service task-spawn: with a Docker daemon present (CI has one) a task
     # whose container fails to start/exits under parallel container churn is set
     # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes
@@ -272,7 +318,11 @@ _SERIAL_TESTS = {
     "tests/test_iot_data.py::test_mtls_mqtt5_refusal_is_v5_connack",
     "tests/test_iot_data.py::test_mtls_inactive_cert_refused",
     "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
+    "tests/test_iot_data.py::test_mtls_registered_cert_connects_whatever_its_ca",
     "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
+    "tests/test_iot_data.py::test_mtls_jitr_certificate_is_listed_by_its_ca",
+    "tests/test_iot_data.py::test_mtls_jitr_auto_registers_an_unknown_cert_without_connack",
+    "tests/test_iot_data.py::test_mtls_jitr_under_an_sni_only_ca_needs_sni",
     "tests/test_iot_data.py::test_mtls_account_scoped_delivery",
     "tests/test_iot_data.py::test_mtls_garbage_bytes_dropped",
     "tests/test_iot_data.py::test_mtls_duplicate_client_id_evicts_first_connection",
@@ -413,6 +463,11 @@ def sts_as_role(sts):
         )
 
     return _make
+
+
+@pytest.fixture(scope="session")
+def backup():
+    return make_client("backup")
 
 
 @pytest.fixture(scope="session")
@@ -612,6 +667,11 @@ def opensearch():
 
 
 @pytest.fixture(scope="session")
+def aoss():
+    return make_client("opensearchserverless")
+
+
+@pytest.fixture(scope="session")
 def kms_client():
     return make_client("kms")
 
@@ -737,6 +797,11 @@ def cur():
 
 
 @pytest.fixture(scope="session")
+def budgets():
+    return make_client("budgets")
+
+
+@pytest.fixture(scope="session")
 def inspector2():
     return make_client("inspector2")
 
@@ -810,7 +875,7 @@ class _FakeContainers:
                 return c
         raise RuntimeError(f"no such container: {key}")
 
-    def list(self, all=False, filters=None):
+    def list(self, all=False, filters=None, sparse=False):
         want = (filters or {}).get("label") or []
         want = [want] if isinstance(want, str) else want
         out = []

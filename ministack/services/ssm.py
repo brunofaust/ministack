@@ -35,7 +35,6 @@ logger = logging.getLogger("ssm")
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 DEFAULT_PAGE_SIZE = 10
 
-from ministack.core.persistence import load_state
 
 _parameters = AccountRegionScopedDict()
 _parameter_history = AccountRegionScopedDict()
@@ -98,10 +97,10 @@ def _restore_parameter_history(data) -> None:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _parameters.update(data.get("parameters", {}))
         _restore_parameter_history(data.get("parameter_history", {}))
@@ -210,15 +209,6 @@ def _parameter_tag_arn(resource_type: str, resource_id: str) -> str | None:
     return _param_arn(resource_id)
 
 
-try:
-    _restored = load_state("ssm")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _encode_next_token(index: int) -> str:
@@ -266,14 +256,46 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+_RESERVED_PREFIX_MSG = 'Parameter name: can\'t be prefixed with "aws" or "ssm" (case-insensitive).'
+_RESERVED_SSM_PATH_MSG = (
+    'Parameter name: can\'t be prefixed with "ssm" (case-insensitive). If formed as a path, it can consist '
+    "of sub-paths divided by slash symbol; each sub-path can be formed as a mix of letters, numbers and "
+    "the following 3 symbols .-_"
+)
+_TAGS_WITH_OVERWRITE_MSG = (
+    "Invalid request: tags and overwrite can't be used together. To create a parameter "
+    "with tags, please remove overwrite flag. To update tags for an existing parameter, "
+    "please use AddTagsToResource or RemoveTagsFromResource."
+)
+
+
+def _reserved_name_error(name: str):
+    """PutParameter refuses names whose first characters are ``aws`` or ``ssm``."""
+    is_path = name.startswith("/")
+    bare = name[1:] if is_path else name
+    lowered = bare.lower()
+    if is_path and lowered.startswith("aws"):
+        return error_response_json("AccessDeniedException", f"No access to reserved parameter name: {bare}.", 400)
+    if lowered.startswith(("aws", "ssm")):
+        msg = _RESERVED_SSM_PATH_MSG if is_path else _RESERVED_PREFIX_MSG
+        return error_response_json("ValidationException", msg, 400)
+    return None
+
+
 def _put_parameter(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
 
-    param_type = data.get("Type", "String")
-    value = data.get("Value", "")
+    reserved = _reserved_name_error(name)
+    if reserved:
+        return reserved
+
     overwrite = data.get("Overwrite", False)
+    if overwrite and data.get("Tags"):
+        return error_response_json("ValidationException", _TAGS_WITH_OVERWRITE_MSG, 400)
+
+    value = data.get("Value", "")
 
     existing = _parameters.get(name)
     alternate_existing = [
@@ -293,6 +315,14 @@ def _put_parameter(data):
             "The parameter already exists. To overwrite this value, set the overwrite option in the request to true.",
             400,
         )
+
+    param_type = data.get("Type")
+    if not param_type:
+        if not existing:
+            return error_response_json(
+                "ValidationException", "A parameter type is required when you create a parameter.", 400
+            )
+        param_type = existing["Type"]
 
     version = (existing["Version"] + 1) if existing else 1
     arn = existing.get("ARN") if existing else _param_arn(name)
@@ -383,9 +413,44 @@ def resolve_parameter_value(name_or_arn, version=None, decrypt=False):
     return param.get("Value")
 
 
+def _split_selector(name_or_arn):
+    """Split a trailing ":version" / ":label"; parameter names cannot contain ":"."""
+    if not name_or_arn:
+        return name_or_arn, None
+    base_colons = 5 if name_or_arn.startswith("arn:") else 0
+    if name_or_arn.count(":") <= base_colons:
+        return name_or_arn, None
+    base, selector = name_or_arn.rsplit(":", 1)
+    return base, selector
+
+
+def _select_parameter(name_or_arn):
+    """(param, error) for GetParameter / GetParameters, honouring name:version and name:label."""
+    base, selector = _split_selector(name_or_arn)
+    name, param = _lookup_parameter(base)
+    if not param:
+        return None, "ParameterNotFound"
+    if selector is None:
+        return param, None
+    history = _parameter_history.get(name) or []
+    if selector.isdigit():
+        entry = next((h for h in history if str(h.get("Version")) == selector), None)
+    else:
+        entry = next((h for h in history if selector in (h.get("Labels") or [])), None)
+    if entry is None:
+        return None, "ParameterVersionNotFound"
+    return {**entry, "Name": param["Name"], "ARN": param["ARN"], "Selector": f":{selector}"}, None
+
+
 def _get_parameter(data):
     name = data.get("Name")
-    _, param = _lookup_parameter(name)
+    param, error = _select_parameter(name)
+    if error == "ParameterVersionNotFound":
+        return error_response_json(
+            "ParameterVersionNotFound",
+            f"Systems Manager could not find version {_split_selector(name)[1]} of {_split_selector(name)[0]}.",
+            400,
+        )
     if not param:
         return error_response_json("ParameterNotFound", f"Parameter {name} not found", 400)
     with_decryption = data.get("WithDecryption", False)
@@ -398,7 +463,7 @@ def _get_parameters(data):
     params = []
     invalid = []
     for name in names:
-        _, p = _lookup_parameter(name)
+        p, _ = _select_parameter(name)
         if p:
             params.append(_param_out(p, with_decryption))
         else:

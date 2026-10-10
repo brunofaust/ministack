@@ -1,10 +1,14 @@
 """Ministack admin/core tests — health, config, persistence, hypercorn compat."""
 
+import asyncio
 import json
 import os
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import pytest
+
+from ministack import app as app_module
 
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
@@ -186,7 +190,7 @@ def test_ministack_persist_sqs_roundtrip():
     saved_queues = dict(_sqs._queues)
     _sqs._queues.clear()
     _sqs._queue_name_to_url.clear()
-    _sqs.restore_state(state)
+    _sqs.load_persisted_state(state)
     assert "http://localhost:4566/000000000000/persist-q" in _sqs._queues
     _sqs._queues.update(saved_queues)
 
@@ -196,7 +200,7 @@ def test_ministack_persist_sns_roundtrip():
     state = _sns.get_state()
     assert "topics" in state
     _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
-    _sns.restore_state(state)
+    _sns.load_persisted_state(state)
     assert "arn:aws:sns:us-east-1:000000000000:persist-topic" in _sns._topics
     _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
 
@@ -206,7 +210,7 @@ def test_ministack_persist_ssm_roundtrip():
     state = _ssm.get_state()
     assert "parameters" in state
     _ssm._parameters.pop("/persist/key")
-    _ssm.restore_state(state)
+    _ssm.load_persisted_state(state)
     assert "/persist/key" in _ssm._parameters
     _ssm._parameters.pop("/persist/key")
 
@@ -216,7 +220,7 @@ def test_ministack_persist_secretsmanager_roundtrip():
     state = _sm.get_state()
     assert "secrets" in state
     _sm._secrets.pop("persist-secret")
-    _sm.restore_state(state)
+    _sm.load_persisted_state(state)
     assert "persist-secret" in _sm._secrets
     _sm._secrets.pop("persist-secret")
 
@@ -226,7 +230,7 @@ def test_ministack_persist_dynamodb_roundtrip():
     state = _ddb.get_state()
     assert "tables" in state
     _ddb._tables.pop("persist-tbl")
-    _ddb.restore_state(state)
+    _ddb.load_persisted_state(state)
     assert "persist-tbl" in _ddb._tables
     _ddb._tables.pop("persist-tbl")
 
@@ -236,7 +240,7 @@ def test_ministack_persist_eventbridge_roundtrip():
     state = _eb.get_state()
     assert "rules" in state
     _eb._rules.pop("default|persist-rule")
-    _eb.restore_state(state)
+    _eb.load_persisted_state(state)
     assert "default|persist-rule" in _eb._rules
     _eb._rules.pop("default|persist-rule")
 
@@ -246,7 +250,7 @@ def test_ministack_persist_kinesis_roundtrip():
     state = _kin.get_state()
     assert "streams" in state
     _kin._streams.pop("persist-stream")
-    _kin.restore_state(state)
+    _kin.load_persisted_state(state)
     assert "persist-stream" in _kin._streams
     _kin._streams.pop("persist-stream")
 
@@ -257,7 +261,7 @@ def test_ministack_persist_kms_roundtrip():
     state = _kms.get_state()
     assert "keys" in state
     _kms._keys.pop(key_id)
-    _kms.restore_state(state)
+    _kms.load_persisted_state(state)
     assert key_id in _kms._keys
     assert _kms._keys[key_id]["Description"] == "persist-key"
     _kms._keys.pop(key_id)
@@ -268,7 +272,7 @@ def test_ministack_persist_ec2_roundtrip():
     state = _ec2.get_state()
     assert "instances" in state
     _ec2._instances.pop("i-persist01")
-    _ec2.restore_state(state)
+    _ec2.load_persisted_state(state)
     assert "i-persist01" in _ec2._instances
     _ec2._instances.pop("i-persist01")
 
@@ -278,7 +282,7 @@ def test_ministack_persist_route53_roundtrip():
     state = _r53.get_state()
     assert "zones" in state
     _r53._zones.pop("Z00PERSIST")
-    _r53.restore_state(state)
+    _r53.load_persisted_state(state)
     assert "Z00PERSIST" in _r53._zones
     _r53._zones.pop("Z00PERSIST")
 
@@ -288,7 +292,7 @@ def test_ministack_persist_cognito_roundtrip():
     state = _cog.get_state()
     assert "user_pools" in state
     _cog._user_pools.pop("us-east-1_PERSIST")
-    _cog.restore_state(state)
+    _cog.load_persisted_state(state)
     assert "us-east-1_PERSIST" in _cog._user_pools
     _cog._user_pools.pop("us-east-1_PERSIST")
 
@@ -298,7 +302,7 @@ def test_ministack_persist_ecr_roundtrip():
     state = _ecr.get_state()
     assert "repositories" in state
     _ecr._repositories.pop("persist-repo")
-    _ecr.restore_state(state)
+    _ecr.load_persisted_state(state)
     assert "persist-repo" in _ecr._repositories
     _ecr._repositories.pop("persist-repo")
 
@@ -308,7 +312,7 @@ def test_ministack_persist_cloudwatch_roundtrip():
     state = _cw.get_state()
     assert "alarms" in state
     _cw._alarms.pop("persist-alarm")
-    _cw.restore_state(state)
+    _cw.load_persisted_state(state)
     assert "persist-alarm" in _cw._alarms
     _cw._alarms.pop("persist-alarm")
 
@@ -323,7 +327,7 @@ def test_ministack_persist_s3_metadata_roundtrip():
     assert "bucket_versioning" in state
     _s3._buckets.pop("persist-bkt")
     _s3._bucket_versioning.pop("persist-bkt")
-    _s3.restore_state(state)
+    _s3.load_persisted_state(state)
     assert "persist-bkt" in _s3._buckets
     assert _s3._buckets["persist-bkt"]["objects"] == {}  # objects not restored
     assert _s3._bucket_versioning["persist-bkt"] == "Enabled"
@@ -349,7 +353,7 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
     _s3._bucket_logging_config.pop("persist-log-bkt")
     _s3._bucket_accelerate_config.pop("persist-log-bkt")
     _s3._bucket_request_payment_config.pop("persist-log-bkt")
-    _s3.restore_state(state)
+    _s3.load_persisted_state(state)
     assert "TargetBucket>tgt" in _s3._bucket_logging_config["persist-log-bkt"]
     assert "Enabled" in _s3._bucket_accelerate_config["persist-log-bkt"]
     assert "Requester" in _s3._bucket_request_payment_config["persist-log-bkt"]
@@ -378,7 +382,7 @@ def test_ministack_persist_lambda_roundtrip():
         # the bytes themselves live under ${STATE_DIR}/lambda-blobs/{sha}.zip.
         assert state["functions"]["persist-fn"]["code_zip"] == {"code_blob_ref": sha}
         _lam._functions.pop("persist-fn")
-        _lam.restore_state(state)
+        _lam.load_persisted_state(state)
         assert "persist-fn" in _lam._functions
         # code_zip is restored back to bytes.
         assert _lam._functions["persist-fn"]["code_zip"] == code
@@ -402,7 +406,7 @@ def test_ministack_persist_rds_roundtrip():
     assert "instances" in state
     assert "_docker_container_id" not in state["instances"]["persist-db"]
     _rds._instances.pop("persist-db")
-    _rds.restore_state(state)
+    _rds.load_persisted_state(state)
     assert "persist-db" in _rds._instances
     assert _rds._instances["persist-db"]["Engine"] == "postgres"
     _rds._instances.pop("persist-db")
@@ -421,7 +425,7 @@ def test_ministack_persist_ecs_roundtrip():
     assert "_docker_ids" not in state["tasks"]["arn:persist-task"]
     _ecs._clusters.pop("persist-cluster")
     _ecs._tasks.pop("arn:persist-task")
-    _ecs.restore_state(state)
+    _ecs.load_persisted_state(state)
     assert "persist-cluster" in _ecs._clusters
     assert "arn:persist-task" in _ecs._tasks
     assert _ecs._tasks["arn:persist-task"]["lastStatus"] == "STOPPED"
@@ -440,7 +444,7 @@ def test_ministack_persist_elasticache_roundtrip():
     assert "clusters" in state
     assert "_docker_container_id" not in state["clusters"]["persist-cache"]
     _ec._clusters.pop("persist-cache")
-    _ec.restore_state(state)
+    _ec.load_persisted_state(state)
     assert "persist-cache" in _ec._clusters
     assert _ec._clusters["persist-cache"]["Engine"] == "redis"
     _ec._clusters.pop("persist-cache")
@@ -460,7 +464,7 @@ def test_ministack_persist_stepfunctions_roundtrip():
     assert "state_machines" in state
     assert sm_arn in state["state_machines"]
     _sfn._state_machines.pop(sm_arn)
-    _sfn.restore_state(state)
+    _sfn.load_persisted_state(state)
     assert sm_arn in _sfn._state_machines
     assert _sfn._state_machines[sm_arn]["name"] == "persist-sm"
     _sfn._state_machines.pop(sm_arn)
@@ -486,7 +490,7 @@ def test_ministack_persist_stepfunctions_running_marked_failed():
     state = _sfn.get_state()
     _sfn._executions.pop(run_arn)
     _sfn._executions.pop(done_arn)
-    _sfn.restore_state(state)
+    _sfn.load_persisted_state(state)
     # RUNNING execution should be marked FAILED
     restored_run = _sfn._executions[run_arn]
     assert restored_run["status"] == "FAILED"
@@ -601,7 +605,7 @@ def test_lambda_svc_restore_does_not_forward_reference_ensure_poller():
         "function_urls": {},
     }
     # Must not raise NameError
-    lam_mod.restore_state(fake_state)
+    lam_mod.load_persisted_state(fake_state)
     assert "fake-uuid" in [e["UUID"] for e in lam_mod._esms.values()] or True
 
 
@@ -824,6 +828,47 @@ def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker
     assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
 
 
+@pytest.mark.serial
+def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monkeypatch):
+    """A full listing inspects every container, so one failed inspect used to cost the whole sweep."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-1")
+    for name in ("left-1", "left-2", "left-3"):
+        _exited_container(fake_docker, container_reaper, name, db_id=name)
+    full_list = fake_docker.containers.list
+
+    def listing(all=False, filters=None, sparse=False):
+        if not sparse:
+            raise RuntimeError("inspect of left-2 failed")
+        return full_list(all=all, filters=filters, sparse=sparse)
+
+    monkeypatch.setattr(fake_docker.containers, "list", listing)
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-2")
+    assert container_reaper.reap_all(fake_docker, include_unlabelled=True) == 3
+    assert fake_docker.live() == []
+
+
+@pytest.mark.serial
+def test_periodic_reaper_skips_only_the_container_it_cannot_inspect(fake_docker, monkeypatch):
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    for name in ("gone-1", "broken", "gone-2"):
+        _exited_container(fake_docker, container_reaper, name, db_id=name)
+
+    def failing_reload():
+        raise RuntimeError("inspect failed")
+
+    monkeypatch.setattr(fake_docker.containers.get("broken"), "reload", failing_reload)
+    container_reaper.register_live_ids("rds", lambda: [])
+    assert container_reaper.reap_abandoned(fake_docker) == 2
+    assert fake_docker.live() == ["broken"]
+
+
 def test_persistence_keeps_state_when_a_module_fails_to_load():
     """A service that could not import must not overwrite its persisted state.
 
@@ -866,3 +911,158 @@ def test_a_failed_service_module_reports_no_state():
     from ministack.app import _ErrorModule
 
     assert _ErrorModule("appsync", "No module named 'graphql'").get_state() is None
+
+
+# Request-body framing (aws-chunked, Content-Length)
+
+@pytest.mark.parametrize(
+    ("body", "headers"),
+    [
+        (b"3", {"content-encoding": "aws-chunked"}),
+        (b"x\r\n", {"content-encoding": "aws-chunked"}),
+        (b"3\r\nab", {"content-encoding": "aws-chunked"}),
+        (b"3\r\nabc\r\n", {"content-encoding": "aws-chunked"}),
+        (b"3\r\nabc\r\n0\r\n", {"content-encoding": "aws-chunked"}),
+        (
+            b"1\r\na\r\n0\r\n\r\n",
+            {"content-encoding": "aws-chunked", "x-amz-decoded-content-length": "2"},
+        ),
+        (
+            b"1\r\na\r\n0\r\n\r\n",
+            {"content-encoding": "aws-chunked", "x-amz-trailer": "x-amz-checksum-crc32"},
+        ),
+    ],
+)
+def test_decode_aws_chunked_rejects_incomplete_or_inconsistent_body(body, headers):
+    with pytest.raises(app_module._IncompleteRequestBody):
+        app_module._decode_aws_chunked_body(body, headers)
+
+
+def test_decode_aws_chunked_accepts_complete_body_and_announced_trailer():
+    body = (
+        b"3;chunk-signature=ignored\r\nabc\r\n"
+        b"0;chunk-signature=ignored\r\n"
+        b"x-amz-checksum-crc32: value\r\n\r\n"
+    )
+    headers = {
+        "content-encoding": "aws-chunked",
+        "x-amz-decoded-content-length": "3",
+        "x-amz-trailer": "x-amz-checksum-crc32",
+    }
+
+    assert app_module._decode_aws_chunked_body(body, headers) == b"abc"
+    assert headers["x-amz-checksum-crc32"] == "value"
+
+
+def _run_asgi_request(monkeypatch, headers, body_message):
+    messages = []
+    received = iter([body_message])
+
+    async def receive():
+        return next(received)
+
+    async def send(message):
+        messages.append(message)
+
+    async def unexpected_dispatch(*_args):
+        pytest.fail("incomplete request body reached service dispatch")
+
+    monkeypatch.setattr(app_module, "_dispatch_service_request", unexpected_dispatch)
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "PUT",
+        "scheme": "http",
+        "path": "/bucket/key",
+        "raw_path": b"/bucket/key",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost:4566"), *headers],
+        "client": ("127.0.0.1", 55555),
+        "server": ("127.0.0.1", 4566),
+    }
+
+    asyncio.run(app_module.app(scope, receive, send))
+    return messages
+
+
+@pytest.mark.parametrize(
+    ("headers", "body"),
+    [
+        ([(b"content-length", b"5")], b"abc"),
+        ([(b"content-encoding", b"aws-chunked")], b"3\r\nab"),
+    ],
+)
+def test_incomplete_s3_body_returns_incomplete_body_before_dispatch(monkeypatch, headers, body):
+    messages = _run_asgi_request(
+        monkeypatch,
+        headers,
+        {"type": "http.request", "body": body, "more_body": False},
+    )
+    response = next(message for message in messages if message["type"] == "http.response.start")
+    response_body = next(message["body"] for message in messages if message["type"] == "http.response.body")
+
+    assert response["status"] == 400
+    assert ET.fromstring(response_body).findtext("Code") == "IncompleteBody"
+    assert ET.fromstring(response_body).findtext("Message") == (
+        "You did not provide the number of bytes specified by the Content-Length HTTP header.")
+
+
+def test_s3_body_disconnect_stops_before_dispatch(monkeypatch):
+    messages = _run_asgi_request(monkeypatch, [], {"type": "http.disconnect"})
+
+    assert messages == []
+
+
+def test_incomplete_non_s3_body_is_dispatched_without_s3_error(monkeypatch):
+    dispatched = []
+
+    async def record_dispatch(*args):
+        dispatched.append(args)
+        return 200, {}, b""
+
+    monkeypatch.setattr(app_module, "_dispatch_service_request", record_dispatch)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"Action=ListQueues", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/", "raw_path": b"/", "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost:4566"), (b"content-length", b"99"),
+                    (b"content-type", b"application/x-www-form-urlencoded"),
+                    (b"authorization", b"AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/sqs/aws4_request, "
+                                       b"SignedHeaders=host, Signature=x")],
+        "client": ("127.0.0.1", 55555), "server": ("127.0.0.1", 4566),
+    }
+    asyncio.run(app_module.app(scope, receive, send))
+    assert all(b"IncompleteBody" not in m.get("body", b"") for m in sent)
+    assert len(dispatched) == 1 and dispatched[0][3] == b"Action=ListQueues"
+
+
+def test_drop_containers_logs_the_ids_it_could_not_remove(caplog):
+    import logging
+
+    from ministack.core import container_reaper
+
+    class _C:
+        def __init__(self, cid, fail):
+            self.id, self.fail = cid, fail
+
+        def stop(self, timeout=None):
+            if self.fail:
+                raise RuntimeError("gone")
+
+        def remove(self, v=False, force=False):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="container_reaper"):
+        removed = container_reaper.drop_containers([_C("a" * 64, False), _C("b" * 64, True)])
+    assert removed == 1
+    assert "bbbbbbbbbbbb" in caplog.text and "aaaaaaaaaaaa" not in caplog.text

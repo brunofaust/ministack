@@ -220,6 +220,8 @@ def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
                 "responseTemplates": {"application/json": '{"persisted":true}'},
             },
         )
+        _status, _headers, body = service._create_deployment(api_id, {})
+        deployment_id = json.loads(body)["id"]
 
         snapshot = service.get_state()
         service.reset()
@@ -228,6 +230,7 @@ def test_apigwv1_gateway_response_state_survives_persistence_roundtrip():
         restored = service._gateway_responses[api_id]["BAD_REQUEST_BODY"]
         assert restored["statusCode"] == "422"
         assert restored["responseTemplates"] == {"application/json": '{"persisted":true}'}
+        assert service._deployed_gateway_responses[api_id][deployment_id] == {"BAD_REQUEST_BODY": restored}
     finally:
         service.reset()
 
@@ -1031,8 +1034,8 @@ def test_apigwv1_execute_token_authorizer(apigw_v1, lam):
     - Allow policy               -> 200, with the returned context (values
       stringified) plus principalId injected into requestContext.authorizer.
     """
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
     import uuid as _uuid
 
     suffix = _uuid.uuid4().hex[:8]
@@ -1152,8 +1155,8 @@ def test_apigwv1_execute_aws_iam_requires_auth_header(apigw_v1, lam):
 
     We do not verify the SigV4 signature; only the presence check is enforced.
     """
-    import urllib.request as _urlreq
     import urllib.error as _urlerr
+    import urllib.request as _urlreq
     import uuid as _uuid
 
     fname = f"intg-v1-iam-{_uuid.uuid4().hex[:8]}"
@@ -2306,6 +2309,17 @@ def test_apigwv1_update_api_key(apigw_v1):
     assert isinstance(resp["lastUpdatedDate"], datetime.datetime)
     apigw_v1.delete_api_key(apiKey=key_id)
 
+def test_apigwv1_get_api_keys_filters_by_name_query(apigw_v1):
+    """GetApiKeys with nameQuery returns only the keys whose names start with it."""
+    key_ids = [
+        apigw_v1.create_api_key(name=name)["id"]
+        for name in ("v1-namequery-other", "v1-namequery-target", "v1-namequery-target-2")
+    ]
+    resp = apigw_v1.get_api_keys(nameQuery="v1-namequery-target")
+    assert sorted(item["name"] for item in resp["items"]) == ["v1-namequery-target", "v1-namequery-target-2"]
+    for key_id in key_ids:
+        apigw_v1.delete_api_key(apiKey=key_id)
+
 def test_apigwv1_update_usage_plan(apigw_v1):
     """UpdateUsagePlan updates name via patchOperations."""
     plan_id = apigw_v1.create_usage_plan(name="v1-plan-update-before")["id"]
@@ -2494,8 +2508,9 @@ def test_apigwv1_custom_domain_empty_base_path_is_root_mapping(apigw_v1):
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 
-def test_apigwv1_execute_missing_stage_404(apigw_v1):
-    """execute-api returns 404 when stage does not exist."""
+def test_apigwv1_execute_missing_stage_403(apigw_v1):
+    """execute-api answers an unknown stage with 403 Forbidden, outside the
+    gateway responses."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -2504,14 +2519,16 @@ def test_apigwv1_execute_missing_stage_404(apigw_v1):
     apigw_v1.put_method(restApiId=api_id, resourceId=root_id, httpMethod="GET", authorizationType="NONE")
     apigw_v1.put_integration(restApiId=api_id, resourceId=root_id, httpMethod="GET", type="MOCK")
     apigw_v1.create_deployment(restApiId=api_id)
-    # Do NOT create a stage — request to a nonexistent stage should 404
+    # Do NOT create a stage — request to a nonexistent stage should 403
 
     url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/nonexistent/"
     req = _urlreq.Request(url, method="GET")
     req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
     with pytest.raises(_urlerr.HTTPError) as exc:
         _urlreq.urlopen(req)
-    assert exc.value.code == 404
+    assert exc.value.code == 403
+    assert exc.value.headers["x-amzn-ErrorType"] == "ForbiddenException"
+    assert exc.value.read() == b'{"message":"Forbidden"}'
     apigw_v1.delete_rest_api(restApiId=api_id)
 
 def test_apigwv1_execute_missing_method_403(apigw_v1):
@@ -3750,6 +3767,51 @@ def test_apigwv1_authorizer_cache_is_scoped_per_method_arn(apigw_v1, lam, sqs):
         _auth_delete_queue(sqs, qname)
 
 
+_AUTH_IDENTITY_REQUEST_AUTHORIZER = (
+    "def handler(event, context):\n"
+    "    identity = event['requestContext']['identity']\n"
+    "    return {\n"
+    "        'principalId': 'u1',\n"
+    "        'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+    "            {'Action': 'execute-api:Invoke', 'Effect': 'Allow',\n"
+    "             'Resource': event['methodArn']}]},\n"
+    "        'context': {'sourceIp': identity['sourceIp'],\n"
+    "                    'userAgent': identity['userAgent']},\n"
+    "    }\n"
+)
+
+
+def test_apigwv1_request_authorizer_event_has_identity(apigw_v1, lam):
+    """A REQUEST authorizer event carries requestContext.identity, as in the
+    AWS docs' REQUEST authorizer input example. Authorizers that read the
+    caller's sourceIp or userAgent from it must not crash."""
+    backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
+    authz = _auth_make_lambda(lam, "req", _AUTH_IDENTITY_REQUEST_AUTHORIZER)
+    api_id, _ = _auth_build_api(
+        apigw_v1, backend,
+        dict(name="req", type="REQUEST", authorizerUri=_auth_lambda_uri(authz),
+             identitySource="method.request.header.Authorization",
+             authorizerResultTtlInSeconds=0),
+    )
+    try:
+        status, body = _auth_http(
+            _auth_execute_url(api_id, "test", "secure"),
+            headers={
+                "Authorization": "anything",
+                "User-Agent": "identity-test/1.0",
+                "X-Forwarded-For": "203.0.113.7, 10.0.0.1",
+            },
+        )
+        assert status == 200, body
+        authorizer = json.loads(body)
+        assert authorizer["sourceIp"] == "203.0.113.7"
+        assert authorizer["userAgent"] == "identity-test/1.0"
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, backend)
+        _auth_drop_lambda(lam, authz)
+
+
 def test_apigwv1_authorizer_cache_is_scoped_per_stage(apigw_v1, lam, sqs):
     """API Gateway caches authorizer results per stage: a verdict computed on
     one stage never answers the same token on another."""
@@ -3824,10 +3886,15 @@ def test_apigwv1_authorizer_invalid_validation_expression_is_500(apigw_v1, lam):
         _auth_drop_lambda(lam, authz)
 
 
-def test_apigwv1_authorizer_without_principal_id_is_500_and_not_cached(apigw_v1, lam, sqs):
-    """AWS requires a principal. An Allow policy with no principalId is an
-    AUTHORIZER_CONFIGURATION_ERROR, not an allow that reaches the backend with
-    an empty principalId — and a configuration error is never cached."""
+def test_apigwv1_authorizer_without_principal_id_reaches_the_backend(apigw_v1, lam, sqs):
+    """An Allow policy with no principalId is NOT a configuration error: the
+    request reaches the backend with 200 and an authorizer context carrying no
+    principalId (captured eu-north-1 2026-09-20 — HTTP 200, body "ok").
+
+    Restores the coverage #1756 dropped. The sibling below is the contrast: a
+    response with no policyDocument IS a configuration error, because API
+    Gateway has nothing to authorize against.
+    """
     qname = _auth_counter_queue(sqs)
     backend = _auth_make_lambda(lam, "be", _AUTH_ECHO_BACKEND)
     authz = _auth_make_lambda(
@@ -3842,15 +3909,14 @@ def test_apigwv1_authorizer_without_principal_id_is_500_and_not_cached(apigw_v1,
     api_id, _ = _auth_build_api(
         apigw_v1, backend,
         dict(name="noprincipal", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
-             authorizerResultTtlInSeconds=300),
+             authorizerResultTtlInSeconds=0),
     )
     try:
         url = _auth_execute_url(api_id, "test", "secure")
-        for _ in range(2):
-            status, body = _auth_http(url, headers={"Authorization": "allow-abc"})
-            assert status == 500
-            assert json.loads(body) == {"message": "Internal server error"}
-        assert _auth_count(sqs, qname) == 2, "a configuration error must not be cached"
+        status, body = _auth_http(url, headers={"Authorization": "allow-abc"})
+        assert status == 200, body
+        context = json.loads(body)
+        assert not (context or {}).get("principalId")
     finally:
         _auth_drop_api(apigw_v1, api_id)
         _auth_drop_lambda(lam, backend)
@@ -4491,9 +4557,1112 @@ def test_apigwv1_cognito_authorization_scopes(apigw_v1, lam, cognito_idp):
         assert _call(_v1_signed_token({**base, "scope": "files/read files/write"})) == 200
         # A token whose scopes do not overlap is authenticated but not authorized.
         assert _call(_v1_signed_token({**base, "scope": "other/scope"})) == 403
+        assert _auth_http(url, headers={"Host": host, "Authorization": _v1_signed_token({**base, "scope": "other/scope"})})[1] == b'{"message": "Forbidden"}'
         # An ID token carries no scopes at all, so it can never satisfy one.
         assert _call(_v1_signed_token({**base, "token_use": "id", "aud": "c1"})) == 403
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         lam.delete_function(FunctionName=fname)
         cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+# ---- Data plane: gateway responses ----
+
+_GWRESP_AUTHORIZER = (
+    "def handler(event, context):\n"
+    "    headers = {k.lower(): v for k, v in (event.get('headers') or {}).items()}\n"
+    "    token = event.get('authorizationToken') or headers.get('authorization', '')\n"
+    "    if token == 'unauth':\n"
+    "        raise Exception('Unauthorized')\n"
+    "    if token == 'crash':\n"
+    "        raise ValueError('boom')\n"
+    "    effect = 'Deny' if token == 'deny' else 'Allow'\n"
+    "    policy = {'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+    "        {'Action': 'execute-api:Invoke', 'Effect': effect,\n"
+    "         'Resource': event['methodArn'].split('/')[0] + '/*'}]}}\n"
+    "    if token != 'noprincipal':\n"
+    "        policy['principalId'] = 'u1'\n"
+    "    return policy\n"
+)
+_GWRESP_MISSING_FN = "v1-gwresp-does-not-exist"
+
+
+@pytest.fixture(scope="module")
+def gwresp_api(apigw_v1, lam):
+    """A deployed API (stage s1, variable sv) serving MOCK /mock and /mock500,
+    TOKEN-guarded /auth/{x}, AWS_IAM /iam and an AWS_PROXY /nolambda naming a
+    missing function."""
+    authz = _auth_make_lambda(lam, "gwresp", _GWRESP_AUTHORIZER)
+    api_id = apigw_v1.create_rest_api(name=f"v1-gwresp-{_uuid_mod.uuid4().hex[:6]}")["id"]
+    root_id = _auth_root_id(apigw_v1, api_id)
+    authorizer_id = apigw_v1.create_authorizer(
+        restApiId=api_id, name="tok", type="TOKEN", authorizerUri=_auth_lambda_uri(authz),
+        identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+    )["id"]
+
+    def mock(path_part, parent=root_id, status="200", **method_kwargs):
+        rid = apigw_v1.create_resource(restApiId=api_id, parentId=parent, pathPart=path_part)["id"]
+        method_kwargs.setdefault("authorizationType", "NONE")
+        apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod="GET", **method_kwargs)
+        apigw_v1.put_integration(
+            restApiId=api_id, resourceId=rid, httpMethod="GET", type="MOCK",
+            requestTemplates={"application/json": f'{{"statusCode": {status}}}'},
+        )
+        apigw_v1.put_integration_response(
+            restApiId=api_id, resourceId=rid, httpMethod="GET", statusCode="200",
+            responseTemplates={"application/json": '{"ok":true}'},
+        )
+        apigw_v1.put_integration_response(
+            restApiId=api_id, resourceId=rid, httpMethod="GET", statusCode="500", selectionPattern="500",
+            responseTemplates={"application/json": '{"mock":"500"}'},
+        )
+        return rid
+
+    request_authorizer_id = apigw_v1.create_authorizer(
+        restApiId=api_id, name="req", type="REQUEST", authorizerUri=_auth_lambda_uri(authz),
+        identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+    )["id"]
+    missing_authorizer_id = apigw_v1.create_authorizer(
+        restApiId=api_id, name="missing", type="TOKEN", authorizerUri=_auth_lambda_uri(_GWRESP_MISSING_FN),
+        identitySource="method.request.header.Authorization", authorizerResultTtlInSeconds=0,
+    )["id"]
+
+    mock("mock")
+    mock("mock500", status="500")
+    auth_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="auth")["id"]
+    mock("{x}", parent=auth_id, authorizationType="CUSTOM", authorizerId=authorizer_id)
+    req_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="req")["id"]
+    mock("{x}", parent=req_id, authorizationType="CUSTOM", authorizerId=request_authorizer_id)
+    missing_id = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="authmissing")["id"]
+    mock("{x}", parent=missing_id, authorizationType="CUSTOM", authorizerId=missing_authorizer_id)
+    mock("iam", authorizationType="AWS_IAM")
+    rid = apigw_v1.create_resource(restApiId=api_id, parentId=root_id, pathPart="nolambda")["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=rid, httpMethod="GET", authorizationType="NONE")
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=rid, httpMethod="GET", type="AWS_PROXY",
+        integrationHttpMethod="POST", uri=_auth_lambda_uri(_GWRESP_MISSING_FN),
+    )
+    apigw_v1.create_deployment(restApiId=api_id, stageName="s1", variables={"sv": "stagevar-v"})
+    try:
+        yield api_id
+    finally:
+        _auth_drop_api(apigw_v1, api_id)
+        _auth_drop_lambda(lam, authz)
+
+
+def _gwresp_deploy(apigw_v1, api_id, responses):
+    """Replace the API's customized gateway responses and redeploy stage s1."""
+    for item in apigw_v1.get_gateway_responses(restApiId=api_id)["items"]:
+        if not item["defaultResponse"]:
+            apigw_v1.delete_gateway_response(restApiId=api_id, responseType=item["responseType"])
+    for response_type, kwargs in responses.items():
+        apigw_v1.put_gateway_response(restApiId=api_id, responseType=response_type, **kwargs)
+    apigw_v1.create_deployment(restApiId=api_id, stageName="s1")
+
+
+def _gwresp_call(api_id, path, headers=None, stage="s1"):
+    """(status, lower-cased headers, raw body) without raising on errors."""
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(_auth_execute_url(api_id, stage, path), headers=headers or {})
+    try:
+        resp = _urlreq.urlopen(req, timeout=30)
+    except _urlerr.HTTPError as e:
+        resp = e
+    return resp.status, {k.lower(): v for k, v in resp.headers.items()}, resp.read()
+
+
+_GWRESP_DENY = "User is not authorized to access this resource with an explicit deny in an identity-based policy"
+
+
+@pytest.mark.parametrize(
+    "path,headers,status,response_type,error_type,builtin_body",
+    [
+        ("mock", {}, 200, None, None, b'{"ok":true}'),
+        # The MOCK request template's statusCode selects the integration response.
+        ("mock500", {}, 500, None, None, b'{"mock":"500"}'),
+        ("nope", {}, 403, "MISSING_AUTHENTICATION_TOKEN", "MissingAuthenticationTokenException",
+         b'{"message":"Missing Authentication Token"}'),
+        ("iam", {}, 403, "MISSING_AUTHENTICATION_TOKEN", "MissingAuthenticationTokenException",
+         b'{"message":"Missing Authentication Token"}'),
+        ("auth/abc", {}, 401, "UNAUTHORIZED", "UnauthorizedException", b'{"message":"Unauthorized"}'),
+        ("auth/abc", {"Authorization": "unauth"}, 401, "UNAUTHORIZED", "UnauthorizedException",
+         b'{"message":"Unauthorized"}'),
+        ("auth/abc", {"Authorization": "deny"}, 403, "ACCESS_DENIED", "AccessDeniedException",
+         b'{"Message":"%s"}' % _GWRESP_DENY.encode()),
+        ("auth/abc", {"Authorization": "crash"}, 500, "AUTHORIZER_FAILURE", "AuthorizerConfigurationException",
+         b'{"message":null}'),
+        ("auth/abc", {"Authorization": "allow"}, 200, None, None, b'{"ok":true}'),
+        # An authorizer returning no principalId still has its policy evaluated, TOKEN and REQUEST alike.
+        ("auth/abc", {"Authorization": "noprincipal"}, 200, None, None, b'{"ok":true}'),
+        ("req/abc", {"Authorization": "noprincipal"}, 200, None, None, b'{"ok":true}'),
+        ("req/abc", {"Authorization": "allow"}, 200, None, None, b'{"ok":true}'),
+        # An authorizer naming a missing function; AWS renders its messageString with a leading space too.
+        ("authmissing/abc", {"Authorization": "x"}, 500, "AUTHORIZER_CONFIGURATION_ERROR",
+         "AuthorizerConfigurationException", b'{"message": "Internal server error"}'),
+        # AWS renders this type's messageString with a leading space.
+        ("nolambda", {}, 500, "API_CONFIGURATION_ERROR", "InternalServerErrorException",
+         b'{"message": "Internal server error"}'),
+    ],
+)
+def test_apigwv1_gateway_response_types(
+    apigw_v1, gwresp_api, path, headers, status, response_type, error_type, builtin_body
+):
+    """Each gateway error resolves to its response type: built-in body without
+    customization, the type's own customized response once every type is
+    tagged. Integration responses never carry x-amzn-ErrorType."""
+    _gwresp_deploy(apigw_v1, gwresp_api, {})
+    got_status, got_headers, body = _gwresp_call(gwresp_api, path, headers)
+    assert (got_status, got_headers.get("x-amzn-errortype"), body) == (status, error_type, builtin_body)
+
+    tagged = {t: {"responseParameters": {"gatewayresponse.header.X-Gw-Type": f"'{t}'"}}
+              for t in apigateway_v1._DEFAULT_GATEWAY_RESPONSE_STATUS_CODES}
+    tagged["DEFAULT_4XX"] = {"responseParameters": {"gatewayresponse.header.X-Default": "'4'"}}
+    tagged["DEFAULT_5XX"] = {"responseParameters": {"gatewayresponse.header.X-Default": "'5'"}}
+    _gwresp_deploy(apigw_v1, gwresp_api, tagged)
+    got_status, got_headers, body = _gwresp_call(gwresp_api, path, headers)
+    assert got_headers.get("x-gw-type") == response_type
+    assert "x-default" not in got_headers
+    assert got_headers.get("x-amzn-errortype") == error_type
+    if response_type:
+        # A customized response keeps the type's default status and template.
+        assert got_status == int(apigateway_v1._DEFAULT_GATEWAY_RESPONSE_STATUS_CODES[response_type])
+        assert json.loads(body) == {"message": next(iter(json.loads(builtin_body).values()))}
+
+
+_GWRESP_D4 = {
+    "responseParameters": {"gatewayresponse.header.X-Default": "'d4'"},
+    "responseTemplates": {"application/json": '{"d4":$context.error.messageString,"type":"$context.error.responseType"}'},
+}
+_GWRESP_D5 = {
+    "responseParameters": {"gatewayresponse.header.X-Default": "'d5'"},
+    "responseTemplates": {"application/json": '{"d5":$context.error.messageString,"type":"$context.error.responseType"}'},
+}
+
+
+@pytest.mark.parametrize(
+    "path,headers,responses,status,x_default,body",
+    [
+        # A specific response replaces DEFAULT_4XX (no header merge) and may override the status.
+        ("nope", {}, {"DEFAULT_4XX": _GWRESP_D4, "MISSING_AUTHENTICATION_TOKEN": {
+            "statusCode": "404", "responseParameters": {"gatewayresponse.header.X-Mat": "'mat'"},
+            "responseTemplates": {"application/json": '{"notfound":$context.error.messageString}'}}},
+         404, None, {"notfound": "Missing Authentication Token"}),
+        ("nope", {}, {"DEFAULT_4XX": _GWRESP_D4}, 403, "d4",
+         {"d4": "Missing Authentication Token", "type": "MISSING_AUTHENTICATION_TOKEN"}),
+        ("nope", {}, {"DEFAULT_5XX": _GWRESP_D5}, 403, None, {"message": "Missing Authentication Token"}),
+        ("auth/abc", {"Authorization": "deny"}, {"DEFAULT_4XX": _GWRESP_D4}, 403, "d4",
+         {"d4": _GWRESP_DENY, "type": "ACCESS_DENIED"}),
+        ("auth/abc", {"Authorization": "crash"}, {"DEFAULT_4XX": _GWRESP_D4, "DEFAULT_5XX": _GWRESP_D5}, 500, "d5",
+         {"d5": None, "type": "AUTHORIZER_FAILURE"}),
+    ],
+)
+def test_apigwv1_gateway_response_precedence(
+    apigw_v1, gwresp_api, path, headers, responses, status, x_default, body
+):
+    _gwresp_deploy(apigw_v1, gwresp_api, responses)
+    got_status, got_headers, got_body = _gwresp_call(gwresp_api, path, headers)
+    assert (got_status, got_headers.get("x-default"), json.loads(got_body)) == (status, x_default, body)
+    assert ("x-mat" in got_headers) == ("MISSING_AUTHENTICATION_TOKEN" in responses)
+
+
+@pytest.mark.parametrize(
+    "path,headers,expected",
+    [
+        ("auth/abc?q=qv", {"Origin": "https://probe.example", "Accept": "application/xml"},
+         {"x-origin": "https://probe.example", "x-query": "qv"}),
+        # A missing source omits the header; an empty one keeps it empty.
+        ("auth/abc", {"Origin": ""}, {"x-origin": "", "x-query": None}),
+        ("auth/abc", {}, {"x-origin": None, "x-query": None}),
+    ],
+)
+def test_apigwv1_gateway_response_mappings(apigw_v1, gwresp_api, path, headers, expected):
+    _gwresp_deploy(apigw_v1, gwresp_api, {"UNAUTHORIZED": {
+        "statusCode": "418",
+        "responseParameters": {
+            "gatewayresponse.header.Access-Control-Allow-Origin": "'*'",
+            "gatewayresponse.header.X-Origin": "method.request.header.origin",
+            "gatewayresponse.header.X-Path": "method.request.path.x",
+            "gatewayresponse.header.X-Query": "method.request.querystring.q",
+            "gatewayresponse.header.X-Stagevar": "stageVariables.sv",
+            "gatewayresponse.header.X-Req": "context.requestId",
+        },
+        "responseTemplates": {"application/json": (
+            '{"msg":$context.error.messageString,"type":"$context.error.responseType",'
+            '"raw":"$context.error.message","rid":"$context.requestId",'
+            '"rpath":"$context.resourcePath","stage":"$context.stage"}'
+        )},
+    }})
+    status, got_headers, body = _gwresp_call(gwresp_api, path, headers)
+    assert status == 418
+    assert got_headers["content-type"] == "application/json"
+    assert got_headers["access-control-allow-origin"] == "*"
+    assert (got_headers["x-path"], got_headers["x-stagevar"]) == ("abc", "stagevar-v")
+    assert {k: got_headers.get(k) for k in expected} == expected
+    request_id = got_headers["x-amzn-requestid"]
+    assert got_headers["x-req"] == request_id
+    assert json.loads(body) == {"msg": "Unauthorized", "type": "UNAUTHORIZED", "raw": "Unauthorized",
+                    "rid": request_id, "rpath": "/auth/{x}", "stage": "s1"}
+
+
+def test_apigwv1_gateway_response_configuration_error_variables(apigw_v1, gwresp_api):
+    """$context.error.responseType of an authorizer configuration error renders as
+    API_CONFIGURATION_ERROR while the entry, status and x-amzn-ErrorType stay the
+    authorizer's; $context.status renders empty (both measured)."""
+    template = '{"t":"$context.error.responseType","m":$context.error.messageString,"s":"$context.status"}'
+    _gwresp_deploy(apigw_v1, gwresp_api, {
+        "AUTHORIZER_CONFIGURATION_ERROR": {"statusCode": "503", "responseTemplates": {"application/json": template}},
+        "DEFAULT_5XX": {"responseTemplates": {"application/json": template}},
+    })
+    status, headers, body = _gwresp_call(gwresp_api, "authmissing/abc", {"Authorization": "x"})
+    assert (status, headers.get("x-amzn-errortype")) == (503, "AuthorizerConfigurationException")
+    assert body == b'{"t":"API_CONFIGURATION_ERROR","m": "Internal server error","s":""}'
+    status, headers, body = _gwresp_call(gwresp_api, "nolambda")
+    assert (status, headers.get("x-amzn-errortype")) == (500, "InternalServerErrorException")
+    assert body == b'{"t":"API_CONFIGURATION_ERROR","m": "Internal server error","s":""}'
+
+
+def test_apigwv1_gateway_responses_take_effect_on_deployment(apigw_v1, gwresp_api):
+    """The data plane answers with the responses of the stage's last deployment."""
+    _gwresp_deploy(apigw_v1, gwresp_api, {})
+
+    def marker():
+        return _gwresp_call(gwresp_api, "nope")[1].get("x-mark")
+
+    apigw_v1.put_gateway_response(
+        restApiId=gwresp_api, responseType="MISSING_AUTHENTICATION_TOKEN",
+        responseParameters={"gatewayresponse.header.X-Mark": "'v1'"},
+    )
+    assert marker() is None
+    apigw_v1.create_deployment(restApiId=gwresp_api, stageName="s1")
+    assert marker() == "v1"
+    apigw_v1.delete_gateway_response(restApiId=gwresp_api, responseType="MISSING_AUTHENTICATION_TOKEN")
+    assert marker() == "v1"
+    apigw_v1.create_deployment(restApiId=gwresp_api, stageName="s1")
+    assert marker() is None
+
+
+def test_apigwv1_gateway_response_defaults_on_the_control_plane(apigw_v1, gwresp_api):
+    """PutGatewayResponse without templates stores the default template; an
+    uncustomized type reports the DEFAULT_4XX / DEFAULT_5XX it inherits."""
+    _gwresp_deploy(apigw_v1, gwresp_api, {"DEFAULT_4XX": _GWRESP_D4})
+    put = apigw_v1.put_gateway_response(
+        restApiId=gwresp_api, responseType="ACCESS_DENIED",
+        responseParameters={"gatewayresponse.header.X-A": "'a'"},
+    )
+    assert put["responseTemplates"] == {"application/json": '{"message":$context.error.messageString}'}
+
+    expected_unauthorized = {
+        "responseType": "UNAUTHORIZED", "statusCode": "401", "defaultResponse": True,
+        "responseParameters": _GWRESP_D4["responseParameters"],
+        "responseTemplates": _GWRESP_D4["responseTemplates"],
+    }
+    got = apigw_v1.get_gateway_response(restApiId=gwresp_api, responseType="UNAUTHORIZED")
+    got.pop("ResponseMetadata")
+    assert got == expected_unauthorized
+    items = {i["responseType"]: i for i in apigw_v1.get_gateway_responses(restApiId=gwresp_api)["items"]}
+    assert items["UNAUTHORIZED"] == expected_unauthorized
+    assert items["API_CONFIGURATION_ERROR"]["responseParameters"] == {}
+
+    apigw_v1.delete_gateway_response(restApiId=gwresp_api, responseType="DEFAULT_4XX")
+    got = apigw_v1.get_gateway_response(restApiId=gwresp_api, responseType="UNAUTHORIZED")
+    assert (got["defaultResponse"], got["responseParameters"]) == (True, {})
+
+
+# The checks API Gateway runs before the integration.
+
+def _mock_method(apigw_v1, api_id, resource_id, http_method, **method_kwargs):
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource_id,
+                        httpMethod=http_method, authorizationType="NONE",
+                        **method_kwargs)
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource_id, httpMethod=http_method,
+        type="MOCK", requestTemplates={"application/json": '{"statusCode":200}'})
+    apigw_v1.put_method_response(restApiId=api_id, resourceId=resource_id,
+                                 httpMethod=http_method, statusCode="200")
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource_id, httpMethod=http_method,
+        statusCode="200", responseTemplates={"application/json": '{"ok":true}'})
+
+
+def _stage_call(api_id, path, method="GET", body=None, headers=()):
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    req = _urlreq.Request(f"http://{host}/p{path}", method=method,
+                          data=body.encode() if isinstance(body, str) else body)
+    req.add_header("Host", host)
+    for name, value in headers:
+        req.add_header(name, value)
+    try:
+        response = _urlreq.urlopen(req)
+        return response.status, response.read().decode()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read().decode()
+
+
+def _gw_api(apigw_v1, name):
+    api_id = apigw_v1.create_rest_api(name=name)["id"]
+    root = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+    return api_id, root
+
+
+def test_apigwv1_api_key_required_refuses_a_missing_or_unknown_key(apigw_v1):
+    """403 INVALID_API_KEY for a missing or unknown key."""
+    api_id, root = _gw_api(apigw_v1, f"gwkey-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="key")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+
+        assert _stage_call(api_id, "/key") == (403, '{"message":"Forbidden"}')
+        assert _stage_call(api_id, "/key", headers=[("x-api-key", "nope")]) == (
+            403, '{"message":"Forbidden"}')
+
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
+                                      enabled=True)
+        assert _stage_call(api_id, "/key",
+                           headers=[("x-api-key", key["value"])])[0] == 403
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p"}])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"],
+                                       keyType="API_KEY")
+        assert _stage_call(api_id, "/key",
+                           headers=[("x-api-key", key["value"])]) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_create_api_key_keeps_the_given_value(apigw_v1):
+    wanted = f"own-key-value-{_uuid_mod.uuid4().hex[:12]}"
+    api_id, root = _gw_api(apigw_v1, f"gwkey-{_uuid_mod.uuid4().hex[:8]}")
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True,
+                                  value=wanted, customerId="customer-1")
+    try:
+        assert key["value"] == wanted
+        assert key["customerId"] == "customer-1"
+        stored = apigw_v1.get_api_key(apiKey=key["id"], includeValue=True)
+        assert stored["value"] == wanted
+        assert stored["customerId"] == "customer-1"
+
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="key")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p"}])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"],
+                                       keyType="API_KEY")
+        assert _stage_call(api_id, "/key",
+                           headers=[("x-api-key", wanted)]) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        apigw_v1.delete_api_key(apiKey=key["id"])
+
+
+def test_apigwv1_create_api_key_refuses_a_value_under_20_characters(apigw_v1):
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
+                                value="x" * 19)
+    err = exc.value.response
+    assert err["Error"]["Code"] == "BadRequestException"
+    assert err["Error"]["Message"] == "API Key value should be at least 20 characters"
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", value="x" * 20)
+    assert key["value"] == "x" * 20
+    apigw_v1.delete_api_key(apiKey=key["id"])
+
+
+def test_apigwv1_usage_plan_quota_is_enforced_per_key(apigw_v1):
+    """Quota 1 serves one request, then 429 QUOTA_EXCEEDED."""
+    api_id, root = _gw_api(apigw_v1, f"gwquota-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="key")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}",
+                                      enabled=True)
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p"}],
+            quota={"limit": 1, "offset": 0, "period": "DAY"})["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"],
+                                       keyType="API_KEY")
+        headers = [("x-api-key", key["value"])]
+        assert _stage_call(api_id, "/key", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/key", headers=headers) == (
+            429, '{"message":"Limit Exceeded"}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_method_and_stage_throttling_answer_429(apigw_v1):
+    """A 0/0 limit refuses everything with TooManyRequestsException; a real limit does not."""
+    api_id, root = _gw_api(apigw_v1, f"gwthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="thr")["id"]
+        _mock_method(apigw_v1, api_id, resource, "GET")
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
+
+        def throttle(path_prefix, rate, burst):
+            apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+                {"op": "replace", "path": f"{path_prefix}/throttling/rateLimit",
+                 "value": str(rate)},
+                {"op": "replace", "path": f"{path_prefix}/throttling/burstLimit",
+                 "value": str(burst)},
+            ])
+
+        throttle("/~1thr/GET", 0, 0)
+        assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
+        assert _gwresp_call(api_id, "thr", stage="p")[1].get(
+            "x-amzn-errortype") == "TooManyRequestsException"
+        throttle("/~1thr/GET", 100, 50)
+        assert _stage_call(api_id, "/thr") == (200, '{"ok":true}')
+        apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+            {"op": "remove", "path": "/~1thr/GET"}])
+        throttle("/*/*", 0, 0)
+        assert _stage_call(api_id, "/thr") == (429, '{"message":"Too Many Requests"}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def _plan_key(apigw_v1, api_id, **plan_kwargs):
+    """The value of a new key in a new usage plan on stage p."""
+    key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True)
+    stage = {"apiId": api_id, "stage": "p"}
+    if "method_throttle" in plan_kwargs:
+        stage["throttle"] = plan_kwargs.pop("method_throttle")
+    plan = apigw_v1.create_usage_plan(name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+                                      apiStages=[stage], **plan_kwargs)["id"]
+    apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"], keyType="API_KEY")
+    return [("x-api-key", key["value"])]
+
+
+def test_apigwv1_usage_plan_throttle_answers_429(apigw_v1):
+    """The plan limit applies to every method the key calls, stage limits too."""
+    api_id, root = _gw_api(apigw_v1, f"gwplthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        for part, required in (("a", True), ("open", False)):
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=part)["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=required)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        apigw_v1.update_stage(restApiId=api_id, stageName="p", patchOperations=[
+            {"op": "replace", "path": "/*/*/throttling/rateLimit", "value": "1000"},
+            {"op": "replace", "path": "/*/*/throttling/burstLimit", "value": "500"},
+        ])
+        closed = _plan_key(apigw_v1, api_id, throttle={"rateLimit": 0, "burstLimit": 0})
+        tiny = _plan_key(apigw_v1, api_id, throttle={"rateLimit": 0.01, "burstLimit": 1})
+        free = _plan_key(apigw_v1, api_id)
+        throttled = (429, '{"message":"Too Many Requests"}')
+
+        assert _stage_call(api_id, "/a", headers=closed) == throttled
+        assert _stage_call(api_id, "/open", headers=closed) == throttled
+        assert _stage_call(api_id, "/open") == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=free) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=tiny) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/open", headers=tiny) == throttled
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_method_throttle_adds_to_the_plan_limit(apigw_v1):
+    """A per-method plan limit throttles that method and never lifts the plan limit."""
+    api_id, root = _gw_api(apigw_v1, f"gwplmthr-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        for part in ("a", "b"):
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=part)["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        closed_a = _plan_key(apigw_v1, api_id,
+                             throttle={"rateLimit": 1000, "burstLimit": 500},
+                             method_throttle={"/a/GET": {"rateLimit": 0, "burstLimit": 0}})
+        open_a = _plan_key(apigw_v1, api_id,
+                           throttle={"rateLimit": 0, "burstLimit": 0},
+                           method_throttle={"/a/GET": {"rateLimit": 1000, "burstLimit": 500}})
+        throttled = (429, '{"message":"Too Many Requests"}')
+
+        assert _stage_call(api_id, "/a", headers=closed_a) == throttled
+        assert _stage_call(api_id, "/b", headers=closed_a) == (200, '{"ok":true}')
+        assert _stage_call(api_id, "/a", headers=open_a) == throttled
+        assert _stage_call(api_id, "/b", headers=open_a) == throttled
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_usage_plan_method_throttle_is_per_api_stage(apigw_v1):
+    """The same method on two API stages of one plan has two buckets."""
+    apis = [_gw_api(apigw_v1, f"gwplstg-{_uuid_mod.uuid4().hex[:8]}") for _ in range(2)]
+    try:
+        for api_id, root in apis:
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart="a")["id"]
+            _mock_method(apigw_v1, api_id, resource, "GET", apiKeyRequired=True)
+            apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        key = apigw_v1.create_api_key(name=f"k-{_uuid_mod.uuid4().hex[:6]}", enabled=True)
+        limits = {"/a/GET": {"rateLimit": 0.01, "burstLimit": 1}}
+        plan = apigw_v1.create_usage_plan(
+            name=f"p-{_uuid_mod.uuid4().hex[:6]}",
+            apiStages=[{"apiId": api_id, "stage": "p", "throttle": limits} for api_id, _ in apis])["id"]
+        apigw_v1.create_usage_plan_key(usagePlanId=plan, keyId=key["id"], keyType="API_KEY")
+        headers = [("x-api-key", key["value"])]
+        first, second = (api_id for api_id, _ in apis)
+
+        assert _stage_call(first, "/a", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(second, "/a", headers=headers) == (200, '{"ok":true}')
+        assert _stage_call(first, "/a", headers=headers) == (429, '{"message":"Too Many Requests"}')
+    finally:
+        for api_id, _ in apis:
+            apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_checks_parameters_and_body(apigw_v1):
+    """BAD_REQUEST_PARAMETERS and BAD_REQUEST_BODY."""
+    api_id, root = _gw_api(apigw_v1, f"gwval-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        apigw_v1.create_model(
+            restApiId=api_id, name="m1", contentType="application/json",
+            schema=json.dumps({"type": "object", "required": ["name"],
+                               "properties": {"name": {"type": "string"}}}))
+        validator = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v", validateRequestBody=True,
+            validateRequestParameters=True)["id"]
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="val")["id"]
+        _mock_method(apigw_v1, api_id, resource, "POST",
+                     requestValidatorId=validator,
+                     requestModels={"application/json": "m1"},
+                     requestParameters={"method.request.querystring.q": True})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        json_header = [("Content-Type", "application/json")]
+
+        assert _stage_call(api_id, "/val", "POST", '{"name":"x"}', json_header) == (
+            400, '{"message": "Missing required request parameters: [q]"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
+            400, '{"message": "Invalid request body"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", "not json", json_header) == (
+            400, '{"message": "Invalid request body"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", '{"name":123}', json_header) == (
+            400, '{"message": "Invalid request body"}')
+        assert _stage_call(api_id, "/val?q=1", "POST", '{"name":"x"}',
+                           json_header) == (200, '{"ok":true}')
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+
+        for path in ("/val", "/val?q=1"):
+            with pytest.raises(_urlerr.HTTPError) as exc:
+                _urlreq.urlopen(_urlreq.Request(
+                    f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p{path}",
+                    method="POST", data=b"{}", headers=dict(json_header)))
+            assert exc.value.headers["x-amzn-ErrorType"] == "BadRequestException"
+        apigw_v1.put_gateway_response(
+            restApiId=api_id, responseType="BAD_REQUEST_BODY", responseTemplates={
+                "application/json":
+                    '{"m":$context.error.messageString,"e":"$context.error.message"}'})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/val?q=1", "POST", "{}", json_header) == (
+            400, '{"m": "Invalid request body","e":"Invalid request body"}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_applies_json_schema_draft4(apigw_v1):
+    """The body is checked against the draft 4 keywords of the model."""
+    api_id, root = _gw_api(apigw_v1, f"gwjs-{_uuid_mod.uuid4().hex[:8]}")
+
+    def prop(schema, ok, bad):
+        return ({"type": "object", "properties": {"v": schema}},
+                [f'{{"v":{b}}}' for b in ok], [f'{{"v":{b}}}' for b in bad])
+
+    cases = {
+        "Enum": prop({"enum": ["red", "blue"]}, ['"red"'], ['"green"']),
+        "Pattern": prop({"type": "string", "pattern": "[0-9]"}, ['"a1b"'], ['"abc"']),
+        "Length": prop({"type": "string", "minLength": 2, "maxLength": 2},
+                       ['"ab"', '"\U0001F600\U0001F600"'], ['"a"', '"abc"']),
+        "Range": prop({"minimum": 1, "maximum": 10, "exclusiveMaximum": True},
+                      ["1", "9.5", '"x"'], ["0", "10"]),
+        "Multiple": prop({"multipleOf": 0.5}, ["1.5"], ["1.2"]),
+        "Int": prop({"type": "integer"}, ["3", "-0"], ["3.0", "3.5", "1e2", "true", '"3"']),
+        "Num": prop({"type": "number"}, ["1e2"], ["true", '"1"']),
+        "Bool": prop({"type": "boolean"}, ["false"], ['"true"', "0"]),
+        "Nullable": prop({"type": ["string", "null"]}, ["null", '"x"'], ["1"]),
+        "List": prop({"type": "array", "items": {"type": "string"}, "minItems": 1,
+                      "maxItems": 2, "uniqueItems": True},
+                     ['["a"]'], ["[]", '["a","b","c"]', "[1]", '["a","a"]']),
+        "Tuple": prop({"type": "array", "items": [{"type": "string"}, {"type": "integer"}],
+                       "additionalItems": False}, ['["a",1]', '["a"]'], ["[1,1]", '["a",1,2]']),
+        "Combined": prop({"anyOf": [{"type": "string"}, {"allOf": [{"minimum": 1}, {"maximum": 2}]}],
+                          "not": {"enum": ["no"]}}, ['"x"', "1.5"], ["3", '"no"']),
+        "OneOf": prop({"oneOf": [{"type": "integer"}, {"minimum": 2}]}, ["1"], ["3", "1.5"]),
+        "Formats": ({"type": "object", "properties": {
+            "email": {"format": "email"}, "time": {"format": "date-time"},
+            "ip": {"format": "ipv4"}, "ip6": {"format": "ipv6"},
+            "host": {"format": "hostname"}, "uri": {"format": "uri"}}},
+            ['{"email":"a@b.io","time":"2026-09-30T12:00:00Z","ip":"10.0.0.1","ip6":"::1",'
+             '"host":"a_b.example","uri":"rel/path"}'],
+            ['{"email":"nope"}', '{"time":"2026-09-30"}', '{"ip":"999.0.0.1"}',
+             '{"ip6":"zz::"}', '{"host":"-bad-"}', '{"uri":"not a uri"}']),
+        "Closed": ({"type": "object", "properties": {"a": {}}, "additionalProperties": False},
+                   ['{"a":1}'], ['{"a":1,"b":2}']),
+        "Extra": ({"type": "object", "patternProperties": {"^n_": {"type": "number"}},
+                   "additionalProperties": {"type": "string"}},
+                  ['{"n_a":1,"b":"x"}'], ['{"n_a":"x"}', '{"b":1}']),
+        "Count": ({"type": "object", "minProperties": 1, "maxProperties": 2,
+                   "dependencies": {"a": ["b"]}},
+                  ['{"a":1,"b":1}', '{"b":1}'], ["{}", '{"a":1}', '{"a":1,"b":2,"c":3}']),
+        "Local": ({"definitions": {"s": {"type": "string"}}, "type": "object",
+                   "properties": {"v": {"$ref": "#/definitions/s"}}}, ['{"v":"x"}'], ['{"v":1}']),
+        "Ref": prop({"$ref": f"https://apigateway.amazonaws.com/restapis/{api_id}/models/Other"},
+                    ['{"id":"x"}'], ["{}", '{"id":1}']),
+        "Any": ({}, ["1", '"x"', "[" * 1000 + "]" * 1000],
+                ["", "not json", "[" * 1001 + "]" * 1001, "[" * 100000 + "]" * 100000]),
+        "Deep": ({"definitions": {"a": {"type": "array", "items": {"$ref": "#/definitions/a"}}},
+                  "$ref": "#/definitions/a"}, ["[[]]", "[" * 1000 + "]" * 1000], ["[1]", "[" * 1001 + "]" * 1001]),
+    }
+    try:
+        validator = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v", validateRequestBody=True)["id"]
+        apigw_v1.create_model(
+            restApiId=api_id, name="Other", contentType="application/json",
+            schema=json.dumps({"type": "object", "required": ["id"],
+                               "properties": {"id": {"type": "string"}}}))
+        for name, (schema, _ok, _bad) in cases.items():
+            apigw_v1.create_model(restApiId=api_id, name=name,
+                                  contentType="application/json", schema=json.dumps(schema))
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=name)["id"]
+            _mock_method(apigw_v1, api_id, resource, "POST", requestValidatorId=validator,
+                         requestModels={"application/json": name})
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        json_header = [("Content-Type", "application/json")]
+        for name, (_schema, ok, bad) in cases.items():
+            for body in ok:
+                assert _stage_call(api_id, f"/{name}", "POST", body, json_header) == (
+                    200, '{"ok":true}'), (name, body)
+            for body in bad:
+                assert _stage_call(api_id, f"/{name}", "POST", body, json_header) == (
+                    400, '{"message": "Invalid request body"}'), (name, body)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_schema_loop_answers_500(apigw_v1):
+    """A schema that applies itself to the same value answers 500; a pure $ref cycle passes."""
+    api_id, root = _gw_api(apigw_v1, f"gwloop-{_uuid_mod.uuid4().hex[:8]}")
+    models = f"https://apigateway.amazonaws.com/restapis/{api_id}/models"
+
+    def defs(a, b=None):
+        return {"definitions": {"a": a, "b": b or {}}, "$ref": "#/definitions/a"}
+
+    loop = {"allOf": [{"$ref": "#/definitions/a"}]}
+    cases = {
+        "PureRef": (defs({"$ref": "#/definitions/b"}, {"$ref": "#/definitions/a"}), ["{}"], [], []),
+        "AllOf": (defs(loop), [], [], ["{}", "1"]),
+        "AnyOf": (defs({"anyOf": [{"type": "object"}, {"$ref": "#/definitions/a"}]}), [], [], ["{}"]),
+        "Not": (defs({"not": {"$ref": "#/definitions/a"}}), [], [], ["{}"]),
+        "TypeFirst": (defs({"type": "string", "allOf": [{"$ref": "#/definitions/a"}]}), [], [], ["{}"]),
+        "Depends": (defs({"dependencies": {"x": {"$ref": "#/definitions/a"}}}), ["{}"], [], ['{"x":1}']),
+        "Nested": ({"definitions": {"a": loop}, "type": "object", "required": ["n"],
+                    "properties": {"c": {"$ref": "#/definitions/a"}}}, ['{"n":1}'], ['{"c":1}'],
+                   ['{"n":1,"c":1}']),
+        "Twice": (defs({"allOf": [{"$ref": "#/definitions/b"}] * 2}, {"type": "object"}),
+                  ["{}"], ["1"], []),
+        "Siblings": ({"definitions": {"a": loop}, "properties": {
+            "a": {"type": "string"}, "c": {"$ref": "#/definitions/a"}}},
+            ['{"a":"x"}'], ['{"a":1}'], ['{"a":1,"c":1}', '{"c":1,"a":1}']),
+        "Closed": ({"definitions": {"a": loop}, "properties": {"c": {"$ref": "#/definitions/a"}},
+                    "additionalProperties": False}, [], ['{"c":1,"z":1}', '{"z":1,"c":1}'], ['{"c":1}']),
+        "Items": ({"definitions": {"a": loop}, "items": [{"type": "string"}, {"$ref": "#/definitions/a"}]},
+                  [], ["[1]"], ["[1,1]"]),
+        "Yy": ({"type": "object"}, [], [], ["{}"]),
+        "Xx": ({"allOf": [{"$ref": f"{models}/Yy"}]}, [], [], ["{}"]),
+        "Py": ({"type": "object"}, ["{}"], [], []),
+        "Px": ({"$ref": f"{models}/Py"}, ["{}", "1"], [], []),
+        "Self": ({"type": "object"}, ["{}"], [], []),
+    }
+    updates = {"Yy": {"allOf": [{"$ref": f"{models}/Xx"}]}, "Py": {"$ref": f"{models}/Px"},
+               "Self": defs({"$ref": f"{models}/Self"})}
+    try:
+        validator = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v", validateRequestBody=True)["id"]
+        for name, (schema, *_bodies) in cases.items():
+            apigw_v1.create_model(restApiId=api_id, name=name,
+                                  contentType="application/json", schema=json.dumps(schema))
+            resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                                pathPart=name)["id"]
+            _mock_method(apigw_v1, api_id, resource, "POST", requestValidatorId=validator,
+                         requestModels={"application/json": name})
+        for name, schema in updates.items():
+            apigw_v1.update_model(restApiId=api_id, modelName=name, patchOperations=[{
+                "op": "replace", "path": "/schema", "value": json.dumps(schema)}])
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        json_header = [("Content-Type", "application/json")]
+        expected = ((200, '{"ok":true}'), (400, '{"message": "Invalid request body"}'),
+                    (500, '{"message": "Internal server error"}'))
+        for name, (_schema, *bodies) in cases.items():
+            for answer, sent in zip(expected, bodies):
+                for body in sent:
+                    assert _stage_call(api_id, f"/{name}", "POST", body, json_header) == answer, (
+                        name, body)
+        import urllib.error as _urlerr
+        import urllib.request as _urlreq
+
+        with pytest.raises(_urlerr.HTTPError) as exc:
+            _urlreq.urlopen(_urlreq.Request(
+                f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/p/AllOf",
+                method="POST", data=b"{}", headers=dict(json_header)))
+        assert exc.value.headers["x-amzn-ErrorType"] == "InternalServerErrorException"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_strict_passthrough_refuses_an_unmatched_media_type(apigw_v1):
+    """415 UNSUPPORTED_MEDIA_TYPE."""
+    api_id, root = _gw_api(apigw_v1, f"gwmedia-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        resource = apigw_v1.create_resource(restApiId=api_id, parentId=root,
+                                            pathPart="media")["id"]
+        _mock_method(apigw_v1, api_id, resource, "POST")
+        apigw_v1.update_integration(
+            restApiId=api_id, resourceId=resource, httpMethod="POST",
+            patchOperations=[{"op": "replace", "path": "/passthroughBehavior",
+                              "value": "NEVER"}])
+        apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+        assert _stage_call(api_id, "/media", "POST", "hello",
+                           [("Content-Type", "text/plain")]) == (
+            415, '{"message":"Unsupported Media Type"}')
+        assert _stage_call(api_id, "/media", "POST", "{}",
+                           [("Content-Type", "application/json")]) == (200, '{"ok":true}')
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_request_validator_crud(apigw_v1):
+    api_id, _root = _gw_api(apigw_v1, f"gwrv-{_uuid_mod.uuid4().hex[:8]}")
+    try:
+        created = apigw_v1.create_request_validator(
+            restApiId=api_id, name="v1", validateRequestBody=True,
+            validateRequestParameters=True)
+        assert created["name"] == "v1"
+        assert created["validateRequestBody"] is True
+        assert [v["name"] for v in apigw_v1.get_request_validators(
+            restApiId=api_id)["items"]] == ["v1"]
+        assert apigw_v1.get_request_validator(
+            restApiId=api_id, requestValidatorId=created["id"])["name"] == "v1"
+        updated = apigw_v1.update_request_validator(
+            restApiId=api_id, requestValidatorId=created["id"], patchOperations=[
+                {"op": "replace", "path": "/name", "value": "renamed"},
+                {"op": "replace", "path": "/validateRequestBody", "value": "false"}])
+        assert (updated["name"], updated["validateRequestBody"]) == ("renamed", False)
+        apigw_v1.delete_request_validator(
+            restApiId=api_id, requestValidatorId=created["id"])
+        assert apigw_v1.get_request_validators(restApiId=api_id)["items"] == []
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.get_request_validator(restApiId=api_id,
+                                           requestValidatorId=created["id"])
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def _sqs_api(apigw_v1, queue_name, *, path_part="send", account="000000000000",
+             region="us-east-1", request_templates=None,
+             integration_responses=None, passthrough=None):
+    """REST API with POST /<path_part> backed by a non-proxy AWS integration
+    pointing at ``sqs:path/{account}/{queue_name}`` (#2045)."""
+    api_id, root = _gw_api(apigw_v1, f"gwsqs-{_uuid_mod.uuid4().hex[:8]}")
+    resource = apigw_v1.create_resource(
+        restApiId=api_id, parentId=root, pathPart=path_part)["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource,
+                        httpMethod="POST", authorizationType="NONE")
+    apigw_v1.put_method_response(restApiId=api_id, resourceId=resource,
+                                 httpMethod="POST", statusCode="200")
+    kwargs = {}
+    if passthrough:
+        kwargs["passthroughBehavior"] = passthrough
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource, httpMethod="POST", type="AWS",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:{region}:sqs:path/{account}/{queue_name}",
+        credentials=f"arn:aws:iam::{account}:role/apigw-sqs",
+        requestParameters={
+            "integration.request.header.Content-Type":
+                "'application/x-www-form-urlencoded'"},
+        requestTemplates=request_templates or {},
+        **kwargs)
+    for status_code, extra in (integration_responses or {}).items():
+        apigw_v1.put_integration_response(
+            restApiId=api_id, resourceId=resource, httpMethod="POST",
+            statusCode=status_code, **extra)
+    apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+    return api_id
+
+
+def test_apigwv1_execute_sqs_integration_delivers_message(apigw_v1, sqs):
+    """#2045 repro: AWS -> sqs:path renders the request template, sends the
+    message, and flows the reply through the integration response."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={
+            "application/json":
+                "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"},
+        integration_responses={"200": {
+            "responseTemplates": {"application/json": '{"message":"accepted"}'}}})
+    try:
+        status, text = _stage_call(
+            api_id, "/send", method="POST", body='{"hello":"world"}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 200
+        assert json.loads(text) == {"message": "accepted"}
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get(
+            "Messages", [])
+        assert [m["Body"] for m in msgs] == ['{"hello":"world"}']
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_vtl_subset(apigw_v1, sqs):
+    """$input.json / $input.params render inside the request template."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={
+            "application/json":
+                "Action=SendMessage"
+                "&MessageBody=$util.urlEncode($input.json('$.msg'))"
+                "-$input.params('tenant')"},
+        integration_responses={"200": {}})
+    try:
+        status, _ = _stage_call(
+            api_id, "/send?tenant=blue", method="POST",
+            body='{"msg":"hi there"}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get(
+            "Messages", [])
+        assert [m["Body"] for m in msgs] == ["hi there-blue"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_cognito_claims_template(apigw_v1, sqs, cognito_idp):
+    """#set, interpolated "" strings and $context.authorizer.claims, as in the
+    template CDK users pass through an AwsIntegration to SQS."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    queue_name = f"apigw-q-{suffix}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    pool_id = cognito_idp.create_user_pool(PoolName=f"sqs-claims-{suffix}")["UserPool"]["Id"]
+    client_id = cognito_idp.create_user_pool_client(
+        UserPoolId=pool_id, ClientName="c",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"])["UserPoolClient"]["ClientId"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pool_id, Username="test-user", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "user@example.com"}])
+    cognito_idp.admin_set_user_password(
+        UserPoolId=pool_id, Username="test-user", Password="Passw0rd!", Permanent=True)
+    token = cognito_idp.initiate_auth(
+        ClientId=client_id, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "test-user", "PASSWORD": "Passw0rd!"},
+    )["AuthenticationResult"]["IdToken"]
+
+    template = (
+        "#set($body = $input.json('$'))\n"
+        "#set($id = $input.params('id'))\n"
+        "Action=SendMessage&MessageBody=$util.urlEncode(\"{\"\"body\"\":$body,"
+        "\"\"pathParameters\"\":{\"\"id\"\":\"\"$id\"\"},\"\"requestContext\"\":"
+        "{\"\"authorizer\"\":{\"\"claims\"\":{\"\"cognito:username\"\":"
+        "\"\"$!context.authorizer.claims.get('cognito:username')\"\",\"\"email\"\":"
+        "\"\"$!context.authorizer.claims.get('email')\"\"}}}}\")")
+    api_id, root = _gw_api(apigw_v1, f"gwsqs-{suffix}")
+    items = apigw_v1.create_resource(restApiId=api_id, parentId=root, pathPart="items")["id"]
+    resource = apigw_v1.create_resource(restApiId=api_id, parentId=items, pathPart="{id}")["id"]
+    authorizer = apigw_v1.create_authorizer(
+        restApiId=api_id, name="cog", type="COGNITO_USER_POOLS",
+        providerARNs=[f"arn:aws:cognito-idp:us-east-1:000000000000:userpool/{pool_id}"],
+        identitySource="method.request.header.Authorization")["id"]
+    apigw_v1.put_method(restApiId=api_id, resourceId=resource, httpMethod="PUT",
+                        authorizationType="COGNITO_USER_POOLS", authorizerId=authorizer)
+    apigw_v1.put_integration(
+        restApiId=api_id, resourceId=resource, httpMethod="PUT", type="AWS",
+        integrationHttpMethod="POST",
+        uri=f"arn:aws:apigateway:us-east-1:sqs:path/000000000000/{queue_name}",
+        credentials="arn:aws:iam::000000000000:role/apigw-sqs",
+        requestParameters={"integration.request.header.Content-Type":
+                           "'application/x-www-form-urlencoded'"},
+        requestTemplates={"application/json": template})
+    for code in ("200", "400"):
+        apigw_v1.put_method_response(restApiId=api_id, resourceId=resource,
+                                     httpMethod="PUT", statusCode=code)
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource, httpMethod="PUT", statusCode="200",
+        responseTemplates={"application/json": '{"message": "Request accepted"}'})
+    apigw_v1.put_integration_response(
+        restApiId=api_id, resourceId=resource, httpMethod="PUT", statusCode="400",
+        selectionPattern=r"4\d{2}",
+        responseTemplates={"application/json": '{"message": "Bad Request"}'})
+    apigw_v1.create_deployment(restApiId=api_id, stageName="p")
+    try:
+        status, text = _stage_call(
+            api_id, "/items/item-1", method="PUT", body='{"name":"example"}',
+            headers=[("Content-Type", "application/json"), ("Authorization", token)])
+        assert (status, json.loads(text)) == (200, {"message": "Request accepted"})
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get("Messages", [])
+        assert [m["Body"] for m in msgs] == [
+            '{"body":{"name":"example"},"pathParameters":{"id":"item-1"},'
+            '"requestContext":{"authorizer":{"claims":{"cognito:username":"test-user",'
+            '"email":"user@example.com"}}}}']
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def _render_v1(template, body="", params=None, context=None):
+    return apigateway_v1._render_request_template_v1(template, body, params or {}, context)
+
+
+def test_apigwv1_template_set_lines_render_nothing():
+    assert _render_v1("#set($a = 'x')\n  #set ($b = \"$a/y\")\r\nA=$a&B=$b") == "A=x&B=x/y"
+
+
+def test_apigwv1_template_comments_strip_through_end_of_line():
+    assert _render_v1("Action=SendMessage##\n&MessageBody=x## tail\n#* block\n*#&k=v") == (
+        "Action=SendMessage&MessageBody=x&k=v")
+
+
+def test_apigwv1_template_string_literals():
+    template = "#set($v = \"in\")$util.urlEncode(\"a \"\"$v\"\" b\")|$util.urlEncode('$v ''q''')"
+    assert _render_v1(template) == "a+%22in%22+b|%24v+%27q%27"
+
+
+def test_apigwv1_template_set_null_keeps_the_previous_value():
+    ctx = {"authorizer": {"claims": {}}}
+    assert _render_v1("#set($a = 'kept')#set($a = $context.authorizer.claims.get('nope'))$a",
+                      context=ctx) == "kept"
+
+
+def test_apigwv1_template_undefined_references():
+    assert _render_v1("$undefined|$!undefined|$!{undefined}|$10") == "$undefined|||$10"
+
+
+def test_apigwv1_template_context_authorizer_values():
+    claims_ctx = {"authorizer": {"claims": {"email": "a@b.c", "cognito:username": "u"}}}
+    assert _render_v1(
+        "$context.authorizer.claims.email|$context.authorizer.claims.get('cognito:username')"
+        "|$!context.authorizer.claims.missing|$!context.authorizer.claims",
+        context=claims_ctx) == "a@b.c|u||"
+    lambda_ctx = {"authorizer": {"principalId": "p1", "numKey": "1"}}
+    assert _render_v1("$context.authorizer.principalId-$context.authorizer.numKey",
+                      context=lambda_ctx) == "p1-1"
+
+
+def test_apigwv1_execute_sqs_integration_passthrough(apigw_v1, sqs):
+    """No matching request template: the body passes through as the Query
+    call itself (WHEN_NO_MATCH default)."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={"application/json": "Action=SendMessage&MessageBody=x"},
+        integration_responses={"200": {}})
+    try:
+        status, _ = _stage_call(
+            api_id, "/send", method="POST",
+            body="Action=SendMessage&MessageBody=raw-form-body",
+            headers=[("Content-Type", "application/x-www-form-urlencoded")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1).get(
+            "Messages", [])
+        assert [m["Body"] for m in msgs] == ["raw-form-body"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_backend_errors_map(apigw_v1, sqs):
+    """selectionPattern matches the backend status code; unmatched statuses
+    land on the default (patternless) response."""
+    missing = f"missing-q-{_uuid_mod.uuid4().hex[:8]}"
+    api_id = _sqs_api(
+        apigw_v1, missing,
+        request_templates={
+            "application/json":
+                "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"},
+        integration_responses={
+            "200": {"responseTemplates": {"application/json": '{"ok":true}'}},
+            "502": {"selectionPattern": "400",
+                    "responseTemplates": {"application/json": '{"ok":false}'}}})
+    try:
+        status, text = _stage_call(
+            api_id, "/send", method="POST", body='{"x":1}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 502
+        assert json.loads(text) == {"ok": False}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+    # No pattern matches the MissingAction 400: the default response absorbs it.
+    api_id = _sqs_api(
+        apigw_v1, missing,
+        request_templates={"application/json": "Action=&MessageBody=x"},
+        integration_responses={
+            "200": {"responseTemplates": {"application/json": '{"ok":true}'}}})
+    try:
+        status, text = _stage_call(
+            api_id, "/send", method="POST", body='{"x":1}',
+            headers=[("Content-Type", "application/json")])
+        assert status == 200
+        assert json.loads(text) == {"ok": True}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_execute_sqs_integration_send_message_reply_is_json(apigw_v1, sqs):
+    """The SendMessage reply reaches the response template as SQS's JSON envelope."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={"application/json": "Action=SendMessage&MessageBody=$util.urlEncode($input.body)"},
+        integration_responses={"200": {"responseTemplates": {
+            "application/json": "$input.path('$.SendMessageResponse.SendMessageResult.MessageId')"}}})
+    try:
+        status, text = _stage_call(api_id, "/send", method="POST", body='{"a":1}',
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 200
+        msgs = sqs.receive_message(QueueUrl=qurl, WaitTimeSeconds=1)["Messages"]
+        assert text == msgs[0]["MessageId"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_execute_sqs_integration_without_integration_responses_is_500(apigw_v1, sqs):
+    """No integration response to map the reply: AWS answers 500 Internal server error."""
+    queue_name = f"apigw-q-{_uuid_mod.uuid4().hex[:8]}"
+    qurl = sqs.create_queue(QueueName=queue_name)["QueueUrl"]
+    api_id = _sqs_api(
+        apigw_v1, queue_name,
+        request_templates={"application/json": "Action=SendMessage&MessageBody=x"})
+    try:
+        status, text = _stage_call(api_id, "/send", method="POST", body="{}",
+                                   headers=[("Content-Type", "application/json")])
+        assert status == 500
+        assert json.loads(text) == {"message": "Internal server error"}
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+        sqs.delete_queue(QueueUrl=qurl)

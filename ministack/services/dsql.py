@@ -27,7 +27,6 @@ import time
 
 from ministack.core import container_reaper, pgproxy
 from ministack.core.concurrency import run_offloop
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountScopedDict,
     get_account_id,
@@ -44,6 +43,13 @@ BASE_PORT = int(os.environ.get("DSQL_BASE_PORT", "25432"))
 # served metadata-only.
 _BACKEND_PORT_WINDOW = 30
 PG_IMAGE = os.environ.get("DSQL_PG_IMAGE", "postgres:16-alpine")
+# DSQL-only settings start at their DSQL defaults, so SHOW works before any
+# SET and RESET returns to the DSQL value rather than an empty placeholder.
+PG_COMMAND = ["postgres"] + [
+    arg
+    for name, default in pgproxy.DSQL_SETTINGS.items()
+    for arg in ("-c", f"{name}={default}")
+]
 DSQL_PERSIST = os.environ.get("DSQL_PERSIST", "0").lower() in ("1", "true", "yes")
 # Backend containers are opt-in: default is control-plane-only (metadata stubs).
 DSQL_STRICT = os.environ.get("DSQL_STRICT", "0").lower() in ("1", "true", "yes")
@@ -218,8 +224,7 @@ def _run_backend_container(identifier):
 
     Returns ``(backend_host, backend_port)`` for the proxy to dial. Raises on
     failure; the caller degrades to metadata-only. ``rds`` is imported lazily
-    so the heavy module (and its import-time restore) only loads when a
-    Docker socket actually exists.
+    so its heavy Docker dependencies are loaded only when needed.
     """
     from ministack.services import rds
 
@@ -244,6 +249,7 @@ def _run_backend_container(identifier):
     ms_network = rds._get_ministack_network(docker_client)
     container_kwargs = dict(
         image=PG_IMAGE,
+        command=PG_COMMAND,
         detach=True,
         environment={
             "POSTGRES_USER": "postgres",
@@ -1127,10 +1133,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if not data:
         return
     clusters = data.get("clusters", {})
@@ -1218,12 +1224,6 @@ def reset():
     _port_counter[0] = BASE_PORT
 
 
-try:
-    _restored = load_state("dsql")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 async def handle_request(method, path, headers, body, query_params):

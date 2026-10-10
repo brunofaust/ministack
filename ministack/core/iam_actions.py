@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import re
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from defusedxml.ElementTree import ParseError, fromstring
 
@@ -40,8 +40,9 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "bedrock": "bedrock",
     "bedrock-agent": "bedrock",
     "bedrock-agent-runtime": "bedrock",
-    "bedrock-agentcore": "bedrock",
+    "bedrock-agentcore": "bedrock-agentcore",
     "bedrock-runtime": "bedrock",
+    "budgets": "budgets",
     "cloudcontrol": "cloudformation",
     "cloudformation": "cloudformation",
     "cloudfront": "cloudfront",
@@ -72,7 +73,11 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "inspector2": "inspector2",
     "iot": "iot",
     "iot-data": "iot",
-    "iot-jobs-data": "iot",
+    # The jobs data plane has its own IAM namespace. AWS authorizes the four
+    # HTTP job-execution operations as iotjobsdata:..., and a grant of the
+    # same operation name under iot: does not carry them. The
+    # fifth operation in that model is the exception below.
+    "iot-jobs-data": "iotjobsdata",
     "iotwireless": "iotwireless",
     "kafka": "kafka",
     "kinesis": "kinesis",
@@ -86,6 +91,7 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "monitoring": "cloudwatch",
     "mq": "mq",
     "opensearch": "es",
+    "opensearchserverless": "aoss",
     "organizations": "organizations",
     "pipes": "pipes",
     "rds": "rds",
@@ -112,6 +118,18 @@ SERVICE_TO_IAM_NAMESPACE: dict[str, str] = {
     "waf": "waf",
     "waf-regional": "waf-regional",
     "wafv2": "wafv2",
+}
+
+
+# The map above is keyed by service, so it moves every operation the service's
+# botocore model declares. Where AWS does not, the pair belongs here.
+# StartCommandExecution rides the jobs data-plane endpoint and model, but its
+# own API reference derives the permission from iot:StartCommandExecution, and
+# the Service Authorization Reference lists only the four job-execution
+# operations under iotjobsdata. Read by the generic REST route matcher only,
+# the tier every rest-json operation resolves through.
+_IAM_NAMESPACE_BY_OPERATION: dict[tuple[str, str], str] = {
+    ("iot-jobs-data", "StartCommandExecution"): "iot",
 }
 
 
@@ -228,6 +246,8 @@ _S3_OBJECT_QUERY_ACTIONS: dict[str, dict[str, str]] = {
     "retention": {"GET": "GetObjectRetention", "PUT": "PutObjectRetention"},
     "legal-hold": {"GET": "GetObjectLegalHold", "PUT": "PutObjectLegalHold"},
     "attributes": {"GET": "GetObjectAttributes"},
+    "annotation": {"GET": "GetObjectAnnotation", "PUT": "PutObjectAnnotation",
+                   "DELETE": "DeleteObjectAnnotation"},
     "select": {"POST": "GetObject"},   # SelectObjectContent reads the object
     "torrent": {"GET": "GetObject"},
 }
@@ -266,6 +286,9 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
                 break
     if action is None:
         action = _S3_ACTIONS.get((method, depth))
+    # GET ?annotation without annotationName is ListObjectAnnotations.
+    if action == "GetObjectAnnotation" and "annotationName" not in query_params:
+        action = "ListObjectAnnotations"
 
     if depth == 2 and action and _query_param(query_params, "versionId"):
         action = _S3_VERSIONED_ACTIONS.get(action, action)
@@ -274,7 +297,8 @@ def _s3_action(method: str, path: str, query_params: dict) -> str | None:
 
 # Operations that take x-amz-bypass-governance-retention; when the header says
 # true they also need s3:BypassGovernanceRetention on the object.
-_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention"})
+_S3_GOVERNANCE_BYPASS_ACTIONS = frozenset({"DeleteObject", "DeleteObjectVersion", "PutObjectRetention",
+                                           "PutObjectAnnotation", "DeleteObjectAnnotation"})
 
 
 def _s3_source_object(headers: dict) -> tuple[str, str] | None:
@@ -434,7 +458,7 @@ _BOTOCORE_SERVICE_MAP: dict[str, list[str]] = {
     "bedrock-runtime": ["bedrock-runtime"],
     "bedrock-agent": ["bedrock-agent"],
     "bedrock-agent-runtime": ["bedrock-agent-runtime"],
-    "bedrock-agentcore": [],  # no botocore model yet
+    "bedrock-agentcore": [],  # InvokeAgentRuntime is mapped in extract_iam_action
     "cloudfront": ["cloudfront"],
     "cloudfront-keyvaluestore": ["cloudfront-keyvaluestore"],
     "dsql": ["dsql"],
@@ -634,6 +658,20 @@ def _match_rest_action(service: str, method: str, path: str,
     return best_match
 
 
+def _agentcore_runtime_arn(path: str) -> str | None:
+    """Extract the runtime ARN from an InvokeAgentRuntime URI."""
+    match = re.fullmatch(r"/runtimes/(.+?)/invocations/?", unquote(path))
+    return match.group(1) if match else None
+
+
+def agentcore_endpoint_arn(path: str, query_params: dict) -> str | None:
+    """The runtime-endpoint ARN InvokeAgentRuntime also authorizes: the qualifier, else DEFAULT."""
+    runtime_arn = _agentcore_runtime_arn(path)
+    if not runtime_arn:
+        return None
+    return f"{runtime_arn}/runtime-endpoint/{_query_param(query_params, 'qualifier') or 'DEFAULT'}"
+
+
 def extract_iam_action(service: str, method: str, path: str,
                        headers: dict, body: bytes,
                        query_params: dict) -> str | None:
@@ -642,6 +680,12 @@ def extract_iam_action(service: str, method: str, path: str,
     if namespace is None:
         logger.debug("AUTH: no IAM namespace for service %s — allowing", service)
         return None
+
+    # API Gateway management authorizes HTTP verbs, not SDK operation names.
+    # Handle it before Query/JSON extraction: those protocols cannot override
+    # the action of a REST management request (v1 and v2 share this namespace).
+    if service == "apigateway":
+        return f"apigateway:{method}" if method in {"GET", "POST", "PUT", "PATCH", "DELETE"} else None
 
     # Tier 1: Action query param (query-protocol services)
     action_name = _action_from_query(query_params, body,
@@ -665,10 +709,29 @@ def extract_iam_action(service: str, method: str, path: str,
         if action_name:
             return f"lambda:{action_name}"
 
+    if service == "bedrock-agentcore" and method == "POST":
+        if _agentcore_runtime_arn(path):
+            return "bedrock-agentcore:InvokeAgentRuntime"
+
+    if service == "bedrock-agentcore" and path.startswith("/resourcepolicy/"):
+        policy_action = {
+            "PUT": "PutResourcePolicy",
+            "GET": "GetResourcePolicy",
+            "DELETE": "DeleteResourcePolicy",
+        }.get(method)
+        if policy_action:
+            return f"bedrock-agentcore:{policy_action}"
+
+    # The control-plane model also declares ``GET /runtimes/{id}``. Its
+    # permissive ARN route would otherwise misclassify an invalid GET against
+    # the data-plane invocation path as GetAgentRuntime.
+    if service == "bedrock-agentcore" and "/invocations" in unquote(path):
+        return None
+
     # Tier 4: Generic botocore route matcher (all other REST services)
     action_name = _match_rest_action(service, method, path, query_params)
     if action_name:
-        return f"{namespace}:{action_name}"
+        return f"{_IAM_NAMESPACE_BY_OPERATION.get((service, action_name), namespace)}:{action_name}"
 
     logger.debug("AUTH: could not extract action for %s %s %s — allowing",
                  service, method, path)
@@ -825,6 +888,12 @@ def extract_resource_arn(service: str, method: str, path: str,
             return resources[0]
         return "*"
 
+    if service == "bedrock-agentcore" and path.startswith("/resourcepolicy/"):
+        return unquote(path[len("/resourcepolicy/"):]) or "*"
+
+    if service == "bedrock-agentcore" and method == "POST":
+        return _agentcore_runtime_arn(path) or "*"
+
     if service == "lambda":
         # Path: /2015-03-31/functions/{name}/...
         path_parts = [p for p in path.split("/") if p]
@@ -899,6 +968,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         if not secret_id:
             secret_id = _safe_json_field(body, "Name")
         if secret_id:
+            # AWS evaluates against the stored ARN, whose six random characters
+            # the request need not carry. The handlers' own lookup reads them;
+            # a miss keeps the name-derived ARN.
+            from ministack.services import secretsmanager as secretsmanager_svc
+
+            _, secret = secretsmanager_svc._resolve(secret_id)
+            if secret:
+                return secret["ARN"]
             if secret_id.startswith("arn:"):
                 return secret_id
             return f"arn:aws:secretsmanager:{region}:{account_id}:secret:{secret_id}"
@@ -921,7 +998,7 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "sts":
-        role_arn = _query_param(query_params, "RoleArn")
+        role_arn = _query_param(query_params, "RoleArn") or _safe_json_field(body, "RoleArn")
         if role_arn:
             return role_arn
         return "*"
@@ -972,6 +1049,9 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "logs":
+        action = headers.get("x-amz-target", "").rsplit(".", 1)[-1]
+        if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+            return _safe_json_field(body, "resourceArn") or "*"
         name = _safe_json_field(body, "logGroupName")
         if name:
             return f"arn:aws:logs:{region}:{account_id}:log-group:{name}"
@@ -1175,12 +1255,14 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "signer":
-        # StartSigningJob and GetSigningProfile are scoped to the profile,
+        # StartSigningJob, GetSigningProfile, CancelSigningProfile and the
+        # three profile-permission actions are scoped to the profile,
         # DescribeSigningJob to the job; ListSigningJobs and PutSigningProfile
         # carry no resource (Service Authorization Reference). The ARNs put a
         # `/` before the resource type: arn:aws:signer:r:a:/signing-profiles/n
         parts = [p for p in path.split("/") if p]
-        if parts and parts[0] == "signing-profiles" and len(parts) > 1 and method == "GET":
+        if (parts and parts[0] == "signing-profiles" and len(parts) > 1
+                and not (method == "PUT" and len(parts) == 2)):
             return f"arn:aws:signer:{region}:{account_id}:/signing-profiles/{parts[1]}"
         if parts and parts[0] == "signing-jobs":
             if len(parts) > 1:
@@ -1192,6 +1274,29 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "ssm":
+        action = _action_from_target(headers)
+        if action in {"AddTagsToResource", "RemoveTagsFromResource", "ListTagsForResource"}:
+            try:
+                data = json.loads(body) if body else {}
+            except (json.JSONDecodeError, TypeError):
+                return "*"
+            if not isinstance(data, dict) or data.get("ResourceType", "Parameter") != "Parameter":
+                return "*"
+            resource_id = data.get("ResourceId", "")
+            if not isinstance(resource_id, str) or not resource_id:
+                return "*"
+            if resource_id.startswith("arn:"):
+                # The handler also accepts parameter ARN aliases. Authorize
+                # accepted local aliases as the canonical parameter resource,
+                # while retaining foreign and malformed ARNs as supplied.
+                from ministack.services.ssm import _parameter_name_from_arn
+
+                parsed = _parameter_name_from_arn(resource_id)
+                if parsed and parsed[0] == account_id and parsed[1] == region:
+                    resource_id = parsed[2]
+                else:
+                    return resource_id
+            return f"arn:aws:ssm:{region}:{account_id}:parameter/{resource_id.lstrip('/')}"
         name = _param(body, query_params, "Name")
         if name:
             return f"arn:aws:ssm:{region}:{account_id}:parameter{name if name.startswith('/') else '/' + name}"
@@ -1433,6 +1538,7 @@ def extract_resource_arn(service: str, method: str, path: str,
             "rules": "rule",
             "jobs": "job",
             "provisioning-templates": "provisioningtemplate",
+            "job-templates": "jobtemplate",
         }
         for segment, rtype in _IOT_RESOURCES.items():
             if segment in parts:
@@ -1444,22 +1550,16 @@ def extract_resource_arn(service: str, method: str, path: str,
     # --- API Gateway (REST path-based) ---
 
     if service == "apigateway":
-        parts = [p for p in path.split("/") if p]
-        # v2: /v2/apis/{apiId}
-        if "apis" in parts:
-            ai = parts.index("apis")
-            if ai + 1 < len(parts):
-                api_id = parts[ai + 1]
-                return f"arn:aws:apigateway:{region}::/apis/{api_id}"
-            return f"arn:aws:apigateway:{region}::/apis/*"
-        # v1: /restapis/{restApiId}
-        if "restapis" in parts:
-            ri = parts.index("restapis")
-            if ri + 1 < len(parts):
-                api_id = parts[ri + 1]
-                return f"arn:aws:apigateway:{region}::/restapis/{api_id}"
-            return f"arn:aws:apigateway:{region}::/restapis/*"
-        return "*"
+        # Management ARNs retain the complete resource/collection path and
+        # have an empty account component. The v2 endpoint prefix is not part
+        # of the ARN. Decode URI labels, including the HTTP API $default stage.
+        # AWS ignores trailing slashes when authorizing management resources,
+        # as our control-plane handlers do when resolving the target resource.
+        resource_path = unquote(path[3:] if path.startswith("/v2/") else path).rstrip("/")
+        if resource_path.startswith("/tags/"):
+            # Tags: ::/tags/{url-encoded-resource-arn} (API Gateway ARN reference).
+            resource_path = "/tags/" + quote(resource_path[len("/tags/"):], safe="")
+        return f"arn:aws:apigateway:{region}::{resource_path}"
 
     # --- Bedrock (REST path-based, multiple sub-services) ---
 
@@ -1576,6 +1676,13 @@ def eventbridge_resource_arns(body: bytes, region: str, account_id: str) -> list
     return arns
 
 
+def _dynamodb_table_arn(table: str, region: str, account_id: str) -> str:
+    """TableName also accepts the table's ARN."""
+    if table.startswith("arn:"):
+        return table
+    return f"arn:aws:dynamodb:{region}:{account_id}:table/{table}"
+
+
 def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[str]:
     """Return every table ARN addressed by a DynamoDB JSON request."""
     try:
@@ -1586,17 +1693,99 @@ def dynamodb_resource_arns(body: bytes, region: str, account_id: str) -> list[st
     if isinstance(table, str) and table:
         index = data.get("IndexName")
         suffix = f"/index/{index}" if isinstance(index, str) and index else ""
-        return [
-            f"arn:aws:dynamodb:{region}:{account_id}:table/{table}{suffix}"
-        ]
+        return [_dynamodb_table_arn(table, region, account_id) + suffix]
     else:
         request_items = data.get("RequestItems") if isinstance(data, dict) else None
         tables = list(request_items) if isinstance(request_items, dict) else []
     return [
-        f"arn:aws:dynamodb:{region}:{account_id}:table/{name}"
+        _dynamodb_table_arn(name, region, account_id)
         for name in tables
         if isinstance(name, str) and name
     ]
+
+
+def logs_service_context(action: str, body: bytes, resource_arn: str,
+                         region: str, account_id: str) -> dict:
+    """Tag conditions from the Logs payload and the existing scoped resource.
+
+    Read stored tags before dispatch: incoming tags must not replace ownership
+    context, and an untag request must still see the tags it proposes removing.
+    """
+    from ministack.services import cloudwatch_logs as logs
+
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    context = {}
+
+    def add_tags(prefix, tags):
+        if not isinstance(tags, dict):
+            return
+        for name, value in tags.items():
+            key = f"{prefix}/{name}".lower()
+            if key not in context:
+                context[key] = value
+            else:
+                previous = context[key]
+                context[key] = (previous if isinstance(previous, list) else [previous]) + [value]
+
+    if action in {"CreateLogGroup", "TagLogGroup", "TagResource"}:
+        tags = data.get("tags", {})
+        if isinstance(tags, dict):
+            add_tags("aws:RequestTag", tags)
+            context["aws:TagKeys"] = list(tags)
+    elif action in {"UntagLogGroup", "UntagResource"}:
+        keys = data.get("tags" if action == "UntagLogGroup" else "tagKeys", [])
+        if isinstance(keys, list):
+            context["aws:TagKeys"] = keys
+
+    if action == "CreateLogGroup":
+        return context
+    record = logs.resolve_tag_resource(resource_arn, account_id=account_id, region=region)
+    if record is not None:
+        add_tags("aws:ResourceTag", record.get("tags", {}))
+    return context
+_DYNAMODB_TRANSACT_ITEM_ACTIONS = {
+    "ConditionCheck": "dynamodb:ConditionCheckItem",
+    "Put": "dynamodb:PutItem",
+    "Update": "dynamodb:UpdateItem",
+    "Delete": "dynamodb:DeleteItem",
+    "Get": "dynamodb:GetItem",
+}
+
+
+def dynamodb_transaction_checks(
+    iam_action: str, body: bytes, region: str, account_id: str
+) -> list[tuple[str, str]]:
+    """Per-item ``(action, table ARN)`` checks of a DynamoDB transaction.
+
+    ``TransactWriteItems`` and ``TransactGetItems`` are not IAM actions: each
+    item is authorized as the single-item action it performs, on its own table.
+    An item naming more than one member (AWS rejects it, the handler does not)
+    is checked for every member, so none can ride along unchecked.
+    Returns an empty list for any other action or a body with no usable item.
+    """
+    if iam_action not in ("dynamodb:TransactWriteItems", "dynamodb:TransactGetItems"):
+        return []
+    try:
+        data = json.loads(body or b"{}")
+    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
+        return []
+    items = data.get("TransactItems") if isinstance(data, dict) else None
+    checks = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        for member, action in _DYNAMODB_TRANSACT_ITEM_ACTIONS.items():
+            detail = item.get(member)
+            table = detail.get("TableName") if isinstance(detail, dict) else None
+            if isinstance(table, str) and table:
+                checks.append((action, _dynamodb_table_arn(table, region, account_id)))
+    return checks
 
 
 def dynamodb_service_context(body: bytes) -> dict:
@@ -1648,19 +1837,36 @@ def dynamodb_service_context(body: bytes) -> dict:
 
 def access_denied_response(service: str, action: str, principal_arn: str,
                            request_id: str, *, error_code: str = "",
-                           message: str = "", headers: dict | None = None) -> tuple:
-    """Format a 403 error response matching the service's protocol.
+                           message: str = "", headers: dict | None = None,
+                           resource_arn: str = "*", explicit_deny: bool = False) -> tuple:
+    """Format a denial matching the service's protocol.
 
     A denial the caller's SDK cannot parse is barely better than no denial: it
     surfaces as a bare 403 with the code buried in an unread body, so a client
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if not message:
+    if service in {"ssm", "logs"} and not error_code:
+        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
+        # capitalized Message naming the resource, as observed on live AWS.
+        reason = (
+            "with an explicit deny in an identity-based policy" if explicit_deny
+            else f"because no identity-based policy allows the {action} action"
+        )
         message = (
             f"User: {principal_arn} is not authorized to perform: {action} "
-            f"because no identity-based policy allows the {action} action"
+            f"on resource: {resource_arn} {reason}"
         )
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
+    if not message:
+        reason = (
+            "with an explicit deny in an identity-based policy" if explicit_deny
+            else f"because no identity-based policy allows the {action} action"
+        )
+        message = f"User: {principal_arn} is not authorized to perform: {action} {reason}"
     code = error_code or "AccessDenied"
     protocol = _SERVICE_PROTOCOL.get(service, "json")
     if service in _CBOR_CAPABLE:

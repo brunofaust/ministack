@@ -18,13 +18,25 @@ Supports:
   KeyValueStore: CreateKeyValueStore, DescribeKeyValueStore, ListKeyValueStores,
                  UpdateKeyValueStore, DeleteKeyValueStore
   Cache policies: CreateCachePolicy, GetCachePolicy, GetCachePolicyConfig,
-                 UpdateCachePolicy, DeleteCachePolicy, ListDistributionsByCachePolicyId
+                 UpdateCachePolicy, DeleteCachePolicy, ListCachePolicies,
+                 ListDistributionsByCachePolicyId — includes the fixed catalog
+                 of AWS-managed policies (Type=managed), which are immutable
   Origin request policies: CreateOriginRequestPolicy, GetOriginRequestPolicy,
                  GetOriginRequestPolicyConfig, UpdateOriginRequestPolicy,
-                 DeleteOriginRequestPolicy, ListDistributionsByOriginRequestPolicyId
+                 DeleteOriginRequestPolicy, ListOriginRequestPolicies,
+                 ListDistributionsByOriginRequestPolicyId — includes the
+                 AWS-managed policy catalog (Type=managed), immutable
   Response headers policies: CreateResponseHeadersPolicy, GetResponseHeadersPolicy,
                  GetResponseHeadersPolicyConfig, UpdateResponseHeadersPolicy,
-                 DeleteResponseHeadersPolicy, ListDistributionsByResponseHeadersPolicyId
+                 DeleteResponseHeadersPolicy, ListResponseHeadersPolicies,
+                 ListDistributionsByResponseHeadersPolicyId — includes the
+                 AWS-managed policy catalog (Type=managed), immutable
+  Monitoring subscriptions: CreateMonitoringSubscription, GetMonitoringSubscription,
+                 DeleteMonitoringSubscription
+  Public keys: CreatePublicKey, GetPublicKey, GetPublicKeyConfig,
+                 UpdatePublicKey, DeletePublicKey, ListPublicKeys
+  Key groups: CreateKeyGroup, GetKeyGroup, GetKeyGroupConfig,
+                 UpdateKeyGroup, DeleteKeyGroup, ListKeyGroups
   Tags: TagResource, UntagResource, ListTagsForResource
   SaaS Manager (multi-tenant distributions):
                  CreateConnectionGroup, GetConnectionGroup,
@@ -48,6 +60,7 @@ import logging
 import random
 import re
 import string
+import uuid
 from datetime import datetime, timezone
 from urllib.parse import unquote
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -55,7 +68,6 @@ from xml.etree.ElementTree import Element, SubElement, tostring
 from defusedxml.ElementTree import fromstring
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import AccountScopedDict, get_account_id, new_uuid
 
 logger = logging.getLogger("cloudfront")
@@ -100,6 +112,14 @@ _RHP_CFG_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/config$"
 _RHP_ID_RE = re.compile(r"^/2020-05-31/response-headers-policy/([^/]+)/?$")
 _DIST_BY_RHP_RE = re.compile(r"^/2020-05-31/distributionsByResponseHeadersPolicyId/([^/]+)/?$")
 
+_PUBLIC_KEY_RE = re.compile(r"^/2020-05-31/public-key/?$")
+_PUBLIC_KEY_CFG_RE = re.compile(r"^/2020-05-31/public-key/([^/]+)/config$")
+_PUBLIC_KEY_ID_RE = re.compile(r"^/2020-05-31/public-key/([^/]+)/?$")
+
+_KEY_GROUP_RE = re.compile(r"^/2020-05-31/key-group/?$")
+_KEY_GROUP_CFG_RE = re.compile(r"^/2020-05-31/key-group/([^/]+)/config$")
+_KEY_GROUP_ID_RE = re.compile(r"^/2020-05-31/key-group/([^/]+)/?$")
+
 # SaaS Manager path regexes. Get* identifiers may be an ARN — the ASGI layer
 # hands us the percent-decoded path, so an ARN's embedded "/" lands in the
 # identifier segment. The identifier regexes are greedy and MUST be matched
@@ -129,8 +149,6 @@ _DIST_BY_CONN_MODE_RE = re.compile(r"^/2020-05-31/distributionsByConnectionMode/
 # the payload member's locationName, MaxItems defaults to 100, an empty list
 # omits Items, and NextMarker is omitted when there is no next page.
 # ---------------------------------------------------------------------------
-_KEY_GROUP_LIST_RE = re.compile(r"^/2020-05-31/key-group/?$")
-_PUBLIC_KEY_LIST_RE = re.compile(r"^/2020-05-31/public-key/?$")
 _FLE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption/?$")
 _FLE_PROFILE_LIST_RE = re.compile(r"^/2020-05-31/field-level-encryption-profile/?$")
 _CDP_LIST_RE = re.compile(r"^/2020-05-31/continuous-deployment-policy/?$")
@@ -153,6 +171,8 @@ _kvstores = AccountScopedDict()  # Name -> KVS record
 _cache_policies = AccountScopedDict()  # Id -> cache policy record
 _origin_request_policies = AccountScopedDict()  # Id -> origin request policy record
 _response_headers_policies = AccountScopedDict()  # Id -> response headers policy record
+_public_keys = AccountScopedDict()  # Id -> public key record
+_key_groups = AccountScopedDict()  # Id -> key group record
 _connection_groups = AccountScopedDict()  # Id -> connection group record (SaaS Manager)
 _distribution_tenants = AccountScopedDict()  # Id -> distribution tenant record (SaaS Manager)
 _tenant_invalidations = AccountScopedDict()  # tenant_id -> [invalidation record, ...]
@@ -168,13 +188,15 @@ def reset():
     _cache_policies.clear()
     _origin_request_policies.clear()
     _response_headers_policies.clear()
-    _managed_cache_policies.clear()
-    _managed_origin_request_policies.clear()
-    _managed_response_headers_policies.clear()
-    _seed_all_managed_policies()
+    _public_keys.clear()
+    _key_groups.clear()
     _connection_groups.clear()
     _distribution_tenants.clear()
     _tenant_invalidations.clear()
+    # Drop the JS workers so their compiled-function cache does not outlive a
+    # reset (mirrors appsync.reset()'s appsync_js.reset()).
+    from ministack.core import cloudfront_js
+    cloudfront_js.reset()
 
 
 def get_state():
@@ -189,6 +211,8 @@ def get_state():
             "cache_policies": _cache_policies,
             "origin_request_policies": _origin_request_policies,
             "response_headers_policies": _response_headers_policies,
+            "public_keys": _public_keys,
+            "key_groups": _key_groups,
             "connection_groups": _connection_groups,
             "distribution_tenants": _distribution_tenants,
             "tenant_invalidations": _tenant_invalidations,
@@ -197,10 +221,10 @@ def get_state():
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     _distributions.update(data.get("distributions", {}))
     _invalidations.update(data.get("invalidations", {}))
     _tags.update(data.get("tags", {}))
@@ -210,19 +234,13 @@ def restore_state(data):
     _cache_policies.update(data.get("cache_policies", {}))
     _origin_request_policies.update(data.get("origin_request_policies", {}))
     _response_headers_policies.update(data.get("response_headers_policies", {}))
+    _public_keys.update(data.get("public_keys", {}))
+    _key_groups.update(data.get("key_groups", {}))
     _connection_groups.update(data.get("connection_groups", {}))
     _distribution_tenants.update(data.get("distribution_tenants", {}))
     _tenant_invalidations.update(data.get("tenant_invalidations", {}))
 
 
-try:
-    _restored = load_state("cloudfront")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +257,14 @@ def _inv_id() -> str:
     return "I" + "".join(random.choices(_ID_CHARS, k=13))
 
 
+def _pk_id() -> str:
+    return "K" + "".join(random.choices(_ID_CHARS, k=13))
+
+
+def _kg_id() -> str:
+    return "K" + "".join(random.choices(_ID_CHARS, k=13))
+
+
 # Real SaaS Manager resource IDs are dt_/cg_-prefixed KSUIDs (27 base62 chars).
 _KSUID_CHARS = string.ascii_letters + string.digits
 
@@ -251,8 +277,21 @@ def _conn_group_id() -> str:
     return "cg_" + "".join(random.choices(_KSUID_CHARS, k=27))
 
 
-def _routing_endpoint() -> str:
+def _cloudfront_domain() -> str:
+    """AWS's edge domain shape: 'd' + 13 lowercase alphanumerics +
+    '.cloudfront.net' (e.g. d111111abcdef8.cloudfront.net) — assigned to both
+    a distribution's DomainName and a connection group's RoutingEndpoint."""
     return "d" + "".join(random.choices(string.ascii_lowercase + string.digits, k=13)) + ".cloudfront.net"
+
+
+def _new_distribution_domain() -> str:
+    """A `_cloudfront_domain()` value not already used by a distribution in
+    this account."""
+    existing = {d["DomainName"] for d in _distributions.values()}
+    domain = _cloudfront_domain()
+    while domain in existing:
+        domain = _cloudfront_domain()
+    return domain
 
 
 def _now_iso() -> str:
@@ -1056,6 +1095,93 @@ def _build_cache_policy_xml(parent, policy):
     _build_cache_policy_config_xml(cfg_el, policy["Config"])
 
 
+# ---------------------------------------------------------------------------
+# AWS-managed policies (cache / origin request / response headers).
+# ---------------------------------------------------------------------------
+
+_MANAGED_POLICY_LAST_MODIFIED = "2020-05-20T04:29:32.290Z"
+
+
+def _managed_etag(policy_id: str) -> str:
+    """A stable, unique ETag for a managed policy (real AWS ETags are opaque)."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"ministack-cloudfront-managed-policy/{policy_id}"))
+
+
+def _managed_policy(policy_id: str, config: dict) -> dict:
+    return {
+        "Id": policy_id,
+        "ETag": _managed_etag(policy_id),
+        "LastModifiedTime": _MANAGED_POLICY_LAST_MODIFIED,
+        "Config": config,
+    }
+
+
+def _cache_params(gzip, brotli, header_behavior, headers, cookie_behavior, cookies, qs_behavior, qs):
+    return {
+        "EnableAcceptEncodingGzip": gzip,
+        "EnableAcceptEncodingBrotli": brotli,
+        "HeaderBehavior": header_behavior, "Headers": list(headers),
+        "CookieBehavior": cookie_behavior, "Cookies": list(cookies),
+        "QueryStringBehavior": qs_behavior, "QueryStrings": list(qs),
+    }
+
+
+_MANAGED_CACHE_POLICIES = {
+    pid: _managed_policy(pid, cfg)
+    for pid, cfg in {
+        "2e54312d-136d-493c-8eb9-b001f22f67d2": {
+            "Name": "Managed-Amplify", "Comment": "", "MinTTL": 2, "DefaultTTL": 2, "MaxTTL": 600,
+            "Parameters": _cache_params(
+                True, True, "whitelist", ["Authorization", "CloudFront-Viewer-Country", "Host"],
+                "all", [], "all", [],
+            ),
+        },
+        "4135ea2d-6df8-44a3-9df3-4b5a84be39ad": {
+            "Name": "Managed-CachingDisabled", "Comment": "", "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
+            "Parameters": _cache_params(False, False, "none", [], "none", [], "none", []),
+        },
+        "658327ea-f89d-4fab-a63d-7e88639e58f6": {
+            "Name": "Managed-CachingOptimized", "Comment": "", "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": _cache_params(True, True, "none", [], "none", [], "none", []),
+        },
+        "b2884449-e4de-46a7-ac36-70bc7f1ddd6d": {
+            "Name": "Managed-CachingOptimizedForUncompressedObjects", "Comment": "",
+            "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": _cache_params(False, False, "none", [], "none", [], "none", []),
+        },
+        "08627262-05a9-4f76-9ded-b50ca2e3a84f": {
+            "Name": "Managed-Elemental-MediaPackage", "Comment": "",
+            "MinTTL": 0, "DefaultTTL": 86400, "MaxTTL": 31536000,
+            "Parameters": _cache_params(
+                True, False, "whitelist", ["Origin"], "none", [],
+                "whitelist", ["aws.manifestfilter", "start", "end", "m"],
+            ),
+        },
+        "83da9c7e-98b4-4e11-a168-04f0df8e2c65": {
+            "Name": "Managed-UseOriginCacheControlHeaders", "Comment": "",
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 31536000,
+            "Parameters": _cache_params(
+                True, True, "whitelist",
+                ["Host", "Origin", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"],
+                "all", [], "none", [],
+            ),
+        },
+        "4cc15a8a-d715-48a4-82b8-cc0b614638fe": {
+            "Name": "Managed-UseOriginCacheControlHeaders-QueryStrings", "Comment": "",
+            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 31536000,
+            "Parameters": _cache_params(
+                True, True, "whitelist",
+                ["Host", "Origin", "X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"],
+                "all", [], "all", [],
+            ),
+        },
+    }.items()
+}
+
+_ILLEGAL_UPDATE_MSG = "The specified CloudFront managed policy cannot be updated."
+_ILLEGAL_DELETE_MSG = "The specified CloudFront managed policy cannot be deleted."
+
+
 def _value_contains(obj, target):
     """Best-effort recursive search for a policy Id anywhere in a distribution record."""
     if isinstance(obj, str):
@@ -1078,7 +1204,7 @@ def _create_cache_policy(body):
     cfg, err = _parse_cache_policy_config(el)
     if err is not None:
         return err
-    for existing in _cache_policies.values():
+    for existing in (*_cache_policies.values(), *_MANAGED_CACHE_POLICIES.values()):
         if existing["Config"]["Name"] == cfg["Name"]:
             return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
     policy_id = new_uuid()
@@ -1097,7 +1223,7 @@ def _create_cache_policy(body):
 
 
 def _get_cache_policy(policy_id):
-    policy = _cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _MANAGED_CACHE_POLICIES.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -1108,7 +1234,7 @@ def _get_cache_policy(policy_id):
 
 
 def _get_cache_policy_config(policy_id):
-    policy = _cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)
+    policy = _cache_policies.get(policy_id) or _MANAGED_CACHE_POLICIES.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
 
@@ -1119,8 +1245,8 @@ def _get_cache_policy_config(policy_id):
 
 
 def _update_cache_policy(policy_id, headers, body):
-    if policy_id in _managed_cache_policies:
-        return _managed_policy_error("cache policy", policy_id)
+    if policy_id in _MANAGED_CACHE_POLICIES:
+        return _error("IllegalUpdate", _ILLEGAL_UPDATE_MSG, 400)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1139,7 +1265,7 @@ def _update_cache_policy(policy_id, headers, body):
     cfg, err = _parse_cache_policy_config(el)
     if err is not None:
         return err
-    for existing in _cache_policies.values():
+    for existing in (*_cache_policies.values(), *_MANAGED_CACHE_POLICIES.values()):
         if existing["Id"] != policy_id and existing["Config"]["Name"] == cfg["Name"]:
             return _error("CachePolicyAlreadyExists", "A cache policy with the same name already exists.", 409)
     new_etag = new_uuid()
@@ -1155,8 +1281,8 @@ def _update_cache_policy(policy_id, headers, body):
 
 
 def _delete_cache_policy(policy_id, headers):
-    if policy_id in _managed_cache_policies:
-        return _managed_policy_error("cache policy", policy_id)
+    if policy_id in _MANAGED_CACHE_POLICIES:
+        return _error("IllegalDelete", _ILLEGAL_DELETE_MSG, 400)
     policy = _cache_policies.get(policy_id)
     if not policy:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
@@ -1181,7 +1307,7 @@ def _delete_cache_policy(policy_id, headers):
 
 
 def _list_distributions_by_cache_policy(policy_id):
-    if not (_cache_policies.get(policy_id) or _managed_cache_policies.get(policy_id)):
+    if not _cache_policies.get(policy_id) and policy_id not in _MANAGED_CACHE_POLICIES:
         return _error("NoSuchCachePolicy", "The cache policy does not exist.", 404)
     dist_ids = _distributions_using_cache_policy(policy_id)
 
@@ -1270,6 +1396,11 @@ def _policy_precheck_if_match(headers, policy):
     return None
 
 
+def _policy_lookup(store, spec, pid):
+    """Custom store first, then the type's AWS-managed catalog."""
+    return store.get(pid) or spec["managed"].get(pid)
+
+
 def _policy_create(store, spec, body):
     el = _parse_body(body)
     if el is None:
@@ -1277,7 +1408,7 @@ def _policy_create(store, spec, body):
     cfg, err = spec["parse"](el)
     if err is not None:
         return err
-    for existing in store.values():
+    for existing in (*store.values(), *spec["managed"].values()):
         if existing["Config"]["Name"] == cfg["Name"]:
             return _error(spec["dup"], f"A {spec['label']} with the same name already exists.", 409)
     pid = new_uuid()
@@ -1292,7 +1423,7 @@ def _policy_create(store, spec, body):
 
 
 def _policy_get(store, spec, pid):
-    policy = store.get(pid) or spec["managed"].get(pid)
+    policy = _policy_lookup(store, spec, pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["resource_tag"], lambda r: spec["build_resource"](r, policy),
@@ -1300,7 +1431,7 @@ def _policy_get(store, spec, pid):
 
 
 def _policy_get_config(store, spec, pid):
-    policy = store.get(pid) or spec["managed"].get(pid)
+    policy = _policy_lookup(store, spec, pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     return _xml_response(spec["config_tag"], lambda r: spec["build_config"](r, policy["Config"]),
@@ -1309,7 +1440,7 @@ def _policy_get_config(store, spec, pid):
 
 def _policy_update(store, spec, pid, headers, body):
     if pid in spec["managed"]:
-        return _managed_policy_error(spec["label"], pid)
+        return _error("IllegalUpdate", _ILLEGAL_UPDATE_MSG, 400)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1322,7 +1453,7 @@ def _policy_update(store, spec, pid, headers, body):
     cfg, err = spec["parse"](el)
     if err is not None:
         return err
-    for existing in store.values():
+    for existing in (*store.values(), *spec["managed"].values()):
         if existing["Id"] != pid and existing["Config"]["Name"] == cfg["Name"]:
             return _error(spec["dup"], f"A {spec['label']} with the same name already exists.", 409)
     new_etag = new_uuid()
@@ -1335,7 +1466,7 @@ def _policy_update(store, spec, pid, headers, body):
 
 def _policy_delete(store, spec, pid, headers):
     if pid in spec["managed"]:
-        return _managed_policy_error(spec["label"], pid)
+        return _error("IllegalDelete", _ILLEGAL_DELETE_MSG, 400)
     policy = store.get(pid)
     if not policy:
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
@@ -1352,7 +1483,7 @@ def _policy_delete(store, spec, pid, headers):
 
 
 def _policy_list_distributions(store, spec, pid):
-    if not (store.get(pid) or spec["managed"].get(pid)):
+    if not _policy_lookup(store, spec, pid):
         return _error(spec["missing"], f"The {spec['label']} does not exist.", 404)
     dist_ids = _distributions_using_policy(pid)
 
@@ -1424,6 +1555,63 @@ def _build_orp_xml(parent, policy):
     _build_orp_config_xml(cfg_el, policy["Config"])
 
 
+def _orp_cfg(name, header_behavior, headers=(), cookie_behavior="none", qs_behavior="none", qs=()):
+    return {
+        "Name": name, "Comment": "",
+        "HeaderBehavior": header_behavior, "Headers": list(headers),
+        "CookieBehavior": cookie_behavior, "Cookies": [],
+        "QueryStringBehavior": qs_behavior, "QueryStrings": list(qs),
+    }
+
+
+# Managed origin request policies (Developer Guide, "Use managed origin request policies").
+_MANAGED_ORIGIN_REQUEST_POLICIES = {
+    pid: _managed_policy(pid, cfg)
+    for pid, cfg in {
+        "216adef6-5c7f-47e4-b989-5492eafa07d3": _orp_cfg(
+            "Managed-AllViewer", "allViewer", cookie_behavior="all", qs_behavior="all",
+        ),
+        "33f36d7e-f396-46d9-90e0-52428a34d9dc": _orp_cfg(
+            "Managed-AllViewerAndCloudFrontHeaders-2022-06", "allViewerAndWhitelistCloudFront",
+            headers=[
+                "CloudFront-Forwarded-Proto", "CloudFront-Is-Android-Viewer", "CloudFront-Is-Desktop-Viewer",
+                "CloudFront-Is-IOS-Viewer", "CloudFront-Is-Mobile-Viewer", "CloudFront-Is-SmartTV-Viewer",
+                "CloudFront-Is-Tablet-Viewer", "CloudFront-Viewer-Address", "CloudFront-Viewer-ASN",
+                "CloudFront-Viewer-City", "CloudFront-Viewer-Country", "CloudFront-Viewer-Country-Name",
+                "CloudFront-Viewer-Country-Region", "CloudFront-Viewer-Country-Region-Name",
+                "CloudFront-Viewer-Http-Version", "CloudFront-Viewer-Latitude", "CloudFront-Viewer-Longitude",
+                "CloudFront-Viewer-Metro-Code", "CloudFront-Viewer-Postal-Code", "CloudFront-Viewer-Time-Zone",
+                "CloudFront-Viewer-TLS",
+            ],
+            cookie_behavior="all", qs_behavior="all",
+        ),
+        "b689b0a8-53d0-40ab-baf2-68738e2966ac": _orp_cfg(
+            "Managed-AllViewerExceptHostHeader", "allExcept", headers=["Host"],
+            cookie_behavior="all", qs_behavior="all",
+        ),
+        "59781a5b-3903-41f3-afcb-af62929ccde1": _orp_cfg(
+            "Managed-CORS-CustomOrigin", "whitelist", headers=["Origin"],
+        ),
+        "88a5eaf4-2fd4-4709-b370-b4c650ea3fcf": _orp_cfg(
+            "Managed-CORS-S3Origin", "whitelist",
+            headers=["Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method"],
+        ),
+        "775133bc-15f2-49f9-abea-afb2e0bf67d2": _orp_cfg(
+            "Managed-Elemental-MediaTailor-PersonalizedManifests", "whitelist",
+            headers=["Origin", "Access-Control-Request-Headers", "Access-Control-Request-Method",
+                     "User-Agent", "X-Forwarded-For"],
+            qs_behavior="all",
+        ),
+        "bf0718e1-ba1e-49d1-88b1-f726733018ae": _orp_cfg(
+            "Managed-HostHeaderOnly", "whitelist", headers=["Host"],
+        ),
+        "acba4595-bd28-49b8-b9fe-13317c0390fa": _orp_cfg(
+            "Managed-UserAgentRefererHeaders", "whitelist", headers=["User-Agent", "Referer"],
+        ),
+    }.items()
+}
+
+
 _ORP_SPEC = {
     "label": "origin request policy", "resource_tag": "OriginRequestPolicy",
     "config_tag": "OriginRequestPolicyConfig", "path": "/2020-05-31/origin-request-policy",
@@ -1431,6 +1619,7 @@ _ORP_SPEC = {
     "missing": "NoSuchOriginRequestPolicy", "dup": "OriginRequestPolicyAlreadyExists",
     "in_use": "OriginRequestPolicyInUse", "parse": _parse_orp_config,
     "build_resource": _build_orp_xml, "build_config": _build_orp_config_xml,
+    "managed": _MANAGED_ORIGIN_REQUEST_POLICIES,
 }
 
 
@@ -1448,7 +1637,7 @@ def _parse_rhp_config(el):
     if not name:
         return None, _error("InvalidArgument", "The response headers policy name is required.", 400)
     cfg = {"Name": name, "Comment": _text(el, "Comment"), "Cors": None, "Security": None,
-           "ServerTiming": None}
+           "ServerTiming": None, "CustomHeaders": [], "RemoveHeaders": []}
 
     cors_el = _find(el, "CorsConfig")
     if cors_el is not None:
@@ -1517,7 +1706,6 @@ def _parse_rhp_config(el):
 
     ch_el = _find(el, "CustomHeadersConfig")
     if ch_el is not None:
-        cfg["CustomHeaders"] = []
         items_el = _find(ch_el, "Items")
         if items_el is not None:
             for it in items_el:
@@ -1530,7 +1718,6 @@ def _parse_rhp_config(el):
 
     rh_el = _find(el, "RemoveHeadersConfig")
     if rh_el is not None:
-        cfg["RemoveHeaders"] = []
         items_el = _find(rh_el, "Items")
         if items_el is not None:
             for it in items_el:
@@ -1600,25 +1787,23 @@ def _build_rhp_config_xml(parent, cfg):
         if st.get("SamplingRate") is not None:
             SubElement(stel, "SamplingRate").text = _fmt_rate(st["SamplingRate"])
 
-    if "CustomHeaders" in cfg:
-        ch = SubElement(parent, "CustomHeadersConfig")
-        SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
-        if cfg["CustomHeaders"]:
-            items = SubElement(ch, "Items")
-            for hdr in cfg["CustomHeaders"]:
-                it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
-                SubElement(it, "Header").text = hdr["Header"]
-                SubElement(it, "Value").text = hdr["Value"]
-                SubElement(it, "Override").text = _bstr(hdr["Override"])
+    ch = SubElement(parent, "CustomHeadersConfig")
+    SubElement(ch, "Quantity").text = str(len(cfg["CustomHeaders"]))
+    if cfg["CustomHeaders"]:
+        items = SubElement(ch, "Items")
+        for hdr in cfg["CustomHeaders"]:
+            it = SubElement(items, "ResponseHeadersPolicyCustomHeader")
+            SubElement(it, "Header").text = hdr["Header"]
+            SubElement(it, "Value").text = hdr["Value"]
+            SubElement(it, "Override").text = _bstr(hdr["Override"])
 
-    if "RemoveHeaders" in cfg:
-        rh = SubElement(parent, "RemoveHeadersConfig")
-        SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
-        if cfg["RemoveHeaders"]:
-            items = SubElement(rh, "Items")
-            for hdr in cfg["RemoveHeaders"]:
-                it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
-                SubElement(it, "Header").text = hdr["Header"]
+    rh = SubElement(parent, "RemoveHeadersConfig")
+    SubElement(rh, "Quantity").text = str(len(cfg["RemoveHeaders"]))
+    if cfg["RemoveHeaders"]:
+        items = SubElement(rh, "Items")
+        for hdr in cfg["RemoveHeaders"]:
+            it = SubElement(items, "ResponseHeadersPolicyRemoveHeader")
+            SubElement(it, "Header").text = hdr["Header"]
 
 
 def _build_rhp_xml(parent, policy):
@@ -1628,6 +1813,67 @@ def _build_rhp_xml(parent, policy):
     _build_rhp_config_xml(cfg_el, policy["Config"])
 
 
+def _rhp_managed_cors(allow_methods=(), expose_headers=None):
+    return {
+        "AllowOrigins": ["*"], "AllowHeaders": [], "AllowMethods": list(allow_methods),
+        "AllowCredentials": False, "OriginOverride": False,
+        "ExposeHeaders": expose_headers, "MaxAgeSec": None,
+    }
+
+
+# The full security-headers set shared by SecurityHeadersPolicy and both
+# combined CORS+security managed policies (identical settings per AWS docs).
+_RHP_MANAGED_SECURITY = {
+    "XSSProtection": {"Override": False, "Protection": True, "ModeBlock": True, "ReportUri": None},
+    "FrameOptions": {"Override": False, "FrameOption": "SAMEORIGIN"},
+    "ReferrerPolicy": {"Override": False, "ReferrerPolicy": "strict-origin-when-cross-origin"},
+    "ContentTypeOptions": {"Override": True},
+    "StrictTransportSecurity": {
+        "Override": False, "IncludeSubdomains": None, "Preload": None, "AccessControlMaxAgeSec": 31536000,
+    },
+}
+
+
+def _rhp_cfg(name, cors=None, security=None):
+    return {
+        "Name": name, "Comment": "", "Cors": cors, "Security": security,
+        "ServerTiming": None, "CustomHeaders": [], "RemoveHeaders": [],
+    }
+
+
+# Managed response headers policies (Developer Guide, "Use managed response headers policies").
+_MANAGED_RESPONSE_HEADERS_POLICIES = {
+    pid: _managed_policy(pid, cfg)
+    for pid, cfg in {
+        "e61eb60c-9c35-4d20-a928-2b84e02af89c": _rhp_cfg(
+            "Managed-CORS-and-SecurityHeadersPolicy",
+            cors=_rhp_managed_cors(), security=dict(_RHP_MANAGED_SECURITY),
+        ),
+        "5cc3b908-e619-4b99-88e5-2cf7f45965bd": _rhp_cfg(
+            "Managed-CORS-With-Preflight",
+            cors=_rhp_managed_cors(
+                allow_methods=["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+                expose_headers=["*"],
+            ),
+        ),
+        "eaab4381-ed33-4a86-88ca-d9558dc6cd63": _rhp_cfg(
+            "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
+            cors=_rhp_managed_cors(
+                allow_methods=["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+                expose_headers=["*"],
+            ),
+            security=dict(_RHP_MANAGED_SECURITY),
+        ),
+        "67f7725c-6f97-4210-82d7-5512b31e9d03": _rhp_cfg(
+            "Managed-SecurityHeadersPolicy", security=dict(_RHP_MANAGED_SECURITY),
+        ),
+        "60669652-455b-4ae9-85a4-c4c02393f86c": _rhp_cfg(
+            "Managed-SimpleCORS", cors=_rhp_managed_cors(),
+        ),
+    }.items()
+}
+
+
 _RHP_SPEC = {
     "label": "response headers policy", "resource_tag": "ResponseHeadersPolicy",
     "config_tag": "ResponseHeadersPolicyConfig", "path": "/2020-05-31/response-headers-policy",
@@ -1635,197 +1881,312 @@ _RHP_SPEC = {
     "missing": "NoSuchResponseHeadersPolicy", "dup": "ResponseHeadersPolicyAlreadyExists",
     "in_use": "ResponseHeadersPolicyInUse", "parse": _parse_rhp_config,
     "build_resource": _build_rhp_xml, "build_config": _build_rhp_config_xml,
+    "managed": _MANAGED_RESPONSE_HEADERS_POLICIES,
 }
 
 
 # ---------------------------------------------------------------------------
-# AWS-managed cache / origin-request / response-headers policies.
-#
-# Real AWS ships a fixed catalog of managed policies with stable IDs that
-# are identical in every account and region — there is no "owner" account,
-# unlike the per-account customer stores above (``_cache_policies`` etc.,
-# which are ``AccountScopedDict``). Terraform's
-# ``data "aws_cloudfront_cache_policy" { name = "Managed-CachingDisabled" }``
-# (and the origin-request / response-headers equivalents) resolve by NAME
-# against this catalog at PLAN time. MiniStack already implements full CRUD
-# for *custom* policies (CreateCachePolicy, CreateDistribution, ...) but
-# never seeded the managed set, so any Terraform plan referencing e.g.
-# "Managed-CachingDisabled" aborted before a single resource was created:
-#   Error: no matching CloudFront Cache Policy (Managed-CachingDisabled)
-#
-# Modeled directly on the IAM AWS-managed-policy pattern (see
-# ``_aws_managed_policies`` in services/iam.py, PR #609): a plain,
-# non-account-scoped module-level dict seeded at import time and in
-# ``reset()`` — every account/tenant reads the same catalog, and it is
-# immutable from a session's perspective (Update/Delete on a managed ID
-# are rejected the same way real AWS rejects them).
-#
-# Only the commonly-referenced subset is seeded, not AWS's full ~15-policy
-# catalog — see docs/busydone-gaps/cloudfront-managed-policies.md for the
-# exact seeded-vs-skipped list and the scope rationale. IDs, TTLs, and
-# forwarding/header behaviour below are transcribed verbatim from the AWS
-# Managed Policy Reference (fetched 2026-08-15):
-#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-cache-policies.html
-#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-origin-request-policies.html
-#   https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/using-managed-response-headers-policies.html
+# Public keys
 # ---------------------------------------------------------------------------
-_managed_cache_policies: dict = {}
-_managed_origin_request_policies: dict = {}
-_managed_response_headers_policies: dict = {}
-
-# Real AWS's original managed-policy set was published on this date; used
-# as a plausible fixed LastModifiedTime rather than "now" so it doesn't
-# drift on every reset. Not independently verified per-policy — low-stakes
-# relative to the Id (which callers key lookups on).
-_MANAGED_POLICY_LAST_MODIFIED = "2020-05-20T04:34:00.000Z"
 
 
-def _make_managed_policy_record(policy_id: str, config: dict) -> dict:
+def _parse_public_key_config(el):
+    caller_reference = _text(el, "CallerReference")
+    name = _text(el, "Name")
+    encoded_key = _text(el, "EncodedKey")
+    if not caller_reference or not name or not encoded_key:
+        return None, _error(
+            "InvalidArgument", "CallerReference, Name, and EncodedKey are required.", 400
+        )
     return {
-        "Id": policy_id,
-        "ETag": new_uuid(),
-        "LastModifiedTime": _MANAGED_POLICY_LAST_MODIFIED,
-        "Config": config,
-    }
+        "CallerReference": caller_reference, "Name": name,
+        "EncodedKey": encoded_key, "Comment": _text(el, "Comment"),
+    }, None
 
 
-def _managed_policy_error(label: str, policy_id: str) -> tuple:
-    """Real AWS rejects Update/Delete on a managed policy's fixed Id.
-    Mirrors the AccessDenied convention IAM already uses for its own
-    AWS-managed policies (see ``_delete_policy`` in services/iam.py)."""
-    return _error(
-        "AccessDenied",
-        f"The specified {label} ({policy_id}) is an AWS-managed CloudFront policy "
-        "and cannot be modified or deleted.",
-        403,
+def _build_public_key_config_xml(parent, cfg):
+    SubElement(parent, "CallerReference").text = cfg["CallerReference"]
+    SubElement(parent, "Name").text = cfg["Name"]
+    SubElement(parent, "EncodedKey").text = cfg["EncodedKey"]
+    if cfg.get("Comment"):
+        SubElement(parent, "Comment").text = cfg["Comment"]
+
+
+def _build_public_key_xml(parent, pk):
+    SubElement(parent, "Id").text = pk["Id"]
+    SubElement(parent, "CreatedTime").text = pk["CreatedTime"]
+    cfg_el = SubElement(parent, "PublicKeyConfig")
+    _build_public_key_config_xml(cfg_el, pk["Config"])
+
+
+def _public_keys_using(pk_id):
+    return [kg.get("Id", "") for kg in _key_groups.values() if pk_id in kg["Config"].get("Items", [])]
+
+
+def _create_public_key(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_public_key_config(el)
+    if err is not None:
+        return err
+    pk_id = _pk_id()
+    etag = new_uuid()
+    pk = {"Id": pk_id, "ETag": etag, "CreatedTime": _now_iso(), "Config": cfg}
+    _public_keys[pk_id] = pk
+    logger.info("CreatePublicKey id=%s name=%s", pk_id, cfg["Name"])
+    return _xml_response(
+        "PublicKey", lambda r: _build_public_key_xml(r, pk), status=201,
+        extra_headers={"ETag": etag, "Location": f"/2020-05-31/public-key/{pk_id}"},
     )
 
 
-def _seed_managed_cache_policies() -> None:
-    seeds = [
-        ("4135ea2d-6df8-44a3-9df3-4b5a84be39ad", {
-            "Name": "Managed-CachingDisabled",
-            "Comment": "Policy with caching disabled",
-            "MinTTL": 0, "DefaultTTL": 0, "MaxTTL": 0,
-            "Parameters": {
-                "EnableAcceptEncodingGzip": False, "EnableAcceptEncodingBrotli": False,
-                "HeaderBehavior": "none", "Headers": [],
-                "CookieBehavior": "none", "Cookies": [],
-                "QueryStringBehavior": "none", "QueryStrings": [],
-            },
-        }),
-        ("658327ea-f89d-4fab-a63d-7e88639e58f6", {
-            "Name": "Managed-CachingOptimized",
-            "Comment": "Policy with caching enabled. Supports Gzip and Brotli compression.",
-            "MinTTL": 1, "DefaultTTL": 86400, "MaxTTL": 31536000,
-            "Parameters": {
-                "EnableAcceptEncodingGzip": True, "EnableAcceptEncodingBrotli": True,
-                "HeaderBehavior": "none", "Headers": [],
-                "CookieBehavior": "none", "Cookies": [],
-                "QueryStringBehavior": "none", "QueryStrings": [],
-            },
-        }),
-    ]
-    for policy_id, cfg in seeds:
-        _managed_cache_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+def _get_public_key(pk_id):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    return _xml_response("PublicKey", lambda r: _build_public_key_xml(r, pk), extra_headers={"ETag": pk["ETag"]})
 
 
-def _seed_managed_origin_request_policies() -> None:
-    seeds = [
-        ("216adef6-5c7f-47e4-b989-5492eafa07d3", {
-            "Name": "Managed-AllViewer",
-            "Comment": "Includes all values (headers, cookies, and query strings) in the viewer request.",
-            "HeaderBehavior": "allViewer", "Headers": [],
-            "CookieBehavior": "all", "Cookies": [],
-            "QueryStringBehavior": "all", "QueryStrings": [],
-        }),
-        ("b689b0a8-53d0-40ab-baf2-68738e2966ac", {
-            "Name": "Managed-AllViewerExceptHostHeader",
-            "Comment": "Includes all values (headers, cookies, and query strings) in the viewer request, "
-                       "except for the Host header.",
-            "HeaderBehavior": "allExcept", "Headers": ["Host"],
-            "CookieBehavior": "all", "Cookies": [],
-            "QueryStringBehavior": "all", "QueryStrings": [],
-        }),
-    ]
-    for policy_id, cfg in seeds:
-        _managed_origin_request_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+def _get_public_key_config(pk_id):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    return _xml_response(
+        "PublicKeyConfig", lambda r: _build_public_key_config_xml(r, pk["Config"]),
+        extra_headers={"ETag": pk["ETag"]},
+    )
 
 
-def _rhp_managed_security_headers_block() -> dict:
-    """The shared 5-header ``SecurityHeadersPolicy`` block, verbatim from the
-    AWS Managed Policy Reference — reused by both *-and-SecurityHeadersPolicy
-    combo policies below."""
+def _update_public_key(pk_id, headers, body):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != pk["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_public_key_config(el)
+    if err is not None:
+        return err
+    # Only the comment can change.
+    if any(cfg[k] != pk["Config"][k] for k in ("CallerReference", "Name", "EncodedKey")):
+        return _error("CannotChangeImmutablePublicKeyFields", "Only the comment can be changed.", 400)
+    new_etag = new_uuid()
+    pk["Config"] = cfg
+    pk["ETag"] = new_etag
+    _public_keys[pk_id] = pk
+    logger.info("UpdatePublicKey id=%s", pk_id)
+    return _xml_response("PublicKey", lambda r: _build_public_key_xml(r, pk), extra_headers={"ETag": new_etag})
+
+
+def _delete_public_key(pk_id, headers):
+    pk = _public_keys.get(pk_id)
+    if not pk:
+        return _error("NoSuchPublicKey", "The public key does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != pk["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    if _public_keys_using(pk_id):
+        return _error("PublicKeyInUse", "The public key is attached to one or more key groups.", 409)
+    del _public_keys[pk_id]
+    logger.info("DeletePublicKey id=%s", pk_id)
+    return 204, {}, b""
+
+
+def _list_public_keys(query_params):
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    keys = list(_public_keys.values())
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "Quantity").text = str(len(keys))
+        if keys:
+            items_el = SubElement(root, "Items")
+            for pk in keys:
+                summary = SubElement(items_el, "PublicKeySummary")
+                SubElement(summary, "Id").text = pk["Id"]
+                SubElement(summary, "Name").text = pk["Config"]["Name"]
+                SubElement(summary, "CreatedTime").text = pk["CreatedTime"]
+                SubElement(summary, "EncodedKey").text = pk["Config"]["EncodedKey"]
+                if pk["Config"].get("Comment"):
+                    SubElement(summary, "Comment").text = pk["Config"]["Comment"]
+
+    return _xml_response("PublicKeyList", build)
+
+
+# ---------------------------------------------------------------------------
+# Key groups
+# ---------------------------------------------------------------------------
+
+
+def _parse_key_group_config(el):
+    name = _text(el, "Name")
+    if not name:
+        return None, _error("InvalidArgument", "The key group name is required.", 400)
+    items_el = _find(el, "Items")
+    items = []
+    if items_el is not None:
+        for child in items_el:
+            local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+            if local == "PublicKey":
+                items.append(child.text or "")
+    if not items:
+        return None, _error("InvalidArgument", "A key group must contain at least one public key.", 400)
+    for pk_id in items:
+        if pk_id not in _public_keys:
+            return None, _error("InvalidArgument", f"Public key {pk_id} does not exist.", 400)
+    return {"Name": name, "Items": items, "Comment": _text(el, "Comment")}, None
+
+
+def _build_key_group_config_xml(parent, cfg):
+    SubElement(parent, "Name").text = cfg["Name"]
+    items_el = SubElement(parent, "Items")
+    for pk_id in cfg["Items"]:
+        SubElement(items_el, "PublicKey").text = pk_id
+    if cfg.get("Comment"):
+        SubElement(parent, "Comment").text = cfg["Comment"]
+
+
+def _build_key_group_xml(parent, kg):
+    SubElement(parent, "Id").text = kg["Id"]
+    SubElement(parent, "LastModifiedTime").text = kg["LastModifiedTime"]
+    cfg_el = SubElement(parent, "KeyGroupConfig")
+    _build_key_group_config_xml(cfg_el, kg["Config"])
+
+
+def _trusted_key_group_ids(dist):
+    try:
+        root = fromstring(dist.get("config_xml") or "")
+    except Exception:
+        return set()
     return {
-        "XSSProtection": {"Override": False, "Protection": True, "ModeBlock": True, "ReportUri": None},
-        "FrameOptions": {"Override": False, "FrameOption": "SAMEORIGIN"},
-        "ReferrerPolicy": {"Override": False, "ReferrerPolicy": "strict-origin-when-cross-origin"},
-        "ContentTypeOptions": {"Override": True},
-        "StrictTransportSecurity": {
-            "Override": False, "IncludeSubdomains": None, "Preload": None,
-            "AccessControlMaxAgeSec": 31536000,
-        },
+        el.text for tkg in root.iter() if tkg.tag.split("}")[-1] == "TrustedKeyGroups"
+        for el in tkg.iter() if el.tag.split("}")[-1] == "KeyGroup" and el.text
     }
 
 
-def _seed_managed_response_headers_policies() -> None:
-    simple_cors = {
-        "AllowOrigins": ["*"], "AllowHeaders": ["*"], "AllowMethods": ["GET"],
-        "AllowCredentials": False, "OriginOverride": False,
-        "ExposeHeaders": None, "MaxAgeSec": None,
-    }
-    preflight_cors = {
-        "AllowOrigins": ["*"], "AllowHeaders": ["*"],
-        "AllowMethods": ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
-        "AllowCredentials": False, "OriginOverride": False,
-        "ExposeHeaders": ["*"], "MaxAgeSec": None,
-    }
-    seeds = [
-        ("60669652-455b-4ae9-85a4-c4c02393f86c", {
-            "Name": "Managed-SimpleCORS",
-            "Comment": "Policy to allow simple CORS requests from any origin.",
-            "Cors": dict(simple_cors), "Security": None, "ServerTiming": None,
-            "CustomHeaders": [], "RemoveHeaders": [],
-        }),
-        ("5cc3b908-e619-4b99-88e5-2cf7f45965bd", {
-            "Name": "Managed-CORS-With-Preflight",
-            "Comment": "Policy to allow CORS requests from any origin, including preflight requests.",
-            "Cors": dict(preflight_cors), "Security": None, "ServerTiming": None,
-            "CustomHeaders": [], "RemoveHeaders": [],
-        }),
-        ("e61eb60c-9c35-4d20-a928-2b84e02af89c", {
-            "Name": "Managed-CORS-and-SecurityHeadersPolicy",
-            "Comment": "Policy to allow simple CORS requests from any origin, and add a set of security "
-                       "headers to every response.",
-            "Cors": dict(simple_cors), "Security": _rhp_managed_security_headers_block(), "ServerTiming": None,
-            "CustomHeaders": [], "RemoveHeaders": [],
-        }),
-        ("eaab4381-ed33-4a86-88ca-d9558dc6cd63", {
-            "Name": "Managed-CORS-with-preflight-and-SecurityHeadersPolicy",
-            "Comment": "Policy to allow CORS requests from any origin, including preflight requests, and "
-                       "add a set of security headers to every response.",
-            "Cors": dict(preflight_cors), "Security": _rhp_managed_security_headers_block(), "ServerTiming": None,
-            "CustomHeaders": [], "RemoveHeaders": [],
-        }),
-    ]
-    for policy_id, cfg in seeds:
-        _managed_response_headers_policies[policy_id] = _make_managed_policy_record(policy_id, cfg)
+def _key_groups_using(kg_id):
+    return [d.get("Id", "") for d in _distributions.values() if kg_id in _trusted_key_group_ids(d)]
 
 
-def _seed_all_managed_policies() -> None:
-    _seed_managed_cache_policies()
-    _seed_managed_origin_request_policies()
-    _seed_managed_response_headers_policies()
+def _create_key_group(body):
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_key_group_config(el)
+    if err is not None:
+        return err
+    for existing in _key_groups.values():
+        if existing["Config"]["Name"] == cfg["Name"]:
+            return _error("KeyGroupAlreadyExists", "A key group with the same name already exists.", 409)
+    kg_id = _kg_id()
+    etag = new_uuid()
+    kg = {"Id": kg_id, "ETag": etag, "LastModifiedTime": _now_iso(), "Config": cfg}
+    _key_groups[kg_id] = kg
+    logger.info("CreateKeyGroup id=%s name=%s", kg_id, cfg["Name"])
+    return _xml_response(
+        "KeyGroup", lambda r: _build_key_group_xml(r, kg), status=201,
+        extra_headers={"ETag": etag, "Location": f"/2020-05-31/key-group/{kg_id}"},
+    )
 
 
-# Wire the managed catalogs into the shared ORP/RHP spec dicts so the
-# generic ``_policy_get``/``_policy_update``/``_policy_delete``/
-# ``_list_policies`` helpers can look them up without a third store
-# parameter at every call site.
-_ORP_SPEC["managed"] = _managed_origin_request_policies
-_RHP_SPEC["managed"] = _managed_response_headers_policies
+def _get_key_group(kg_id):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    return _xml_response("KeyGroup", lambda r: _build_key_group_xml(r, kg), extra_headers={"ETag": kg["ETag"]})
 
-_seed_all_managed_policies()
+
+def _get_key_group_config(kg_id):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    return _xml_response(
+        "KeyGroupConfig", lambda r: _build_key_group_config_xml(r, kg["Config"]),
+        extra_headers={"ETag": kg["ETag"]},
+    )
+
+
+def _update_key_group(kg_id, headers, body):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != kg["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    el = _parse_body(body)
+    if el is None:
+        return _error("MalformedXML", "The XML document is malformed.", 400)
+    cfg, err = _parse_key_group_config(el)
+    if err is not None:
+        return err
+    for existing in _key_groups.values():
+        if existing["Id"] != kg_id and existing["Config"]["Name"] == cfg["Name"]:
+            return _error("KeyGroupAlreadyExists", "A key group with the same name already exists.", 409)
+    new_etag = new_uuid()
+    kg["Config"] = cfg
+    kg["ETag"] = new_etag
+    kg["LastModifiedTime"] = _now_iso()
+    logger.info("UpdateKeyGroup id=%s", kg_id)
+    return _xml_response("KeyGroup", lambda r: _build_key_group_xml(r, kg), extra_headers={"ETag": new_etag})
+
+
+def _delete_key_group(kg_id, headers):
+    kg = _key_groups.get(kg_id)
+    if not kg:
+        return _error("NoSuchResource", "The key group does not exist.", 404)
+    if_match = headers.get("if-match")
+    if not if_match:
+        return _error("InvalidIfMatchVersion", "The If-Match version is missing or not valid for the resource.", 400)
+    if if_match != kg["ETag"]:
+        return _error(
+            "PreconditionFailed",
+            "The precondition given in one or more of the request-header fields evaluated to false.",
+            412,
+        )
+    if _key_groups_using(kg_id):
+        return _error("ResourceInUse", "The key group is attached to one or more distributions.", 409)
+    del _key_groups[kg_id]
+    logger.info("DeleteKeyGroup id=%s", kg_id)
+    return 204, {}, b""
+
+
+def _list_key_groups(query_params):
+    max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
+    groups = list(_key_groups.values())
+
+    def build(root):
+        SubElement(root, "MaxItems").text = max_items
+        SubElement(root, "Quantity").text = str(len(groups))
+        if groups:
+            items_el = SubElement(root, "Items")
+            for kg in groups:
+                summary = SubElement(items_el, "KeyGroupSummary")
+                kg_el = SubElement(summary, "KeyGroup")
+                _build_key_group_xml(kg_el, kg)
+
+    return _xml_response("KeyGroupList", build)
 
 
 # ---------------------------------------------------------------------------
@@ -1888,17 +2249,13 @@ def _list_anycast_ip_lists(query_params):
 
 
 def _list_cache_policies(query_params):
-    """CachePolicyList wrapping AWS-managed + stored custom cache policies,
-    filtered by the optional ``Type`` param (``managed`` | ``custom``);
-    omitted returns both, matching real AWS."""
+    """CachePolicyList: managed policies plus stored custom ones."""
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    type_filter = _qval(query_params, "Type", "") or None
-    if type_filter not in (None, "managed", "custom"):
-        return _error("InvalidArgument", "Invalid Type value.", 400)
+    type_filter = _qval(query_params, "Type", "")
     entries = []
-    if type_filter in (None, "managed"):
-        entries.extend(("managed", p) for p in _managed_cache_policies.values())
-    if type_filter in (None, "custom"):
+    if type_filter in ("", "managed"):
+        entries.extend(("managed", p) for p in _MANAGED_CACHE_POLICIES.values())
+    if type_filter in ("", "custom"):
         entries.extend(("custom", p) for p in _cache_policies.values())
 
     def build(root):
@@ -1916,21 +2273,13 @@ def _list_cache_policies(query_params):
 
 
 def _list_policies(store, spec, query_params):
-    """Generic ``*PolicyList`` wrapping AWS-managed + stored custom policies,
-    filtered by the optional ``Type`` param (``managed`` | ``custom``);
-    omitted returns both, matching real AWS.
-
-    Shared by origin request policies and response headers policies; the
-    summary member, resource tag, and managed catalog come from ``spec``.
-    """
+    """Generic ``*PolicyList``: managed policies plus stored custom ones."""
     max_items = _qval(query_params, "MaxItems", _DEFAULT_MAX_ITEMS) or _DEFAULT_MAX_ITEMS
-    type_filter = _qval(query_params, "Type", "") or None
-    if type_filter not in (None, "managed", "custom"):
-        return _error("InvalidArgument", "Invalid Type value.", 400)
+    type_filter = _qval(query_params, "Type", "")
     entries = []
-    if type_filter in (None, "managed"):
+    if type_filter in ("", "managed"):
         entries.extend(("managed", p) for p in spec["managed"].values())
-    if type_filter in (None, "custom"):
+    if type_filter in ("", "custom"):
         entries.extend(("custom", p) for p in store.values())
 
     def build(root):
@@ -1947,17 +2296,63 @@ def _list_policies(store, spec, query_params):
     return _xml_response(spec["list_tag"], build)
 
 
-def _get_monitoring_subscription(dist_id):
-    """MiniStack does not persist monitoring subscriptions. Real AWS returns
-    NoSuchDistribution (404) for an unknown distribution and
-    NoSuchMonitoringSubscription (404) when none is configured."""
-    if dist_id not in _distributions:
+def _build_monitoring_subscription_xml(parent, sub):
+    cfg = SubElement(parent, "RealtimeMetricsSubscriptionConfig")
+    SubElement(cfg, "RealtimeMetricsSubscriptionStatus").text = sub["RealtimeMetricsSubscriptionStatus"]
+
+
+_MONITORING_SUB_STATUSES = {"Enabled", "Disabled"}
+
+
+def _create_monitoring_subscription(dist_id, body):
+    """CreateMonitoringSubscription (POST, 200): NoSuchDistribution when the distribution is unknown."""
+    dist = _distributions.get(dist_id)
+    if not dist:
         return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
-    return _error(
-        "NoSuchMonitoringSubscription",
-        "A monitoring subscription does not exist for the specified distribution.",
-        404,
-    )
+    el = _parse_body(body)
+    cfg_el = _find(el, "RealtimeMetricsSubscriptionConfig") if el is not None else None
+    status = _text(cfg_el, "RealtimeMetricsSubscriptionStatus") if cfg_el is not None else ""
+    if status not in _MONITORING_SUB_STATUSES:
+        return _error(
+            "InvalidArgument", "RealtimeMetricsSubscriptionStatus must be Enabled or Disabled.", 400
+        )
+    sub = {"RealtimeMetricsSubscriptionStatus": status}
+    dist["MonitoringSubscription"] = sub
+    logger.info("CreateMonitoringSubscription dist=%s status=%s", dist_id, status)
+    return _xml_response("MonitoringSubscription", lambda r: _build_monitoring_subscription_xml(r, sub))
+
+
+def _get_monitoring_subscription(dist_id):
+    """NoSuchDistribution (404) for an unknown distribution,
+    NoSuchMonitoringSubscription (404) when none is configured."""
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    sub = dist.get("MonitoringSubscription")
+    if not sub:
+        return _error(
+            "NoSuchMonitoringSubscription",
+            "A monitoring subscription does not exist for the specified distribution.",
+            404,
+        )
+    return _xml_response("MonitoringSubscription", lambda r: _build_monitoring_subscription_xml(r, sub))
+
+
+def _delete_monitoring_subscription(dist_id):
+    """DeleteMonitoringSubscription: 200 with an empty body per the API model
+    (unlike the 204-with-empty-body shape most other CloudFront deletes use)."""
+    dist = _distributions.get(dist_id)
+    if not dist:
+        return _error("NoSuchDistribution", "The specified distribution does not exist.", 404)
+    if not dist.get("MonitoringSubscription"):
+        return _error(
+            "NoSuchMonitoringSubscription",
+            "A monitoring subscription does not exist for the specified distribution.",
+            404,
+        )
+    dist["MonitoringSubscription"] = None
+    logger.info("DeleteMonitoringSubscription dist=%s", dist_id)
+    return 200, {}, b""
 
 
 # ---------------------------------------------------------------------------
@@ -2133,6 +2528,53 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _policy_list_distributions(_response_headers_policies, _RHP_SPEC, m.group(1))
 
+    # UpdatePublicKey is PUT .../config, unlike the other families.
+    m = _PUBLIC_KEY_CFG_RE.match(path)
+    if m:
+        pk_id = m.group(1)
+        if method == "GET":
+            return _get_public_key_config(pk_id)
+        if method == "PUT":
+            return _update_public_key(pk_id, headers, body)
+
+    m = _PUBLIC_KEY_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_public_key(body)
+        if method == "GET":
+            return _list_public_keys(query_params)
+
+    m = _PUBLIC_KEY_ID_RE.match(path)
+    if m:
+        pk_id = m.group(1)
+        if method == "GET":
+            return _get_public_key(pk_id)
+        if method == "DELETE":
+            return _delete_public_key(pk_id, headers)
+
+    # Key group routes
+    m = _KEY_GROUP_CFG_RE.match(path)
+    if m:
+        if method == "GET":
+            return _get_key_group_config(m.group(1))
+
+    m = _KEY_GROUP_RE.match(path)
+    if m:
+        if method == "POST":
+            return _create_key_group(body)
+        if method == "GET":
+            return _list_key_groups(query_params)
+
+    m = _KEY_GROUP_ID_RE.match(path)
+    if m:
+        kg_id = m.group(1)
+        if method == "GET":
+            return _get_key_group(kg_id)
+        if method == "PUT":
+            return _update_key_group(kg_id, headers, body)
+        if method == "DELETE":
+            return _delete_key_group(kg_id, headers)
+
     # CloudFront Functions API (used by Terraform aws_cloudfront_function)
     m = _FUN_DESCRIBE_RE.match(path)
     if m:
@@ -2288,14 +2730,6 @@ async def handle_request(method, path, headers, body, query_params):
     # Read-only list surface for resource families with no backing store.
     # Family split matches botocore: KeyGroupList-style carry no Marker/
     # IsTruncated; the OAI/StreamingDistribution/VpcOrigin family does.
-    m = _KEY_GROUP_LIST_RE.match(path)
-    if m and method == "GET":
-        return _empty_marker_list(query_params, "KeyGroupList", with_marker=False)
-
-    m = _PUBLIC_KEY_LIST_RE.match(path)
-    if m and method == "GET":
-        return _empty_marker_list(query_params, "PublicKeyList", with_marker=False)
-
     m = _FLE_LIST_RE.match(path)
     if m and method == "GET":
         return _empty_marker_list(query_params, "FieldLevelEncryptionList", with_marker=False)
@@ -2329,8 +2763,14 @@ async def handle_request(method, path, headers, body, query_params):
         return _list_anycast_ip_lists(query_params)
 
     m = _MONITORING_SUB_RE.match(path)
-    if m and method == "GET":
-        return _get_monitoring_subscription(m.group(1))
+    if m:
+        dist_id = m.group(1)
+        if method == "GET":
+            return _get_monitoring_subscription(dist_id)
+        if method == "POST":
+            return _create_monitoring_subscription(dist_id, body)
+        if method == "DELETE":
+            return _delete_monitoring_subscription(dist_id)
 
     return _error("NoSuchResource", f"No route for {method} {path}", 404)
 
@@ -2370,7 +2810,7 @@ def _create_distribution(headers, body):
         "Id": dist_id,
         "ARN": f"arn:aws:cloudfront::{get_account_id()}:distribution/{dist_id}",
         "Status": "Deployed",
-        "DomainName": f"{dist_id}.cloudfront.net",
+        "DomainName": _new_distribution_domain(),
         "LastModifiedTime": now,
         "ETag": etag,
         "CallerReference": caller_ref,
@@ -3403,7 +3843,7 @@ def _create_connection_group(body):
         "CreatedTime": now,
         "LastModifiedTime": now,
         "Ipv6Enabled": _xbool(el, "Ipv6Enabled", True),
-        "RoutingEndpoint": _routing_endpoint(),
+        "RoutingEndpoint": _cloudfront_domain(),
         "AnycastIpListId": _opt_text(el, "AnycastIpListId"),
         "Enabled": _xbool(el, "Enabled", True),
         "IsDefault": False,
@@ -3428,7 +3868,7 @@ def _default_connection_group():
         "CreatedTime": now,
         "LastModifiedTime": now,
         "Ipv6Enabled": True,
-        "RoutingEndpoint": _routing_endpoint(),
+        "RoutingEndpoint": _cloudfront_domain(),
         "AnycastIpListId": None,
         "Enabled": True,
         "IsDefault": True,
@@ -4081,3 +4521,195 @@ def _list_distributions_by_connection_mode(mode):
         return _error("InvalidArgument", "Invalid ConnectionMode value.", 400)
     items = [d for d in _distributions.values() if _dist_connection_mode(d) == mode]
     return _xml_response("DistributionList", lambda root: _build_distribution_list_xml(root, items))
+
+
+# ---------------------------------------------------------------------------
+# Data-plane support: cloudfront_dataplane serves traffic through this
+# accessor surface rather than the module-private stores directly.
+# ---------------------------------------------------------------------------
+
+
+def find_distribution_for_label(label: str):
+    """The distribution whose DomainName is ``<label>.cloudfront.net``."""
+    domain = f"{label}.cloudfront.net"
+    for dist in _distributions.values():
+        if dist.get("DomainName", "").lower() == domain:
+            return dist
+    return None
+
+
+# S3 REST-endpoint domain shapes of an origin's DomainName (Developer Guide, "Amazon S3 origin").
+_S3_ORIGIN_DOMAIN_RE = re.compile(
+    r"^(?P<bucket>[a-z0-9][a-z0-9.-]*[a-z0-9])\.s3(?:\.[a-z0-9-]+|-[a-z0-9-]+)?\.amazonaws\.com$"
+)
+
+
+def _s3_origin_bucket(domain_name: str):
+    m = _S3_ORIGIN_DOMAIN_RE.match((domain_name or "").strip().lower())
+    return m.group("bucket") if m else None
+
+
+def _dataplane_custom_headers(origin_el):
+    """Origin.CustomHeaders as a list of (HeaderName, HeaderValue)."""
+    headers = []
+    ch_el = _find(origin_el, "CustomHeaders")
+    items_el = _find(ch_el, "Items") if ch_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "OriginCustomHeader":
+                name = _text(it, "HeaderName")
+                if name:
+                    headers.append((name, _text(it, "HeaderValue")))
+    return headers
+
+
+def _dataplane_origin(origin_el):
+    custom = _find(origin_el, "CustomOriginConfig")
+    s3cfg = _find(origin_el, "S3OriginConfig")
+    domain_name = _text(origin_el, "DomainName")
+    return {
+        "id": _text(origin_el, "Id"),
+        "domain_name": domain_name,
+        "origin_path": _opt_text(origin_el, "OriginPath") or "",
+        "custom_headers": _dataplane_custom_headers(origin_el),
+        # An S3 origin's bucket comes only from its DomainName.
+        "s3_bucket": _s3_origin_bucket(domain_name) if s3cfg is not None else None,
+        "oac_id": _opt_text(origin_el, "OriginAccessControlId") or "",
+        "oai_id": ((_text(s3cfg, "OriginAccessIdentity") or "").rsplit("/", 1)[-1] if s3cfg is not None else ""),
+        "http_port": int(_text(custom, "HTTPPort") or "80") if custom is not None else 80,
+        "https_port": int(_text(custom, "HTTPSPort") or "443") if custom is not None else 443,
+        "protocol_policy": _text(custom, "OriginProtocolPolicy") if custom is not None else "match-viewer",
+        # Response timeout doc ("Origin response timeout"): default 30s.
+        "read_timeout": int(_text(custom, "OriginReadTimeout") or "30") if custom is not None else 30,
+    }
+
+
+def _dataplane_function_associations(behavior_el):
+    associations = {}
+    fa_el = _find(behavior_el, "FunctionAssociations")
+    items_el = _find(fa_el, "Items") if fa_el is not None else None
+    if items_el is None:
+        return associations
+    for it in items_el:
+        if _local_tag_name(it) == "FunctionAssociation":
+            associations[_text(it, "EventType")] = _text(it, "FunctionARN")
+    return associations
+
+
+def _dataplane_forwarded_values(behavior_el):
+    """Legacy ``ForwardedValues`` (botocore cloudfront service-2.json), used
+    by a behavior that has no CachePolicyId. Returns None when the behavior
+    carries no ForwardedValues block either (nothing legacy to forward)."""
+    fv_el = _find(behavior_el, "ForwardedValues")
+    if fv_el is None:
+        return None
+    cookies_el = _find(fv_el, "Cookies")
+    return {
+        "query_string": _xbool(fv_el, "QueryString", False),
+        "headers": _parse_name_items(fv_el, "Headers"),
+        "cookies_forward": _text(cookies_el, "Forward", "none") if cookies_el is not None else "none",
+        "cookies_whitelist": _parse_name_items(cookies_el, "WhitelistedNames") if cookies_el is not None else [],
+    }
+
+
+def _dataplane_allowed_methods(behavior_el):
+    """The behavior's AllowedMethods.Items, or None when the block is absent
+    (nothing to enforce — see cloudfront_dataplane.py's method check)."""
+    am_el = _find(behavior_el, "AllowedMethods")
+    if am_el is None:
+        return None
+    items_el = _find(am_el, "Items")
+    methods = []
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "Method":
+                methods.append(it.text or "")
+    return methods
+
+
+def _dataplane_behavior(behavior_el, path_pattern=None):
+    return {
+        "path_pattern": path_pattern,
+        "target_origin_id": _text(behavior_el, "TargetOriginId"),
+        "viewer_protocol_policy": _text(behavior_el, "ViewerProtocolPolicy", "allow-all"),
+        "allowed_methods": _dataplane_allowed_methods(behavior_el),
+        "cache_policy_id": _opt_text(behavior_el, "CachePolicyId"),
+        "origin_request_policy_id": _opt_text(behavior_el, "OriginRequestPolicyId"),
+        "response_headers_policy_id": _opt_text(behavior_el, "ResponseHeadersPolicyId"),
+        "forwarded_values": _dataplane_forwarded_values(behavior_el),
+        "functions": _dataplane_function_associations(behavior_el),
+    }
+
+
+def parse_distribution_dataplane_config(dist: dict) -> dict:
+    """A distribution's config reduced to what the data plane dispatches on."""
+    config_el = _dist_config_el(dist)
+
+    origins = {}
+    origins_el = _find(config_el, "Origins")
+    items_el = _find(origins_el, "Items") if origins_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "Origin":
+                origin = _dataplane_origin(it)
+                origins[origin["id"]] = origin
+
+    default_el = _find(config_el, "DefaultCacheBehavior")
+    default_behavior = _dataplane_behavior(default_el) if default_el is not None else None
+
+    ordered_behaviors = []
+    behaviors_el = _find(config_el, "CacheBehaviors")
+    items_el = _find(behaviors_el, "Items") if behaviors_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            if _local_tag_name(it) == "CacheBehavior":
+                ordered_behaviors.append(_dataplane_behavior(it, _text(it, "PathPattern")))
+
+    custom_error_responses = {}
+    errors_el = _find(config_el, "CustomErrorResponses")
+    items_el = _find(errors_el, "Items") if errors_el is not None else None
+    if items_el is not None:
+        for it in items_el:
+            # AWS takes ResponsePagePath and ResponseCode only together; ErrorCachingMinTTL alone sets no page.
+            if _local_tag_name(it) == "CustomErrorResponse" and _text(it, "ResponsePagePath") and _text(it, "ResponseCode"):
+                custom_error_responses[int(_text(it, "ErrorCode"))] = {
+                    "page": _text(it, "ResponsePagePath"), "response_code": int(_text(it, "ResponseCode")),
+                }
+
+    return {
+        "default_root_object": _opt_text(config_el, "DefaultRootObject") or "",
+        "origins": origins,
+        "default_behavior": default_behavior,
+        "ordered_behaviors": ordered_behaviors,
+        "custom_error_responses": custom_error_responses,
+    }
+
+
+def cache_policy_params(policy_id):
+    """A cache policy's Parameters dict (managed or custom), or None when the
+    policy has no ParametersInCacheKeyAndForwardedToOrigin block (nothing
+    beyond the defaults CloudFront always includes) or doesn't exist."""
+    policy = _cache_policies.get(policy_id) or _MANAGED_CACHE_POLICIES.get(policy_id)
+    return policy["Config"].get("Parameters") if policy else None
+
+
+def origin_request_policy_config(policy_id):
+    """A custom or AWS-managed origin request policy's Config dict, or None."""
+    policy = _origin_request_policies.get(policy_id) or _MANAGED_ORIGIN_REQUEST_POLICIES.get(policy_id)
+    return policy["Config"] if policy else None
+
+
+def response_headers_policy_config(policy_id):
+    """A custom or AWS-managed response-headers policy's Config dict, or None."""
+    policy = _response_headers_policies.get(policy_id) or _MANAGED_RESPONSE_HEADERS_POLICIES.get(policy_id)
+    return policy["Config"] if policy else None
+
+
+def live_function_code(function_arn: str):
+    """The published (LIVE) JS body for a FunctionAssociation's FunctionARN,
+    or None when the ARN doesn't resolve to a published function."""
+    name = function_arn.rsplit("/", 1)[-1] if function_arn else ""
+    fn = _functions.get(name)
+    if not fn or not fn.get("live_etag"):
+        return None
+    return _function_view(fn, "LIVE").get("code", fn["code"])

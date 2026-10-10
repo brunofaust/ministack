@@ -1,13 +1,22 @@
+import asyncio
+import base64
 import io
+import json
 import os
 import time
 import uuid as _uuid_mod
 import zipfile
+from types import SimpleNamespace
 
 import boto3
+import cbor2
 import pytest
 from botocore.config import Config
+from botocore.eventstream import EventStreamBuffer
 from botocore.exceptions import ClientError
+
+from ministack.core.responses import AccountRegionScopedDict, request_scope
+from ministack.services import kinesis
 
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
 
@@ -286,6 +295,128 @@ def test_kinesis_register_deregister_consumer(kin):
     kin.delete_stream(StreamName=sname)
 
 
+def _subscribe_setup(kin, shards=1):
+    sname = f"intg-sub-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=sname, ShardCount=shards)
+    stream_arn = kin.describe_stream(StreamName=sname)["StreamDescription"]["StreamARN"]
+    consumer_arn = kin.register_stream_consumer(
+        StreamARN=stream_arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    return sname, consumer_arn
+
+
+def test_kinesis_subscribe_to_shard_pushes_backlog_then_new_records(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    first = [kin.put_record(StreamName=sname, Data=f"r{i}".encode(), PartitionKey="k")["SequenceNumber"]
+             for i in range(2)]
+    resp = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                  StartingPosition={"Type": "TRIM_HORIZON"})
+    events = iter(resp["EventStream"])
+    event = next(events)["SubscribeToShardEvent"]
+    assert [r["Data"] for r in event["Records"]] == [b"r0", b"r1"]
+    assert [r["SequenceNumber"] for r in event["Records"]] == first
+    assert event["ContinuationSequenceNumber"] == first[-1]
+    assert event["MillisBehindLatest"] == 0
+
+    third = kin.put_record(StreamName=sname, Data=b"r2", PartitionKey="k")["SequenceNumber"]
+    event = next(events)["SubscribeToShardEvent"]
+    assert [(r["Data"], r["PartitionKey"]) for r in event["Records"]] == [(b"r2", "k")]
+    assert event["ContinuationSequenceNumber"] == third
+    resp["EventStream"].close()
+
+    resumed = kin.subscribe_to_shard(
+        ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+        StartingPosition={"Type": "AFTER_SEQUENCE_NUMBER", "SequenceNumber": first[0]})
+    with pytest.raises(ClientError) as exc:  # refused within 5 s of the first call
+        kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                               StartingPosition={"Type": "LATEST"})
+    assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    event = next(iter(resumed["EventStream"]))["SubscribeToShardEvent"]
+    assert [r["SequenceNumber"] for r in event["Records"]] == [first[1], third]
+    resumed["EventStream"].close()
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_latest_starts_empty_and_takeover_ends_the_old_stream(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    kin.put_record(StreamName=sname, Data=b"old", PartitionKey="k")
+    old = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                 StartingPosition={"Type": "LATEST"})
+    old_events = iter(old["EventStream"])
+    event = next(old_events)["SubscribeToShardEvent"]
+    assert event["Records"] == [] and event["ContinuationSequenceNumber"]
+
+    time.sleep(5.2)
+    new = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                 StartingPosition={"Type": "LATEST"})
+    with pytest.raises(ClientError) as exc:
+        for _ in old_events:
+            pass
+    assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    assert next(iter(new["EventStream"]))["SubscribeToShardEvent"]["Records"] == []
+    new["EventStream"].close()
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_ends_with_child_shards_after_a_split(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    resp = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                  StartingPosition={"Type": "TRIM_HORIZON"})
+    events = iter(resp["EventStream"])
+    assert "ChildShards" not in next(events)["SubscribeToShardEvent"]
+    kin.split_shard(StreamName=sname, ShardToSplit="shardId-000000000000",
+                    NewStartingHashKey=str(2**127))
+    last = [e["SubscribeToShardEvent"] for e in events][-1]
+    assert sorted(c["ShardId"] for c in last["ChildShards"]) == [
+        "shardId-000000000001", "shardId-000000000002"]
+    assert all(c["ParentShards"] == ["shardId-000000000000"] for c in last["ChildShards"])
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_errors(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    cases = [
+        (dict(ConsumerARN=consumer_arn + "0", ShardId="shardId-000000000000",
+              StartingPosition={"Type": "LATEST"}), "ResourceNotFoundException"),
+        (dict(ConsumerARN=consumer_arn, ShardId="shardId-000000000009",
+              StartingPosition={"Type": "LATEST"}), "ResourceNotFoundException"),
+        (dict(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+              StartingPosition={"Type": "AT_SEQUENCE_NUMBER"}), "InvalidArgumentException"),
+    ]
+    for kwargs, code in cases:
+        with pytest.raises(ClientError) as exc:
+            kin.subscribe_to_shard(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_cbor_events(kin):
+    import urllib.request
+
+    import cbor2
+    from botocore.eventstream import EventStreamBuffer
+
+    sname, consumer_arn = _subscribe_setup(kin)
+    kin.put_record(StreamName=sname, Data=b"\x00\x01", PartitionKey="k")
+    request = urllib.request.Request(
+        kin.meta.endpoint_url, method="POST",
+        data=cbor2.dumps({"ConsumerARN": consumer_arn, "ShardId": "shardId-000000000000",
+                          "StartingPosition": {"Type": "TRIM_HORIZON"}}),
+        headers={"Content-Type": "application/x-amz-cbor-1.1",
+                 "X-Amz-Target": "Kinesis_20131202.SubscribeToShard",
+                 "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/kinesis/aws4_request"})
+    buffer, messages = EventStreamBuffer(), []
+    with urllib.request.urlopen(request, timeout=10) as response:
+        while len(messages) < 2:
+            buffer.add_data(response.read1(65536))
+            messages.extend(buffer)
+    assert messages[0].headers[":event-type"] == "initial-response"
+    event = messages[1]
+    assert event.headers[":content-type"] == "application/x-amz-cbor-1.1"
+    record = cbor2.loads(event.payload)["Records"][0]
+    assert record["Data"] == b"\x00\x01"
+    kin.delete_stream(StreamName=sname)
+
+
 def test_kinesis_consumer_arns_reject_foreign_region_without_exact_key_fallback(kin):
     """ConsumerARN paths must not resolve a consumer owned by another request region."""
     west = _regional_kin("us-west-2")
@@ -374,7 +505,7 @@ def test_kinesis_restore_legacy_account_scoped_state_uses_arn_region():
         set_request_account_id(account_id)
         set_request_region("us-east-1")
 
-        _kin.restore_state({
+        _kin.load_persisted_state({
             "streams": legacy_streams,
             "shard_iterators": legacy_iterators,
             "consumers": legacy_consumers,
@@ -608,3 +739,204 @@ def test_kinesis_describe_echoes_the_encryption_key_id(kin):
     desc = kin.describe_stream(StreamName=name)["StreamDescription"]
     assert desc["EncryptionType"] == "NONE"
     assert "KeyId" not in desc
+
+
+# --- SubscribeToShard across retention pruning (in-process dispatch) ---
+
+_SUB_STARTS = ("TRIM_HORIZON", "LATEST", "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER", "AT_TIMESTAMP")
+_SUB_SHARD = "shardId-000000000000"
+
+
+@pytest.fixture
+def subscription_state(monkeypatch):
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr(kinesis, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(kinesis, "_streams", AccountRegionScopedDict())
+    monkeypatch.setattr(kinesis, "_consumers", AccountRegionScopedDict())
+    monkeypatch.setattr(kinesis, "_subscriptions", {})
+    monkeypatch.setattr(kinesis, "_SUBSCRIPTION_IDLE_SECONDS", 0)
+    return clock
+
+
+async def _sub_call(action, data, is_cbor=False):
+    encode = cbor2.dumps if is_cbor else lambda value: json.dumps(value).encode()
+    headers = {"x-amz-target": f"Kinesis_20131202.{action}"}
+    if is_cbor:
+        headers["content-type"] = "application/x-amz-cbor-1.1"
+    result = await kinesis.handle_request("POST", "/", headers, encode(data), {})
+    assert result[0] == 200, result
+    if action == "SubscribeToShard":
+        return result[2]
+    return cbor2.loads(result[2]) if is_cbor else json.loads(result[2])
+
+
+async def _sub_setup():
+    await _sub_call("CreateStream", {"StreamName": "retention", "ShardCount": 1})
+    arn = (await _sub_call("DescribeStream", {"StreamName": "retention"}))["StreamDescription"]["StreamARN"]
+    consumer = await _sub_call("RegisterStreamConsumer", {"StreamARN": arn, "ConsumerName": "reader"})
+    return consumer["Consumer"]["ConsumerARN"]
+
+
+async def _sub_put(value):
+    return (await _sub_call("PutRecord", {
+        "StreamName": "retention", "PartitionKey": "p", "Data": base64.b64encode(value).decode(),
+    }))["SequenceNumber"]
+
+
+def _sub_starting(kind, sequence, timestamp):
+    result = {"Type": kind}
+    if "SEQUENCE_NUMBER" in kind:
+        result["SequenceNumber"] = sequence
+    if kind == "AT_TIMESTAMP":
+        result["Timestamp"] = timestamp
+    return result
+
+
+async def _sub_run(response, is_cbor, on_event):
+    disconnect = asyncio.Event()
+    events = []
+
+    async def receive():
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if not message.get("body"):
+            return
+        buffer = EventStreamBuffer()
+        buffer.add_data(message["body"])
+        for frame in buffer:
+            assert frame.headers[":message-type"] == "event", frame.headers
+            assert frame.headers[":content-type"] == (
+                "application/x-amz-cbor-1.1" if is_cbor else "application/json")
+            if frame.headers[":event-type"] == "initial-response":
+                continue
+            assert frame.headers[":event-type"] == "SubscribeToShardEvent"
+            event = cbor2.loads(frame.payload) if is_cbor else json.loads(frame.payload)
+            events.append(event)
+            if await on_event(event, len(events)):
+                disconnect.set()
+
+    await asyncio.wait_for(response.runner(send, receive), timeout=5)
+    return events
+
+
+@pytest.mark.parametrize("is_cbor", [False, True], ids=["json", "cbor"])
+@pytest.mark.parametrize("kind", _SUB_STARTS)
+def test_subscription_delivers_after_repeated_retention_and_idle_polls(subscription_state, kind, is_cbor):
+    clock = subscription_state
+
+    async def exercise():
+        with request_scope("000000000000", "us-east-1"):
+            consumer = await _sub_setup()
+            old = await _sub_put(b"old")
+            timestamp = clock[0]
+            clock[0] += 3
+            retained = await _sub_put(b"retained")
+            clock[0] += 24 * 3600 - 4
+            response = await _sub_call("SubscribeToShard", {
+                "ConsumerARN": consumer, "ShardId": _SUB_SHARD,
+                "StartingPosition": _sub_starting(kind, old, timestamp),
+            }, is_cbor)
+            expected = []
+
+            async def on_event(event, number):
+                # The two backlog records expire separately within the normal
+                # five-minute subscription lifetime. Idle and append after
+                # each pruning, while keeping newly delivered records alive.
+                if number == 1:
+                    clock[0] += 2
+                    kinesis._expire_records(kinesis._streams["retention"])
+                elif number == 4:
+                    clock[0] += 3
+                    kinesis._expire_records(kinesis._streams["retention"])
+                elif number in (2, 5):
+                    expected.append(await _sub_put(f"new-{number}".encode()))
+                return number == 7
+
+            events = await _sub_run(response, is_cbor, on_event)
+            initial = ([] if kind == "LATEST" else [retained] if kind == "AFTER_SEQUENCE_NUMBER"
+                       else [old, retained])
+            assert [r["SequenceNumber"] for r in events[0]["Records"]] == initial
+            assert [r["SequenceNumber"] for e in events[1:] for r in e["Records"]] == expected
+            assert events[1]["Records"] == events[4]["Records"] == events[6]["Records"] == []
+            assert events[1]["ContinuationSequenceNumber"] == events[0]["ContinuationSequenceNumber"]
+            assert events[2]["ContinuationSequenceNumber"] == expected[0]
+            assert events[3]["ContinuationSequenceNumber"] == expected[0]
+            assert events[4]["ContinuationSequenceNumber"] == expected[0]
+            assert events[5]["ContinuationSequenceNumber"] == expected[1]
+            assert events[6]["ContinuationSequenceNumber"] == expected[1]
+            assert all(e["MillisBehindLatest"] == 0 and "ChildShards" not in e for e in events)
+            records = events[2]["Records"] + events[5]["Records"]
+            assert [r["Data"] if is_cbor else base64.b64decode(r["Data"]) for r in records] == [
+                b"new-2", b"new-5"]
+            assert not kinesis._subscriptions
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("is_cbor", [False, True], ids=["json", "cbor"])
+@pytest.mark.parametrize("kind", _SUB_STARTS)
+def test_subscription_keeps_checkpoint_when_all_records_expire_before_runner(subscription_state, kind, is_cbor):
+    clock = subscription_state
+
+    async def exercise():
+        with request_scope("000000000000", "us-east-1"):
+            consumer = await _sub_setup()
+            old = await _sub_put(b"old")
+            timestamp = clock[0]
+            shard_start = kinesis._streams["retention"]["shards"][_SUB_SHARD]["starting_sequence_number"]
+            clock[0] += 24 * 3600 - 1
+            response = await _sub_call("SubscribeToShard", {
+                "ConsumerARN": consumer, "ShardId": _SUB_SHARD,
+                "StartingPosition": _sub_starting(kind, old, timestamp),
+            }, is_cbor)
+            clock[0] += 2
+            kinesis._expire_records(kinesis._streams["retention"])
+
+            async def on_event(event, number):
+                return True
+
+            events = await _sub_run(response, is_cbor, on_event)
+            assert events[0]["Records"] == []
+            # Preserve the existing selected checkpoint value; do not invent
+            # an AWS empty-shard checkpoint number.
+            checkpoint = old if kind in ("LATEST", "AFTER_SEQUENCE_NUMBER") else shard_start
+            assert events[0]["ContinuationSequenceNumber"] == checkpoint
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("is_cbor", [False, True], ids=["json", "cbor"])
+@pytest.mark.parametrize("kind", _SUB_STARTS)
+def test_subscription_captures_selection_before_runner_and_pruning(subscription_state, kind, is_cbor):
+    clock = subscription_state
+
+    async def exercise():
+        with request_scope("000000000000", "us-east-1"):
+            consumer = await _sub_setup()
+            await _sub_put(b"expired-prefix")
+            clock[0] += 1
+            selected = await _sub_put(b"selected")
+            timestamp = clock[0]
+            clock[0] += 24 * 3600 - 1
+            response = await _sub_call("SubscribeToShard", {
+                "ConsumerARN": consumer, "ShardId": _SUB_SHARD,
+                "StartingPosition": _sub_starting(kind, selected, timestamp),
+            }, is_cbor)
+            # Only the prefix expires. Append between response creation and
+            # runner startup, so LATEST must retain the establishment boundary.
+            clock[0] += 1
+            appended = await _sub_put(b"appended")
+
+            async def on_event(event, number):
+                return True
+
+            # Run with another request's context to exercise the saved tenant.
+            with request_scope("111111111111", "eu-west-1"):
+                events = await _sub_run(response, is_cbor, on_event)
+            expected = [appended] if kind in ("LATEST", "AFTER_SEQUENCE_NUMBER") else [selected, appended]
+            assert [r["SequenceNumber"] for r in events[0]["Records"]] == expected
+            assert events[0]["ContinuationSequenceNumber"] == appended
+
+    asyncio.run(exercise())

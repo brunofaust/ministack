@@ -495,6 +495,13 @@ def _connect(instance, engine, database=None, password=None,
         return conn
 
 
+def _generated_fields(cursor, engine):
+    """The AUTO_INCREMENT value MySQL assigned; Aurora PostgreSQL returns none (use RETURNING)."""
+    if engine in ("postgres", "aurora-postgresql") or not cursor.lastrowid:
+        return []
+    return [{"longValue": cursor.lastrowid}]
+
+
 def _field_value(val, type_name=None):
     """Convert a Python value to an RDS Data API Field object."""
     if val is None:
@@ -671,9 +678,19 @@ def _execute_statement(data):
         cursor = conn.cursor()
         cursor.execute(exec_sql, params or None)
 
+        updated = max(cursor.rowcount, 0)
+        if engine in ("postgres", "aurora-postgresql"):
+            status = getattr(cursor, "statusmessage", None)
+            command = status.split()[:1] if isinstance(status, str) else []
+            # psycopg2 counts returned rows for SELECT, not affected rows.
+            # Use the command tag, not SQL text or description: DML RETURNING
+            # also returns rows. This is not an audit of side effects in CTEs.
+            if command == ["SELECT"]:
+                updated = 0
+
         response = {
-            "numberOfRecordsUpdated": cursor.rowcount if cursor.rowcount >= 0 else 0,
-            "generatedFields": [],
+            "numberOfRecordsUpdated": updated,
+            "generatedFields": _generated_fields(cursor, engine),
         }
 
         if cursor.description:
@@ -874,7 +891,7 @@ def _batch_execute_statement(data):
 
         if not parameter_sets:
             cursor.execute(sql)
-            update_results.append({"generatedFields": []})
+            update_results.append({"generatedFields": _generated_fields(cursor, engine)})
         else:
             # Convert :name placeholders to %(name)s for DB-API
             sample = _convert_parameters(parameter_sets[0])
@@ -883,7 +900,7 @@ def _batch_execute_statement(data):
             for param_set in parameter_sets:
                 params = _convert_parameters(param_set)
                 cursor.execute(exec_sql, params or None)
-                update_results.append({"generatedFields": []})
+                update_results.append({"generatedFields": _generated_fields(cursor, engine)})
 
         cursor.close()
         if own_conn:

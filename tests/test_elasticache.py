@@ -36,6 +36,7 @@ def _ec_client(region):
     )
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_create(ec):
     ec.create_cache_cluster(
         CacheClusterId="test-redis",
@@ -50,6 +51,7 @@ def test_elasticache_create(ec):
     assert clusters[0]["Engine"] == "redis"
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_cache_node_full_fields(ec):
     """terraform-provider-aws v6 derefs CacheNodeCreateTime / ParameterGroupStatus /
     CustomerAvailabilityZone without nil checks. Issue #675."""
@@ -69,6 +71,7 @@ def test_elasticache_cache_node_full_fields(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_replication_group(ec):
     ec.create_replication_group(
         ReplicationGroupId="test-rg",
@@ -78,12 +81,10 @@ def test_elasticache_replication_group(ec):
     resp = ec.describe_replication_groups(ReplicationGroupId="test-rg")
     assert resp["ReplicationGroups"][0]["ReplicationGroupId"] == "test-rg"
 
-@requires_docker
 def test_elasticache_engines(ec):
     resp = ec.describe_cache_engine_versions(Engine="redis")
     assert len(resp["CacheEngineVersions"]) > 0
 
-@requires_docker
 def test_elasticache_valkey_engine_versions(ec):
     resp = ec.describe_cache_engine_versions(Engine="valkey")
     versions = resp["CacheEngineVersions"]
@@ -92,6 +93,7 @@ def test_elasticache_valkey_engine_versions(ec):
     assert all(v["CacheParameterGroupFamily"].startswith("valkey") for v in versions)
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_valkey_create_cluster(ec):
     ec.create_cache_cluster(
         CacheClusterId="test-valkey",
@@ -109,6 +111,7 @@ def test_elasticache_valkey_create_cluster(ec):
     assert cluster["CacheNodes"][0]["Endpoint"]["Port"] != 11211
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_valkey_replication_group(ec):
     ec.create_replication_group(
         ReplicationGroupId="test-valkey-rg",
@@ -121,7 +124,6 @@ def test_elasticache_valkey_replication_group(ec):
     assert rg["ReplicationGroupId"] == "test-valkey-rg"
     assert rg["NodeGroups"][0]["PrimaryEndpoint"]["Port"] != 11211
 
-@requires_docker
 def test_elasticache_modify_subnet_group(ec):
     ec.create_cache_subnet_group(
         CacheSubnetGroupName="test-mod-ecsg",
@@ -136,7 +138,6 @@ def test_elasticache_modify_subnet_group(ec):
     resp = ec.describe_cache_subnet_groups(CacheSubnetGroupName="test-mod-ecsg")
     assert resp["CacheSubnetGroups"][0]["CacheSubnetGroupDescription"] == "Updated EC SG"
 
-@requires_docker
 def test_elasticache_user_crud(ec):
     ec.create_user(
         UserId="test-user-1",
@@ -151,7 +152,6 @@ def test_elasticache_user_crud(ec):
     ec.modify_user(UserId="test-user-1", AccessString="on ~keys:* +get")
     ec.delete_user(UserId="test-user-1")
 
-@requires_docker
 def test_elasticache_user_group_crud(ec):
     ec.create_user(
         UserId="ug-usr-1",
@@ -167,7 +167,6 @@ def test_elasticache_user_group_crud(ec):
     ec.delete_user_group(UserGroupId="test-ug-1")
     ec.delete_user(UserId="ug-usr-1")
 
-@requires_docker
 def test_elasticache_reset_clears_param_groups():
     """ElastiCache reset restores built-in parameter groups and resets port counter."""
     from ministack.services import elasticache as _ec
@@ -178,7 +177,6 @@ def test_elasticache_reset_clears_param_groups():
     assert "default.redis7" in _ec._param_group_params
     assert _ec._port_counter[0] == _ec.BASE_PORT
 
-@requires_docker
 def test_elasticache_parameter_group_crud(ec):
     """CreateCacheParameterGroup / DescribeCacheParameterGroups / DeleteCacheParameterGroup."""
     ec.create_cache_parameter_group(
@@ -194,6 +192,7 @@ def test_elasticache_parameter_group_crud(ec):
     ec.delete_cache_parameter_group(CacheParameterGroupName="test-pg-v39")
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_snapshot_crud(ec):
     """CreateSnapshot / DescribeSnapshots / DeleteSnapshot."""
     ec.create_cache_cluster(
@@ -209,6 +208,7 @@ def test_elasticache_snapshot_crud(ec):
     ec.delete_snapshot(SnapshotName="test-snap-v39")
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_tags(ec):
     """AddTagsToResource / ListTagsForResource / RemoveTagsFromResource."""
     ec.create_cache_cluster(
@@ -281,6 +281,7 @@ def test_elasticache_cluster_tag_arn_uses_cache_cluster_arn_field(ec):
 
 # Migrated from test_ec.py
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_create_cluster_v2(ec):
     resp = ec.create_cache_cluster(
         CacheClusterId="ec-cc-v2",
@@ -295,6 +296,7 @@ def test_elasticache_create_cluster_v2(ec):
     assert len(c["CacheNodes"]) == 1
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_describe_clusters_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-dc-v2a",
@@ -317,6 +319,7 @@ def test_elasticache_describe_clusters_v2(ec):
     assert resp2["CacheClusters"][0]["Engine"] == "memcached"
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_replication_group_v2(ec):
     resp = ec.create_replication_group(
         ReplicationGroupId="ec-rg-v2",
@@ -334,7 +337,6 @@ def test_elasticache_replication_group_v2(ec):
     desc = ec.describe_replication_groups(ReplicationGroupId="ec-rg-v2")
     assert desc["ReplicationGroups"][0]["ReplicationGroupId"] == "ec-rg-v2"
 
-@requires_docker
 def test_elasticache_engine_versions_v2(ec):
     redis = ec.describe_cache_engine_versions(Engine="redis")
     assert len(redis["CacheEngineVersions"]) > 0
@@ -344,6 +346,7 @@ def test_elasticache_engine_versions_v2(ec):
     assert len(mc["CacheEngineVersions"]) > 0
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_tags_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-tag-v2",
@@ -371,6 +374,7 @@ def test_elasticache_tags_v2(ec):
     assert any(t["Key"] == "tier" for t in tags2)
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_snapshot_v2(ec):
     ec.create_cache_cluster(
         CacheClusterId="ec-snap-v2",
@@ -386,7 +390,6 @@ def test_elasticache_snapshot_v2(ec):
     assert len(desc["Snapshots"]) == 1
     assert desc["Snapshots"][0]["SnapshotName"] == "ec-snap-v2-s1"
 
-@requires_docker
 def test_elasticache_describe_cache_parameters(ec):
     """DescribeCacheParameters returns parameters for a parameter group."""
     ec.create_cache_parameter_group(
@@ -398,7 +401,6 @@ def test_elasticache_describe_cache_parameters(ec):
     assert "Parameters" in resp
     assert len(resp["Parameters"]) > 0
 
-@requires_docker
 def test_elasticache_modify_cache_parameter_group(ec):
     """ModifyCacheParameterGroup updates parameter values."""
     ec.create_cache_parameter_group(
@@ -812,7 +814,7 @@ def test_elasticache_restore_legacy_account_scoped_state_adopts_record_arn_regio
     try:
         set_request_account_id(account_id)
         set_request_region("us-east-1")
-        _ec.restore_state({
+        _ec.load_persisted_state({
             "clusters": legacy_clusters,
             "replication_groups": legacy_rgs,
             "subnet_groups": legacy_subnets,
@@ -844,6 +846,7 @@ def test_elasticache_restore_legacy_account_scoped_state_adopts_record_arn_regio
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_modify_cache_cluster_num_nodes(ec):
     """ModifyCacheCluster: scale NumCacheNodes up and down."""
     cid = f"mod-cc-{_uid()}"
@@ -869,6 +872,7 @@ def test_modify_cache_cluster_num_nodes(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_modify_cache_cluster_node_type_and_engine(ec):
     """ModifyCacheCluster: update CacheNodeType and EngineVersion."""
     cid = f"mod-nt-{_uid()}"
@@ -895,6 +899,7 @@ def test_modify_cache_cluster_node_type_and_engine(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_reboot_cache_cluster(ec):
     """RebootCacheCluster: reboot and verify cluster stays available."""
     cid = f"reboot-{_uid()}"
@@ -920,6 +925,7 @@ def test_reboot_cache_cluster(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_delete_replication_group(ec):
     """DeleteReplicationGroup: create then delete, verify gone."""
     rg_id = f"del-rg-{_uid()}"
@@ -946,6 +952,7 @@ def test_delete_replication_group(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_modify_replication_group(ec):
     """ModifyReplicationGroup: update description and CacheNodeType."""
     rg_id = f"mod-rg-{_uid()}"
@@ -1016,6 +1023,7 @@ def test_modify_replication_group_missing_user_group_fails_before_mutation(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_increase_replica_count(ec):
     """IncreaseReplicaCount: scale replicas up from 1 to 3."""
     rg_id = f"inc-rep-{_uid()}"
@@ -1048,6 +1056,7 @@ def test_increase_replica_count(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_decrease_replica_count(ec):
     """DecreaseReplicaCount: scale replicas down from 3 to 1."""
     rg_id = f"dec-rep-{_uid()}"
@@ -1078,7 +1087,6 @@ def test_decrease_replica_count(ec):
 # 7. DeleteCacheSubnetGroup
 # ---------------------------------------------------------------------------
 
-@requires_docker
 def test_delete_cache_subnet_group(ec):
     """DeleteCacheSubnetGroup: create then delete, verify gone."""
     name = f"del-sg-{_uid()}"
@@ -1104,7 +1112,6 @@ def test_delete_cache_subnet_group(ec):
 # 8. ResetCacheParameterGroup
 # ---------------------------------------------------------------------------
 
-@requires_docker
 def test_reset_cache_parameter_group_full(ec):
     """ResetCacheParameterGroup: full reset restores defaults."""
     pg = f"reset-full-{_uid()}"
@@ -1134,7 +1141,6 @@ def test_reset_cache_parameter_group_full(ec):
     ec.delete_cache_parameter_group(CacheParameterGroupName=pg)
 
 
-@requires_docker
 def test_reset_cache_parameter_group_selective(ec):
     """ResetCacheParameterGroup: selective reset of specific parameter."""
     pg = f"reset-sel-{_uid()}"
@@ -1173,6 +1179,7 @@ def test_reset_cache_parameter_group_selective(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_delete_snapshot_explicit(ec):
     """DeleteSnapshot: create snapshot, delete it, verify gone."""
     cid = f"snap-del-{_uid()}"
@@ -1205,6 +1212,7 @@ def test_delete_snapshot_explicit(ec):
 # ---------------------------------------------------------------------------
 
 @requires_docker
+@pytest.mark.data_plane
 def test_describe_events_all(ec):
     """DescribeEvents: listing all events returns results."""
     # create a cluster to generate at least one event
@@ -1223,6 +1231,7 @@ def test_describe_events_all(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_describe_events_filter_source_type(ec):
     """DescribeEvents: filter by SourceType."""
     rg_id = f"evt-rg-{_uid()}"
@@ -1241,6 +1250,7 @@ def test_describe_events_filter_source_type(ec):
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_describe_events_filter_source_id(ec):
     """DescribeEvents: filter by SourceIdentifier."""
     cid = f"evt-src-{_uid()}"
@@ -1262,6 +1272,7 @@ def test_describe_events_filter_source_id(ec):
 # 11. Replication group member cluster lifecycle
 # ---------------------------------------------------------------------------
 
+@pytest.mark.data_plane
 def test_replication_group_creates_member_clusters(ec):
     """CreateReplicationGroup should register member clusters visible via DescribeCacheClusters."""
     rg_id = f"rg-members-{_uid()}"
@@ -1284,6 +1295,7 @@ def test_replication_group_creates_member_clusters(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@pytest.mark.data_plane
 def test_delete_replication_group_removes_member_clusters(ec):
     """DeleteReplicationGroup should also remove its member clusters."""
     rg_id = f"rg-del-mem-{_uid()}"
@@ -1305,6 +1317,7 @@ def test_delete_replication_group_removes_member_clusters(ec):
         assert "CacheClusterNotFound" in str(exc.value)
 
 
+@pytest.mark.data_plane
 def test_replication_group_tags_on_create(ec):
     """Tags passed at CreateReplicationGroup should be retrievable via ListTagsForResource."""
     rg_id = f"rg-tags-{_uid()}"
@@ -1326,6 +1339,7 @@ def test_replication_group_tags_on_create(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@pytest.mark.data_plane
 def test_replication_group_cluster_mode_uses_cluster_on_default_group(ec):
     """Cluster-mode-enabled replication groups use the .cluster.on default group."""
     rg_id = f"rg-cluster-pg-{_uid()}"
@@ -1343,6 +1357,7 @@ def test_replication_group_cluster_mode_uses_cluster_on_default_group(ec):
     ec.delete_replication_group(ReplicationGroupId=rg_id)
 
 
+@pytest.mark.data_plane
 def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
     """AddTagsToResource/RemoveTagsFromResource on a replication group fan out to members."""
     rg_id = f"rg-tag-fanout-{_uid()}"
@@ -1369,17 +1384,295 @@ def test_replication_group_tag_updates_propagate_to_member_clusters(ec):
 
 
 # ---------------------------------------------------------------------------
-# 12. Serverless cache operations — not implemented in MiniStack
+# 12. Serverless caches
 # ---------------------------------------------------------------------------
 
-@requires_docker
-def test_serverless_cache_not_implemented(ec):
-    """Serverless cache operations are not yet implemented; verify graceful error."""
-    with pytest.raises(ClientError):
-        ec.create_serverless_cache(
-            ServerlessCacheName="test-serverless",
-            Engine="redis",
-        )
+def _wait_serverless(ec, name, timeout=180):
+    deadline = time.time() + timeout
+    while True:
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        if cache["Status"] not in ("creating", "modifying") or time.time() > deadline:
+            return cache
+        time.sleep(0.5)
+
+
+def _serverless_ca_file(tmp_path):
+    import urllib.request
+    with urllib.request.urlopen(f"{ENDPOINT}/_ministack/elasticache/ca.pem", timeout=10) as resp:
+        pem = resp.read()
+    assert pem.startswith(b"-----BEGIN CERTIFICATE-----")
+    path = tmp_path / "elasticache-ca.pem"
+    path.write_bytes(pem)
+    return str(path)
+
+
+def _tls_command(endpoint, ca_file, command):
+    import socket
+    import ssl
+    ctx = ssl.create_default_context(cafile=ca_file)
+    with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=10) as raw:
+        with ctx.wrap_socket(raw, server_hostname=endpoint["Address"]) as conn:
+            parts = command.split()
+            conn.sendall(f"*{len(parts)}\r\n".encode()
+                         + b"".join(f"${len(p)}\r\n{p}\r\n".encode() for p in parts))
+            return conn.recv(65536)
+
+
+def test_serverless_cache_create_describe_delete(ec):
+    name = f"sls-{_uid()}"
+    created = ec.create_serverless_cache(
+        ServerlessCacheName=name,
+        Engine="valkey",
+        MajorEngineVersion="8",
+        Description="cache & <counters>",
+        SecurityGroupIds=["sg-0123"],
+        SubnetIds=["subnet-a", "subnet-b"],
+        CacheUsageLimits={"DataStorage": {"Maximum": 1, "Unit": "GB"},
+                          "ECPUPerSecond": {"Maximum": 1000}},
+        Tags=[{"Key": "env", "Value": "dev"}],
+    )["ServerlessCache"]
+    try:
+        assert created["Status"] in ("creating", "available")
+        assert created["Engine"] == "valkey"
+        assert created["MajorEngineVersion"] == "8"
+        assert created["FullEngineVersion"] == "8.1"
+        assert created["Description"] == "cache & <counters>"
+        assert created["SecurityGroupIds"] == ["sg-0123"]
+        assert created["SubnetIds"] == ["subnet-a", "subnet-b"]
+        assert created["CacheUsageLimits"] == {"DataStorage": {"Maximum": 1, "Unit": "GB"},
+                                               "ECPUPerSecond": {"Maximum": 1000}}
+        assert created["SnapshotRetentionLimit"] == 0
+        assert "KmsKeyId" not in created and "UserGroupId" not in created
+        assert created["StorageEncryptionType"] == "sse-elasticache"
+        arn = created["ARN"]
+        assert arn.startswith("arn:aws:elasticache:us-east-1:") and arn.endswith(f":serverlesscache:{name}")
+
+        described = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"]
+        assert [c["ARN"] for c in described] == [arn]
+        assert {t["Key"]: t["Value"] for t in ec.list_tags_for_resource(ResourceName=arn)["TagList"]} == {"env": "dev"}
+        ec.add_tags_to_resource(ResourceName=arn, Tags=[{"Key": "team", "Value": "core"}])
+        ec.remove_tags_from_resource(ResourceName=arn, TagKeys=["env"])
+        assert ec.list_tags_for_resource(ResourceName=arn)["TagList"] == [{"Key": "team", "Value": "core"}]
+
+        with pytest.raises(ClientError) as exc:
+            ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+        assert exc.value.response["Error"]["Code"] == "ServerlessCacheAlreadyExistsFault"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    finally:
+        deleted = ec.delete_serverless_cache(ServerlessCacheName=name)["ServerlessCache"]
+    assert deleted["Status"] == "deleting"
+    for call in (lambda: ec.describe_serverless_caches(ServerlessCacheName=name),
+                 lambda: ec.delete_serverless_cache(ServerlessCacheName=name),
+                 lambda: ec.list_tags_for_resource(ResourceName=arn)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "ServerlessCacheNotFoundFault"
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+
+@pytest.mark.parametrize("engine,major", [("memcached", None), ("valkey", "6"), ("redis", "8")])
+def test_serverless_cache_rejects_unsupported_engine_version(ec, engine, major):
+    kwargs = {"MajorEngineVersion": major} if major else {}
+    with pytest.raises(ClientError) as exc:
+        ec.create_serverless_cache(ServerlessCacheName=f"sls-bad-{_uid()}", Engine=engine, **kwargs)
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+
+
+def test_serverless_cache_storage_encryption_type_sse_kms(ec):
+    name = f"sls-kms-{_uid()}"
+    created = ec.create_serverless_cache(
+        ServerlessCacheName=name, Engine="valkey",
+        KmsKeyId="arn:aws:kms:us-east-1:000000000000:key/test-key",
+    )["ServerlessCache"]
+    try:
+        assert created["KmsKeyId"] == "arn:aws:kms:us-east-1:000000000000:key/test-key"
+        assert created["StorageEncryptionType"] == "sse-kms"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_serverless_cache_valkey_major_9(ec):
+    name = f"sls-v9-{_uid()}"
+    created = ec.create_serverless_cache(
+        ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="9",
+    )["ServerlessCache"]
+    try:
+        assert created["MajorEngineVersion"] == "9"
+        assert created["FullEngineVersion"] == "9.0"
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_serverless_cache_name_is_lowercased(ec):
+    mixed = f"MyCache-{_uid()}"
+    lower = mixed.lower()
+    created = ec.create_serverless_cache(ServerlessCacheName=mixed, Engine="valkey")["ServerlessCache"]
+    try:
+        assert created["ServerlessCacheName"] == lower
+        assert created["ARN"].endswith(f":serverlesscache:{lower}")
+        described = ec.describe_serverless_caches(ServerlessCacheName=mixed.upper())["ServerlessCaches"]
+        assert [c["ServerlessCacheName"] for c in described] == [lower]
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=mixed)
+    with pytest.raises(ClientError) as exc:
+        ec.describe_serverless_caches(ServerlessCacheName=lower)
+    assert exc.value.response["Error"]["Code"] == "ServerlessCacheNotFoundFault"
+
+
+def test_serverless_cache_modify_rejects_invalid_engine_change(ec):
+    name = f"sls-engchg-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey", MajorEngineVersion="8")
+    try:
+        cache = _wait_serverless(ec, name)
+        assert (cache["Engine"], cache["MajorEngineVersion"]) == ("valkey", "8")
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_serverless_cache(ServerlessCacheName=name, MajorEngineVersion="7")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        assert (cache["Engine"], cache["MajorEngineVersion"]) == ("valkey", "8")
+
+        with pytest.raises(ClientError) as exc:
+            ec.modify_serverless_cache(ServerlessCacheName=name, Engine="redis")
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        assert (cache["Engine"], cache["MajorEngineVersion"]) == ("valkey", "8")
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+def test_serverless_cache_modify(ec):
+    name = f"sls-mod-{_uid()}"
+    ec.create_serverless_cache(
+        ServerlessCacheName=name, Engine="redis",
+        CacheUsageLimits={"DataStorage": {"Maximum": 5, "Unit": "GB"}},
+    )
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        assert (cache["MajorEngineVersion"], cache["FullEngineVersion"]) == ("7", "7.1")
+
+        modified = ec.modify_serverless_cache(ServerlessCacheName=name, Description="rate limits")
+        assert modified["ServerlessCache"]["Description"] == "rate limits"
+        ec.modify_serverless_cache(ServerlessCacheName=name, SnapshotRetentionLimit=3,
+                                   DailySnapshotTime="09:00")
+        # All-zero limits remove them, as the Terraform provider sends to clear the block.
+        ec.modify_serverless_cache(ServerlessCacheName=name, CacheUsageLimits={
+            "DataStorage": {"Maximum": 0, "Minimum": 0, "Unit": "GB"},
+            "ECPUPerSecond": {"Maximum": 0, "Minimum": 0}})
+        cache = ec.describe_serverless_caches(ServerlessCacheName=name)["ServerlessCaches"][0]
+        assert cache["SnapshotRetentionLimit"] == 3
+        assert cache["DailySnapshotTime"] == "09:00"
+        assert "CacheUsageLimits" not in cache
+
+        for kwargs, code in (
+            ({}, "InvalidParameterCombination"),
+            ({"UserGroupId": "missing-group", "RemoveUserGroup": True}, "InvalidParameterCombination"),
+            ({"UserGroupId": "missing-group"}, "UserGroupNotFound"),
+        ):
+            with pytest.raises(ClientError) as exc:
+                ec.modify_serverless_cache(ServerlessCacheName=name, **kwargs)
+            assert exc.value.response["Error"]["Code"] == code
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+    with pytest.raises(ClientError) as exc:
+        ec.modify_serverless_cache(ServerlessCacheName=name, Description="gone")
+    assert exc.value.response["Error"]["Code"] == "ServerlessCacheNotFoundFault"
+
+
+def test_serverless_cache_describe_pages(ec):
+    names = [f"sls-page-{_uid()}" for _ in range(3)]
+    for name in names:
+        ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+    try:
+        seen, token = [], None
+        while True:
+            kwargs = {"MaxResults": 2, **({"NextToken": token} if token else {})}
+            page = ec.describe_serverless_caches(**kwargs)
+            assert len(page["ServerlessCaches"]) <= 2
+            seen += [c["ServerlessCacheName"] for c in page["ServerlessCaches"]]
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(seen)
+        assert len(seen) == len(set(seen))
+    finally:
+        for name in names:
+            ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+@pytest.mark.data_plane
+def test_serverless_cache_serves_tls_only(ec, tmp_path):
+    """Serverless caches have no plaintext listener; a client that trusts
+    MiniStack's ElastiCache CA connects with TLS and verifies the hostname."""
+    import socket
+    ca_file = _serverless_ca_file(tmp_path)
+    name = f"sls-tls-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+    try:
+        cache = _wait_serverless(ec, name)
+        assert cache["Status"] == "available"
+        endpoint = cache["Endpoint"]
+        assert cache["ReaderEndpoint"] == endpoint
+        assert _tls_command(endpoint, ca_file, "PING") == b"+PONG\r\n"
+        assert b"valkey_version:8.1" in _tls_command(endpoint, ca_file, "INFO server")
+
+        with socket.create_connection((endpoint["Address"], endpoint["Port"]), timeout=10) as raw:
+            raw.sendall(b"*1\r\n$4\r\nPING\r\n")
+            raw.settimeout(5)
+            try:
+                reply = raw.recv(64)
+            except (ConnectionResetError, socket.timeout):
+                reply = b""
+        assert b"PONG" not in reply
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+    with pytest.raises(OSError):
+        _tls_command(endpoint, ca_file, "PING")
+
+
+@pytest.mark.data_plane
+def test_serverless_cache_is_one_cluster_mode_shard(ec, tmp_path):
+    """AWS serves a serverless cache in cluster mode: keys in different slots
+    fail together with CROSSSLOT, and CLUSTER SLOTS names the cache endpoint."""
+    ca_file = _serverless_ca_file(tmp_path)
+    name = f"sls-slots-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="valkey")
+    try:
+        endpoint = _wait_serverless(ec, name)["Endpoint"]
+        assert _tls_command(endpoint, ca_file, "MGET {a}x {b}y").startswith(b"-CROSSSLOT")
+        assert _tls_command(endpoint, ca_file, "MGET {a}x {a}y") == b"*2\r\n$-1\r\n$-1\r\n"
+        address = endpoint["Address"]
+        assert _tls_command(endpoint, ca_file, "CLUSTER SLOTS").startswith(
+            f"*1\r\n*3\r\n:0\r\n:16383\r\n*4\r\n${len(address)}\r\n{address}\r\n:{endpoint['Port']}\r\n".encode())
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
+
+
+@pytest.mark.data_plane
+def test_serverless_cache_engine_change_replaces_container_on_same_endpoint(ec, tmp_path):
+    ca_file = _serverless_ca_file(tmp_path)
+    name = f"sls-eng-{_uid()}"
+    ec.create_serverless_cache(ServerlessCacheName=name, Engine="redis")
+    try:
+        before = _wait_serverless(ec, name)
+        assert b"redis_version:" in _tls_command(before["Endpoint"], ca_file, "INFO server")
+        assert b"valkey_version" not in _tls_command(before["Endpoint"], ca_file, "INFO server")
+
+        modified = ec.modify_serverless_cache(ServerlessCacheName=name, Engine="valkey",
+                                              MajorEngineVersion="8")["ServerlessCache"]
+        assert modified["Status"] == "modifying"
+        with pytest.raises(ClientError) as exc:
+            ec.modify_serverless_cache(ServerlessCacheName=name, Description="busy")
+        assert exc.value.response["Error"]["Code"] == "InvalidServerlessCacheStateFault"
+
+        after = _wait_serverless(ec, name)
+        assert (after["Status"], after["Engine"], after["FullEngineVersion"]) == ("available", "valkey", "8.1")
+        if not os.environ.get("DOCKER_NETWORK"):
+            assert after["Endpoint"] == before["Endpoint"]
+        assert b"valkey_version:8.1" in _tls_command(after["Endpoint"], ca_file, "INFO server")
+    finally:
+        ec.delete_serverless_cache(ServerlessCacheName=name)
 
 
 
@@ -1404,6 +1697,7 @@ def _make_zip_js(code: str) -> bytes:
 
 
 @requires_docker
+@pytest.mark.data_plane
 def test_elasticache_lambda_network_connectivity(ec, lam):
     """Prove that Lambda containers can TCP-connect to an ElastiCache container."""
     cluster_id = "net-test-redis"
@@ -1535,7 +1829,7 @@ def test_elasticache_restore_state_marks_clusters_for_respawn(monkeypatch):
 
     monkeypatch.setattr(_ec, "_spawn_redis_container", fake_spawn)
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "clusters": {
             "clustertest": {
                 "CacheClusterId": "clustertest",
@@ -1573,7 +1867,7 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     monkeypatch.setattr(_ec, "_spawn_redis_container",
                           lambda name, engine, engine_version, labels: ("rg-host", 6379, f"cid-{name}"))
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "replication_groups": {
             "rg-1": {
                 "ReplicationGroupId": "rg-1",
@@ -1625,7 +1919,7 @@ def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
             "_docker_container_ids": [f"dead-rg-{region}"],
         })
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "clusters": clusters,
         "replication_groups": replication_groups,
     })
@@ -1677,7 +1971,7 @@ def test_elasticache_respawn_failure_is_logged_and_does_not_block_requests(monke
 
     monkeypatch.setattr(_ec, "_spawn_redis_container", boom)
 
-    _ec.restore_state({
+    _ec.load_persisted_state({
         "clusters": {
             "c1": {
                 "CacheClusterId": "c1", "Engine": "redis", "EngineVersion": "7.1",
@@ -1833,6 +2127,7 @@ def test_elasticache_delete_during_deferred_start_leaves_no_container(fake_docke
     )
 
 
+@pytest.mark.data_plane
 def test_elasticache_cluster_create_time_present_and_parsed(ec):
     """DescribeCacheClusters emits CacheClusterCreateTime as an ISO8601 TStamp
     (it was stored as a float epoch and previously absent from the XML)."""
@@ -1850,3 +2145,155 @@ def test_elasticache_cluster_create_time_present_and_parsed(ec):
         assert isinstance(cluster.get("CacheClusterCreateTime"), datetime.datetime)
     finally:
         ec.delete_cache_cluster(CacheClusterId="cluster-createtime")
+
+
+# ---------------------------------------------------------------------------
+# Serverless caches — provisioning state, not liveness
+# ---------------------------------------------------------------------------
+
+def test_serverless_announce_flags_skip_a_hostname_redis_refuses():
+    assert elasticache._serverless_announce_flags("localhost", 26500) == (
+        "--cluster-announce-tls-port 26500 --cluster-announce-hostname localhost "
+        "--cluster-preferred-endpoint-type hostname")
+    assert elasticache._serverless_announce_flags("ministack_app_1", 26500) == "--cluster-announce-tls-port 26500"
+
+
+def _serverless_create_params(name, engine="valkey"):
+    return {"ServerlessCacheName": [name], "Engine": [engine]}
+
+
+@pytest.mark.serial
+def test_serverless_cache_without_docker_points_at_sidecar(monkeypatch):
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ec.reset()
+    monkeypatch.setattr(ec, "_get_docker", lambda: None)
+    status, _headers, _body = ec._create_serverless_cache(_serverless_create_params("nodocker"))
+    assert status == 200
+    rec = ec._serverless_caches["nodocker"]
+    assert rec["Status"] == "available"
+    assert rec["Endpoint"] == {"Address": ec.REDIS_DEFAULT_HOST, "Port": ec.REDIS_DEFAULT_PORT}
+    ec.reset()
+
+
+@pytest.mark.serial
+def test_serverless_cache_deleted_while_provisioning_leaves_no_container(fake_docker, monkeypatch):
+    """A container that comes up after its cache was deleted is removed by the
+    finisher itself: the delete had nothing to find, by id or by name."""
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ec.reset()
+    monkeypatch.setattr(ec, "_get_docker", lambda: fake_docker)
+
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def fake_spawn(name, engine, full_version, host_port, labels, wait=True):
+        started.set()
+        release.wait(timeout=10)
+        container = fake_docker.containers.run(name=name, labels=labels)
+        return "localhost", host_port, container.id
+    monkeypatch.setattr(ec, "_spawn_serverless_container", fake_spawn)
+
+    orig = ec.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), finished.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(ec, "spawn_background", tracked)
+
+    ec._create_serverless_cache(_serverless_create_params("race"))
+    assert started.wait(timeout=10)
+    ec._delete_serverless_cache({"ServerlessCacheName": ["race"]})
+    release.set()
+    assert finished.wait(timeout=10)
+
+    assert "race" not in ec._serverless_caches
+    assert fake_docker.live() == [], f"leaked container(s) {fake_docker.live()}"
+
+
+@pytest.mark.serial
+def test_serverless_cache_failed_start_reports_create_failed(fake_docker, monkeypatch):
+    import threading
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import elasticache as ec
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ec.reset()
+    monkeypatch.setattr(ec, "_get_docker", lambda: fake_docker)
+
+    def boom(**_kw):
+        raise RuntimeError("valkey never answered a TLS PING")
+    monkeypatch.setattr(ec, "_spawn_serverless_container", boom)
+    finished = threading.Event()
+    orig = ec.spawn_background
+
+    def tracked(fn, *a, **kw):
+        t = orig(fn, *a, **kw)
+        threading.Thread(target=lambda: (t.join(), finished.set()), daemon=True).start()
+        return t
+    monkeypatch.setattr(ec, "spawn_background", tracked)
+
+    ec._create_serverless_cache(_serverless_create_params("broken"))
+    assert finished.wait(timeout=10)
+    assert ec._serverless_caches["broken"]["Status"] == "create-failed"
+    assert "Endpoint" not in ec._serverless_caches["broken"]
+    ec.reset()
+
+
+def test_serverless_cache_persists_and_respawns_on_the_same_port(monkeypatch):
+    from ministack.services import elasticache as ec
+
+    ec.reset()
+    record = {
+        "ServerlessCacheName": "kept", "Status": "available", "Engine": "valkey",
+        "MajorEngineVersion": "8", "FullEngineVersion": "8.1", "CreateTime": time.time(),
+        "ARN": "arn:aws:elasticache:us-west-2:000000000000:serverlesscache:kept",
+        "Endpoint": {"Address": "localhost", "Port": 16400},
+        "_host_port": 16400, "_docker_container_id": "dead",
+    }
+    ec._serverless_caches.set_scoped("000000000000", "us-west-2", "kept", record)
+    state = ec.get_state()
+    persisted = state["serverless_caches"].get_scoped("000000000000", "us-west-2", "kept")
+    assert "_docker_container_id" not in persisted
+    ec.reset()
+
+    spawned = []
+
+    def fake_spawn(name, engine, full_version, host_port, labels, wait=True):
+        spawned.append((name, engine, full_version, host_port, labels["region"], wait))
+        return "localhost", host_port, "cid-new"
+    monkeypatch.setattr(ec, "_spawn_serverless_container", fake_spawn)
+    monkeypatch.setattr(ec, "_get_docker", lambda: object())
+
+    ec.load_persisted_state(state)
+    ec._ensure_live_containers()
+    assert spawned == [("ministack-elasticache-serverless-000000000000-us-west-2-kept",
+                        "valkey", "8.1", 16400, "us-west-2", False)]
+    restored = ec._serverless_caches.get_scoped("000000000000", "us-west-2", "kept")
+    assert restored["_docker_container_id"] == "cid-new"
+    assert restored["Endpoint"] == {"Address": "localhost", "Port": 16400}
+    assert "cid-new" in ec._live_container_ids()
+    ec.reset()
+
+
+def test_serverless_ca_persists_across_restart(monkeypatch):
+    from ministack.services import elasticache as ec
+
+    pem = ec.serverless_ca_cert_pem()
+    state = ec.get_state()
+    assert state["serverless_ca"]["ca_cert_pem"] == pem
+
+    monkeypatch.setattr(ec, "_serverless_ca", None)
+    ec.load_persisted_state(state)
+    assert ec.serverless_ca_cert_pem() == pem

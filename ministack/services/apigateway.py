@@ -53,7 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
+from ministack.core.arn import ArnParseError, execute_api_arn, execute_api_route_arn, parse_arn
 from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
     AccountRegionScopedDict,
@@ -67,6 +67,30 @@ _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 logger = logging.getLogger("apigateway")
+
+_PCT_RUN_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+
+
+def decode_http_api_path(raw_path: str) -> str:
+    """Decode a request path the way an HTTP API builds ``rawPath``: every escape
+    decodes except ``%25``, so ``a%252Eb`` arrives as ``a%252Eb``, not ``a%2Eb``."""
+
+    def _decode(match):
+        run, out, pending = match.group(0), [], bytearray()
+        for i in range(0, len(run), 3):
+            byte = int(run[i + 1 : i + 3], 16)
+            if byte == 0x25:
+                if pending:
+                    out.append(pending.decode("utf-8", "replace"))
+                    pending.clear()
+                out.append("%25")
+            else:
+                pending.append(byte)
+        if pending:
+            out.append(pending.decode("utf-8", "replace"))
+        return "".join(out)
+
+    return _PCT_RUN_RE.sub(_decode, raw_path)
 
 
 def _timeout_from_env(env_name: str, default_seconds: float) -> float:
@@ -369,6 +393,35 @@ async def handle_request(method, path, headers, body, query_params):
             if isinstance(tag_keys, str):
                 tag_keys = [tag_keys]
             return _untag_resource(resource_arn, tag_keys)
+
+    if resource == "domainnames":
+        name = urllib.parse.unquote(parts[2]) if len(parts) > 2 else None
+        mapping_id = parts[4] if len(parts) > 4 else None
+        if not name:
+            if method == "POST":
+                return _create_domain_name(data)
+            if method == "GET":
+                return _get_domain_names(query_params)
+        elif len(parts) > 3 and parts[3] == "apimappings":
+            if not mapping_id:
+                if method == "POST":
+                    return _create_api_mapping(name, data)
+                if method == "GET":
+                    return _get_api_mappings(name, query_params)
+            else:
+                if method == "GET":
+                    return _get_api_mapping(name, mapping_id)
+                if method == "PATCH":
+                    return _update_api_mapping(name, mapping_id, data)
+                if method == "DELETE":
+                    return _delete_api_mapping(name, mapping_id)
+        elif len(parts) == 3:
+            if method == "GET":
+                return _get_domain_name(name)
+            if method == "PATCH":
+                return _update_domain_name(name, data)
+            if method == "DELETE":
+                return _delete_domain_name(name)
 
     if resource == "apis":
         api_id = parts[2] if len(parts) > 2 else None
@@ -850,11 +903,13 @@ def _evaluate_authorizer_policy(policy_doc, route_arn):
     return "Allow" if allow else "NoMatch"
 
 
-def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars):
+def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars,
+                                        context=None):
     """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
 
     HTTP API identitySource entries use `$request.header.*` / `$request.querystring.*`
-    / `$stageVariables.*` (unlike REST's `method.request.*`). Returns whether
+    / `$stageVariables.*` (unlike REST's `method.request.*`), WebSocket APIs
+    `route.request.header.*` / `route.request.querystring.*` / `stageVariables.*`. Returns whether
     every declared source is present+non-empty and the ordered values (used
     for the cache-key). Mirrors apigateway_v1._request_identity_sources.
     """
@@ -863,6 +918,8 @@ def _request_authorizer_identity_sources(identity_source, headers, query_params,
     for src in (identity_source or []):
         if not isinstance(src, str):
             continue
+        if src.startswith(("route.request.", "stageVariables.")):
+            src = "$" + src.removeprefix("route.")
         val = ""
         if src.startswith("$request.header."):
             val = headers.get(src[len("$request.header."):].lower()) or ""
@@ -872,7 +929,8 @@ def _request_authorizer_identity_sources(identity_source, headers, query_params,
             val = (qv[0] if isinstance(qv, list) else qv) or ""
         elif src.startswith("$stageVariables."):
             val = (stage_vars or {}).get(src[len("$stageVariables."):]) or ""
-        # $context.* identity sources are not modeled; treated as absent.
+        elif src.startswith("$context."):
+            val = (context or {}).get(src[len("$context."):]) or ""
         values.append(val)
         if not val:
             present = False
@@ -914,7 +972,7 @@ def _cache_authorizer_result(key, expires_at, result, context):
 
 
 async def _invoke_request_authorizer_lambda(authorizer, event, account_id, region):
-    """Invoke a REQUEST authorizer's Lambda and return its raw execution result dict."""
+    """Invoke a REQUEST authorizer's Lambda; its response object, or None if it failed or answered no object."""
     from ministack.services import lambda_svc
 
     lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
@@ -924,10 +982,21 @@ async def _invoke_request_authorizer_lambda(authorizer, event, account_id, regio
     if func_data is None or func_config is None:
         return None
     exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
-    return await run_reentrant(
+    result = await run_reentrant(
         lambda_svc._execute_function_with_config_scope, exec_record, event,
         thread_name="ministack-apigw-authorizer",
     )
+    if not result or result.get("error"):
+        return None
+    payload = result.get("body")
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    return payload if isinstance(payload, dict) else None
 
 
 async def _authorize_request_v2(
@@ -963,19 +1032,24 @@ async def _authorize_request_v2(
     ttl = _authorizer_ttl(authorizer)
 
     identity_source = authorizer.get("identitySource") or []
+    context = {
+        "routeKey": route.get("routeKey", "$default"), "stage": stage, "apiId": api_id,
+        "accountId": owner_account_id, "httpMethod": method, "path": path,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "identity.sourceIp": "127.0.0.1", "identity.userAgent": headers.get("user-agent", ""),
+    }
     all_present, id_values = _request_authorizer_identity_sources(
-        identity_source, headers, query_params, stage_vars
+        identity_source, headers, query_params, stage_vars, context
     )
     # "To enable caching, your authorizer must have at least one identity
     # source": the identity values ARE the cache key, so with none declared
     # there is nothing to key on and every caller would otherwise be served
     # the first caller's result.
     caching = ttl > 0 and bool(identity_source)
-    # A missing declared identity source is a 401 without invoking the
-    # Lambda — same AWS-verified shortcut apigateway_v1 uses for REST
-    # REQUEST authorizers.
-    if caching and not all_present:
-        return _jwt_unauthorized(), None
+    # A declared identity source missing from the request is a 401 without
+    # invoking the Lambda, cached or not.
+    if identity_source and not all_present:
+        return (401, {"Content-Type": "application/json"}, b'{"message":"Unauthorized"}'), None
     identity_values = tuple(id_values)
 
     if payload_version == "1.0":
@@ -1051,22 +1125,8 @@ async def _authorize_request_v2(
             cached = (hit[1], hit[2])
 
     if cached is None:
-        result = await _invoke_request_authorizer_lambda(authorizer, event, owner_account_id, owner_region)
-        if result is None:
-            # Authorizer Lambda unresolved / not found -> connection failure.
-            return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
-        if result.get("error"):
-            return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
-
-        payload = result.get("body")
-        if isinstance(payload, (str, bytes)):
-            if isinstance(payload, bytes):
-                payload = payload.decode("utf-8", errors="replace")
-            try:
-                payload = json.loads(payload)
-            except json.JSONDecodeError:
-                payload = None
-        if not isinstance(payload, dict):
+        payload = await _invoke_request_authorizer_lambda(authorizer, event, owner_account_id, owner_region)
+        if payload is None:
             return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
 
         raw_ctx = payload.get("context") or {}
@@ -1258,7 +1318,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     """Execute an API request through a deployed API (data plane)."""
     scope = find_api_scope(api_id)
     if scope is None:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
     owner_account_id, owner_region = scope
 
     from ministack.core.responses import _request_account_id, _request_region
@@ -1275,13 +1335,18 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
         _request_region.reset(region_token)
 
 
+def _http_api_not_found():
+    """AWS's 404 for a request no stage or route of an HTTP API matches."""
+    return 404, {"Content-Type": "application/json"}, b'{"message":"Not Found"}'
+
+
 async def _handle_execute_in_scope(
     api_id, stage, path, method, headers, body, query_params,
     owner_account_id, owner_region,
 ):
     api = _apis.get(api_id)
     if not api:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
 
     # CORS preflight: served from the API's corsConfiguration before any route
     # matching, because AWS responds to OPTIONS itself without invoking the
@@ -1292,11 +1357,13 @@ async def _handle_execute_in_scope(
 
     api_stages = _stages.get(api_id, {})
     if stage not in api_stages and stage != "$default":
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage}' not found"}).encode()
+        return _http_api_not_found()
 
-    route = _match_route(api_id, method, path)
+    # AWS selects the route of a path with extra leading slashes as if it had one.
+    route_path_in = "/" + path.lstrip("/")
+    route = _match_route(api_id, method, route_path_in)
     if not route:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "No route found"}).encode()
+        return _http_api_not_found()
 
     request_headers = {k.lower(): v for k, v in (headers or {}).items()}
     route_key = route.get("routeKey", "$default")
@@ -1304,7 +1371,7 @@ async def _handle_execute_in_scope(
     rk_parts = route_key.split(" ", 1)
     if len(rk_parts) == 2:
         route_path = rk_parts[1]
-    path_params = _extract_path_params(route_path, path) if route_path else {}
+    path_params = _extract_path_params(route_path, route_path_in) if route_path else {}
 
     stage_vars = _get_stage_variables(api_id, stage)
     auth_type = (route.get("authorizationType") or "NONE").upper()
@@ -1521,6 +1588,16 @@ def _v2_request_body_is_text(content_type: str | None) -> bool:
     )
 
 
+def _jwt_claim_to_string(value):
+    """API Gateway hands every JWT claim to a Lambda as a string: numbers as digits,
+    booleans as true/false, and an array as its items in brackets, e.g. "[admin dev]"."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "[" + " ".join(_jwt_claim_to_string(v) for v in value) + "]"
+    return json.dumps(value)
+
+
 async def _invoke_lambda_proxy(
     integration,
     api_id,
@@ -1620,7 +1697,7 @@ async def _invoke_lambda_proxy(
     if authorizer_claims is not None:
         event["requestContext"]["authorizer"] = {
             "jwt": {
-                "claims": authorizer_claims or {},
+                "claims": {k: _jwt_claim_to_string(v) for k, v in (authorizer_claims or {}).items()},
                 "scopes": authorizer_scopes or [],
             }
         }
@@ -1761,6 +1838,15 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> s
     return str(custom)
 
 
+def _api_endpoint_scheme(protocol):
+    """AWS's apiEndpoint scheme once the gateway serves TLS; http otherwise."""
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return "http"
+    return "wss" if protocol == "WEBSOCKET" else "https"
+
+
 def _create_api(data):
     tags = data.get("tags", {})
     try:
@@ -1777,7 +1863,7 @@ def _create_api(data):
         "apiId": api_id,
         "name": data.get("name", "unnamed"),
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
+        "apiEndpoint": f"{_api_endpoint_scheme(protocol)}://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "routeSelectionExpression": data.get("routeSelectionExpression", default_rse),
         "apiKeySelectionExpression": data.get("apiKeySelectionExpression", "$request.header.x-api-key"),
@@ -1860,9 +1946,40 @@ def _delete_cors_configuration(api_id):
 
 # ---- Control plane: Routes ----
 
+_WS_AUTHORIZER_TYPE_MESSAGE = (
+    "Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis."
+)
+
+
+def _ws_authorizer_type_message(api_id, authorizer_type):
+    """The BadRequestException message a WebSocket API answers for an authorizer type it does not support."""
+    if _apis.get(api_id, {}).get("protocolType") == "WEBSOCKET" and authorizer_type != "REQUEST":
+        return _WS_AUTHORIZER_TYPE_MESSAGE
+    return None
+
+
+def _ws_route_authorization_message(api_id, route_key, authorization_type):
+    """The BadRequestException message a WebSocket API answers for route authorization it does not support."""
+    if _apis.get(api_id, {}).get("protocolType") != "WEBSOCKET" or (authorization_type or "NONE") == "NONE":
+        return None
+    if route_key != "$connect":
+        return "Currently, authorization is restricted to the $connect route only"
+    if authorization_type == "JWT":
+        return "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"
+    return None
+
+
+def _ws_route_authorization_error(api_id, route_key, authorization_type):
+    """The BadRequestException a WebSocket API answers for route authorization it does not support."""
+    message = _ws_route_authorization_message(api_id, route_key, authorization_type)
+    return _apigw_error("BadRequestException", message, 400) if message else None
+
+
 def _create_route(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
+    if err := _ws_route_authorization_error(api_id, data.get("routeKey", "$default"), data.get("authorizationType")):
+        return err
     route_id = new_uuid()[:8]
     route = {
         "routeId": route_id,
@@ -1905,6 +2022,10 @@ def _update_route(api_id, route_id, data):
     route = _routes.get(api_id, {}).get(route_id)
     if not route:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
+    if err := _ws_route_authorization_error(
+        api_id, data.get("routeKey", route["routeKey"]), data.get("authorizationType", route.get("authorizationType")),
+    ):
+        return err
     for k in (
         "routeKey",
         "target",
@@ -2170,6 +2291,11 @@ def _validate_tag_resource_arn(resource_arn: str) -> tuple[str | None, tuple | N
     segments = spec.resource[1:].split("/")
     if not segments or any(segment == "" for segment in segments):
         return None, _invalid_tag_resource_arn(resource_arn)
+    if len(segments) == 2 and segments[0] == "domainnames":
+        from ministack.services import apigateway_v1 as v1
+        if segments[1] not in v1._domain_names:
+            return None, _tag_resource_not_found(resource_arn)
+        return _domain_arn(segments[1]), None
     if len(segments) not in (2, 4) or segments[0] != "apis":
         return None, _invalid_tag_resource_arn(resource_arn)
 
@@ -2195,11 +2321,19 @@ def _delete_api_tag_resources(api_id: str):
             _api_tags.pop(resource_arn, None)
 
 
+def _tag_store(canonical_arn: str):
+    """Domain name tags are shared with API Gateway v1."""
+    if "::/domainnames/" in canonical_arn:
+        from ministack.services import apigateway_v1 as v1
+        return v1._v1_tags
+    return _api_tags
+
+
 def _get_tags(resource_arn: str):
     canonical_arn, err = _validate_tag_resource_arn(resource_arn)
     if err:
         return err
-    tags = _api_tags.get(canonical_arn, {})
+    tags = _tag_store(canonical_arn).get(canonical_arn, {})
     return _apigw_response({"tags": tags})
 
 
@@ -2208,7 +2342,7 @@ def _tag_resource(resource_arn: str, data: dict):
     if err:
         return err
     tags = data.get("tags", {})
-    _api_tags.setdefault(canonical_arn, {}).update(tags)
+    _tag_store(canonical_arn).setdefault(canonical_arn, {}).update(tags)
     return 201, {}, b""
 
 
@@ -2216,9 +2350,257 @@ def _untag_resource(resource_arn: str, tag_keys: list):
     canonical_arn, err = _validate_tag_resource_arn(resource_arn)
     if err:
         return err
-    existing = _api_tags.get(canonical_arn, {})
+    existing = _tag_store(canonical_arn).get(canonical_arn, {})
     for key in tag_keys:
         existing.pop(key, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Domain names and API mappings ----
+# One resource with v1 custom domains: records, base path mappings and tags live in apigateway_v1.
+
+_ROUTING_V2_TO_V1 = {
+    "API_MAPPING_ONLY": "BASE_PATH_MAPPING_ONLY",
+    "ROUTING_RULE_ONLY": "ROUTING_RULE_ONLY",
+    "ROUTING_RULE_THEN_API_MAPPING": "ROUTING_RULE_THEN_BASE_PATH_MAPPING",
+}
+_ROUTING_V1_TO_V2 = {v1: v2 for v2, v1 in _ROUTING_V2_TO_V1.items()}
+
+
+def _domain_arn(domain_name):
+    return f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}"
+
+
+def _domain_not_found():
+    return _apigw_error("NotFoundException", "Invalid domain name identifier specified", 404)
+
+
+def _domain_view(record):
+    from ministack.services import apigateway_v1 as v1
+    endpoint = record.get("endpointConfiguration") or {}
+    endpoint_type = (endpoint.get("types") or ["REGIONAL"])[0]
+    regional = endpoint_type == "REGIONAL"
+    config = {
+        "apiGatewayDomainName": record["regionalDomainName" if regional else "distributionDomainName"],
+        "certificateArn": record.get("regionalCertificateArn" if regional else "certificateArn") or None,
+        "certificateName": record.get("regionalCertificateName" if regional else "certificateName") or None,
+        "domainNameStatus": "AVAILABLE",
+        "endpointType": endpoint_type,
+        "hostedZoneId": record["regionalHostedZoneId" if regional else "distributionHostedZoneId"],
+        "ipAddressType": endpoint.get("ipAddressType", "ipv4"),
+        "securityPolicy": record.get("securityPolicy", "TLS_1_2"),
+        "ownershipVerificationCertificateArn": record.get("ownershipVerificationCertificateArn") or None,
+    }
+    arn = _domain_arn(record["domainName"])
+    return {
+        "apiMappingSelectionExpression": "$request.basepath",
+        "domainName": record["domainName"],
+        "domainNameArn": arn,
+        "domainNameConfigurations": [config],
+        "mutualTlsAuthentication": record.get("mutualTlsAuthentication") or None,
+        "routingMode": _ROUTING_V1_TO_V2.get(record.get("routingMode"), "API_MAPPING_ONLY"),
+        "tags": dict(v1._v1_tags.get(arn) or record.get("tags") or {}),
+    }
+
+
+def _apply_domain_configuration(record, configs):
+    config = (configs or [{}])[0]
+    endpoint_type = config.get("endpointType", "REGIONAL")
+    record["endpointConfiguration"] = {"types": [endpoint_type],
+                                       "ipAddressType": config.get("ipAddressType", "ipv4")}
+    arn_key, name_key = (("regionalCertificateArn", "regionalCertificateName")
+                         if endpoint_type == "REGIONAL" else ("certificateArn", "certificateName"))
+    record[arn_key] = config.get("certificateArn", "")
+    record[name_key] = config.get("certificateName", "")
+    record["securityPolicy"] = config.get("securityPolicy", "TLS_1_2")
+    record["ownershipVerificationCertificateArn"] = config.get("ownershipVerificationCertificateArn", "")
+
+
+def _create_domain_name(data):
+    from ministack.services import apigateway_v1 as v1
+    name = data.get("domainName")
+    if not name:
+        return _apigw_error("BadRequestException", "Domain name is required", 400)
+    if name in v1._domain_names:
+        return _apigw_error("ConflictException", "The domain name you provided already exists.", 409)
+    if data.get("routingMode", "API_MAPPING_ONLY") not in _ROUTING_V2_TO_V1:
+        return _apigw_error("BadRequestException", f"Invalid routingMode: {data['routingMode']}", 400)
+    record = {
+        "domainName": name,
+        "certificateName": "",
+        "certificateArn": "",
+        "regionalCertificateName": "",
+        "regionalCertificateArn": "",
+        "distributionDomainName": f"d{new_uuid().replace('-', '')[:13]}.cloudfront.net",
+        "distributionHostedZoneId": "Z2FDTNDATAQYW2",
+        "regionalDomainName": f"d-{new_uuid().replace('-', '')[:10]}.execute-api.{get_region()}.amazonaws.com",
+        "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
+        "mutualTlsAuthentication": data.get("mutualTlsAuthentication") or {},
+        "routingMode": _ROUTING_V2_TO_V1[data.get("routingMode", "API_MAPPING_ONLY")],
+        "tags": {},
+    }
+    _apply_domain_configuration(record, data.get("domainNameConfigurations"))
+    v1._domain_names[name] = record
+    v1._base_path_mappings[name] = {}
+    if data.get("tags"):
+        v1._v1_tags[_domain_arn(name)] = dict(data["tags"])
+    return _apigw_response(_domain_view(record), 201)
+
+
+def _get_domain_name(name):
+    from ministack.services import apigateway_v1 as v1
+    record = v1._domain_names.get(name)
+    return _apigw_response(_domain_view(record)) if record else _domain_not_found()
+
+
+def _page(items, query_params):
+    """One page of items for maxResults/nextToken, or a BadRequestException response."""
+    def value(key):
+        v = (query_params or {}).get(key)
+        return v[0] if isinstance(v, list) else v
+    try:
+        start = int(value("nextToken") or 0)
+        limit = int(value("maxResults") or len(items) or 1)
+    except ValueError:
+        return _apigw_error("BadRequestException", "Invalid nextToken or maxResults", 400)
+    page = {"items": items[start:start + limit]}
+    if start + limit < len(items):
+        page["nextToken"] = str(start + limit)
+    return _apigw_response(page)
+
+
+def _get_domain_names(query_params):
+    from ministack.services import apigateway_v1 as v1
+    return _page([_domain_view(r) for r in v1._domain_names.values()], query_params)
+
+
+def _update_domain_name(name, data):
+    from ministack.services import apigateway_v1 as v1
+    record = v1._domain_names.get(name)
+    if not record:
+        return _domain_not_found()
+    if "routingMode" in data and data["routingMode"] not in _ROUTING_V2_TO_V1:
+        return _apigw_error("BadRequestException", f"Invalid routingMode: {data['routingMode']}", 400)
+    if "domainNameConfigurations" in data:
+        _apply_domain_configuration(record, data["domainNameConfigurations"])
+    if "mutualTlsAuthentication" in data:
+        record["mutualTlsAuthentication"] = data["mutualTlsAuthentication"] or {}
+    if "routingMode" in data:
+        record["routingMode"] = _ROUTING_V2_TO_V1[data["routingMode"]]
+    return _apigw_response(_domain_view(record))
+
+
+def _delete_domain_name(name):
+    from ministack.services import apigateway_v1 as v1
+    if name not in v1._domain_names:
+        return _domain_not_found()
+    v1._domain_names.pop(name, None)
+    v1._base_path_mappings.pop(name, None)
+    v1._v1_tags.pop(_domain_arn(name), None)
+    return 204, {}, b""
+
+
+def _mapping_view(base_path, mapping):
+    return {
+        "apiId": mapping["restApiId"],
+        "apiMappingId": mapping.setdefault("_apiMappingId", new_uuid().replace("-", "")[:6]),
+        "apiMappingKey": "" if base_path == "(none)" else base_path,
+        "stage": mapping["stage"],
+    }
+
+
+def _domain_mappings(name):
+    """The domain's base path mappings, or a NotFoundException response."""
+    from ministack.services import apigateway_v1 as v1
+    if name not in v1._domain_names:
+        return None, _domain_not_found()
+    return v1._base_path_mappings.setdefault(name, {}), None
+
+
+def _find_mapping(mappings, mapping_id):
+    for base_path, mapping in mappings.items():
+        if _mapping_view(base_path, mapping)["apiMappingId"] == mapping_id:
+            return base_path, mapping
+    return None, None
+
+
+def _api_mapping_not_found():
+    return _apigw_error("NotFoundException", "Invalid API mapping identifier specified", 404)
+
+
+def _check_mapping_target(api_id, stage):
+    from ministack.services import apigateway_v1 as v1
+    if api_id in _apis:
+        stages = _stages.get(api_id, {})
+    elif api_id in v1._rest_apis:
+        stages = v1._stages_v1.get(api_id, {})
+    else:
+        return _apigw_error("NotFoundException", "Invalid API identifier specified", 404)
+    if stage not in stages:
+        return _apigw_error("BadRequestException", "Invalid stage identifier specified", 400)
+    return None
+
+
+def _create_api_mapping(name, data):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    api_id, stage = data.get("apiId"), data.get("stage")
+    if not api_id or not stage:
+        return _apigw_error("BadRequestException", "ApiId and Stage are required", 400)
+    if err := _check_mapping_target(api_id, stage):
+        return err
+    base_path = data.get("apiMappingKey") or "(none)"
+    if base_path in mappings:
+        return _apigw_error("ConflictException", "ApiMapping key already exists for this domain name", 409)
+    mappings[base_path] = {"basePath": base_path, "restApiId": api_id, "stage": stage}
+    return _apigw_response(_mapping_view(base_path, mappings[base_path]), 201)
+
+
+def _get_api_mapping(name, mapping_id):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    return _apigw_response(_mapping_view(base_path, mapping)) if mapping else _api_mapping_not_found()
+
+
+def _get_api_mappings(name, query_params):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    return _page([_mapping_view(k, m) for k, m in mappings.items()], query_params)
+
+
+def _update_api_mapping(name, mapping_id, data):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    if not mapping:
+        return _api_mapping_not_found()
+    api_id = data.get("apiId") or mapping["restApiId"]
+    stage = data.get("stage") or mapping["stage"]
+    if err := _check_mapping_target(api_id, stage):
+        return err
+    new_path = (data["apiMappingKey"] or "(none)") if "apiMappingKey" in data else base_path
+    if new_path != base_path and new_path in mappings:
+        return _apigw_error("ConflictException", "ApiMapping key already exists for this domain name", 409)
+    mapping["restApiId"], mapping["stage"] = api_id, stage
+    if new_path != base_path:
+        mapping["basePath"] = new_path
+        mappings[new_path] = mappings.pop(base_path)
+    return _apigw_response(_mapping_view(new_path, mapping))
+
+
+def _delete_api_mapping(name, mapping_id):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    if not mapping:
+        return _api_mapping_not_found()
+    mappings.pop(base_path)
     return 204, {}, b""
 
 
@@ -2227,6 +2609,8 @@ def _untag_resource(resource_arn: str, tag_keys: list):
 def _create_authorizer(api_id, data):
     if api_id not in _apis:
         return _api_not_found(api_id)
+    if message := _ws_authorizer_type_message(api_id, data.get("authorizerType")):
+        return _apigw_error("BadRequestException", message, 400)
     auth_id = new_uuid()[:8]
     authorizer = {
         "authorizerId": auth_id,
@@ -2506,6 +2890,41 @@ def _evaluate_route_selection(expr: str, payload_text: str) -> str:
     return "$default"
 
 
+def _ws_request_context(api_id: str, route_key: str, stage: str, connection_id: str, event_type: str,
+                        request_id: str, source_ip: str, headers: dict) -> dict:
+    """requestContext of a WebSocket event, shared by route integrations and the $connect authorizer."""
+    now_ms = int(time.time() * 1000)
+    return {
+        "routeKey": route_key,
+        "eventType": event_type,
+        "extendedRequestId": new_uuid(),
+        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
+        "stage": stage,
+        "connectedAt": now_ms,
+        "requestTimeEpoch": now_ms,
+        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
+        "requestId": request_id,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "connectionId": connection_id,
+        "apiId": api_id,
+    }
+
+
+def _ws_connect_fields(headers: dict, query_params: dict | None) -> dict:
+    """Handshake headers and query string as a $connect event carries them."""
+    # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
+    return {
+        "headers": dict(headers),
+        "multiValueHeaders": {k: [v] for k, v in headers.items()},
+        "queryStringParameters": {
+            k: (v[-1] if isinstance(v, list) else v) for k, v in query_params.items()
+        } if query_params else None,
+        "multiValueQueryStringParameters": {
+            k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()
+        } if query_params else None,
+    }
+
+
 async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: dict, stage: str,
                             connection_id: str, event_type: str, message_id: str,
                             body_text: str, source_ip: str, headers: dict,
@@ -2573,20 +2992,11 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
     if func_data is None or func_config is None:
         return None
 
-    request_context = {
-        "routeKey": route.get("routeKey", "$default"),
-        "eventType": event_type,
-        "extendedRequestId": new_uuid(),
-        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
-        "stage": stage,
-        "connectedAt": int(time.time() * 1000),
-        "requestTimeEpoch": int(time.time() * 1000),
-        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
-        "requestId": message_id,
-        "domainName": f"{api_id}.execute-api.{_HOST}",
-        "connectionId": connection_id,
-        "apiId": api_id,
-    }
+    request_context = _ws_request_context(
+        api_id, route.get("routeKey", "$default"), stage, connection_id, event_type, message_id, source_ip, headers,
+    )
+    if kwargs.get("authorizer") is not None:
+        request_context["authorizer"] = kwargs["authorizer"]
     if event_type == "DISCONNECT":
         # Populated by handle_websocket from the ASGI disconnect message.
         request_context["disconnectReason"] = kwargs.get("disconnect_reason", "")
@@ -2600,29 +3010,7 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         "isBase64Encoded": False,
     }
     if event_type == "CONNECT":
-        event["headers"] = dict(headers)
-        event["multiValueHeaders"] = {k: [v] for k, v in headers.items()}
-        if query_params:
-            # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
-            event["queryStringParameters"] = {
-                k: (v[-1] if isinstance(v, list) else v)
-                for k, v in query_params.items()
-            }
-            event["multiValueQueryStringParameters"] = {
-                k: (v if isinstance(v, list) else [v])
-                for k, v in query_params.items()
-            }
-        else:
-            event["queryStringParameters"] = None
-            event["multiValueQueryStringParameters"] = None
-        authorizer_claims = kwargs.get("authorizer_claims")
-        if authorizer_claims is not None:
-            request_context["authorizer"] = {
-                "jwt": {
-                    "claims": authorizer_claims,
-                    "scopes": kwargs.get("authorizer_scopes") or [],
-                }
-            }
+        event.update(_ws_connect_fields(headers, query_params))
 
     runtime = func_config.get("Runtime", "")
     code_zip = func_data.get("code_zip")
@@ -2651,6 +3039,77 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: di
         return result.get("result", {})
     # Image/unsupported runtime stub — success without body.
     return {"statusCode": 200, "body": ""}
+
+
+_WS_DENY_REASONS = {
+    "Deny": "with an explicit deny in an identity-based policy",
+    "NoMatch": "because no identity-based policy allows the execute-api:Invoke action",
+}
+
+
+def _authorize_ws_iam(connect_arn, headers, query_params, region):
+    """``(status, message)`` refusing an AWS_IAM $connect, or None; the policy check runs under AUTH=true."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import AuthError, enforce
+    from ministack.core.router import extract_access_key_id
+
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key:
+        return 403, "Missing Authentication Token"
+    denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
+    if isinstance(denied, AuthError):
+        return 403, denied.message
+    if denied:
+        reason = _WS_DENY_REASONS["Deny" if denied.decision == "Deny" else "NoMatch"]
+        return 403, (f"User: {denied.principal_arn} is not authorized to perform: execute-api:Invoke "
+                     f"on resource: {connect_arn} {reason}")
+    return None
+
+
+async def _authorize_ws_connect(api_id, route, request_context, headers, query_params, account_id, region):
+    """Run the $connect REQUEST authorizer: ``(refusal, context)``, a refusal being ``(status, message)``."""
+    from ministack.services.apigateway_v1 import _stringify_context
+
+    authorizer = _authorizers.get(api_id, {}).get(route.get("authorizerId") or "")
+    if not authorizer:
+        return (500, ""), None
+    stage = request_context["stage"]
+    stage_vars = _get_stage_variables(api_id, stage)
+    present, _values = _request_authorizer_identity_sources(
+        authorizer.get("identitySource"), headers, query_params, stage_vars,
+    )
+    if not present:
+        return (401, "Unauthorized"), None
+    method_arn = execute_api_route_arn(region, account_id, api_id, stage, "$connect")
+    event = {
+        "type": "REQUEST",
+        "methodArn": method_arn,
+        **_ws_connect_fields(headers, query_params),
+        "stageVariables": stage_vars,
+        "requestContext": {**request_context, "messageDirection": "IN"},
+    }
+    payload = await _invoke_request_authorizer_lambda(authorizer, event, account_id, region)
+    policy = (payload or {}).get("policyDocument")
+    if not isinstance(policy, dict) or not isinstance(payload.get("context") or {}, dict):
+        return (500, ""), None
+    decision = _evaluate_authorizer_policy(policy, method_arn)
+    if decision != "Allow":
+        return (403, f"User is not authorized to access this resource {_WS_DENY_REASONS[decision]}"), None
+    context = _stringify_context(payload.get("context"))
+    if payload.get("principalId") is not None:
+        context["principalId"] = str(payload["principalId"])
+    return None, context
+
+
+async def _refuse_ws_handshake(scope, send, status, message, connection_id, request_id):
+    """Answer the upgrade with an HTTP error response, as API Gateway does."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": message, "connectionId": connection_id, "requestId": request_id}).encode()
+    await send({"type": "websocket.http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
 
 
 async def handle_websocket(scope, receive, send, api_id: str, path_override: str | None = None):
@@ -2722,32 +3181,39 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
     try:
         # $connect hook
         connect_route = _match_ws_route(api_id, "$connect")
+        authorizer_context = None
         if connect_route is not None:
-            # JWT authorizer validation (mirrors the HTTP API path).
             auth_type = (connect_route.get("authorizationType") or "NONE").upper()
-            ws_authorizer_claims = None
-            ws_authorizer_scopes = []
-            if auth_type == "JWT":
-                authorizer_id = connect_route.get("authorizerId")
-                authorizer = _authorizers.get(api_id, {}).get(authorizer_id) if authorizer_id else None
-                if not authorizer:
-                    await send({"type": "websocket.close", "code": 1008})
-                    return
-                claims, scopes, auth_error = await _validate_jwt_authorizer(
-                    connect_route, authorizer, headers, query_params or {},
+            connect_request_id = new_uuid()
+            refusal = None
+            if auth_type == "CUSTOM":
+                refusal, authorizer_context = await _authorize_ws_connect(
+                    api_id, connect_route,
+                    _ws_request_context(api_id, "$connect", stage, connection_id, "CONNECT",
+                                        connect_request_id, source_ip, headers),
+                    headers, query_params, account_id, owner_region,
                 )
-                if auth_error:
-                    await send({"type": "websocket.close", "code": 1008})
-                    return
-                ws_authorizer_claims = claims or {}
-                ws_authorizer_scopes = scopes or []
+            elif auth_type == "AWS_IAM":
+                refusal = _authorize_ws_iam(
+                    execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
+                    headers, query_params, owner_region,
+                )
+            elif auth_type == "JWT":
+                # only a route restored from state saved before the route checks existed
+                logger.warning(
+                    "WebSocket API %s: JWT authorization on $connect is not supported, refusing the handshake",
+                    api_id,
+                )
+                refusal = (500, "")
+            if refusal:
+                await _refuse_ws_handshake(scope, send, *refusal, connection_id, connect_request_id)
+                return
 
             resp = await _invoke_ws_lambda(
                 api_id, account_id, owner_region, connect_route, stage, connection_id,
-                "CONNECT", new_uuid(), "", source_ip, headers,
+                "CONNECT", connect_request_id, "", source_ip, headers,
                 query_params=query_params,
-                authorizer_claims=ws_authorizer_claims,
-                authorizer_scopes=ws_authorizer_scopes,
+                authorizer=authorizer_context,
             )
             status = int((resp or {}).get("statusCode", 200))
             if status < 200 or status >= 300:
@@ -2822,7 +3288,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 msg_id = new_uuid()
                 resp = await _invoke_ws_lambda(
                     api_id, account_id, owner_region, route, stage, connection_id, "MESSAGE",
-                    msg_id, payload, source_ip, headers,
+                    msg_id, payload, source_ip, headers, authorizer=authorizer_context,
                 )
                 if resp is None:
                     continue
@@ -2850,6 +3316,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                         "DISCONNECT", new_uuid(), "", source_ip, headers,
                         disconnect_code=disconnect_code,
                         disconnect_reason=disconnect_reason,
+                        authorizer=authorizer_context,
                     )
                 except Exception:
                     logger.exception("error firing $disconnect")

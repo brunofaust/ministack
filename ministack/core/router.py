@@ -37,6 +37,12 @@ _LAMBDA_PATH_RE = re.compile(
 # apiVersion — `/2026-04-04/network-connectors[/{Identifier}]`.
 _LAMBDA_CORE_PATH_RE = re.compile(r"^/2026-04-04/network-connectors(?:/|$)")
 
+# The AWS CLI signs MicroVM requests with credential scope `lambda`, so only
+# the path separates them from Lambda's function router.
+_LAMBDA_MICROVM_PATH_RE = re.compile(
+    r"^/2025-09-09/(?:microvms|microvm-images)(?:/|$)"
+)
+
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
 # url-safe base64, generated per-container in services/ecs.py.
 _ECS_METADATA_PATH_RE = re.compile(r"^/v4/[A-Za-z0-9_-]{8,}(?:/.*)?$")
@@ -79,10 +85,7 @@ SERVICE_PATTERNS = {
     "lambda-core": {
         "path_patterns": [r"^/2026-04-04/network-connectors"],
     },
-    # Lambda MicroVMs (2025-09-09) sign with credential scope `lambda-microvms`
-    # and use host `lambda-microvms.{region}.amazonaws.com` — distinct from
-    # Lambda's `lambda.` host, so this must be its own entry. Listed before
-    # `lambda` for clarity; the patterns are disjoint.
+    # Detected by path: the AWS CLI signs these as `lambda`.
     "lambda-microvms": {
         "path_patterns": [r"^/2025-09-09/microvm"],
         "host_patterns": [r"lambda-microvms\."],
@@ -261,6 +264,11 @@ SERVICE_PATTERNS = {
         ],
         "credential_scope": "es",
     },
+    "opensearchserverless": {
+        "target_prefixes": ["OpenSearchServerless."],
+        "host_patterns": [r"^aoss\."],
+        "credential_scope": "aoss",
+    },
     "organizations": {
         "target_prefixes": ["AWSOrganizationsV20161128"],
         "host_patterns": [r"^organizations\."],
@@ -333,9 +341,9 @@ SERVICE_PATTERNS = {
     # routing would otherwise swallow it — and on the `iot` control plane
     # `GET /things/{t}/jobs` is a DIFFERENT operation (ListJobExecutionsForThing)
     # that answers with a different envelope. The pattern must cover both host
-    # spellings: `DescribeEndpoint(endpointType='iot:Jobs')` hands out
-    # `{prefix}.jobs.iot.{region}.{host}`, while the AWS Device SDK's jobs
-    # topics document `{prefix}.data.jobs.iot.{region}.{host}`. The SDK also
+    # spellings: `{prefix}.jobs.iot.{region}.{host}`, the legacy iot:Jobs
+    # endpoint, and `{prefix}.data.jobs.iot.{region}.{host}`, which the AWS
+    # Device SDK's jobs topics document. The SDK also
     # signs with credential scope `iot-jobs-data` (botocore signingName), which
     # the scope early-return resolves via this key.
     "iot-jobs-data": {
@@ -489,6 +497,11 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["AWSOrigamiServiceGateway"],
         "host_patterns": [r"cur\."],
         "credential_scope": "cur",
+    },
+    "budgets": {
+        "target_prefixes": ["AWSBudgetServiceGateway"],
+        "host_patterns": [r"budgets\."],
+        "credential_scope": "budgets",
     },
     "inspector2": {
         "host_patterns": [r"inspector2\."],
@@ -750,10 +763,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                     or path.startswith("/async-invoke")):
                     return "bedrock-runtime"
                 return "bedrock"
-            # Lambda Core signs as `lambda`: its endpointPrefix AND signingName
-            # are both `lambda` (botocore lambda-core/2026-04-30), unlike
-            # lambda-microvms which has its own scope. So the credential scope
-            # cannot tell the two apart and the path has to. This must sit
+            if svc_name == "lambda" and _LAMBDA_MICROVM_PATH_RE.match(path):
+                return "lambda-microvms"
+            # Lambda Core also signs as `lambda`: endpointPrefix AND signingName
+            # are both `lambda` (botocore lambda-core/2026-04-30), so the scope
+            # cannot tell the three apart. The path checks must sit
             # before the SERVICE_PATTERNS early-return below, or `lambda`
             # matches there and the request reaches the function router, which
             # reads `/2026-04-04/network-connectors` as a function name.
@@ -787,6 +801,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "waf-regional": "waf-regional",
                 "es": "opensearch",
                 "opensearch": "opensearch",
+                "aoss": "opensearchserverless",
                 "organizations": "organizations",
                 "account": "account",
                 "batch": "batch",
@@ -824,6 +839,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
+                "budgets": "budgets",
                 "inspector2": "inspector2",
                 "dsql": "dsql",
                 "s3tables": "s3tables",
@@ -976,6 +992,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateTemplate": "ses",
             "SendTemplatedEmail": "ses",
             "SendBulkTemplatedEmail": "ses",
+            "CreateReceiptRuleSet": "ses",
+            "ListReceiptRuleSets": "ses",
+            "DescribeReceiptRuleSet": "ses",
+            "DeleteReceiptRuleSet": "ses",
+            "SetActiveReceiptRuleSet": "ses",
+            "DescribeActiveReceiptRuleSet": "ses",
+            "CreateReceiptRule": "ses",
+            "DescribeReceiptRule": "ses",
+            "DeleteReceiptRule": "ses",
             # RDS actions
             "CreateDBInstance": "rds",
             "DeleteDBInstance": "rds",
@@ -1159,6 +1184,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "SetStackPolicy": "cloudformation",
             "GetStackPolicy": "cloudformation",
             "SignalResource": "cloudformation",
+            "RollbackStack": "cloudformation",
+            "DetectStackDrift": "cloudformation",
+            "DescribeStackDriftDetectionStatus": "cloudformation",
+            "DetectStackResourceDrift": "cloudformation",
+            "DescribeStackResourceDrifts": "cloudformation",
             # EBS Snapshots
             # Note: CreateSnapshot, DeleteSnapshot, DescribeSnapshots are intentionally
             # omitted here because they conflict with ElastiCache actions of the same
@@ -1233,6 +1263,8 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "apigateway"
     # Before the Lambda path check: both live on the Lambda endpoint, and an
     # unsigned caller (curl) has no credential scope to disambiguate with.
+    if _LAMBDA_MICROVM_PATH_RE.match(path_lower):
+        return "lambda-microvms"
     if _LAMBDA_CORE_PATH_RE.match(path_lower):
         return "lambda-core"
     if _LAMBDA_PATH_RE.match(path_lower):

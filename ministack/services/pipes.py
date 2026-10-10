@@ -23,7 +23,6 @@ import time
 from urllib.parse import unquote
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.persistence import load_state
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -31,7 +30,6 @@ from ministack.core.responses import (
     _request_region,
     get_account_id,
     get_region,
-    new_uuid,
 )
 
 logger = logging.getLogger("pipes")
@@ -52,20 +50,18 @@ def get_state():
     }
 
 
-def load_persisted_state(data):
-    return restore_state(data)
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    # Restored RUNNING pipes need the background poller — register_pipe is the
+    # only other place that starts it, and it is not called on warm boot.
+    if any(pipe.get("CurrentState") == "RUNNING" for pipe in _pipes.all_values()):
+        _ensure_poller()
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _restore_pipe_store(data.get("pipes", {}))
         _restore_position_store(data.get("positions", {}))
-        # Restored RUNNING pipes need the background poller — register_pipe
-        # is the only other place that starts it, and it isn't called on
-        # warm-boot. Without this, persisted pipes would silently stop
-        # forwarding events until a new pipe is registered.
-        if any(p.get("CurrentState") == "RUNNING" for p in _pipes.all_values()):
-            _ensure_poller()
 
 
 def _pipe_arn_scope(pipe_arn: str, default_account_id: str | None = None) -> tuple[str, str]:
@@ -132,17 +128,28 @@ def _iter_all_pipes():
         yield account_id, region, pipe
 
 
-try:
-    _restored = load_state("pipes")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted pipes state; continuing fresh")
 
 
 def reset():
     _pipes.clear()
     _positions.clear()
+
+
+def check_same_region(*arns):
+    """Raise ValueError when an ARN names a region other than the pipe's."""
+    for component_arn in arns:
+        try:
+            component_region = parse_arn(component_arn).region
+        except ArnParseError:
+            continue
+        if component_region and component_region != get_region():
+            raise ValueError(CROSS_REGION_PIPE_ERROR)
+
+
+def check_target_supported(target: str) -> None:
+    """Pipes does not take an SNS FIFO topic as a target (measured on AWS)."""
+    if target.startswith("arn:") and target.split(":")[2:3] == ["sns"] and target.endswith(".fifo"):
+        raise ValueError("SNS FIFO topics are not supported as a pipe target.")
 
 
 def register_pipe(
@@ -158,13 +165,8 @@ def register_pipe(
 ):
     pipe_region = get_region()
     # AWS rejects cross-region source/target ARNs before role validation.
-    for component_arn in (source, target):
-        try:
-            component_region = parse_arn(component_arn).region
-        except ArnParseError:
-            continue
-        if component_region and component_region != pipe_region:
-            raise ValueError(CROSS_REGION_PIPE_ERROR)
+    check_same_region(source, target)
+    check_target_supported(target)
 
     arn = f"arn:aws:pipes:{pipe_region}:{get_account_id()}:pipe/{name}"
     state = "STOPPED" if str(desired_state).upper() == "STOPPED" else "RUNNING"
@@ -301,24 +303,13 @@ def _start_state_machine_from_records(sm_arn: str, pipe: dict, records: list) ->
 def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(topic_arn)
-    if not topic:
-        logger.warning("Pipes %s: SNS topic not found %s", pipe.get("Name"), topic_arn)
+    try:
+        result = _sns.publish_internal(topic_arn, json.dumps(record), f"Pipes {pipe.get('Name', '')}")
+    except _sns.SnsPublishError as exc:
+        logger.warning("Pipes %s: SNS publish to %s refused: %s", pipe.get("Name"), topic_arn, exc)
         return
-
-    msg_id = new_uuid()
-    message = json.dumps(record)
-    subject = f"Pipes {pipe.get('Name', '')}"
-
-    topic["messages"].append({
-        "id": msg_id,
-        "message": message,
-        "subject": subject,
-        "message_structure": "",
-        "message_attributes": {},
-        "timestamp": int(time.time()),
-    })
-    _sns._fanout(topic_arn, msg_id, message, subject, "", {})
+    if result is None:
+        logger.warning("Pipes %s: SNS topic not found %s", pipe.get("Name"), topic_arn)
 
 
 def _arn_service(arn: str) -> str:
@@ -521,6 +512,10 @@ def _update_pipe(name, body):
     pipe = _pipes.get(name)
     if pipe is None:
         return _not_found(name)
+    try:
+        check_target_supported(body.get("Target") or "")
+    except ValueError as e:
+        return _error(400, "ValidationException", str(e))
     if "Description" in body:
         pipe["Description"] = body.get("Description", "") or ""
     if "RoleArn" in body:

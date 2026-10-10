@@ -5,6 +5,7 @@ CloudFormation stacks — async stack lifecycle (deploy, delete, update, diff).
 """
 
 import asyncio
+import contextvars
 import copy
 import logging
 from contextlib import contextmanager
@@ -15,15 +16,27 @@ from ministack.core.responses import get_region, new_uuid, now_iso, set_request_
 from .engine import (
     _NO_VALUE,
     _evaluate_conditions,
+    _extract_deps,
+    _intrinsic_references,
     _resolve_dynamic_references,
     _resolve_refs,
     _topological_sort,
 )
 from .provisioners import (
+    _DEFERRED_PREDECESSOR_DELETES,
+    _NAME_SEED,
+    _PROPERTY_ENUMS,
     _RETAIN_REPLACED,
     _RETAINING_POLICIES,
+    _custom_named_replacement_error,
     _delete_resource,
+    _import_resource,
+    _property_enum_errors,
+    _property_recreation,
     _provision_resource,
+    _replacing_change,
+    _snapshot_resource,
+    _tag_map,
     _update_resource,
     _with_stack_tags,
 )
@@ -62,15 +75,26 @@ def _create_stack_task_in_region(coro, stack: dict | None, stack_id: str | None 
         asyncio.get_event_loop().create_task(coro)
 
 
-def _is_custom_resource(resource_type: str) -> bool:
-    """The types whose provisioning blocks on a callback into this server, so
-    they run on a worker thread: custom resources wait for the ResponseURL
-    PUT, a WaitCondition for the signals on its handle, and a nested stack
-    deploys inline and may contain either."""
+def _runs_on_worker_thread(resource_type: str) -> bool:
+    """The types whose provisioning blocks, so they run on a worker thread:
+    custom resources wait for the ResponseURL PUT, a WaitCondition for the
+    signals on its handle, and a nested stack deploys inline and may contain
+    either. ElastiCache clusters and replication groups start and stop their
+    containers through the Docker daemon, the calls elasticache.py itself
+    keeps off the event loop. An IoT certificate is registered through the
+    async IoT handler, which a worker thread can wait for."""
     return (resource_type.startswith("Custom::")
             or resource_type in ("AWS::CloudFormation::CustomResource",
                                  "AWS::CloudFormation::WaitCondition",
-                                 "AWS::CloudFormation::Stack"))
+                                 "AWS::CloudFormation::Stack",
+                                 "AWS::ElastiCache::CacheCluster",
+                                 "AWS::ElastiCache::ReplicationGroup",
+                                 "AWS::IoT::Certificate"))
+
+
+def _update_keeping_seed(*args):
+    """_update_resource's result and the name seed it left."""
+    return _update_resource(*args), _NAME_SEED.get()
 
 
 # ===========================================================================
@@ -78,15 +102,34 @@ def _is_custom_resource(resource_type: str) -> bool:
 # ===========================================================================
 
 
+def _default_resource_policy(res_def, attribute) -> str:
+    """``Delete``, except where AWS documents ``Snapshot`` as the default."""
+    if attribute != "DeletionPolicy":
+        return "Delete"
+    rtype = (res_def or {}).get("Type")
+    props = (res_def or {}).get("Properties") or {}
+    if rtype == "AWS::RDS::DBCluster":
+        return "Snapshot"
+    if rtype == "AWS::RDS::DBInstance" and not props.get("DBClusterIdentifier"):
+        return "Snapshot"
+    return "Delete"
+
+
 def _resource_policy(res_def, attribute, resources, params, conditions, mappings,
                      stack_name, stack_id):
     """A resource's ``DeletionPolicy`` / ``UpdateReplacePolicy`` as a string,
-    ``Delete`` when the template sets none. An intrinsic (``Fn::If``) is
-    resolved like a property; one that does not resolve counts as ``Delete``
-    and is logged, since that is the destructive reading."""
+    ``Delete`` when the template sets none, with one documented exception: AWS
+    defaults ``DeletionPolicy`` to ``Snapshot`` for ``AWS::RDS::DBCluster`` and
+    for ``AWS::RDS::DBInstance`` without ``DBClusterIdentifier``
+    (aws-attribute-deletionpolicy.html; captured eu-north-1 2026-09-19, the
+    stack delete left a manual snapshot behind).
+
+    An intrinsic (``Fn::If``) is resolved like a property; one that does not
+    resolve counts as ``Delete`` and is logged, since that is the destructive
+    reading."""
     value = (res_def or {}).get(attribute)
     if value is None:
-        return "Delete"
+        return _default_resource_policy(res_def, attribute)
     if isinstance(value, dict):
         try:
             value = _resolve_refs(copy.deepcopy(value), resources, params, conditions,
@@ -98,8 +141,16 @@ def _resource_policy(res_def, attribute, resources, params, conditions, mappings
     return str(value)
 
 
+# The ClientRequestToken of the stack operation that is running. The request
+# handler sets it around the operation's handler; the background task of the
+# operation copies the context when it is scheduled, so every event the
+# operation records carries the token ("All events triggered by a given stack
+# operation are assigned the same client request token", API reference).
+CLIENT_REQUEST_TOKEN = contextvars.ContextVar("cfn_client_request_token", default="")
+
+
 def _add_event(stack_id, stack_name, logical_id, resource_type, status,
-               reason="", physical_id=""):
+               reason="", physical_id="", detailed_status=""):
     """Record a stack event."""
     from ministack.services.cloudformation import _stack_events
     event = {
@@ -113,9 +164,36 @@ def _add_event(stack_id, stack_name, logical_id, resource_type, status,
         "ResourceStatusReason": reason,
         "Timestamp": now_iso(),
     }
+    token = CLIENT_REQUEST_TOKEN.get()
+    if token:
+        event["ClientRequestToken"] = token
+    if detailed_status:
+        event["DetailedStatus"] = detailed_status
     if stack_id not in _stack_events:
         _stack_events[stack_id] = []
     _stack_events[stack_id].append(event)
+
+
+# The reasons AWS gives the events of an imported resource.
+_IMPORT_STARTED = "Resource import started."
+_IMPORT_COMPLETED = "Resource import completed."
+_IMPORT_TAGS = "Apply stack-level tags to imported resource if applicable."
+_IMPORT_UNTAG = "Remove stack-level tags from imported resource if applicable."
+
+
+def _adopt_resource(stack_id, stack_name, logical_id, resource_type, identifier):
+    """Import an existing resource during a create or update, with AWS's events."""
+    from .changesets import _import_not_found
+    _add_event(stack_id, stack_name, logical_id, resource_type, "IMPORT_IN_PROGRESS",
+               _IMPORT_STARTED)
+    missing = _import_not_found([{"ResourceType": resource_type, "ResourceIdentifier": identifier}])
+    if missing is not None:
+        raise ValueError(missing)
+    physical_id, attrs = _import_resource(resource_type, identifier)
+    for status, reason in (("IMPORT_IN_PROGRESS", ""), ("IMPORT_COMPLETE", _IMPORT_COMPLETED),
+                           ("UPDATE_IN_PROGRESS", _IMPORT_TAGS), ("UPDATE_COMPLETE", "")):
+        _add_event(stack_id, stack_name, logical_id, resource_type, status, reason, physical_id)
+    return physical_id, attrs
 
 
 # ===========================================================================
@@ -165,13 +243,72 @@ def _resolve_stack_outputs(outputs_defs, conditions, resources, param_values,
     return resolved_outputs, exports
 
 
+def _rollback_failure_reason(failed_records: dict) -> str:
+    """The reason of a rollback that could not finish: failed reverts, then failed deletes."""
+    reverts = sorted(k for k, v in failed_records.items() if "RevertTo" in v)
+    deletes = sorted(k for k, v in failed_records.items() if "RevertTo" not in v)
+    parts = []
+    if reverts:
+        parts.append(f"The following resource(s) failed to update: [{', '.join(reverts)}].")
+    if deletes:
+        parts.append(f"The following resource(s) failed to delete: [{', '.join(deletes)}].")
+    return " ".join(parts)
+
+
+def _sends_back_failed_update(resource_type: str) -> bool:
+    """Whether the resource whose own update failed is sent back too: a provider
+    or a child stack may have changed state before failing; a type's handler did not."""
+    return (resource_type.startswith("Custom::")
+            or resource_type in ("AWS::CloudFormation::CustomResource",
+                                 "AWS::CloudFormation::Stack"))
+
+
+def _mark_rolled_back(record):
+    """The restored record of a resource the rollback updated reports UPDATE_COMPLETE."""
+    if record is not None:
+        record["ResourceStatus"] = "UPDATE_COMPLETE"
+        record["Timestamp"] = now_iso()
+
+
+async def _revert_update(stack_id, stack_name, logical_id, rtype, physical_id,
+                         applied_props, previous_props, attrs, record=None):
+    """Send an in-place update back to the previous properties through the
+    type's update handler; ``record`` takes the attributes it answers."""
+    _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_IN_PROGRESS",
+               physical_id=physical_id)
+    seed_token = _NAME_SEED.set((record or {}).get("_name_seed", ""))
+    try:
+        if _runs_on_worker_thread(rtype):
+            new_pid, new_attrs = await run_reentrant(
+                _update_resource, rtype, physical_id, applied_props,
+                previous_props, stack_name, logical_id, attrs)
+        else:
+            new_pid, new_attrs = _update_resource(
+                rtype, physical_id, applied_props, previous_props,
+                stack_name, logical_id, attrs)
+    except Exception as exc:
+        logger.error("Rollback update of %s failed: %s", logical_id, exc)
+        _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_FAILED",
+                   str(exc), physical_id)
+        raise
+    finally:
+        _NAME_SEED.reset(seed_token)
+    if record is not None:
+        if new_pid != physical_id:
+            logger.warning("Rollback update of %s moved it from %s to %s",
+                           logical_id, physical_id, new_pid)
+            record["PhysicalResourceId"] = new_pid
+        if new_attrs:
+            record["Attributes"] = {**record.get("Attributes", {}), **new_attrs}
+    _mark_rolled_back(record)
+    _add_event(stack_id, stack_name, logical_id, rtype, "UPDATE_COMPLETE",
+               physical_id=new_pid)
+
+
 async def _continue_update_rollback_async(stack_name: str, stack_id: str,
                                           resources_to_skip):
-    """Background task for ContinueUpdateRollback: retry the deletes that
-    failed the update rollback, skipping the logical ids the caller named
-    (their status becomes UPDATE_COMPLETE and the resource stays, as on AWS),
-    and land the stack in UPDATE_ROLLBACK_COMPLETE or, if a delete fails
-    again, UPDATE_ROLLBACK_FAILED."""
+    """ContinueUpdateRollback: retry the failed reverts and deletes; a skipped
+    resource is set to UPDATE_COMPLETE and left as it is."""
     from ministack.services.cloudformation import _stacks
     stack = _stacks.get(stack_name)
     if not stack:
@@ -188,8 +325,17 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "UPDATE_COMPLETE", "Resource rollback skipped by user", pid)
             continue
+        if "RevertTo" in res:
+            try:
+                await _revert_update(
+                    stack_id, stack_name, logical_id, rtype, pid,
+                    res["RevertFrom"], res["RevertTo"], res.get("Attributes"),
+                    stack.get("_resources", {}).get(logical_id))
+            except Exception:
+                still_failed[logical_id] = res
+            continue
         try:
-            if _is_custom_resource(rtype):
+            if _runs_on_worker_thread(rtype):
                 await run_reentrant(_delete_resource, rtype, pid,
                                     res.get("Properties", {}), stack_name, logical_id)
             else:
@@ -205,8 +351,7 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
     await asyncio.sleep(0)
     if still_failed:
         stack["_rollback_failed"] = still_failed
-        reason = ("The following resource(s) failed to delete: "
-                  f"[{', '.join(sorted(still_failed))}].")
+        reason = _rollback_failure_reason(still_failed)
         stack["StackStatus"] = "UPDATE_ROLLBACK_FAILED"
         stack["StackStatusReason"] = reason
         _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
@@ -219,19 +364,295 @@ async def _continue_update_rollback_async(stack_name: str, stack_id: str,
                "UPDATE_ROLLBACK_COMPLETE", physical_id=stack_id)
 
 
+def _failed_operation(is_update, previous_stack, created, failed_update,
+                      failed_logical_id, replaced_ids, cancelled, template,
+                      param_values, retain_except_on_create, stack_tags,
+                      previous_tags, imports=None) -> dict:
+    """What the rollback of a failed operation needs, kept on the stack record
+    of a ``*_FAILED`` stack (``DisableRollback``) until ``RollbackStack`` runs
+    it. Lists only, so the record survives the JSON persistence round trip."""
+    return {
+        "is_update": bool(is_update),
+        "previous_stack": previous_stack,
+        "created": list(created),
+        "failed_update": list(failed_update) if failed_update is not None else None,
+        "failed_logical_id": failed_logical_id,
+        "replaced_ids": list(replaced_ids),
+        "cancelled": bool(cancelled),
+        "template": template,
+        "param_values": param_values,
+        "retain_except_on_create": bool(retain_except_on_create),
+        "stack_tags": list(stack_tags or []),
+        "previous_tags": list(previous_tags or []),
+        "imports": dict(imports or {}),
+    }
+
+
+async def _roll_back_operation(stack_name: str, stack_id: str, stack: dict,
+                               operation: dict, reason_override: str = ""):
+    """Roll a failed create or update back: in-place changes are sent back to
+    their previous properties, what the operation created is deleted (subject
+    to ``DeletionPolicy`` and ``RetainExceptOnCreate``), and an update restores
+    the previous template, parameters, tags and outputs. Runs right after the
+    failure, or later from ``RollbackStack`` for a ``*_FAILED`` stack."""
+    is_update = operation.get("is_update", False)
+    previous_stack = operation.get("previous_stack")
+    created_in_this_run = operation.get("created", [])
+    failed_update = operation.get("failed_update")
+    failed_logical_id = operation.get("failed_logical_id")
+    replaced_ids = set(operation.get("replaced_ids", []))
+    cancelled = operation.get("cancelled", False)
+    template = operation.get("template") or {}
+    param_values = operation.get("param_values") or {}
+    retain_except_on_create = operation.get("retain_except_on_create", False)
+    stack_tags = operation.get("stack_tags") or []
+    previous_tags = operation.get("previous_tags") or []
+    imports = operation.get("imports") or {}
+    mappings = template.get("Mappings", {})
+    conditions = _evaluate_conditions(template, param_values)
+    resources_defs = template.get("Resources", {})
+    provisioned_resources = stack.setdefault("_resources", {})
+    stack.pop("_failed_operation", None)
+
+    # Rollback: delete resources created in this run in reverse order
+    stack["StackStatus"] = "ROLLBACK_IN_PROGRESS" if not is_update else "UPDATE_ROLLBACK_IN_PROGRESS"
+    if reason_override:
+        rollback_reason = reason_override
+    elif cancelled:
+        rollback_reason = "User Initiated"
+    elif is_update and failed_logical_id:
+        verb = "update" if failed_update is not None else "create"
+        rollback_reason = (f"The following resource(s) failed to {verb}: "
+                           f"[{failed_logical_id}]. ")
+    else:
+        rollback_reason = "Rollback requested"
+    _add_event(stack_id, stack_name, stack_name,
+               "AWS::CloudFormation::Stack", stack["StackStatus"],
+               rollback_reason, stack_id)
+
+    rollback_failed_records = {}
+    previous_resources = (
+        previous_stack.get("_resources", {})
+        if is_update and previous_stack else {}
+    )
+
+    async def revert(logical_id, rtype, pid, applied, previous, attrs):
+        # A failed revert is kept for ContinueUpdateRollback.
+        try:
+            await _revert_update(stack_id, stack_name, logical_id, rtype,
+                                 pid, applied, previous, attrs,
+                                 previous_resources.get(logical_id))
+        except Exception:
+            rollback_failed_records[logical_id] = {
+                "PhysicalResourceId": pid, "ResourceType": rtype,
+                "RevertFrom": applied, "RevertTo": previous,
+                "Attributes": attrs,
+            }
+
+    # In-place changes go back first; what the update created is deleted in cleanup.
+    to_delete = []
+    for logical_id in created_in_this_run:
+        res = provisioned_resources.get(logical_id, {})
+        pid = res.get("PhysicalResourceId", "")
+        prev = previous_resources.get(logical_id)
+        if (prev is None or prev.get("PhysicalResourceId") != pid
+                or logical_id in replaced_ids):
+            to_delete.append(logical_id)
+            continue
+        # Pre-existing and same identity: sent back with the tags each side was called with.
+        rtype = res.get("ResourceType", "")
+        applied = _with_stack_tags(rtype, res.get("Properties", {}), stack_tags,
+                                   stack_name, stack_id, logical_id)
+        previous = _with_stack_tags(rtype, prev.get("Properties", {}),
+                                    previous_tags, stack_name, stack_id,
+                                    logical_id)
+        if applied != previous:
+            await revert(logical_id, rtype, pid, applied, previous,
+                         res.get("Attributes", {}))
+    if failed_update is not None:
+        logical_id, rtype, pid, applied, previous, attrs = failed_update
+        if (applied is not None and applied != previous
+                and _sends_back_failed_update(rtype)):
+            await revert(logical_id, rtype, pid, applied, previous, attrs)
+        else:
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "UPDATE_COMPLETE", physical_id=pid)
+            _mark_rolled_back(previous_resources.get(logical_id))
+    # "rolled back to its previous working state ... still deleting any new
+    # resources" (view-stack-events): a cleanup delete failure does not fail it.
+    cleanup_phase = bool(is_update and previous_stack
+                         and not rollback_failed_records)
+
+    def release():
+        # An imported resource leaves the stack as it came; one that failed never got tags.
+        if failed_logical_id in imports:
+            for status in ("IMPORT_ROLLBACK_IN_PROGRESS", "IMPORT_ROLLBACK_COMPLETE"):
+                _add_event(stack_id, stack_name, failed_logical_id,
+                           resources_defs[failed_logical_id].get("Type", ""), status)
+        for logical_id in reversed([lid for lid in to_delete if lid in imports]):
+            res = provisioned_resources.pop(logical_id, {})
+            for status, reason in (("UPDATE_IN_PROGRESS", _IMPORT_UNTAG), ("UPDATE_COMPLETE", ""),
+                                   ("IMPORT_ROLLBACK_IN_PROGRESS", ""),
+                                   ("IMPORT_ROLLBACK_COMPLETE", "")):
+                _add_event(stack_id, stack_name, logical_id, res.get("ResourceType", ""),
+                           status, reason, res.get("PhysicalResourceId", ""))
+
+    # An update releases them before its cleanup, a create after its deletes.
+    if is_update and previous_stack:
+        release()
+    if cleanup_phase:
+        stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE_CLEANUP_IN_PROGRESS"
+        _add_event(stack_id, stack_name, stack_name,
+                   "AWS::CloudFormation::Stack", stack["StackStatus"],
+                   physical_id=stack_id)
+    for logical_id in reversed([lid for lid in to_delete if lid not in imports]):
+        res = provisioned_resources.get(logical_id, {})
+        rtype = res.get("ResourceType", "")
+        pid = res.get("PhysicalResourceId", "")
+        res_props = res.get("Properties", {})
+        policy = _resource_policy(
+            resources_defs.get(logical_id), "DeletionPolicy",
+            provisioned_resources, param_values, conditions, mappings,
+            stack_name, stack_id)
+        if policy == "Retain" and not retain_except_on_create:
+            # ``Retain`` survives even the rollback of the operation
+            # that created it; ``RetainExceptOnCreate`` and the API
+            # parameter of that name are exactly the exception.
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "DELETE_SKIPPED", physical_id=pid)
+            provisioned_resources.pop(logical_id, None)
+            continue
+        _add_event(stack_id, stack_name, logical_id, rtype,
+                   "DELETE_IN_PROGRESS", physical_id=pid)
+        try:
+            if _runs_on_worker_thread(rtype):
+                await run_reentrant(
+                    _delete_resource, rtype, pid, res_props,
+                    stack_name, logical_id
+                )
+            else:
+                _delete_resource(rtype, pid, res_props, stack_name, logical_id)
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "DELETE_COMPLETE", physical_id=pid)
+        except Exception as del_exc:
+            logger.error("Rollback delete of %s failed: %s",
+                         logical_id, del_exc)
+            _add_event(stack_id, stack_name, logical_id, rtype,
+                       "DELETE_FAILED", str(del_exc), pid)
+            if cleanup_phase:
+                provisioned_resources.pop(logical_id, None)
+                continue
+            rollback_failed_records[logical_id] = {
+                "PhysicalResourceId": pid, "ResourceType": rtype,
+                "Properties": res_props,
+            }
+        provisioned_resources.pop(logical_id, None)
+    if not (is_update and previous_stack):
+        release()
+
+    if is_update and previous_stack:
+        # Restore previous resources
+        stack["_resources"] = previous_stack.get("_resources", {})
+        stack["_template"] = previous_stack.get("_template", {})
+        stack["_resolved_params"] = previous_stack.get("_resolved_params", {})
+        # What the API reports has to follow: GetTemplate serves
+        # _template_body and DescribeStacks the Parameters and Tags,
+        # and a rolled-back stack reports what it ran before the
+        # update, not what failed.
+        stack["_template_body"] = previous_stack.get(
+            "_template_body", stack.get("_template_body", ""))
+        stack["Parameters"] = previous_stack.get(
+            "Parameters", stack.get("Parameters", []))
+        stack["Tags"] = previous_stack.get("Tags", stack.get("Tags", []))
+        stack["Outputs"] = previous_stack.get("Outputs", [])
+        stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
+    else:
+        stack["StackStatus"] = "ROLLBACK_COMPLETE"
+    if rollback_failed_records:
+        # A rollback that could not undo what it created or changed
+        # must not report success — real CloudFormation lands the stack
+        # in (UPDATE_)ROLLBACK_FAILED and keeps the failure visible.
+        stack["StackStatus"] = (
+            "UPDATE_ROLLBACK_FAILED" if is_update and previous_stack
+            else "ROLLBACK_FAILED"
+        )
+        reason = _rollback_failure_reason(rollback_failed_records)
+        stack["StackStatusReason"] = reason
+        # What ContinueUpdateRollback retries (or skips).
+        stack["_rollback_failed"] = rollback_failed_records
+        _add_event(stack_id, stack_name, stack_name,
+                   "AWS::CloudFormation::Stack", stack["StackStatus"],
+                   reason, stack_id)
+        return
+    _add_event(stack_id, stack_name, stack_name,
+               "AWS::CloudFormation::Stack", stack["StackStatus"],
+               "" if is_update and previous_stack else "Rollback complete",
+               stack_id)
+
+
+# AWS's reasons for a create that fails its pre-deployment validation.
+_VALIDATION_FAILED = (
+    "Validation failed with {count} error(s). Call DescribeEvents to retrieve the "
+    "full list of issues with resource and property details, resolve each error, "
+    "then retry the operation.")
+_VALIDATION_ROLLBACK = "Validation failure detected. See the operation's FAILED event for details."
+
+
+def _fail_property_validation(stack, stack_id, stack_name, resources_defs, ordered,
+                              param_values, conditions, mappings, disable_rollback):
+    """Fail a create with a property outside its schema enum before provisioning anything."""
+    errors = []
+    for logical_id in ordered:
+        res_def = resources_defs[logical_id]
+        cond = res_def.get("Condition")
+        if cond and not conditions.get(cond, True):
+            continue
+        rtype = res_def.get("Type", "")
+        props = {}
+        for prop in _PROPERTY_ENUMS.get(rtype, {}):
+            raw = (res_def.get("Properties") or {}).get(prop)
+            if any(name in resources_defs for name, _ in _intrinsic_references(raw)):
+                continue
+            props[prop] = _resolve_refs(copy.deepcopy(raw), {}, param_values, conditions,
+                                        mappings, stack_name, stack_id)
+        errors += [(logical_id, prop, reason)
+                   for prop, reason in _property_enum_errors(rtype, props)]
+    if not errors:
+        return False
+    for logical_id, prop, reason in errors:
+        logger.warning("Stack %s validation: /Resources/%s/Properties/%s: %s",
+                       stack_name, logical_id, prop, reason)
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "CREATE_FAILED", _VALIDATION_FAILED.format(count=len(errors)), stack_id,
+               detailed_status="VALIDATION_FAILED")
+    if disable_rollback:
+        stack["StackStatus"] = "CREATE_FAILED"
+        return True
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "ROLLBACK_IN_PROGRESS", _VALIDATION_ROLLBACK, stack_id)
+    _add_event(stack_id, stack_name, stack_name, "AWS::CloudFormation::Stack",
+               "ROLLBACK_COMPLETE", "", stack_id)
+    stack["StackStatus"] = "ROLLBACK_COMPLETE"
+    return True
+
+
 async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                               param_values: dict, disable_rollback: bool,
                               tags: list, is_update: bool = False,
                               previous_stack: dict | None = None,
-                              retain_except_on_create: bool = False):
+                              retain_except_on_create: bool = False,
+                              imports: dict | None = None):
     """Background task: provision resources and set final stack status.
 
     ``retain_except_on_create`` is the API parameter of the same name: a
     rollback of this operation then deletes what the operation created even
     when the template says ``DeletionPolicy: Retain``."""
+    # The identifiers of the resources ImportExistingResources adopts, by logical id.
+    imports = imports or {}
     from ministack.services.cloudformation import _exports, _stacks
     status_prefix = "UPDATE" if is_update else "CREATE"
     stack = _stacks[stack_name]
+    stack.pop("_failed_operation", None)
 
     mappings = template.get("Mappings", {})
     conditions = _evaluate_conditions(template, param_values)
@@ -244,9 +665,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     except ValueError as exc:
         stack["StackStatus"] = f"{status_prefix}_FAILED"
         stack["StackStatusReason"] = str(exc)
+        stack["_failed_operation"] = _failed_operation(
+            is_update, previous_stack, [], None, None, [], False, template,
+            param_values, retain_except_on_create, stack.get("Tags") or [],
+            (previous_stack or {}).get("Tags") or [])
         _add_event(stack_id, stack_name, stack_name,
                    "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
                    str(exc), stack_id)
+        return
+
+    if not is_update and _fail_property_validation(
+            stack, stack_id, stack_name, resources_defs, ordered, param_values,
+            conditions, mappings, disable_rollback):
         return
 
     provisioned_resources: dict = stack.get("_resources", {})
@@ -269,12 +699,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
     fail_reason = ""
     cancelled = False
     replaced_resources = []
+    # (logical id, type, pid, applied, previous, attrs) of a pre-existing resource that failed.
+    failed_update = None
+    failed_logical_id = None
     stack.pop("_cancel_requested", None)
+    stack.pop("_cancel_token", None)
 
     for logical_id in ordered:
         if is_update and stack.pop("_cancel_requested", False):
             # CancelUpdateStack: stop before the next resource and roll the
-            # update back, as on AWS ("User Initiated").
+            # update back, as on AWS ("User Initiated"). The rollback events
+            # are the cancel's, so they carry its ClientRequestToken.
+            CLIENT_REQUEST_TOKEN.set(stack.pop("_cancel_token", ""))
             failed = cancelled = True
             fail_reason = "User Initiated"
             break
@@ -285,6 +721,8 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
         resource_type = res_def.get("Type", "AWS::CloudFormation::CustomResource")
         raw_props = res_def.get("Properties", {})
+        update_attempt = None
+        name_seed = ""
 
         try:
             # Resolve properties
@@ -322,8 +760,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 reuse_secrets=resource_unchanged,
             )
 
-            _add_event(stack_id, stack_name, logical_id, resource_type,
-                       f"{status_prefix}_IN_PROGRESS")
+            if logical_id not in imports:
+                _add_event(stack_id, stack_name, logical_id, resource_type,
+                           f"{status_prefix}_IN_PROGRESS")
 
             # On stack update, route previously-provisioned resources through
             # the type's update handler when one exists; otherwise fall back
@@ -350,31 +789,49 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 new_tagged = _with_stack_tags(
                     resource_type, resolved_props, stack_tags,
                     stack_name, stack_id, logical_id)
+                pending_deletes = []
+                deferred_token = _DEFERRED_PREDECESSOR_DELETES.set(pending_deletes)
+                seed_token = _NAME_SEED.set(prev_resource.get("_name_seed", ""))
+                # A refusal or a replacement leaves the resource as it was: nothing to send back.
+                refused = _custom_named_replacement_error(resource_type, old_tagged, new_tagged)
+                if not refused and _replacing_change(resource_type, old_tagged, new_tagged):
+                    _add_event(stack_id, stack_name, logical_id, resource_type,
+                               "UPDATE_IN_PROGRESS",
+                               "Requested update requires the creation of a new "
+                               "physical resource; hence creating one.", old_pid)
+                elif not refused:
+                    update_attempt = (old_pid, new_tagged, old_tagged, old_attrs)
                 try:
-                    if _is_custom_resource(resource_type):
-                        physical_id, attrs = await run_reentrant(
-                            _update_resource, resource_type, old_pid, old_tagged,
+                    if _runs_on_worker_thread(resource_type):
+                        (physical_id, attrs), name_seed = await run_reentrant(
+                            _update_keeping_seed, resource_type, old_pid, old_tagged,
                             new_tagged, stack_name, logical_id, old_attrs
                         )
                     else:
-                        physical_id, attrs = _update_resource(
+                        (physical_id, attrs), name_seed = _update_keeping_seed(
                             resource_type, old_pid, old_tagged, new_tagged,
                             stack_name, logical_id, old_attrs
                         )
                 finally:
+                    _NAME_SEED.reset(seed_token)
+                    _DEFERRED_PREDECESSOR_DELETES.reset(deferred_token)
                     _RETAIN_REPLACED.reset(token)
-                if physical_id != old_pid:
-                    # A changed physical id is a replacement. Real
-                    # CloudFormation deletes the predecessor in the
-                    # UPDATE_COMPLETE_CLEANUP phase; without this the old
-                    # resource leaked forever, still holding its data.
+                if physical_id != old_pid or pending_deletes:
+                    # A changed physical id, or a predecessor delete the
+                    # handler queued, is a replacement. Real CloudFormation
+                    # deletes the predecessor in the UPDATE_COMPLETE_CLEANUP
+                    # phase and keeps it when the update rolls back.
                     replaced_resources.append(
-                        (logical_id, resource_type, old_pid, old_props))
+                        (logical_id, resource_type, old_pid, physical_id,
+                         old_props, pending_deletes))
             else:
                 new_tagged = _with_stack_tags(
                     resource_type, resolved_props, stack_tags,
                     stack_name, stack_id, logical_id)
-                if _is_custom_resource(resource_type):
+                if logical_id in imports:
+                    physical_id, attrs = _adopt_resource(
+                        stack_id, stack_name, logical_id, resource_type, imports[logical_id])
+                elif _runs_on_worker_thread(resource_type):
                     physical_id, attrs = await run_reentrant(
                         _provision_resource, resource_type, logical_id, new_tagged, stack_name
                     )
@@ -386,15 +843,27 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             logger.error("Failed to provision %s (%s): %s",
                          logical_id, resource_type, exc)
             _add_event(stack_id, stack_name, logical_id, resource_type,
-                       f"{status_prefix}_FAILED", str(exc))
+                       "IMPORT_FAILED" if logical_id in imports else f"{status_prefix}_FAILED",
+                       str(exc))
             failed = True
             fail_reason = f"Resource {logical_id} failed: {exc}"
+            failed_logical_id = logical_id
+            if update_attempt is not None:
+                failed_update = (logical_id, resource_type, *update_attempt)
+            elif is_update and previous_stack and logical_id in previous_stack.get(
+                    "_resources", {}):
+                failed_update = (
+                    logical_id, resource_type,
+                    previous_stack["_resources"][logical_id].get(
+                        "PhysicalResourceId", logical_id),
+                    None, None, None)
             break
 
         provisioned_resources[logical_id] = {
             "PhysicalResourceId": physical_id,
             "ResourceType": resource_type,
-            "ResourceStatus": f"{status_prefix}_COMPLETE",
+            "ResourceStatus": ("UPDATE_COMPLETE" if logical_id in imports
+                               else f"{status_prefix}_COMPLETE"),
             "LogicalResourceId": logical_id,
             "Properties": resolved_props,
             "Attributes": attrs,
@@ -402,15 +871,43 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         }
         if dynamic_values:
             provisioned_resources[logical_id]["_dynamic"] = dynamic_values
+        if name_seed:
+            provisioned_resources[logical_id]["_name_seed"] = name_seed
         created_in_this_run.append(logical_id)
 
-        _add_event(stack_id, stack_name, logical_id, resource_type,
-                   f"{status_prefix}_COMPLETE", physical_id=physical_id)
+        if logical_id not in imports:
+            _add_event(stack_id, stack_name, logical_id, resource_type,
+                       f"{status_prefix}_COMPLETE", physical_id=physical_id)
+
+    resolved_outputs: list = []
+    new_exports: dict = {}
+    if not failed:
+        try:
+            # A resource the update removes is still recorded here (its delete
+            # runs below); an output that reads it must fail, as on AWS.
+            surviving = {k: v for k, v in provisioned_resources.items() if k not in to_remove}
+            resolved_outputs, new_exports = _resolve_stack_outputs(
+                outputs_defs, conditions, surviving, param_values,
+                mappings, stack_name, stack_id)
+        except Exception as exc:
+            # An output that cannot be resolved -- typically Fn::GetAtt to an
+            # attribute the resource does not expose -- fails the operation
+            # after every resource was created. Real CloudFormation rolls back
+            # at exactly this point, with the resolution error as the reason.
+            logger.error("Failed to resolve outputs of %s: %s", stack_name, exc)
+            failed = True
+            fail_reason = str(exc)
+            _add_event(stack_id, stack_name, stack_name,
+                       "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
+                       fail_reason, stack_id)
 
     # Replacement cleanup (update case): delete each replaced resource's
-    # predecessor, as real CloudFormation does after UPDATE_COMPLETE.
+    # predecessor, as real CloudFormation does after UPDATE_COMPLETE, in
+    # reverse order so a dependent goes before what it depends on. Nothing
+    # is deleted before this point, so a rollback keeps the old resources.
     if not failed and replaced_resources:
-        for logical_id, rtype, old_pid, old_props in replaced_resources:
+        for (logical_id, rtype, old_pid, new_pid, old_props,
+             pending_deletes) in reversed(replaced_resources):
             policy = _resource_policy(
                 resources_defs.get(logical_id), "UpdateReplacePolicy",
                 provisioned_resources, param_values, conditions, mappings,
@@ -418,11 +915,18 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             if policy in _RETAINING_POLICIES:
                 # The predecessor leaves CloudFormation's scope and keeps
                 # existing, as on AWS (a DELETE_SKIPPED event, no delete call).
-                _add_event(stack_id, stack_name, logical_id, rtype,
-                           "DELETE_SKIPPED", physical_id=old_pid)
+                if new_pid != old_pid:
+                    _add_event(stack_id, stack_name, logical_id, rtype,
+                               "DELETE_SKIPPED", physical_id=old_pid)
                 continue
             try:
-                if _is_custom_resource(rtype):
+                # The handler's own delete first: it knows the old record's
+                # key where the physical id does not carry it.
+                for delete_fn, args, kwargs in pending_deletes:
+                    delete_fn(*args, **kwargs)
+                if new_pid == old_pid:
+                    continue
+                if _runs_on_worker_thread(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, old_pid, old_props,
                         stack_name, logical_id
@@ -440,7 +944,14 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
         old_resources = previous_stack.get("_resources", {})
         old_template = previous_stack.get("_template", {}) or {}
         old_defs = old_template.get("Resources", {}) or {}
-        for logical_id in to_remove:
+        # Dependents first, as the stack delete orders it.
+        try:
+            removal_order = [lid for lid in _topological_sort(
+                old_defs, previous_stack.get("_conditions", conditions)) if lid in to_remove]
+        except ValueError:
+            removal_order = []
+        removal_order += [lid for lid in to_remove if lid not in removal_order]
+        for logical_id in reversed(removal_order):
             old_res = old_resources.get(logical_id, {})
             rtype = old_res.get("ResourceType", "")
             pid = old_res.get("PhysicalResourceId", "")
@@ -456,7 +967,9 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 provisioned_resources.pop(logical_id, None)
                 continue
             try:
-                if _is_custom_resource(rtype):
+                if policy == "Snapshot":
+                    _snapshot_resource(rtype, pid, old_props)
+                if _runs_on_worker_thread(rtype):
                     await run_reentrant(
                         _delete_resource, rtype, pid, old_props,
                         stack_name, logical_id
@@ -484,132 +997,22 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
 
     await asyncio.sleep(0)
 
-    resolved_outputs: list = []
-    new_exports: dict = {}
-    if not failed:
-        try:
-            resolved_outputs, new_exports = _resolve_stack_outputs(
-                outputs_defs, conditions, provisioned_resources, param_values,
-                mappings, stack_name, stack_id)
-        except Exception as exc:
-            # An output that cannot be resolved -- typically Fn::GetAtt to an
-            # attribute the resource does not expose -- fails the operation
-            # after every resource was created. Real CloudFormation rolls back
-            # at exactly this point, with the resolution error as the reason.
-            logger.error("Failed to resolve outputs of %s: %s", stack_name, exc)
-            failed = True
-            fail_reason = str(exc)
-            _add_event(stack_id, stack_name, stack_name,
-                       "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
-                       fail_reason, stack_id)
-
     if failed:
+        operation = _failed_operation(
+            is_update, previous_stack, created_in_this_run, failed_update,
+            failed_logical_id, [entry[0] for entry in replaced_resources],
+            cancelled, template, param_values, retain_except_on_create,
+            stack_tags, previous_tags, imports)
         if disable_rollback:
             stack["StackStatus"] = f"{status_prefix}_FAILED"
             stack["StackStatusReason"] = fail_reason
+            # RollbackStack picks this up (the "last known stable state").
+            stack["_failed_operation"] = operation
             _add_event(stack_id, stack_name, stack_name,
                        "AWS::CloudFormation::Stack", f"{status_prefix}_FAILED",
                        fail_reason, stack_id)
         else:
-            # Rollback: delete resources created in this run in reverse order
-            stack["StackStatus"] = "ROLLBACK_IN_PROGRESS" if not is_update else "UPDATE_ROLLBACK_IN_PROGRESS"
-            _add_event(stack_id, stack_name, stack_name,
-                       "AWS::CloudFormation::Stack", stack["StackStatus"],
-                       "User Initiated" if cancelled else "Rollback requested",
-                       stack_id)
-
-            rollback_delete_failures = []
-            rollback_failed_records = {}
-            previous_resources = (
-                previous_stack.get("_resources", {})
-                if is_update and previous_stack else {}
-            )
-            for logical_id in reversed(created_in_this_run):
-                res = provisioned_resources.get(logical_id, {})
-                rtype = res.get("ResourceType", "")
-                pid = res.get("PhysicalResourceId", "")
-                res_props = res.get("Properties", {})
-                prev = previous_resources.get(logical_id)
-                if prev is not None and prev.get("PhysicalResourceId") == pid:
-                    # The resource existed before this update and kept its
-                    # identity (untouched, or updated in place), so it is not
-                    # something this run created: deleting it would destroy a
-                    # resource the restored stack still records. Only new
-                    # resources and replacements under a new physical id are
-                    # undone. An in-place change is not reverted here.
-                    continue
-                policy = _resource_policy(
-                    resources_defs.get(logical_id), "DeletionPolicy",
-                    provisioned_resources, param_values, conditions, mappings,
-                    stack_name, stack_id)
-                if policy == "Retain" and not retain_except_on_create:
-                    # ``Retain`` survives even the rollback of the operation
-                    # that created it; ``RetainExceptOnCreate`` and the API
-                    # parameter of that name are exactly the exception.
-                    _add_event(stack_id, stack_name, logical_id, rtype,
-                               "DELETE_SKIPPED", physical_id=pid)
-                    provisioned_resources.pop(logical_id, None)
-                    continue
-                try:
-                    if _is_custom_resource(rtype):
-                        await run_reentrant(
-                            _delete_resource, rtype, pid, res_props,
-                            stack_name, logical_id
-                        )
-                    else:
-                        _delete_resource(rtype, pid, res_props, stack_name, logical_id)
-                    _add_event(stack_id, stack_name, logical_id, rtype,
-                               "DELETE_COMPLETE", physical_id=pid)
-                except Exception as del_exc:
-                    logger.error("Rollback delete of %s failed: %s",
-                                 logical_id, del_exc)
-                    _add_event(stack_id, stack_name, logical_id, rtype,
-                               "DELETE_FAILED", str(del_exc), pid)
-                    rollback_delete_failures.append(logical_id)
-                    rollback_failed_records[logical_id] = {
-                        "PhysicalResourceId": pid, "ResourceType": rtype,
-                        "Properties": res_props,
-                    }
-                provisioned_resources.pop(logical_id, None)
-
-            if is_update and previous_stack:
-                # Restore previous resources
-                stack["_resources"] = previous_stack.get("_resources", {})
-                stack["_template"] = previous_stack.get("_template", {})
-                stack["_resolved_params"] = previous_stack.get("_resolved_params", {})
-                # What the API reports has to follow: GetTemplate serves
-                # _template_body and DescribeStacks the Parameters and Tags,
-                # and a rolled-back stack reports what it ran before the
-                # update, not what failed.
-                stack["_template_body"] = previous_stack.get(
-                    "_template_body", stack.get("_template_body", ""))
-                stack["Parameters"] = previous_stack.get(
-                    "Parameters", stack.get("Parameters", []))
-                stack["Tags"] = previous_stack.get("Tags", stack.get("Tags", []))
-                stack["Outputs"] = previous_stack.get("Outputs", [])
-                stack["StackStatus"] = "UPDATE_ROLLBACK_COMPLETE"
-            else:
-                stack["StackStatus"] = "ROLLBACK_COMPLETE"
-            if rollback_delete_failures:
-                # A rollback that could not undo what it created must not
-                # report success — real CloudFormation lands the stack in
-                # (UPDATE_)ROLLBACK_FAILED and keeps the failure visible.
-                stack["StackStatus"] = (
-                    "UPDATE_ROLLBACK_FAILED" if is_update and previous_stack
-                    else "ROLLBACK_FAILED"
-                )
-                reason = ("The following resource(s) failed to delete: "
-                          f"[{', '.join(sorted(rollback_delete_failures))}].")
-                stack["StackStatusReason"] = reason
-                # What ContinueUpdateRollback retries (or skips).
-                stack["_rollback_failed"] = rollback_failed_records
-                _add_event(stack_id, stack_name, stack_name,
-                           "AWS::CloudFormation::Stack", stack["StackStatus"],
-                           reason, stack_id)
-                return
-            _add_event(stack_id, stack_name, stack_name,
-                       "AWS::CloudFormation::Stack", stack["StackStatus"],
-                       "Rollback complete", stack_id)
+            await _roll_back_operation(stack_name, stack_id, stack, operation)
         return
 
     # Success: publish outputs and exports
@@ -624,14 +1027,37 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                physical_id=stack_id)
 
 
+def _with_dependencies(logical_ids, res_defs, remaining):
+    """``logical_ids`` plus every resource of ``remaining`` they depend on,
+    directly or through another one (Ref, Fn::GetAtt, Fn::Sub, DependsOn)."""
+    result = set(logical_ids)
+    pending = list(logical_ids)
+    while pending:
+        res_def = res_defs.get(pending.pop())
+        if not res_def:
+            continue
+        for dep in _extract_deps(res_def, remaining):
+            if dep not in result:
+                result.add(dep)
+                pending.append(dep)
+    return result
+
+
 async def _delete_stack_async(stack_name: str, stack_id: str,
-                              retain_resources=()):
+                              retain_resources=(), force=False):
     """Background task: delete all resources and mark stack DELETE_COMPLETE.
 
     A resource whose ``DeletionPolicy`` is ``Retain`` or
     ``RetainExceptOnCreate``, or whose logical id is in ``retain_resources``
     (the ``RetainResources`` parameter of a DeleteStack on a ``DELETE_FAILED``
-    stack), is skipped with a ``DELETE_SKIPPED`` event and keeps existing."""
+    stack), is skipped with a ``DELETE_SKIPPED`` event and keeps existing.
+
+    ``force`` is ``DeletionMode=FORCE_DELETE_STACK``: the console's "Force
+    delete this entire stack" "retains all resources that failed to delete,
+    and retains dependencies of those resources" (cfn-console-delete-stack),
+    and the retained ones show ``DELETE_SKIPPED``. A resource that fails to
+    delete during the forced delete is retained the same way, so the stack
+    reaches ``DELETE_COMPLETE``."""
     from ministack.services.cloudformation import _exports, _stacks
     stack = _stacks.get(stack_name)
     if not stack:
@@ -659,6 +1085,13 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
     # it goes first, so a retried delete reaches it.
     ordered += [lid for lid in resources if lid not in ordered]
 
+    forced_retain = set()
+    if force:
+        forced_retain = _with_dependencies(
+            [lid for lid, res in resources.items()
+             if res.get("ResourceStatus") == "DELETE_FAILED"],
+            res_defs, set(resources))
+
     delete_failures = []
     for logical_id in reversed(ordered):
         res = resources.get(logical_id)
@@ -672,7 +1105,8 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
             res_defs.get(logical_id), "DeletionPolicy", resources,
             stack.get("_resolved_params", {}), conditions,
             template.get("Mappings", {}) if template else {}, stack_name, stack_id)
-        if policy in _RETAINING_POLICIES or logical_id in retain_resources:
+        if (policy in _RETAINING_POLICIES or logical_id in retain_resources
+                or logical_id in forced_retain):
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_SKIPPED", physical_id=pid)
             resources.pop(logical_id, None)
@@ -681,7 +1115,9 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
-            if _is_custom_resource(rtype):
+            if policy == "Snapshot":
+                _snapshot_resource(rtype, pid, res_props)
+            if _runs_on_worker_thread(rtype):
                 await run_reentrant(
                     _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id
@@ -693,6 +1129,13 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
             resources.pop(logical_id, None)
         except Exception as exc:
             logger.error("Delete of %s (%s) failed: %s", logical_id, pid, exc)
+            if force:
+                # A forced delete retains the resource, and what it depends on.
+                _add_event(stack_id, stack_name, logical_id, rtype,
+                           "DELETE_SKIPPED", str(exc), pid)
+                resources.pop(logical_id, None)
+                forced_retain |= _with_dependencies([logical_id], res_defs, set(resources))
+                continue
             _add_event(stack_id, stack_name, logical_id, rtype,
                        "DELETE_FAILED", str(exc), pid)
             res["ResourceStatus"] = "DELETE_FAILED"
@@ -727,6 +1170,30 @@ async def _delete_stack_async(stack_name: str, stack_id: str,
                physical_id=stack_id)
 
 
+# The states a stack create ends in when it failed, rolled back or not.
+_FAILED_CREATE_STATUSES = frozenset({"CREATE_FAILED", "ROLLBACK_COMPLETE", "ROLLBACK_FAILED"})
+
+
+async def _create_then_delete_on_failure(stack_name: str, stack_id: str, deploy_coro):
+    """``OnFailure=DELETE`` (CreateStack) and ``OnStackFailure=DELETE``
+    (CreateChangeSet of type CREATE): run the create, and when it fails,
+    delete the stack once the rollback is over. The stack ends
+    ``DELETE_COMPLETE``, or ``DELETE_FAILED`` when a resource does not delete
+    ("If the deletion of the stack fails, the status of the stack is
+    DELETE_FAILED", API_CreateChangeSet)."""
+    from ministack.services.cloudformation import _change_sets, _stacks
+    await deploy_coro
+    stack = _stacks.get(stack_name)
+    if not stack or stack.get("StackId") != stack_id:
+        return
+    if stack.get("StackStatus") not in _FAILED_CREATE_STATUSES:
+        return
+    await _delete_stack_async(stack_name, stack_id)
+    # A deleted stack takes its change sets with it, as DeleteStack does.
+    for cs_id in [c for c, v in _change_sets.items() if v.get("StackId") == stack_id]:
+        _change_sets.pop(cs_id, None)
+
+
 # ===========================================================================
 # Change Set Helpers
 # ===========================================================================
@@ -745,28 +1212,135 @@ _DIFFED_ATTRIBUTES = (
     "UpdateReplacePolicy",
 )
 
+# Types a stack-tag change leaves out of a change set (measured).
+_UNTAGGED_TYPES = (
+    "AWS::CloudFormation::CustomResource",
+    "AWS::CloudFormation::WaitCondition",
+    "AWS::CloudFormation::WaitConditionHandle",
+)
 
-def _diff_resources(old_template: dict, new_template: dict) -> list:
+
+def _stack_tags_changed(stack: dict, tags: list, tags_given: bool) -> bool:
+    """True when a request's stack tags differ from the stack's, order aside."""
+    return bool(tags or tags_given) and _tag_map(tags) != _tag_map(stack.get("Tags"))
+
+
+_POLICY_ACTIONS = {"Delete": "Delete", "Retain": "Retain", "RetainExceptOnCreate": "Retain",
+                   "Snapshot": "Snapshot"}
+
+
+def _policy_action(res_def: dict, attribute: str, prefix: str = "") -> dict:
+    """The PolicyAction member for the policy in effect on the old resource."""
+    policy = res_def.get(attribute, _default_resource_policy(res_def, attribute))
+    action = _POLICY_ACTIONS.get(policy) if isinstance(policy, str) else None
+    return {"PolicyAction": prefix + action} if action else {}
+
+
+def _replacement(details: list, type_changed: bool) -> str:
+    """The Replacement of a Modify that carries these details."""
+    recreation = {(d["Target"]["RequiresRecreation"], d["Evaluation"]) for d in details}
+    if type_changed or ("Always", "Static") in recreation:
+        return "True"
+    if any(r != "Never" for r, _ in recreation):
+        return "Conditional"
+    return "False"
+
+
+def _reference_details(res_def: dict, replacements: dict, changed_params) -> dict:
+    """Details per property for its references to changed parameters and resources."""
+    rtype = res_def.get("Type", "")
+    found: dict = {}
+    for name, value in (res_def.get("Properties") or {}).items():
+        for ref, attr in _intrinsic_references(value):
+            if ref in changed_params and attr is None:
+                source, entity, evaluation = "ParameterReference", ref, "Static"
+            elif ref in replacements and (attr or replacements[ref] != "False"):
+                source = "ResourceAttribute" if attr else "ResourceReference"
+                entity = f"{ref}.{attr}" if attr else ref
+                evaluation = "Static" if replacements[ref] == "True" else "Dynamic"
+            else:
+                continue
+            detail = {
+                "Target": {"Attribute": "Properties", "Name": name,
+                           "RequiresRecreation": _property_recreation(rtype, name)},
+                "Evaluation": evaluation,
+                "ChangeSource": source,
+                "CausingEntity": entity,
+            }
+            if detail not in found.setdefault(name, []):
+                found[name].append(detail)
+    return found
+
+
+def _diff_resources(old_template: dict, new_template: dict, resources: dict | None = None,
+                    template: dict | None = None, changed_params=(), retag=()) -> list:
     """Diff two templates and return a list of change dicts.
 
     A resource is a ``Modify`` when its ``Properties`` differ or when one of the
     attributes in ``_DIFFED_ATTRIBUTES`` differs; each changed attribute becomes
     a ``Details`` entry (``Target.Attribute``, plus the property name for
     ``Properties``) and is listed in ``Scope``, as the API reference defines them.
+    References in ``template`` (unresolved) to changed parameters or resources add their own details.
+    ``resources`` are the stack's provisioned resources, whose physical ids a
+    ``Remove`` or ``Modify`` reports.
+    Each resource in ``retag`` (the stack's resources when its tags change)
+    outside ``_UNTAGGED_TYPES`` also gets a ``Tags`` entry.
     """
     old_res = old_template.get("Resources", {})
     new_res = new_template.get("Resources", {})
+    raw_res = (template or new_template).get("Resources", {})
     changes = []
 
-    all_keys = old_res.keys() | new_res.keys()
-    for key in sorted(all_keys):
+    common = old_res.keys() & new_res.keys()
+    changed_props, attr_details, type_changed = {}, {}, {}
+    for key in common:
+        old_props = old_res[key].get("Properties", {}) or {}
+        new_props = new_res[key].get("Properties", {}) or {}
+        changed_props[key] = {name for name in set(old_props) | set(new_props)
+                              if old_props.get(name) != new_props.get(name)}
+        attr_details[key] = [
+            {"Target": {"Attribute": attr, "RequiresRecreation": "Never"},
+             "Evaluation": "Static", "ChangeSource": "DirectModification"}
+            for attr in _DIFFED_ATTRIBUTES
+            if old_res[key].get(attr) != new_res[key].get(attr)
+        ]
+        type_changed[key] = old_res[key].get("Type") != new_res[key].get("Type")
+
+    def _modify_details(key, refs):
+        details = []
+        rtype = new_res[key].get("Type", "")
+        for name in sorted(changed_props[key] | set(refs)):
+            if name in changed_props[key]:
+                details.append({
+                    "Target": {"Attribute": "Properties", "Name": name,
+                               "RequiresRecreation": _property_recreation(rtype, name)},
+                    "Evaluation": "Dynamic" if refs.get(name) else "Static",
+                    "ChangeSource": "DirectModification",
+                })
+            details.extend(refs.get(name, []))
+        return details + attr_details[key]
+
+    # Repeat until no reference adds a detail: a change can cascade to its referrers.
+    refs: dict = {}
+    while True:
+        details = {key: _modify_details(key, refs.get(key, {})) for key in common}
+        replacements = {key: _replacement(d, type_changed[key])
+                        for key, d in details.items() if d or type_changed[key]}
+        found = {key: _reference_details(raw_res.get(key, {}), replacements, changed_params)
+                 for key in common}
+        if found == refs:
+            break
+        refs = found
+
+    for key in sorted(old_res.keys() | new_res.keys()):
+        pid = (resources or {}).get(key, {}).get("PhysicalResourceId")
+        physical = {"PhysicalResourceId": pid} if pid else {}
         if key not in old_res:
             changes.append({
                 "ResourceChange": {
                     "Action": "Add",
                     "LogicalResourceId": key,
                     "ResourceType": new_res[key].get("Type", ""),
-                    "Replacement": "False",
                 }
             })
         elif key not in new_res:
@@ -775,49 +1349,39 @@ def _diff_resources(old_template: dict, new_template: dict) -> list:
                     "Action": "Remove",
                     "LogicalResourceId": key,
                     "ResourceType": old_res[key].get("Type", ""),
-                    "PhysicalResourceId": "",
-                    "Replacement": "False",
+                    **physical,
+                    **_policy_action(old_res[key], "DeletionPolicy"),
                 }
             })
         else:
-            details = []
-            old_props = old_res[key].get("Properties", {}) or {}
-            new_props = new_res[key].get("Properties", {}) or {}
-            if old_props != new_props:
-                for name in sorted(set(old_props) | set(new_props)):
-                    if old_props.get(name) != new_props.get(name):
-                        details.append({
-                            "Target": {"Attribute": "Properties", "Name": name,
-                                       "RequiresRecreation": "Conditionally"},
-                            "Evaluation": "Static",
-                            "ChangeSource": "DirectModification",
-                        })
-            for attr in _DIFFED_ATTRIBUTES:
-                if old_res[key].get(attr) != new_res[key].get(attr):
-                    details.append({
-                        "Target": {"Attribute": attr},
-                        "Evaluation": "Static",
-                        "ChangeSource": "DirectModification",
-                    })
-            type_changed = old_res[key].get("Type") != new_res[key].get("Type")
-            if not details and not type_changed:
+            rtype = new_res[key].get("Type", "")
+            retagged = key in retag and not (
+                rtype.startswith("Custom::") or rtype in _UNTAGGED_TYPES)
+            if key not in replacements and not retagged:
                 continue
             scope = []
-            for d in details:
+            for d in details[key]:
                 if d["Target"]["Attribute"] not in scope:
                     scope.append(d["Target"]["Attribute"])
-            if type_changed or old_props != new_props:
-                replacement = "True" if type_changed else "Conditional"
-            else:
-                replacement = "False"
+            replacement = replacements.get(key, "False")
+            if retagged:
+                # First in Details, last in Scope, no ChangeSource (measured).
+                details[key].insert(0, {
+                    "Target": {"Attribute": "Tags", "RequiresRecreation": "Never"},
+                    "Evaluation": "Static",
+                })
+                scope.append("Tags")
             changes.append({
                 "ResourceChange": {
                     "Action": "Modify",
                     "LogicalResourceId": key,
                     "ResourceType": new_res[key].get("Type", ""),
+                    **physical,
                     "Replacement": replacement,
+                    **(_policy_action(new_res[key], "UpdateReplacePolicy", "ReplaceAnd")
+                       if replacement == "True" else {}),
                     "Scope": scope,
-                    "Details": details,
+                    "Details": details[key],
                 }
             })
     return changes

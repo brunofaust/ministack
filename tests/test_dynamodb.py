@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import os
@@ -105,6 +106,75 @@ def test_dynamodb_tables_are_region_isolated_by_name(ddb):
     finally:
         try:
             east.delete_table(TableName=name)
+        except ClientError:
+            pass
+
+
+def test_dynamodb_describe_table_accepts_table_arn(ddb):
+    """DescribeTable accepts the table ARN in TableName, as AWS does; an ARN
+    from another region still resolves to no table."""
+    name = f"arn-describe-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    try:
+        arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+        assert ddb.describe_table(TableName=arn)["Table"]["TableName"] == name
+        other_region_arn = arn.replace(":us-east-1:", ":eu-west-1:")
+        with pytest.raises(ClientError) as e:
+            ddb.describe_table(TableName=other_region_arn)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
+        except ClientError:
+            pass
+
+
+def test_dynamodb_table_arn_accepted_by_every_table_name_operation(ddb):
+    """Every operation whose TableName is a TableArn in the model takes the ARN;
+    batch responses keep the caller's key form, and a foreign ARN is not found."""
+    name = f"arn-ops-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    arn = ddb.describe_table(TableName=name)["Table"]["TableArn"]
+    key = {"pk": {"S": "a"}}
+    try:
+        ddb.put_item(TableName=arn, Item={"pk": {"S": "a"}, "v": {"S": "1"}})
+        assert ddb.get_item(TableName=arn, Key=key)["Item"]["v"] == {"S": "1"}
+        ddb.update_item(TableName=arn, Key=key, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"S": "2"}})
+        assert ddb.query(TableName=arn, KeyConditionExpression="pk = :p",
+                         ExpressionAttributeValues={":p": {"S": "a"}})["Count"] == 1
+        assert ddb.scan(TableName=arn)["Count"] == 1
+        got = ddb.batch_get_item(RequestItems={arn: {"Keys": [key]}})
+        assert list(got["Responses"]) == [arn]
+        ddb.batch_write_item(RequestItems={arn: [{"PutRequest": {"Item": {"pk": {"S": "b"}}}}]})
+        ddb.transact_write_items(TransactItems=[{"Put": {"TableName": arn, "Item": {"pk": {"S": "c"}}}}])
+        items = ddb.transact_get_items(TransactItems=[{"Get": {"TableName": arn, "Key": {"pk": {"S": "c"}}}}])
+        assert items["Responses"][0]["Item"]["pk"] == {"S": "c"}
+        ddb.delete_item(TableName=arn, Key=key)
+        ddb.update_time_to_live(TableName=arn, TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"})
+        assert ddb.describe_time_to_live(TableName=arn)["TimeToLiveDescription"]["AttributeName"] == "ttl"
+        ddb.update_continuous_backups(TableName=arn, PointInTimeRecoverySpecification={"PointInTimeRecoveryEnabled": True})
+        assert ddb.describe_continuous_backups(TableName=arn)["ContinuousBackupsDescription"]
+        assert ddb.describe_kinesis_streaming_destination(TableName=arn)["TableName"] == name
+        ddb.update_table(TableName=arn, BillingMode="PAY_PER_REQUEST")
+        other_region_arn = arn.replace(":us-east-1:", ":eu-west-1:")
+        with pytest.raises(ClientError) as e:
+            ddb.get_item(TableName=other_region_arn, Key=key)
+        assert e.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        ddb.delete_table(TableName=arn)
+    finally:
+        try:
+            ddb.delete_table(TableName=name)
         except ClientError:
             pass
 
@@ -289,7 +359,7 @@ def test_dynamodb_restore_legacy_table_name_metadata_uses_table_arn_region():
     }
 
     try:
-        ddb_service.restore_state({
+        ddb_service.load_persisted_state({
             "tables": tables,
             "ttl_settings": ttl_settings,
             "pitr_settings": pitr_settings,
@@ -359,7 +429,7 @@ def test_dynamodb_restore_ambiguous_legacy_metadata_uses_value_arn_region():
     ]
 
     try:
-        ddb_service.restore_state({
+        ddb_service.load_persisted_state({
             "tables": tables,
             "ttl_settings": ttl_settings,
             "kinesis_destinations": kinesis_destinations,
@@ -2549,8 +2619,10 @@ def test_ddb_sse_description_shape_matches_aws(ddb, kms_client):
     key_id = kms_client.create_key(Description="ddb-sse-t")["KeyMetadata"]["KeyId"]
     key_arn = f"arn:aws:kms:us-east-1:000000000000:key/{key_id}"
     tname = "t-sse-shape"
-    try: ddb.delete_table(TableName=tname)
-    except Exception: pass
+    try:
+        ddb.delete_table(TableName=tname)
+    except Exception:
+        pass
 
     ddb.create_table(
         TableName=tname,
@@ -3781,6 +3853,88 @@ def test_dynamodb_import_table(ddb):
         assert arn in arns
     finally:
         ddb.delete_table(TableName=name)
+
+
+def _await_import(ddb, arn, attempts=40):
+    for _ in range(attempts):
+        desc = ddb.describe_import(ImportArn=arn)["ImportTableDescription"]
+        if desc["ImportStatus"] != "IN_PROGRESS":
+            return desc
+        time.sleep(0.3)
+    raise AssertionError(f"import {arn} never left IN_PROGRESS")
+
+
+def test_dynamodb_import_table_csv_writes_the_rows(ddb, s3):
+    """The rows of the CSV source reach the table.
+
+    The submit response reports zeros while the import is IN_PROGRESS, and the
+    counters land with the terminal status. A key column takes the type its
+    AttributeDefinition declares; every other column is imported as a string.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bucket, name = f"imp-csv-{suffix}", f"imp-csv-table-{suffix}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="rows/data.csv", Body=b"ID,name\n1,Alice\n2,Bob\n")
+    try:
+        submitted = ddb.import_table(
+            S3BucketSource={"S3Bucket": bucket, "S3KeyPrefix": "rows/"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "ID", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "ID", "AttributeType": "N"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]
+        assert (submitted["ImportStatus"], submitted["ProcessedItemCount"],
+                submitted["ImportedItemCount"]) == ("IN_PROGRESS", 0, 0)
+
+        desc = _await_import(ddb, submitted["ImportArn"])
+        assert desc["ImportStatus"] == "COMPLETED"
+        assert (desc["ProcessedItemCount"], desc["ImportedItemCount"],
+                desc["ErrorCount"]) == (2, 2, 0)
+        assert desc["ProcessedSizeBytes"] == 22
+
+        items = sorted(ddb.scan(TableName=name)["Items"], key=lambda i: i["ID"]["N"])
+        assert items == [
+            {"ID": {"N": "1"}, "name": {"S": "Alice"}},
+            {"ID": {"N": "2"}, "name": {"S": "Bob"}},
+        ]
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_import_table_missing_source_fails(ddb):
+    """A source that is not there fails the import instead of completing it.
+
+    "Since the error was caught before the data was imported into the table, a
+    new DynamoDB table is not created" — so the destination goes with it.
+    """
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name = f"imp-missing-{suffix}"
+    try:
+        arn = ddb.import_table(
+            S3BucketSource={"S3Bucket": f"no-such-bucket-{suffix}"},
+            InputFormat="CSV",
+            TableCreationParameters={
+                "TableName": name,
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "BillingMode": "PAY_PER_REQUEST",
+            },
+        )["ImportTableDescription"]["ImportArn"]
+
+        desc = _await_import(ddb, arn)
+        assert desc["ImportStatus"] == "FAILED"
+        assert desc["FailureCode"] == "S3NoSuchBucket"
+        assert desc["ImportedItemCount"] == 0
+        with pytest.raises(ClientError) as exc:
+            ddb.describe_table(TableName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
 
 
 def test_dynamodb_describe_import_not_found(ddb):
@@ -7111,3 +7265,362 @@ def test_contributor_insights_last_update_is_int_epoch(ddb):
             assert isinstance(lud, int), f"expected int epoch, got {type(lud).__name__}: {lud}"
     finally:
         ddb.delete_table(TableName=table)
+
+def test_dynamodb_restore_rebuilds_item_store_for_every_account_and_region():
+    import asyncio
+    from collections import defaultdict
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        request_scope,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import dynamodb as ddb_service
+
+    table_name = f"restore-scope-{_uuid_mod.uuid4().hex[:8]}"
+    scopes = (("000000000000", "us-east-1"), ("111111111111", "eu-west-1"))
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    ddb_service.reset()
+    tables = AccountRegionScopedDict()
+    for account_id, region in scopes:
+        tables.set_scoped(
+            account_id,
+            region,
+            table_name,
+            {
+                "TableName": table_name,
+                "TableArn": f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}",
+                "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
+                "pk_name": "pk",
+                "sk_name": None,
+                "TableStatus": "ACTIVE",
+                # Plain dicts - returned directly from JSON decoder
+                "items": {"existing": {"__no_sort__": {"pk": {"S": "existing"}}}},
+            },
+        )
+
+    def _call(action, payload):
+        headers = {
+            "x-amz-target": f"DynamoDB_20120810.{action}",
+            "content-type": "application/x-amz-json-1.0",
+        }
+        status, _, body = asyncio.run(
+            ddb_service.handle_request("POST", "/", headers, json.dumps(payload).encode(), {})
+        )
+        return status, json.loads(body)
+
+    try:
+        ddb_service.load_persisted_state({"tables": tables})
+
+        for account_id, region in scopes:
+            items = ddb_service._tables.get_scoped(account_id, region, table_name)["items"]
+            assert isinstance(items, defaultdict), (account_id, region)
+
+            with request_scope(account_id, region):
+                status, body = _call("UpdateItem", {
+                    "TableName": table_name,
+                    "Key": {"pk": {"S": "new-after-restart"}},
+                    "UpdateExpression": "SET attr = :v",
+                    "ExpressionAttributeValues": {":v": {"S": "value"}},
+                    "ReturnValues": "ALL_NEW",
+                })
+                assert status == 200, (account_id, region, body)
+                assert body["Attributes"]["attr"] == {"S": "value"}
+
+                status, body = _call("PutItem", {
+                    "TableName": table_name,
+                    "Item": {"pk": {"S": "another-after-restart"}},
+                })
+                assert status == 200, (account_id, region, body)
+
+                status, body = _call("GetItem", {
+                    "TableName": table_name,
+                    "Key": {"pk": {"S": "existing"}},
+                })
+                assert status == 200
+                assert body["Item"] == {"pk": {"S": "existing"}}
+    finally:
+        ddb_service.reset()
+
+
+def test_dynamodb_global_table_replica_lifecycle():
+    home, other = _ddb_client("us-east-1"), _ddb_client("us-west-2")
+    name = f"gt-{_uuid_mod.uuid4().hex[:8]}"
+    home.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}])
+    home.put_item(TableName=name, Item={"pk": {"S": "before"}})
+    home.update_time_to_live(TableName=name, TimeToLiveSpecification={"Enabled": True, "AttributeName": "ttl"})
+    try:
+        home.update_table(TableName=name, ReplicaUpdates=[{"Create": {"RegionName": "us-west-2"}}])
+
+        table = home.describe_table(TableName=name)["Table"]
+        assert table["GlobalTableVersion"] == "2019.11.21"
+        assert table["Replicas"] == [{"RegionName": "us-west-2", "ReplicaStatus": "ACTIVE"}]
+        assert table["StreamSpecification"] == {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+        replica = other.describe_table(TableName=name)["Table"]
+        assert replica["Replicas"] == [{"RegionName": "us-east-1", "ReplicaStatus": "ACTIVE"}]
+        assert replica["TableArn"].startswith("arn:aws:dynamodb:us-west-2:")
+        assert replica["DeletionProtectionEnabled"] is False
+        assert other.describe_time_to_live(TableName=name)["TimeToLiveDescription"]["AttributeName"] == "ttl"
+
+        # Existing items are copied; writes replicate both ways.
+        assert other.get_item(TableName=name, Key={"pk": {"S": "before"}})["Item"]
+        home.put_item(TableName=name, Item={"pk": {"S": "a"}, "v": {"N": "1"}})
+        assert other.get_item(TableName=name, Key={"pk": {"S": "a"}})["Item"]["v"] == {"N": "1"}
+        other.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET v = :v",
+                          ExpressionAttributeValues={":v": {"N": "2"}})
+        assert home.get_item(TableName=name, Key={"pk": {"S": "a"}})["Item"]["v"] == {"N": "2"}
+        other.delete_item(TableName=name, Key={"pk": {"S": "a"}})
+        assert "Item" not in home.get_item(TableName=name, Key={"pk": {"S": "a"}})
+
+        home.update_table(TableName=name, ReplicaUpdates=[{"Delete": {"RegionName": "us-west-2"}}])
+        with pytest.raises(ClientError) as exc:
+            other.describe_table(TableName=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        table = home.describe_table(TableName=name)["Table"]
+        assert "Replicas" not in table and "GlobalTableVersion" not in table
+    finally:
+        for client in (other, home):
+            with contextlib.suppress(ClientError):
+                client.delete_table(TableName=name)
+
+
+def test_dynamodb_global_table_replica_update_errors():
+    home, other = _ddb_client("us-east-1"), _ddb_client("us-west-2")
+    name = f"gt-err-{_uuid_mod.uuid4().hex[:8]}"
+    spec = dict(BillingMode="PAY_PER_REQUEST",
+                AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+                KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}])
+    home.create_table(TableName=name, **spec)
+    other.create_table(TableName=name, **spec)
+    try:
+        cases = [
+            ([{"Create": {"RegionName": "us-east-1"}}],
+             "Cannot add, delete, or update the local region through ReplicaUpdates. "
+             "Use CreateTable, DeleteTable, or UpdateTable as required."),
+            ([{"Create": {"RegionName": "us-west-2"}}],
+             f"Failed to create a the new replica of table with name: '{name}' "
+             "because one or more replicas already existed as tables."),
+            ([{"Delete": {"RegionName": "eu-west-1"}}],
+             "Replica specified in the Replica Update or Replica Delete action of the request was not found."),
+        ]
+        for updates, message in cases:
+            with pytest.raises(ClientError) as exc:
+                home.update_table(TableName=name, ReplicaUpdates=updates)
+            assert exc.value.response["Error"]["Code"] == "ValidationException"
+            assert exc.value.response["Error"]["Message"] == message
+        assert "Replicas" not in home.describe_table(TableName=name)["Table"]
+    finally:
+        for client in (other, home):
+            with contextlib.suppress(ClientError):
+                client.delete_table(TableName=name)
+
+
+def test_dynamodb_gsi_query_tracks_every_write_path(ddb):
+    name = f"gsi-track-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                              {"AttributeName": "g", "AttributeType": "S"},
+                              {"AttributeName": "r", "AttributeType": "N"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{"IndexName": "byG",
+                                 "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"},
+                                               {"AttributeName": "r", "KeyType": "RANGE"}],
+                                 "Projection": {"ProjectionType": "ALL"}}])
+
+    def gsi(g):
+        resp = ddb.query(TableName=name, IndexName="byG", KeyConditionExpression="g = :g",
+                         ExpressionAttributeValues={":g": {"S": g}})
+        return [it["pk"]["S"] for it in resp["Items"]]
+
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}, "g": {"S": "x"}, "r": {"N": "2"}})
+        ddb.put_item(TableName=name, Item={"pk": {"S": "b"}, "g": {"S": "x"}, "r": {"N": "1"}})
+        ddb.put_item(TableName=name, Item={"pk": {"S": "sparse"}, "g": {"S": "x"}})
+        assert gsi("x") == ["b", "a"]
+
+        ddb.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET g = :y",
+                        ExpressionAttributeValues={":y": {"S": "y"}})
+        assert gsi("x") == ["b"] and gsi("y") == ["a"]
+
+        ddb.batch_write_item(RequestItems={name: [
+            {"PutRequest": {"Item": {"pk": {"S": "c"}, "g": {"S": "y"}, "r": {"N": "0"}}}},
+            {"DeleteRequest": {"Key": {"pk": {"S": "b"}}}}]})
+        assert gsi("x") == [] and gsi("y") == ["c", "a"]
+
+        ddb.transact_write_items(TransactItems=[
+            {"Update": {"TableName": name, "Key": {"pk": {"S": "c"}}, "UpdateExpression": "SET g = :z",
+                        "ExpressionAttributeValues": {":z": {"S": "z"}}}},
+            {"Delete": {"TableName": name, "Key": {"pk": {"S": "a"}}}}])
+        assert gsi("y") == [] and gsi("z") == ["c"]
+
+        ddb.execute_statement(Statement=f"UPDATE \"{name}\" SET g = 'w' WHERE pk = 'c'")
+        assert gsi("z") == [] and gsi("w") == ["c"]
+        ddb.execute_statement(Statement=f"INSERT INTO \"{name}\" VALUE {{'pk': 'd', 'g': 'w', 'r': 9}}")
+        assert gsi("w") == ["c", "d"]
+        ddb.execute_statement(Statement=f"DELETE FROM \"{name}\" WHERE pk = 'c'")
+        assert gsi("w") == ["d"]
+
+        ddb.delete_item(TableName=name, Key={"pk": {"S": "d"}})
+        assert gsi("w") == []
+        assert ddb.describe_table(TableName=name)["Table"]["ItemCount"] == 1
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_index_membership_not_persisted():
+    from ministack.services import dynamodb as _d
+    table = {"pk_name": "pk", "sk_name": None, "items": _d.defaultdict(dict),
+             "GlobalSecondaryIndexes": [{"IndexName": "byG",
+                                         "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}]}]}
+    _d._set_item(table, "a", "__no_sort__", {"pk": {"S": "a"}, "g": {"S": "x"}})
+    assert _d._index_members(table) == {"byG": {"x": {("a", "__no_sort__"): None}}}
+    _d._set_item(table, "a", "__no_sort__", {"pk": {"S": "a"}, "g": {"S": "y"}})
+    _d._set_item(table, "b", "__no_sort__", {"pk": {"S": "b"}})
+    assert _d._index_members(table) == {"byG": {"y": {("a", "__no_sort__"): None}}}
+    assert table["ItemCount"] == 2
+    _d._remove_item(table, "a", "__no_sort__")
+    assert _d._index_members(table) == {"byG": {}} and table["ItemCount"] == 1
+    assert "a" not in table["items"]
+    _d._tables.set_scoped("000000000000", "us-east-1", "persist-probe", table)
+    try:
+        state = _d.get_state()["tables"].get_scoped("000000000000", "us-east-1", "persist-probe")
+        assert _d._INDEX_MEMBERS not in state and _d._INDEX_MEMBERS in table
+    finally:
+        _d._tables.pop_scoped("000000000000", "us-east-1", "persist-probe", None)
+
+
+def test_dynamodb_client_request_token_expires_after_ten_minutes(monkeypatch):
+    from ministack.services import dynamodb as _d
+    now = [1_000_000.0]
+    monkeypatch.setattr(_d.time, "time", lambda: now[0])
+    monkeypatch.setattr(_d, "_txn_token_sweep_at", 0.0)
+    token, stale = f"crt-{_uuid_mod.uuid4().hex}", f"crt-{_uuid_mod.uuid4().hex}"
+    try:
+        _d._txn_token_store(stale, {"signature": {}, "response": {}})
+        now[0] += 300
+        _d._txn_token_store(token, {"signature": {}, "response": {}})
+        now[0] += 299
+        assert _d._txn_token_lookup(stale) is not None
+        now[0] += 1
+        assert _d._txn_token_lookup(stale) is None
+        assert _d._txn_token_lookup(token) is not None
+        now[0] += 300
+        assert _d._txn_token_lookup(token) is None
+        _d._txn_token_store(f"crt-{_uuid_mod.uuid4().hex}", {"signature": {}, "response": {}})
+        assert all(t not in (token, stale) for _, _, t in (k for k, _ in _d._txn_idempotency.all_items()))
+    finally:
+        _d._txn_idempotency.pop(token, None)
+        _d._txn_idempotency.pop(stale, None)
+
+
+def test_dynamodb_stream_skips_writes_that_change_nothing(ddb, ddb_streams):
+    name = f"noop-stream-{_uuid_mod.uuid4().hex[:8]}"
+    arn = ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        StreamSpecification={"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    )["TableDescription"]["LatestStreamArn"]
+    try:
+        item = {"pk": {"S": "a"}, "v": {"N": "1"}}
+        ddb.put_item(TableName=name, Item=item)
+        ddb.put_item(TableName=name, Item=item)
+        ddb.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"N": "1"}})
+        ddb.update_item(TableName=name, Key={"pk": {"S": "a"}}, UpdateExpression="SET v = :v",
+                        ExpressionAttributeValues={":v": {"N": "2"}})
+        shard = ddb_streams.describe_stream(StreamArn=arn)["StreamDescription"]["Shards"][0]["ShardId"]
+        it = ddb_streams.get_shard_iterator(StreamArn=arn, ShardId=shard,
+                                            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        events = [r["eventName"] for r in ddb_streams.get_records(ShardIterator=it)["Records"]]
+        assert events == ["INSERT", "MODIFY"]
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_gsi_multi_attribute_keys(ddb):
+    name = f"multi-key-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": n, "AttributeType": "S"} for n in ("pk", "a", "b", "s1", "s2")],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        GlobalSecondaryIndexes=[{
+            "IndexName": "Idx", "Projection": {"ProjectionType": "ALL"},
+            "KeySchema": [{"AttributeName": "a", "KeyType": "HASH"}, {"AttributeName": "b", "KeyType": "HASH"},
+                          {"AttributeName": "s1", "KeyType": "RANGE"}, {"AttributeName": "s2", "KeyType": "RANGE"}],
+        }])
+
+    def query(cond, **vals):
+        return ddb.query(TableName=name, IndexName="Idx", KeyConditionExpression=cond,
+                         ExpressionAttributeValues={f":{k}": {"S": v} for k, v in vals.items()})
+
+    try:
+        rows = [("1", "x", "y", "p", "2"), ("2", "x", "y", "p", "1"), ("3", "x", "y", "q", "1"),
+                ("4", "x", "z", "p", "1"), ("5", "x", "y", "p", None)]
+        for pk, a, b, s1, s2 in rows:
+            item = {"pk": {"S": pk}, "a": {"S": a}, "b": {"S": b}, "s1": {"S": s1}}
+            if s2:
+                item["s2"] = {"S": s2}
+            ddb.put_item(TableName=name, Item=item)
+
+        def pks(resp):
+            return [it["pk"]["S"] for it in resp["Items"]]
+
+        assert pks(query("a = :a AND b = :b", a="x", b="y")) == ["2", "1", "3"]
+        assert pks(query("a = :a AND b = :b AND s1 = :s1 AND s2 >= :s2", a="x", b="y", s1="p", s2="2")) == ["1"]
+        assert pks(query("a = :a AND b = :b AND begins_with(s1, :s1)", a="x", b="y", s1="q")) == ["3"]
+        page = ddb.query(TableName=name, IndexName="Idx", Limit=1, KeyConditionExpression="a = :a AND b = :b",
+                         ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}})
+        assert set(page["LastEvaluatedKey"]) == {"pk", "a", "b", "s1", "s2"}
+        rest = ddb.query(TableName=name, IndexName="Idx", ExclusiveStartKey=page["LastEvaluatedKey"],
+                         KeyConditionExpression="a = :a AND b = :b",
+                         ExpressionAttributeValues={":a": {"S": "x"}, ":b": {"S": "y"}})
+        assert pks(rest) == ["1", "3"]
+
+        with pytest.raises(ClientError) as exc:
+            query("a = :a", a="x")
+        assert exc.value.response["Error"]["Message"] == "Query condition missed key schema element: b"
+        for cond, vals in (("a = :a AND b = :b AND s2 = :s2", {"s2": "1"}),
+                           ("a = :a AND b = :b AND s1 > :s1 AND s2 = :s2", {"s1": "a", "s2": "1"})):
+            with pytest.raises(ClientError) as exc:
+                query(cond, a="x", b="y", **vals)
+            assert exc.value.response["Error"]["Message"] == "Query key condition not supported"
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_query_and_scan_pages_stop_at_1mb(ddb):
+    name = f"page-1mb-{_uuid_mod.uuid4().hex[:8]}"
+    ddb.create_table(
+        TableName=name, BillingMode="PAY_PER_REQUEST",
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
+                              {"AttributeName": "sk", "AttributeType": "S"}],
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}, {"AttributeName": "sk", "KeyType": "RANGE"}])
+    try:
+        for i in range(30):
+            ddb.put_item(TableName=name, Item={"pk": {"S": "p"}, "sk": {"S": f"{i:03}"}, "b": {"S": "x" * 100_000}})
+        for op, kwargs in (("query", {"KeyConditionExpression": "pk = :p",
+                                      "ExpressionAttributeValues": {":p": {"S": "p"}}}),
+                           ("scan", {})):
+            pages, start = [], None
+            while True:
+                extra = {"ExclusiveStartKey": start} if start else {}
+                resp = getattr(ddb, op)(TableName=name, **kwargs, **extra)
+                pages.append(resp["Count"])
+                start = resp.get("LastEvaluatedKey")
+                if not start:
+                    break
+            assert pages == [10, 10, 10], (op, pages)
+        filtered = ddb.scan(TableName=name, FilterExpression="sk = :none",
+                            ExpressionAttributeValues={":none": {"S": "none"}})
+        assert filtered["Count"] == 0 and filtered["ScannedCount"] == 10 and "LastEvaluatedKey" in filtered
+    finally:
+        ddb.delete_table(TableName=name)

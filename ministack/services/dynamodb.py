@@ -19,6 +19,9 @@ Uses X-Amz-Target header for action routing (JSON API).
 import base64
 import binascii
 import copy
+import csv
+import gzip
+import io
 import json
 import logging
 import os
@@ -29,6 +32,7 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake, spawn_background
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -38,6 +42,7 @@ from ministack.core.responses import (
     json_response,
     new_uuid,
     now_iso,
+    request_scope,
 )
 from ministack.services._dynamodb_keywords import AWS_KEYWORDS
 
@@ -64,14 +69,20 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _DDB_PARTITION_RE = re.compile(r"^aws(?:-[a-z]+)*$")
 _DDB_REGION_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)+-[0-9]+$")
 _DDB_ACCOUNT_RE = re.compile(r"^[0-9]{12}$")
+# CsvOptions.Delimiter: {"max": 1, "min": 1, "pattern": "[,;:|\\t ]"}.
+_CSV_DELIMITER_RE = re.compile(r"[,;:|\t ]")
 
 # Real AWS reports Export/Import as IN_PROGRESS at submit time; the flip to
 # COMPLETED happens asynchronously. We simulate that by holding IN_PROGRESS
 # on the first DescribeExport/DescribeImport calls within this grace window.
 _EXPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_EXPORT_COMPLETE_AFTER_SEC", "1"))
-_IMPORT_COMPLETE_AFTER_SEC = float(os.environ.get("MINISTACK_DDB_IMPORT_COMPLETE_AFTER_SEC", "1"))
+_IMPORT_COMPLETE_AFTER_SEC = 1.0
+# "The log group name is /aws-dynamodb/imports. The error log stream name is
+# import-id/error."
+_IMPORT_LOG_GROUP = "/aws-dynamodb/imports"
+# "DynamoDB Import from Amazon S3 can support up to 50 concurrent import jobs".
+_IMPORT_CONCURRENCY_LIMIT = 50
 
-from ministack.core.persistence import load_state
 
 # Region-scoped: DynamoDB tables are region-specific in AWS. Account-only
 # keying made name lookups find cross-region tables while ARN ops (which
@@ -105,8 +116,12 @@ _lock = threading.Lock()
 # ── Persistence ────────────────────────────────────────────
 
 def get_state():
+    tables = AccountRegionScopedDict()
+    for (account_id, region, table_name), table in _tables.all_items():
+        tables.set_scoped(account_id, region, table_name, copy.deepcopy(
+            {k: v for k, v in table.items() if k != _INDEX_MEMBERS}))
     return {
-        "tables": copy.deepcopy(_tables),
+        "tables": tables,
         "tags": copy.deepcopy(_tags),
         "ttl_settings": copy.deepcopy(_ttl_settings),
         "pitr_settings": copy.deepcopy(_pitr_settings),
@@ -188,14 +203,14 @@ def _restore_table_name_metadata(store: AccountRegionScopedDict, data) -> None:
 
 
 def load_persisted_state(data):
-    return restore_state(data)
+    return _restore_state(data)
 
 
-def restore_state(data):
+def _restore_state(data):
     if data:
         _tables.update(data.get("tables", {}))
         # Restore items as defaultdict(dict) — JSON deserializes as plain dict
-        for tbl in _tables.values():
+        for tbl in _tables.all_values():
             if isinstance(tbl.get("items"), dict) and not isinstance(tbl["items"], defaultdict):
                 tbl["items"] = defaultdict(dict, tbl["items"])
             # Migrate legacy SSEDescription shape (pre-#411): convert
@@ -212,17 +227,12 @@ def restore_state(data):
         _resource_policies.update(data.get("resource_policies", {}))
         _exports.update(data.get("exports", {}))
         _imports.update(data.get("imports", {}))
+        # No worker on this side of the restart; DescribeImport closes it out.
+        for _desc in _imports._data.values():
+            if isinstance(_desc, dict) and _desc.get("ImportStatus") == "IN_PROGRESS":
+                _desc["_orphaned"] = True
 
 
-try:
-    _restored = load_state("dynamodb")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +510,28 @@ def _attribute_value_size(value: dict) -> int:
     return 0
 
 
+# A Query/Scan page holds at most 1 MB of items read, before any filter.
+_DDB_PAGE_SIZE_BYTES = 1_048_576
+
+
+def _paginate_evaluated_items(items, limit, table, index_name=None):
+    """One Query/Scan page: up to ``Limit`` items, stopping before the item
+    that would take the data read past 1 MB. Index reads count the index
+    entry (its projected attributes). Returns (page, stopped_at_boundary)."""
+    page = []
+    page_bytes = 0
+    for item in items:
+        entry = _apply_index_projection(item, table, index_name) if index_name else item
+        item_bytes = _item_size_bytes(entry)
+        if page and page_bytes + item_bytes > _DDB_PAGE_SIZE_BYTES:
+            return page, True
+        page.append(item)
+        page_bytes += item_bytes
+        if (limit is not None and len(page) >= int(limit)) or page_bytes >= _DDB_PAGE_SIZE_BYTES:
+            return page, True
+    return page, False
+
+
 def _item_size_bytes(item: dict) -> int:
     total = 0
     if not isinstance(item, dict):
@@ -656,9 +688,55 @@ def stream_live_records(table_name: str, *, account_id=None, region=None) -> lis
     return _live_stream_records(table_name, account_id, region)
 
 
-def drop_stream_records(table_name: str) -> None:
-    _stream_records.pop(table_name, None)
-    _stream_trimmed.pop(table_name, None)
+# Streams closed by disabling them or deleting their table, by stream ARN.
+# "If you disable a stream on a table, the data in the stream continues to be
+# readable for 24 hours."
+_closed_streams = AccountRegionScopedDict()
+
+
+def _sweep_closed_streams() -> None:
+    cutoff = time.time() - _STREAM_RETENTION_SECONDS
+    for (account_id, region, arn), closed in _closed_streams.all_items():
+        if closed["ClosedAt"] < cutoff:
+            _closed_streams.pop_scoped(account_id, region, arn, None)
+
+
+def closed_stream(stream_arn: str) -> dict | None:
+    """The closed stream ``stream_arn`` with its unexpired records, or None."""
+    _sweep_closed_streams()
+    closed = _closed_streams.get(stream_arn)
+    if closed is None:
+        return None
+    records = closed["records"]
+    cutoff = time.time() - _STREAM_RETENTION_SECONDS
+    expired = 0
+    while expired < len(records) and _record_age_cutoff(records[expired], cutoff):
+        expired += 1
+    if expired:
+        del records[:expired]
+        closed["trimmed"] += expired
+    return closed
+
+
+def drop_stream_records(table_name: str, table: dict | None = None) -> None:
+    """Detach the table's current stream; an enabled one stays readable as closed."""
+    records = _stream_records.pop(table_name, None) or []
+    trimmed = _stream_trimmed.pop(table_name, 0)
+    spec = (table or {}).get("StreamSpecification") or {}
+    arn = (table or {}).get("LatestStreamArn")
+    if not spec.get("StreamEnabled") or not arn:
+        return
+    _sweep_closed_streams()
+    _closed_streams[arn] = {
+        "TableName": table_name,
+        "StreamLabel": table.get("LatestStreamLabel", ""),
+        "StreamViewType": spec.get("StreamViewType", "NEW_AND_OLD_IMAGES"),
+        "KeySchema": copy.deepcopy(table.get("KeySchema", [])),
+        "CreationRequestDateTime": table.get("CreationDateTime", 0),
+        "ClosedAt": time.time(),
+        "records": records,
+        "trimmed": trimmed,
+    }
 
 
 def _next_stream_seq():
@@ -684,7 +762,7 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
             "SizeBytes": 0,
             "StreamViewType": view_type,
         },
-        "eventSourceARN": f"{table['TableArn']}/stream/{_stream_label()}",
+        "eventSourceARN": table.get("LatestStreamArn") or f"{table['TableArn']}/stream/{_stream_label()}",
     }
 
     ref_item = new_item or old_item or {}
@@ -703,7 +781,8 @@ def _build_change_record(table: dict, event_name: str, old_item: dict | None, ne
     return record
 
 
-def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, new_item: dict | None):
+def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, new_item: dict | None,
+                       replicate: bool = True):
     """Emit a change to DynamoDB Streams (if enabled) and to any ACTIVE Kinesis
     streaming destinations registered for this table.
 
@@ -714,6 +793,8 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
     table = _tables.get(table_name)
     if not table:
         return
+    if replicate:
+        _replicate_write(table, event_name, old_item, new_item)
 
     spec = table.get("StreamSpecification") or {}
     streams_enabled = bool(spec.get("StreamEnabled"))
@@ -721,12 +802,14 @@ def _emit_stream_event(table_name: str, event_name: str, old_item: dict | None, 
     if not streams_enabled and not has_kinesis:
         return
 
-    if streams_enabled:
+    # A PutItem/UpdateItem that changes no data writes no stream record.
+    if streams_enabled and not (event_name == "MODIFY" and old_item == new_item):
         view_type = spec.get("StreamViewType", "NEW_AND_OLD_IMAGES")
         record = _build_change_record(table, event_name, old_item, new_item, view_type)
         if table_name not in _stream_records:
             _stream_records[table_name] = []
         _stream_records[table_name].append(record)
+        esm_wake.set()
         _trim_stream_records(table_name)
 
     if has_kinesis:
@@ -791,13 +874,10 @@ def _ttl_reaper():
                             ttl_val = _extract_key_val(ttl_attr)
                             try:
                                 if float(ttl_val) <= now:
-                                    del sk_map[sk_val]
+                                    _remove_item(table, pk_val, sk_val)
                                     logger.debug("TTL expired item %s/%s from %s", pk_val, sk_val, table_name)
                             except (ValueError, TypeError):
                                 pass
-                        if not sk_map:
-                            del table["items"][pk_val]
-                    _update_counts(table)
         except Exception as exc:
             logger.error("TTL reaper error: %s", exc)
 
@@ -933,6 +1013,8 @@ def _validate_data_plane_table_name(name) -> tuple | None:
     if len(name) < 1:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
+    if name.startswith("arn:"):
+        return None  # A table ARN not in this account and region answers ResourceNotFoundException.
     if len(name) > 255:
         return error_response_json("ValidationException",
             f"1 validation error detected: Value '{name}' at 'tableName' failed to satisfy constraint: Member must have length less than or equal to 255", 400)
@@ -1252,7 +1334,7 @@ def _create_table(data):
 
 
 def _delete_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     if _tables[name].get("DeletionProtectionEnabled"):
@@ -1260,17 +1342,20 @@ def _delete_table(data):
             "Table is protected against deletion. To delete the table, disable deletion protection.", 400)
     desc = _table_description(name)
     desc["TableStatus"] = "DELETING"
-    del _tables[name]
+    remaining = [r for r in _replica_group(_tables[name]) if r != get_region()]
+    deleted = _tables.pop(name)
+    if remaining:
+        _set_replica_group(name, remaining)
     _tags.pop(desc.get("TableArn", ""), None)
     _ttl_settings.pop(name, None)
     _pitr_settings.pop(name, None)
     _kinesis_destinations.pop(name, None)
-    drop_stream_records(name)
+    drop_stream_records(name, deleted)
     return json_response({"TableDescription": desc})
 
 
 def _describe_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     return json_response({"Table": _table_description(name)})
@@ -1289,8 +1374,114 @@ def _list_tables(data):
     return json_response(result)
 
 
+_GLOBAL_TABLE_VERSION = "2019.11.21"
+
+
+def _replica_group(table) -> list:
+    """Every region of the global table ``table`` belongs to, its own included."""
+    return table.get("_global_regions") or []
+
+
+def _set_replica_group(name, regions):
+    account = get_account_id()
+    for region in regions:
+        member = _tables.get_scoped(account, region, name)
+        if member is not None:
+            member["_global_regions"] = sorted(regions) if len(regions) > 1 else []
+
+
+def _create_replica(name, table, region):
+    """Copy ``table`` into ``region`` as a replica, with its items."""
+    account = get_account_id()
+    replica = copy.deepcopy({k: v for k, v in table.items() if k not in ("items", _INDEX_MEMBERS)})
+    replica["items"] = defaultdict(dict, copy.deepcopy(dict(table["items"])))
+    arn = f"arn:aws:dynamodb:{region}:{account}:table/{name}"
+    replica.update({
+        "TableArn": arn, "TableId": new_uuid(), "CreationDateTime": int(time.time()),
+        "TableStatus": "ACTIVE", "DeletionProtectionEnabled": False,
+    })
+    for index in replica.get("GlobalSecondaryIndexes", []) + replica.get("LocalSecondaryIndexes", []):
+        index["IndexArn"] = f"{arn}/index/{index['IndexName']}"
+    label = _stream_label()
+    replica["LatestStreamLabel"] = label
+    replica["LatestStreamArn"] = f"{arn}/stream/{label}"
+    _tables.set_scoped(account, region, name, replica)
+    ttl = _ttl_settings.get(name)
+    if ttl:
+        _ttl_settings.set_scoped(account, region, name, copy.deepcopy(ttl))
+
+
+def _apply_replica_updates(name, table, updates):
+    """UpdateTable ReplicaUpdates (global tables version 2019.11.21)."""
+    account, home = get_account_id(), get_region()
+    regions = set(_replica_group(table)) or {home}
+    for update in updates:
+        action = next(iter(update), None)
+        region = (update.get(action) or {}).get("RegionName", "")
+        if region == home:
+            return error_response_json("ValidationException",
+                "Cannot add, delete, or update the local region through ReplicaUpdates. "
+                "Use CreateTable, DeleteTable, or UpdateTable as required.", 400)
+        if action == "Create":
+            if _tables.get_scoped(account, region, name) is not None:
+                return error_response_json("ValidationException",
+                    f"Failed to create a the new replica of table with name: '{name}' "
+                    "because one or more replicas already existed as tables.", 400)
+            # MREC replicates through Streams, so they are on for every replica.
+            if not (table.get("StreamSpecification") or {}).get("StreamEnabled"):
+                table["StreamSpecification"] = {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"}
+                label = _stream_label()
+                table["LatestStreamLabel"] = label
+                table["LatestStreamArn"] = f"{table['TableArn']}/stream/{label}"
+            _create_replica(name, table, region)
+            regions.add(region)
+        elif action in ("Update", "Delete"):
+            if region not in regions:
+                return error_response_json("ValidationException",
+                    "Replica specified in the Replica Update or Replica Delete action of the request was not found.", 400)
+            if action == "Delete":
+                deleted = _tables.pop_scoped(account, region, name, None)
+                _ttl_settings.pop_scoped(account, region, name, None)
+                _pitr_settings.pop_scoped(account, region, name, None)
+                with request_scope(account, region):
+                    drop_stream_records(name, deleted)
+                regions.discard(region)
+    _set_replica_group(name, regions)
+    if len(regions) <= 1:
+        table["_global_regions"] = []
+    return None
+
+
+def _replicate_write(table, event_name, old_item, new_item):
+    """Apply a write to the table's other replicas, as MREC global tables do."""
+    regions = _replica_group(table)
+    if not regions:
+        return
+    account, home, name = get_account_id(), get_region(), table["TableName"]
+    item = new_item if new_item is not None else old_item
+    for region in regions:
+        if region == home:
+            continue
+        with request_scope(account, region):
+            replica = _tables.get(name)
+            if replica is None:
+                continue
+            pk_val = _extract_key_val(item.get(replica["pk_name"]))
+            sk_val = _extract_key_val(item.get(replica["sk_name"])) if replica["sk_name"] else "__no_sort__"
+            previous = replica["items"].get(pk_val, {}).get(sk_val)
+            if new_item is None:
+                _remove_item(replica, pk_val, sk_val)
+            else:
+                _set_item(replica, pk_val, sk_val, copy.deepcopy(new_item))
+            if new_item is None and previous is None:
+                continue
+            replica_event = "REMOVE" if new_item is None else ("MODIFY" if previous else "INSERT")
+            _emit_stream_event(name, replica_event, previous,
+                               copy.deepcopy(new_item) if new_item is not None else None, replicate=False)
+
+
 def _update_table(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Requested resource not found: Table: {name} not found", 400)
     table = _tables[name]
@@ -1354,6 +1545,8 @@ def _update_table(data):
     if "StreamSpecification" in data:
         stream_spec = data["StreamSpecification"]
         stream_was_enabled = bool((table.get("StreamSpecification") or {}).get("StreamEnabled"))
+        if stream_was_enabled and not stream_spec.get("StreamEnabled"):
+            drop_stream_records(name, table)
         table["StreamSpecification"] = stream_spec
         if stream_spec.get("StreamEnabled") and not stream_was_enabled:
             stream_label = _stream_label()
@@ -1387,6 +1580,8 @@ def _update_table(data):
     # AttributeDefinitions — stored definitions do not satisfy the check
     # (measured eu-west-2, 2026-07-12, paritysuite).
     defined_attrs = {a["AttributeName"] for a in data.get("AttributeDefinitions", [])}
+    if data.get("GlobalSecondaryIndexUpdates"):
+        table.pop(_INDEX_MEMBERS, None)
     for update in data.get("GlobalSecondaryIndexUpdates", []):
         if "Create" in update:
             gsi_def = copy.deepcopy(update["Create"])
@@ -1442,6 +1637,11 @@ def _update_table(data):
         if ad["AttributeName"] in referenced
     ]
 
+    if data.get("ReplicaUpdates"):
+        err = _apply_replica_updates(name, table, data["ReplicaUpdates"])
+        if err:
+            return err
+
     return json_response({"TableDescription": _table_description(name)})
 
 
@@ -1476,6 +1676,10 @@ def _table_description(name):
     if t.get("OnDemandThroughput"):
         desc["OnDemandThroughput"] = t["OnDemandThroughput"]
     desc["DeletionProtectionEnabled"] = t.get("DeletionProtectionEnabled", False)
+    if _replica_group(t):
+        desc["GlobalTableVersion"] = _GLOBAL_TABLE_VERSION
+        desc["Replicas"] = [{"RegionName": r, "ReplicaStatus": "ACTIVE"}
+                            for r in _replica_group(t) if r != get_region()]
     desc["WarmThroughput"] = t.get("WarmThroughput", {
         "ReadUnitsPerSecond": 0,
         "WriteUnitsPerSecond": 0,
@@ -1631,7 +1835,7 @@ def _add_item_collection_metrics(result: dict, data: dict, table: dict, item: di
 
 
 def _put_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1686,8 +1890,7 @@ def _put_item(data):
         if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, old_item)
 
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
 
     event_name = "MODIFY" if old_item else "INSERT"
     _emit_stream_event(name, event_name, old_item, item)
@@ -1701,7 +1904,7 @@ def _put_item(data):
 
 
 def _get_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1741,7 +1944,7 @@ def _get_item(data):
 
 
 def _delete_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1778,9 +1981,8 @@ def _delete_item(data):
             return _conditional_check_failed(data, old_item)
 
     if old_item is not None:
-        table["items"].get(pk_val, {}).pop(sk_val, None)
+        _remove_item(table, pk_val, sk_val)
         _emit_stream_event(name, "REMOVE", old_item, None)
-    _update_counts(table)
 
     result = {}
     if data.get("ReturnValues") == "ALL_OLD" and old_item:
@@ -1801,7 +2003,7 @@ def _key_attribute_update_error(table, updated_attrs):
 
 
 def _update_item(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -1912,8 +2114,7 @@ def _update_item(data):
     if err:
         return err
 
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
 
     event_name = "MODIFY" if old_item else "INSERT"
     _emit_stream_event(name, event_name, old_item, item)
@@ -1942,7 +2143,7 @@ def _update_item(data):
 # ---------------------------------------------------------------------------
 
 def _query(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -2046,6 +2247,11 @@ def _query(data):
             "1 validation error detected: Must specify either a ProjectionExpression or non-empty AttributesToGet when Select is SPECIFIC_ATTRIBUTES", 400)
 
     pk_name, sk_name, is_gsi = _resolve_index_keys(table, index_name)
+    index = _index_def(table, index_name) if index_name else None
+    hash_names, range_names = _index_key_lists(index) if index else ([pk_name], [sk_name] if sk_name else [])
+    multi_key = len(hash_names) > 1 or len(range_names) > 1
+    if multi_key:
+        pk_name, sk_name = hash_names[0], (range_names[0] if range_names else None)
     # ConsistentRead on a GSI is invalid (only LSIs support strongly-consistent reads).
     if data.get("ConsistentRead") and is_gsi:
         return error_response_json("ValidationException",
@@ -2060,24 +2266,28 @@ def _query(data):
         if table.get("sk_name"):
             required.add(table["sk_name"])
         if index_name:
-            required.add(pk_name)
-            if sk_name:
-                required.add(sk_name)
+            required.update(hash_names + range_names)
         if not required.issubset(esk.keys()):
             return error_response_json("ValidationException",
                 "The provided starting key is invalid", 400)
 
-    if key_conditions:
-        pk_val = _extract_pk_from_key_conditions(key_conditions, pk_name)
-    else:
-        pk_val = _extract_pk_from_condition(key_cond, eav, ean, pk_name)
-    if pk_val is None:
-        return error_response_json("ValidationException",
-            f"Query condition missed key schema element: {pk_name}", 400)
+    # Every partition-key attribute needs an equality condition; a
+    # multi-attribute partition is the tuple of their values.
+    pk_vals = []
+    for _hn in hash_names:
+        if key_conditions:
+            _hv = _extract_pk_from_key_conditions(key_conditions, _hn)
+        else:
+            _hv = _extract_pk_from_condition(key_cond, eav, ean, _hn)
+        if _hv is None:
+            return error_response_json("ValidationException",
+                f"Query condition missed key schema element: {_hn}", 400)
+        pk_vals.append(_hv)
+    pk_val = pk_vals[0] if len(pk_vals) == 1 else tuple(pk_vals)
     # A key-condition value whose type does not match the key's schema type is
     # rejected, as on real AWS ("Condition parameter type does not match schema
     # type") — MiniStack used to accept N for an S key and return the row.
-    for _kn in (pk_name, sk_name):
+    for _kn in hash_names + range_names:
         if not _kn:
             continue
         _av = _key_condition_av(key_cond, key_conditions, eav, ean, _kn)
@@ -2095,9 +2305,7 @@ def _query(data):
             kce_tokens = _tokenize(key_cond)
         except Exception:
             kce_tokens = []
-        allowed = {pk_name}
-        if sk_name:
-            allowed.add(sk_name)
+        allowed = set(hash_names + range_names)
         # A document path on a key attribute is rejected up front (AWS).
         if any(tok[0] == "DOT" for tok in kce_tokens):
             return error_response_json("ValidationException",
@@ -2117,6 +2325,11 @@ def _query(data):
                 if resolved and resolved not in allowed:
                     return error_response_json("ValidationException",
                         f"Query condition missed key schema element: {resolved}", 400)
+        # Multi-attribute sort keys are queried left to right without gaps,
+        # and only the last one queried may use a range condition.
+        if len(range_names) > 1 and not _multi_sort_condition_ok(kce_tokens, ean, range_names):
+            return error_response_json("ValidationException",
+                "Query key condition not supported", 400)
         # Key-condition operands are validated like key values themselves:
         # an empty string/binary operand is rejected with the same error AWS
         # raises for empty key attribute values.
@@ -2153,13 +2366,16 @@ def _query(data):
                 return error_response_json("ValidationException",
                     "The provided starting key does not match the range key predicate", 400)
 
-    if is_gsi or index_name:
+    members = _index_members(table).get(index_name) if index_name else None
+    if members is not None:
+        # Only this index partition; sparse items are never members.
+        bucket = table["items"]
+        candidates = [bucket[pk][sk] for pk, sk in members.get(pk_val, ()) if sk in bucket.get(pk, ())]
+    elif is_gsi or index_name:
         candidates = []
         for pk_bucket in table["items"].values():
             for it in pk_bucket.values():
                 if pk_name in it and _extract_key_val(it[pk_name]) == pk_val:
-                    # Sparse index: for composite GSIs/LSIs, items that have the index
-                    # hash key but are missing the index range key are excluded.
                     if sk_name and sk_name not in it:
                         continue
                     candidates.append(it)
@@ -2170,7 +2386,7 @@ def _query(data):
         # GSI/LSI: order by (INDEX_SORT, BASE_PK, BASE_SK). The base-table keys
         # tiebreak rows with equal INDEX_SORT (or hash-only GSIs), matching
         # real DynamoDB's hidden ordering and making pagination cursors stable.
-        sort_keys = _index_order_keys(table, sk_name)
+        sort_keys = _index_order_keys(table, range_names)
         candidates.sort(
             key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys),
             reverse=not scan_forward,
@@ -2188,15 +2404,13 @@ def _query(data):
             return error_response_json("ValidationException", str(exc), 400)
 
     if esk:
-        candidates = _apply_exclusive_start_key(candidates, esk, pk_name, sk_name, scan_forward, table=table)
+        candidates = _apply_exclusive_start_key(
+            candidates, esk, pk_name, range_names if multi_key else sk_name, scan_forward, table=table)
 
     # AWS returns a LastEvaluatedKey whenever it stopped *because of* the
     # limit — including when the results end exactly at the limit, since it
     # doesn't look ahead. The follow-up page then returns 0 items and no key.
-    has_more = False
-    if limit is not None and len(candidates) >= limit:
-        has_more = len(candidates) > 0
-        candidates = candidates[:limit]
+    candidates, has_more = _paginate_evaluated_items(candidates, limit, table, index_name)
 
     scanned_count = len(candidates)
     query_filter = data.get("QueryFilter")
@@ -2231,9 +2445,9 @@ def _query(data):
     if has_more and candidates:
         lek = _build_key(candidates[-1], table["pk_name"], table["sk_name"])
         if index_name:
-            ik = _build_key(candidates[-1], pk_name, sk_name)
-            for k, v in ik.items():
-                lek.setdefault(k, v)
+            for k in hash_names + range_names:
+                if k in candidates[-1]:
+                    lek.setdefault(k, candidates[-1][k])
         result["LastEvaluatedKey"] = lek
 
     _add_consumed_capacity(result, data, name, index_name=data.get("IndexName"))
@@ -2241,7 +2455,7 @@ def _query(data):
 
 
 def _scan(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     err = _validate_data_plane_table_name(name)
     if err:
         return err
@@ -2364,16 +2578,17 @@ def _scan(data):
 
     if index_name:
         pk_name_idx, sk_name_idx, is_gsi = _resolve_index_keys(table, index_name)
+        idx_hashes, idx_ranges = _index_key_lists(_index_def(table, index_name) or {})
         if is_gsi:
             # Sparse GSI semantics: items lacking ANY of the index's key
             # attributes (hash, or range on a composite GSI) don't appear.
-            all_items = [it for it in all_items if pk_name_idx in it and (not sk_name_idx or sk_name_idx in it)]
+            all_items = [it for it in all_items if all(n in it for n in idx_hashes + idx_ranges)]
         else:
             # LSI: items lacking the index's RANGE attribute don't appear.
             if sk_name_idx:
                 all_items = [it for it in all_items if sk_name_idx in it]
         # Sort by index key ordering so ESK/LEK pagination is consistent.
-        sort_keys = _index_order_keys(table, sk_name_idx)
+        sort_keys = _index_order_keys(table, idx_ranges or sk_name_idx)
         all_items.sort(key=lambda it: tuple(_index_order_value(it, n, t) for n, t in sort_keys))
 
     # Parallel scan: partition items deterministically across segments by
@@ -2400,26 +2615,22 @@ def _scan(data):
         if table.get("sk_name"):
             required.add(table["sk_name"])
         if index_name:
-            required.add(pk_name_idx)
-            if sk_name_idx:
-                required.add(sk_name_idx)
+            required.update(idx_hashes + idx_ranges)
         if not required.issubset(esk.keys()):
             return error_response_json("ValidationException",
                 "The provided starting key is invalid: The provided key element does not match the schema", 400)
         if index_name:
             # For index scans, use index-aware ordering (same as Query pagination).
             all_items = _apply_exclusive_start_key(
-                all_items, esk, pk_name_idx, sk_name_idx, scan_forward=True, table=table
+                all_items, esk, pk_name_idx, idx_ranges if len(idx_ranges) > 1 else sk_name_idx,
+                scan_forward=True, table=table
             )
         else:
             all_items = _apply_exclusive_start_key_scan(all_items, esk, table)
 
     # Same LastEvaluatedKey semantics as Query: stopping exactly at the limit
     # still yields a key, because AWS doesn't look ahead.
-    has_more = False
-    if limit is not None and len(all_items) >= limit:
-        has_more = len(all_items) > 0
-        all_items = all_items[:limit]
+    all_items, has_more = _paginate_evaluated_items(all_items, limit, table, index_name)
 
     scanned_count = len(all_items)
 
@@ -2452,9 +2663,9 @@ def _scan(data):
     if has_more and all_items:
         lek = _build_key(all_items[-1], table["pk_name"], table["sk_name"])
         if index_name:
-            ik = _build_key(all_items[-1], pk_name_idx, sk_name_idx)
-            for k, v in ik.items():
-                lek.setdefault(k, v)
+            for k in idx_hashes + idx_ranges:
+                if k in all_items[-1]:
+                    lek.setdefault(k, all_items[-1][k])
         result["LastEvaluatedKey"] = lek
 
     _add_consumed_capacity(result, data, name, index_name=data.get("IndexName"))
@@ -2694,8 +2905,7 @@ def _partiql_insert(table, parsed):
     if pk_val in table["items"] and sk_val in table["items"][pk_val]:
         return error_response_json("DuplicateItemException",
                                    "Duplicate primary key exists in table", 400)
-    table["items"][pk_val][sk_val] = item
-    _update_counts(table)
+    _set_item(table, pk_val, sk_val, item)
     return json_response({})
 
 
@@ -2995,9 +3205,8 @@ def _partiql_update(table, parsed):
         _partiql_remove_path(work, parts)
         applied_paths.append(parts)
     # Nothing failed — commit the working copy.
-    item.clear()
-    item.update(work)
-    item_after = item
+    _set_item(table, pk_key, sk_key, work)
+    item_after = work
 
     if returning:
         r = returning.upper().strip()
@@ -3043,10 +3252,7 @@ def _partiql_delete(table, parsed):
         return _conditional_check_failed({}, item)
 
     item_before = copy.deepcopy(item) if returning else None
-    del table["items"][pk_key][sk_key]
-    if not table["items"][pk_key]:
-        del table["items"][pk_key]
-    _update_counts(table)
+    _remove_item(table, pk_key, sk_key)
 
     if returning and returning.upper().strip() == "ALL OLD *":
         return json_response({"Items": [item_before] if item_before else []})
@@ -3184,7 +3390,7 @@ def _execute_transaction(data):
     crt = data.get("ClientRequestToken")
     signature = None
     if crt:
-        prior = _txn_idempotency.get(crt)
+        prior = _txn_token_lookup(crt)
         signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
         if prior is not None:
             if prior.get("signature") == signature:
@@ -3270,6 +3476,7 @@ def _execute_transaction(data):
             tbl = _tables.get(tname)
             if tbl is not None:
                 tbl["items"] = defaultdict(dict, items)
+                _items_replaced(tbl)
         idx, code, msg = failure
         reasons = [{"Code": "None"} for _ in statements]
         reasons[idx] = {"Code": code.split("#")[-1], "Message": msg}
@@ -3306,7 +3513,7 @@ def _execute_transaction(data):
                              "WriteCapacityUnits": write_units})
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
+        _txn_token_store(crt, {"signature": signature, "response": result, "sizes": txn_sizes})
     return json_response(result)
 
 
@@ -3849,7 +4056,7 @@ def _batch_write_item(data):
     # in a single BatchWriteItem call.
     seen_keys = set()
     for table_name, requests in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
@@ -3890,7 +4097,7 @@ def _batch_write_item(data):
             seen_keys.add(key_repr)
     unprocessed = {}
     for table_name, requests in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             return error_response_json(
                 "ResourceNotFoundException",
@@ -3908,8 +4115,8 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"][pk_val][sk_val] = item
-                _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
+                _set_item(table, pk_val, sk_val, item)
+                _emit_stream_event(_normalize_table_name(table_name), "MODIFY" if old_item else "INSERT", old_item, item)
                 _accumulate_write_capacity(cap, table, old_item, item)
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"]["Key"]
@@ -3917,11 +4124,10 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"].get(pk_val, {}).pop(sk_val, None)
+                _remove_item(table, pk_val, sk_val)
                 if old_item:
-                    _emit_stream_event(table_name, "REMOVE", old_item, None)
+                    _emit_stream_event(_normalize_table_name(table_name), "REMOVE", old_item, None)
                 _accumulate_write_capacity(cap, table, old_item, None)
-        _update_counts(table)
     result = {"UnprocessedItems": unprocessed}
     rc = data.get("ReturnConsumedCapacity", "NONE")
     if rc != "NONE":
@@ -3956,12 +4162,12 @@ def _batch_get_item(data):
                 f"1 validation error detected: Value at 'RequestItems.{_bg_table_name}.member.Keys' failed to satisfy constraint: Member must have length less than or equal to {_DDB_BATCH_GET_MAX}", 400)
     # Non-existent table check before processing (AWS validates upfront).
     for table_name in request_items:
-        if table_name not in _tables:
+        if _normalize_table_name(table_name) not in _tables:
             return error_response_json("ResourceNotFoundException",
                 "Requested resource not found", 400)
     # Duplicate-key rejection.
     for table_name, cfg in request_items.items():
-        table = _tables[table_name]
+        table = _tables[_normalize_table_name(table_name)]
         seen = set()
         for key in cfg.get("Keys", []):
             key_repr = (
@@ -3975,7 +4181,7 @@ def _batch_get_item(data):
     responses = {}
     unprocessed = {}
     for table_name, config in request_items.items():
-        table = _tables.get(table_name)
+        table = _tables.get(_normalize_table_name(table_name))
         if not table:
             unprocessed[table_name] = config
             continue
@@ -4006,6 +4212,10 @@ def _batch_get_item(data):
 
 def _transact_write_items(data):
     items_list = data.get("TransactItems", [])
+    for _txn_item in items_list if isinstance(items_list, list) else []:
+        for _txn_op in (_txn_item.values() if isinstance(_txn_item, dict) else []):
+            if isinstance(_txn_op, dict) and "TableName" in _txn_op:
+                _txn_op["TableName"] = _normalize_table_name(_txn_op["TableName"])
     if not items_list:
         return error_response_json("ValidationException",
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
@@ -4024,7 +4234,7 @@ def _transact_write_items(data):
     # raises IdempotentParameterMismatchException.
     crt = data.get("ClientRequestToken")
     if crt:
-        prior = _txn_idempotency.get(crt)
+        prior = _txn_token_lookup(crt)
         # Drop the ClientRequestToken from the payload signature so equality
         # is on the actual transaction body.
         signature = {k: v for k, v in data.items() if k != "ClientRequestToken"}
@@ -4193,7 +4403,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(item.get(tbl["pk_name"]))
             sk_val = _extract_key_val(item.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"][pk_val][sk_val] = item
+            _set_item(tbl, pk_val, sk_val, item)
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             _txn_write_effects.setdefault(table_name, []).append((old_item, item))
         elif op_type == "Delete":
@@ -4201,7 +4411,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(key.get(tbl["pk_name"]))
             sk_val = _extract_key_val(key.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"].get(pk_val, {}).pop(sk_val, None)
+            _remove_item(tbl, pk_val, sk_val)
             if old_item:
                 _emit_stream_event(table_name, "REMOVE", old_item, None)
             _txn_write_effects.setdefault(table_name, []).append((old_item, None))
@@ -4214,10 +4424,9 @@ def _transact_write_items(data):
             ue = op.get("UpdateExpression", "")
             if ue:
                 item, _ = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
-            tbl["items"][pk_val][sk_val] = item
+            _set_item(tbl, pk_val, sk_val, item)
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             _txn_write_effects.setdefault(table_name, []).append((old_item, item))
-        _update_counts(tbl)
 
     # ConsumedCapacity: a transactional write costs 2 x ceil(size/1KB) WCU per
     # item on the table (measured against real DynamoDB, eu-west-2, by
@@ -4256,15 +4465,41 @@ def _transact_write_items(data):
     if rc != "NONE" and consumed:
         result["ConsumedCapacity"] = consumed
     if crt:
-        _txn_idempotency[crt] = {"signature": signature, "response": result, "sizes": txn_sizes}
+        _txn_token_store(crt, {"signature": signature, "response": result, "sizes": txn_sizes})
     return json_response(result)
 
 
 _txn_idempotency = AccountRegionScopedDict()
+_TXN_TOKEN_TTL = 600  # "valid for 10 minutes after the first request that uses it is completed"
+_txn_token_sweep_at = 0.0
+
+
+def _txn_token_lookup(crt):
+    prior = _txn_idempotency.get(crt)
+    if prior is not None and time.time() - prior["completed_at"] >= _TXN_TOKEN_TTL:
+        _txn_idempotency.pop(crt, None)
+        return None
+    return prior
+
+
+def _txn_token_store(crt, entry):
+    global _txn_token_sweep_at
+    now = time.time()
+    entry["completed_at"] = now
+    _txn_idempotency[crt] = entry
+    if now >= _txn_token_sweep_at:
+        _txn_token_sweep_at = now + 60
+        for (account_id, region, token), prior in _txn_idempotency.all_items():
+            if now - prior["completed_at"] >= _TXN_TOKEN_TTL:
+                _txn_idempotency.pop_scoped(account_id, region, token, None)
 
 
 def _transact_get_items(data):
     items_list = data.get("TransactItems", [])
+    for _txn_item in items_list if isinstance(items_list, list) else []:
+        for _txn_op in (_txn_item.values() if isinstance(_txn_item, dict) else []):
+            if isinstance(_txn_op, dict) and "TableName" in _txn_op:
+                _txn_op["TableName"] = _normalize_table_name(_txn_op["TableName"])
     if not items_list:
         return error_response_json("ValidationException",
             "1 validation error detected: Value '[]' at 'transactItems' failed to satisfy constraint: Member must have length greater than or equal to 1", 400)
@@ -4410,7 +4645,7 @@ def _transact_cancel_response(total, failures):
 # ---------------------------------------------------------------------------
 
 def _describe_ttl(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     setting = _ttl_settings.get(name, {"TimeToLiveStatus": "DISABLED"})
@@ -4421,7 +4656,7 @@ def _describe_ttl(data):
 
 
 def _update_ttl(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("TimeToLiveSpecification", {})
@@ -4434,6 +4669,10 @@ def _update_ttl(data):
         "TimeToLiveStatus": "ENABLED" if enabled else "DISABLED",
         "AttributeName": attr_name,
     }
+    # A global table's TTL settings are synchronized to every replica.
+    for region in _replica_group(_tables[name]):
+        if region != get_region():
+            _ttl_settings.set_scoped(get_account_id(), region, name, dict(_ttl_settings[name]))
     return json_response({"TimeToLiveSpecification": spec})
 
 
@@ -4442,7 +4681,7 @@ def _update_ttl(data):
 # ---------------------------------------------------------------------------
 
 def _describe_continuous_backups(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     pitr_enabled = _pitr_settings.get(name, False)
@@ -4465,7 +4704,7 @@ def _describe_continuous_backups(data):
 
 
 def _update_continuous_backups(data):
-    name = data.get("TableName")
+    name = _normalize_table_name(data.get("TableName"))
     if name not in _tables:
         return error_response_json("ResourceNotFoundException", f"Table {name} not found", 400)
     spec = data.get("PointInTimeRecoverySpecification", {})
@@ -4584,7 +4823,7 @@ _VALID_PRECISIONS = {"MILLISECOND", "MICROSECOND"}
 
 
 def _validate_kinesis_destination_request(data: dict) -> tuple[str | None, str | None, dict | None]:
-    table_name = data.get("TableName")
+    table_name = _normalize_table_name(data.get("TableName"))
     stream_arn = data.get("StreamArn")
     if not table_name:
         return None, None, error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
@@ -4695,7 +4934,7 @@ def _disable_kinesis_streaming_destination(data):
 
 
 def _describe_kinesis_streaming_destination(data):
-    table_name = data.get("TableName")
+    table_name = _normalize_table_name(data.get("TableName"))
     if not table_name:
         return error_response_json("ValidationException", "The parameter 'TableName' is required but was not present in the request", 400)
     if table_name not in _tables:
@@ -5016,11 +5255,11 @@ def _export_arn(table_arn: str) -> str:
     return f"{table_arn}/export/{int(time.time() * 1000)}-{new_uuid()[:8]}"
 
 
-def _import_arn() -> str:
-    return (
-        f"arn:aws:dynamodb:{get_region()}:{get_account_id()}:import/"
-        f"{int(time.time() * 1000)}-{new_uuid()[:8]}"
-    )
+def _import_arn(table_arn: str) -> str:
+    """``<table arn>/import/<epoch millis>-<8 hex>``, the documented shape:
+    ``arn:aws:dynamodb:us-east-1:ACCOUNT:table/target-table/import/01658528578619-c4d4e311``.
+    """
+    return f"{table_arn}/import/{int(time.time() * 1000):014d}-{new_uuid()[:8]}"
 
 
 def _export_table_to_point_in_time(data):
@@ -5118,6 +5357,314 @@ def _list_exports(data):
     return json_response(resp)
 
 
+def _validate_csv_import_options(data):
+    """``InputFormatOptions.Csv`` as the model bounds it.
+
+    ``Delimiter`` is ``{"max": 1, "min": 1, "pattern": "[,;:|\\t ]"}``, and
+    ``HeaderList`` names the attributes each column carries, so a blank or a
+    repeat has no reading.
+    """
+    options = (data.get("InputFormatOptions") or {}).get("Csv")
+    if not isinstance(options, dict):
+        return None
+    delimiter = options.get("Delimiter")
+    if delimiter is not None and not _CSV_DELIMITER_RE.fullmatch(str(delimiter)):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{delimiter}' at "
+            "'inputFormatOptions.csv.delimiter' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: [,;:|\\t ]", 400)
+    header = options.get("HeaderList")
+    if header is None:
+        return None
+    if (not isinstance(header, list) or not header
+            or any(not isinstance(name, str) or not name for name in header)
+            or len(set(header)) != len(header)):
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'inputFormatOptions.csv.headerList' "
+            "failed to satisfy constraint: Member must contain distinct non-empty "
+            "attribute names", 400)
+    return None
+
+
+def _import_description(desc):
+    """The stored import without the result the grace window still holds back."""
+    return {k: v for k, v in desc.items() if not k.startswith("_")}
+
+
+class _ImportFailed(Exception):
+    """An import that cannot run, carrying the ``FailureCode`` it reports."""
+
+    def __init__(self, code, message, *, table_created=True):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        # "Since the error was caught before the data was imported into the
+        # table, a new DynamoDB table is not created."
+        self.table_created = table_created
+
+
+def _import_log_stream(import_arn):
+    """The error stream of one import: log group ``/aws-dynamodb/imports``,
+    stream ``<import id>/error`` where "The import ID is the last path element
+    of the ImportArn field"."""
+    from ministack.services import cloudwatch_logs as _cwl
+
+    now_ms = int(time.time() * 1000)
+    if _IMPORT_LOG_GROUP not in _cwl._log_groups:
+        _cwl._log_groups[_IMPORT_LOG_GROUP] = {
+            "arn": _cwl._make_group_arn(_IMPORT_LOG_GROUP),
+            "creationTime": now_ms,
+            "retentionInDays": None,
+            "tags": {},
+            "subscriptionFilters": {},
+            "streams": {},
+        }
+    group = _cwl._log_groups[_IMPORT_LOG_GROUP]
+    stream_name = f"{import_arn.rsplit('/', 1)[-1]}/error"
+    if stream_name not in group["streams"]:
+        group["streams"][stream_name] = {
+            "events": [],
+            "uploadSequenceToken": "1",
+            "creationTime": now_ms,
+            "firstEventTimestamp": None,
+            "lastEventTimestamp": None,
+            "lastIngestionTime": None,
+        }
+    return group["streams"][stream_name]
+
+
+def _log_import_error(import_arn, bucket, key, item_index, message):
+    """One item-level error, in the shape the documented log event carries:
+    ``{"itemS3Pointer": {...}, "importArn": ..., "errorMessages": [...]}``."""
+    try:
+        stream = _import_log_stream(import_arn)
+    except Exception:
+        logger.debug("DynamoDB import %s: error log unavailable", import_arn, exc_info=True)
+        return
+    ts = int(time.time() * 1000)
+    stream["events"].append({
+        "timestamp": ts,
+        "message": json.dumps({
+            "itemS3Pointer": {"bucket": bucket, "key": key, "itemIndex": item_index},
+            "importArn": import_arn,
+            "errorMessages": [message],
+        }),
+        "ingestionTime": ts,
+    })
+    if stream["firstEventTimestamp"] is None:
+        stream["firstEventTimestamp"] = ts
+    stream["lastEventTimestamp"] = ts
+    stream["lastIngestionTime"] = ts
+
+
+def _import_source_objects(s3_source, compression):
+    """``(key, bytes)`` for every object under the source prefix, key order.
+
+    ``ProcessedSizeBytes`` counts what the import reads, and pricing "is based
+    on the uncompressed size of the source data", so the caller measures the
+    decompressed blob.
+    """
+    from ministack.services import s3 as s3_svc
+
+    bucket_name = (s3_source or {}).get("S3Bucket")
+    bucket = s3_svc._buckets.get(bucket_name)
+    if bucket is None:
+        raise _ImportFailed(
+            "S3NoSuchBucket",
+            "The specified bucket does not exist (Service: Amazon S3; Status Code: 404; "
+            "Error Code: NoSuchBucket)",
+            table_created=False)
+    prefix = (s3_source or {}).get("S3KeyPrefix") or ""
+    keys = sorted(key for key in bucket["objects"]
+                  if key.startswith(prefix) and not key.endswith("/"))
+    if not keys:
+        raise _ImportFailed(
+            "S3NoSuchKey",
+            f"No objects were found under s3://{bucket_name}/{prefix}",
+            table_created=False)
+    objects = []
+    for key in keys:
+        raw = s3_svc._get_object_data(bucket_name, key)
+        if raw is None:
+            continue
+        if compression == "GZIP":
+            try:
+                raw = gzip.decompress(raw)
+            except OSError as exc:
+                raise _ImportFailed("InputFormatError",
+                                    f"{key} is not valid GZIP data: {exc}") from None
+        objects.append((key, raw))
+    return bucket_name, objects
+
+
+def _import_csv_items(blob, options, attribute_types):
+    """``(items, malformed_row_count)`` for one CSV object.
+
+    "If this field is specified then the first line of each CSV file is treated
+    as data instead of the header. If this field is not specified the the first
+    line of each CSV file is treated as the header" (CsvOptions.HeaderList).
+    A key column takes the type its AttributeDefinition declares; every other
+    column is imported as a string, and an empty one is left off the item.
+    """
+    delimiter = options.get("Delimiter") or ","
+    header = options.get("HeaderList")
+    try:
+        # utf-8-sig: a BOM would otherwise become part of the first header,
+        # and every item would carry an attribute nothing can query.
+        rows = list(csv.reader(io.StringIO(blob.decode("utf-8-sig")), delimiter=delimiter))
+    except (UnicodeDecodeError, csv.Error) as exc:
+        raise _ImportFailed("InputFormatError", f"The CSV source is malformed: {exc}") from None
+    if not header:
+        if not rows:
+            return [], []
+        header, rows = rows[0], rows[1:]
+    items, malformed = [], []
+    for index, row in enumerate(rows):
+        if not any(cell.strip() for cell in row):
+            continue
+        if len(row) != len(header):
+            malformed.append((index, f"CSV row has {len(row)} columns but the header "
+                                     f"has {len(header)} columns"))
+            continue
+        item = {}
+        for column, value in zip(header, row):
+            if value == "":
+                continue
+            item[column] = {attribute_types.get(column, "S"): value}
+        items.append((index, item))
+    return items, malformed
+
+
+def _import_dynamodb_json_items(blob):
+    """``(items, malformed)`` for one DYNAMODB_JSON object: one
+    ``{"Item": {...}}`` per line."""
+    items, malformed = [], []
+    for index, line in enumerate(blob.decode("utf-8", errors="replace").splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            malformed.append((index, f"The item is not valid JSON: {exc}"))
+            continue
+        item = record.get("Item") if isinstance(record, dict) else None
+        if isinstance(item, dict):
+            items.append((index, item))
+        else:
+            malformed.append((index, "The item is not in DYNAMODB_JSON format"))
+    return items, malformed
+
+
+def _drop_import_table(table_name):
+    """Undo the table a failed import created, through the service's own path."""
+    try:
+        _delete_table({"TableName": table_name})
+    except Exception:
+        logger.debug("DynamoDB import: could not drop %s", table_name, exc_info=True)
+
+
+def _run_import(import_arn, table_name):
+    """Read the source and write its items, updating the description as it goes.
+
+    Runs on a background thread with the submitting request's account and
+    region snapshotted, so ``DescribeImport`` reports the counters climbing
+    the way a real import does.
+    """
+    if _IMPORT_COMPLETE_AFTER_SEC > 0:
+        time.sleep(_IMPORT_COMPLETE_AFTER_SEC)
+    desc = _imports.get(import_arn)
+    if not desc or desc.get("ImportStatus") != "IN_PROGRESS":
+        return
+    compression = desc.get("InputCompressionType") or "NONE"
+    try:
+        if compression not in ("NONE", "GZIP"):
+            raise _ImportFailed(
+                "InputCompressionTypeNotSupported",
+                f"{compression} decompression needs a library MiniStack does not ship; "
+                "use NONE or GZIP", table_created=False)
+        if desc["InputFormat"] == "ION":
+            raise _ImportFailed(
+                "InputFormatNotSupported",
+                "ION parsing needs a library MiniStack does not ship; "
+                "use CSV or DYNAMODB_JSON", table_created=False)
+        attribute_types = {
+            defn.get("AttributeName"): defn.get("AttributeType", "S")
+            for defn in (desc.get("TableCreationParameters") or {}).get(
+                "AttributeDefinitions", [])
+            if defn.get("AttributeName")
+        }
+        options = (desc.get("InputFormatOptions") or {}).get("Csv") or {}
+        bucket_name, objects = _import_source_objects(desc.get("S3BucketSource"), compression)
+        for key, blob in objects:
+            desc["ProcessedSizeBytes"] += len(blob)
+            try:
+                if desc["InputFormat"] == "CSV":
+                    items, malformed = _import_csv_items(blob, options, attribute_types)
+                else:
+                    items, malformed = _import_dynamodb_json_items(blob)
+            except _ImportFailed as unreadable:
+                # "If the Amazon S3 object itself is malformed ... we may skip
+                # processing the remaining portion of the object."
+                desc["ErrorCount"] += 1
+                _log_import_error(import_arn, bucket_name, key, 0, unreadable.message)
+                continue
+            for index, reason in malformed:
+                desc["ProcessedItemCount"] += 1
+                desc["ErrorCount"] += 1
+                _log_import_error(import_arn, bucket_name, key, index, reason)
+            for index, item in items:
+                desc["ProcessedItemCount"] += 1
+                status, _headers, body = _put_item({"TableName": table_name, "Item": item})
+                if status == 200:
+                    # Counts loads, not the table's ItemCount: "the number of
+                    # items processed in the import table description will not
+                    # match the number of items in the target table".
+                    desc["ImportedItemCount"] += 1
+                else:
+                    desc["ErrorCount"] += 1
+                    _log_import_error(import_arn, bucket_name, key, index,
+                                      _import_error_message(body))
+    except _ImportFailed as failure:
+        if not failure.table_created:
+            _drop_import_table(table_name)
+        _finish_import(desc, "FAILED", failure.code, failure.message)
+        return
+    except Exception:
+        logger.exception("DynamoDB import %s crashed", import_arn)
+        _finish_import(desc, "FAILED", "InternalServerError",
+                       "Internal Failure. Please try your request again.")
+        return
+
+    if desc["ErrorCount"]:
+        # "At the end of job, the import status is set to FAILED with a
+        # FailureCode, ItemValidationError and the FailureMessage ..."
+        _finish_import(
+            desc, "FAILED", "ItemValidationError",
+            "Some of the items failed validation checks and were not imported. "
+            "Please check CloudWatch error logs for more details.")
+        return
+    _finish_import(desc, "COMPLETED")
+
+
+def _import_error_message(body):
+    """The message of the error response ``_put_item`` answered."""
+    try:
+        return json.loads(body.decode("utf-8")).get("message", "")
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
+        return ""
+
+
+def _finish_import(desc, status, failure_code=None, failure_message=None):
+    desc["ImportStatus"] = status
+    desc["EndTime"] = int(time.time())
+    if failure_code:
+        desc["FailureCode"] = failure_code
+        desc["FailureMessage"] = failure_message
+
+
 def _import_table(data):
     s3_source = data.get("S3BucketSource")
     fmt = data.get("InputFormat")
@@ -5131,6 +5678,10 @@ def _import_table(data):
     if fmt not in ("CSV", "DYNAMODB_JSON", "ION"):
         return error_response_json("ValidationException",
             f"Invalid InputFormat: {fmt}. Valid values: CSV, DYNAMODB_JSON, ION", 400)
+    if fmt == "CSV":
+        err = _validate_csv_import_options(data)
+        if err:
+            return err
     if not table_params:
         return error_response_json("ValidationException",
             "1 validation error detected: Value null at 'tableCreationParameters' failed to satisfy constraint: Member must not be null", 400)
@@ -5145,7 +5696,14 @@ def _import_table(data):
     if client_token:
         for desc in _imports.values():
             if desc.get("ClientToken") == client_token:
-                return json_response({"ImportTableDescription": desc})
+                return json_response({"ImportTableDescription": _import_description(desc)})
+    running = sum(1 for desc in _imports.values()
+                  if desc.get("ImportStatus") == "IN_PROGRESS")
+    if running >= _IMPORT_CONCURRENCY_LIMIT:
+        return error_response_json(
+            "LimitExceededException",
+            f"Subscriber limit exceeded: There is a limit of "
+            f"{_IMPORT_CONCURRENCY_LIMIT} concurrent import jobs per account", 400)
     # Create the destination table from TableCreationParameters.
     create_req = dict(table_params)
     status, _, body = _create_table(create_req)
@@ -5153,15 +5711,18 @@ def _import_table(data):
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
     table_arn = _tables[table_name]["TableArn"]
     table_id = _tables[table_name].get("TableId")
-    arn = _import_arn()
-    now = time.time()
+    arn = _import_arn(table_arn)
+    now = int(time.time())
     desc = {
         "ImportArn": arn,
         "ImportStatus": "IN_PROGRESS",
         "TableArn": table_arn,
         "TableId": table_id,
         "S3BucketSource": s3_source,
+        "CloudWatchLogGroupArn": (
+            f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{_IMPORT_LOG_GROUP}:*"),
         "InputFormat": fmt,
+        "InputCompressionType": data.get("InputCompressionType") or "NONE",
         "StartTime": now,
         "ProcessedSizeBytes": 0,
         "ProcessedItemCount": 0,
@@ -5171,12 +5732,12 @@ def _import_table(data):
     }
     if data.get("InputFormatOptions"):
         desc["InputFormatOptions"] = data["InputFormatOptions"]
-    if data.get("InputCompressionType"):
-        desc["InputCompressionType"] = data["InputCompressionType"]
     if client_token:
         desc["ClientToken"] = client_token
     _imports[arn] = desc
-    return json_response({"ImportTableDescription": desc})
+    # spawn_background snapshots this request's account and region.
+    spawn_background(_run_import, arn, table_name, thread_name="ministack-ddb-import")
+    return json_response({"ImportTableDescription": _import_description(desc)})
 
 
 def _describe_import(data):
@@ -5188,10 +5749,12 @@ def _describe_import(data):
     if not desc:
         return error_response_json("ImportNotFoundException",
             f"Import not found: {arn}", 400)
-    if desc.get("ImportStatus") == "IN_PROGRESS" and (time.time() - desc.get("StartTime", 0)) >= _IMPORT_COMPLETE_AFTER_SEC:
-        desc["ImportStatus"] = "COMPLETED"
-        desc["EndTime"] = time.time()
-    return json_response({"ImportTableDescription": desc})
+    # An import restored from a snapshot has no worker behind it.
+    if (desc.get("ImportStatus") == "IN_PROGRESS" and desc.get("_orphaned")
+            and (time.time() - desc.get("StartTime", 0)) >= _IMPORT_COMPLETE_AFTER_SEC):
+        _finish_import(desc, "FAILED", "InternalServerError",
+                       "Internal Failure. Please try your request again.")
+    return json_response({"ImportTableDescription": _import_description(desc)})
 
 
 def _list_imports(data):
@@ -5385,7 +5948,7 @@ def _restore_table_from_backup(data):
     # Restore items.
     snap = desc.get("_items_snapshot") or {}
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(snap))
-    _update_counts(_tables[target])
+    _items_replaced(_tables[target])
     # AWS attaches a RestoreSummary to the response — clients (Terraform, the
     # AWS SDK) read SourceBackupArn / RestoreInProgress to track the restore.
     _tables[target]["RestoreSummary"] = {
@@ -5424,7 +5987,7 @@ def _restore_table_to_point_in_time(data):
     if status != 200:
         return status, {"Content-Type": "application/x-amz-json-1.0"}, body
     _tables[target]["items"] = defaultdict(dict, copy.deepcopy(dict(src.get("items", {}))))
-    _update_counts(_tables[target])
+    _items_replaced(_tables[target])
     return json_response({"TableDescription": _table_description(target)})
 
 
@@ -6689,6 +7252,30 @@ def _index_order_value(item, name, type_hint):
     return _sort_key_value(item.get(name), type_hint)
 
 
+def _multi_sort_condition_ok(tokens, ean, range_names):
+    """Sort-key attributes of a multi-attribute key must be queried left to
+    right without skipping any, with equality on all but the last."""
+    ops = {}
+    i = 0
+    while i < len(tokens):
+        kind, val = tokens[i]
+        if kind == "IDENT" and val.lower() == "begins_with" and i + 2 < len(tokens):
+            arg = tokens[i + 2]
+            name = ean.get(arg[1]) if arg[0] == "NAME_REF" else arg[1]
+            ops.setdefault(name, []).append("range")
+            i += 3
+            continue
+        name = ean.get(val) if kind == "NAME_REF" else (val if kind == "IDENT" else None)
+        if name in range_names and i + 1 < len(tokens):
+            eq = tokens[i + 1][0] == "EQ" or (i >= 2 and tokens[i - 1][0] == "EQ" and tokens[i - 2][0] == "VALUE_REF")
+            ops.setdefault(name, []).append("eq" if eq else "range")
+        i += 1
+    used = [n for n in range_names if n in ops]
+    if used != range_names[:len(used)] or any(len(ops[n]) != 1 for n in used):
+        return False
+    return all(ops[n] == ["eq"] for n in used[:-1])
+
+
 def _index_order_keys(table, sk_name):
     """Ordered list of (attr_name, attr_type) used to sort a GSI/LSI Query
     result deterministically: (INDEX_SORT, BASE_PK, BASE_SK). Real DynamoDB
@@ -6698,7 +7285,8 @@ def _index_order_keys(table, sk_name):
     hash-only)."""
     seen = set()
     keys = []
-    for n in (sk_name, table.get("pk_name"), table.get("sk_name")):
+    index_sorts = list(sk_name) if isinstance(sk_name, (list, tuple)) else [sk_name]
+    for n in (*index_sorts, table.get("pk_name"), table.get("sk_name")):
         if n and n not in seen:
             seen.add(n)
             keys.append((n, _get_attr_type(table, n)))
@@ -7034,6 +7622,111 @@ def _compact_projection(value):
 # ---------------------------------------------------------------------------
 # Misc helpers
 # ---------------------------------------------------------------------------
+
+# Derived per table, never persisted: {index_name: {index hash value:
+# {(base_pk, base_sk): None}}} (insertion-ordered), so a GSI/LSI Query reads its own partition
+# instead of every item. Built on first use; dropped whenever items are
+# replaced wholesale or the index set changes.
+_INDEX_MEMBERS = "_index_members"
+
+
+def _index_key_lists(index):
+    """(HASH names, RANGE names) of an index KeySchema, in order; a GSI may
+    have up to four of each (multi-attribute keys)."""
+    schema = index.get("KeySchema", [])
+    return ([k.get("AttributeName") for k in schema if k.get("KeyType") == "HASH"],
+            [k.get("AttributeName") for k in schema if k.get("KeyType") == "RANGE"])
+
+
+def _index_def(table, index_name):
+    for index in table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", []):
+        if index.get("IndexName") == index_name:
+            return index
+    return None
+
+
+def _index_key_schemas(table):
+    for index in table.get("GlobalSecondaryIndexes", []) + table.get("LocalSecondaryIndexes", []):
+        hashes, ranges = _index_key_lists(index)
+        yield index.get("IndexName"), hashes, ranges
+
+
+def _index_partition(item, hashes, ranges):
+    """The index partition of an item: its HASH value, or the tuple of them
+    for a multi-attribute key; None when any key attribute is missing."""
+    if not hashes or any(n not in item for n in hashes + ranges):
+        return None
+    if len(hashes) == 1:
+        return _extract_key_val(item[hashes[0]])
+    return tuple(_extract_key_val(item[n]) for n in hashes)
+
+
+def _index_members(table):
+    members = table.get(_INDEX_MEMBERS)
+    if members is None:
+        members = {}
+        for name, hash_key, range_key in _index_key_schemas(table):
+            partitions = members.setdefault(name, {})
+            for base_pk, sk_map in table["items"].items():
+                for base_sk, item in sk_map.items():
+                    partition = _index_partition(item, hash_key, range_key)
+                    if partition is not None:
+                        partitions.setdefault(partition, {})[(base_pk, base_sk)] = None
+        table[_INDEX_MEMBERS] = members
+    return members
+
+
+def _index_item(table, base_pk, base_sk, item, add):
+    members = table.get(_INDEX_MEMBERS)
+    if members is None:
+        return
+    for name, hash_key, range_key in _index_key_schemas(table):
+        if name not in members:
+            table.pop(_INDEX_MEMBERS, None)
+            return
+        partition = _index_partition(item, hash_key, range_key)
+        if partition is None:
+            continue
+        partitions = members[name]
+        if add:
+            partitions.setdefault(partition, {})[(base_pk, base_sk)] = None
+        elif partition in partitions:
+            partitions[partition].pop((base_pk, base_sk), None)
+            if not partitions[partition]:
+                del partitions[partition]
+
+
+def _set_item(table, pk_val, sk_val, item):
+    """Store an item, keeping ItemCount and index membership current."""
+    old_item = table["items"].get(pk_val, {}).get(sk_val)
+    if old_item is not None:
+        _index_item(table, pk_val, sk_val, old_item, add=False)
+    else:
+        table["ItemCount"] = table.get("ItemCount", 0) + 1
+        table["TableSizeBytes"] = table["ItemCount"] * 200
+    table["items"].setdefault(pk_val, {})[sk_val] = item
+    _index_item(table, pk_val, sk_val, item, add=True)
+    return old_item
+
+
+def _remove_item(table, pk_val, sk_val):
+    """Delete an item, keeping ItemCount and index membership current."""
+    sk_map = table["items"].get(pk_val)
+    old_item = sk_map.pop(sk_val, None) if sk_map is not None else None
+    if sk_map is not None and not sk_map:
+        del table["items"][pk_val]
+    if old_item is not None:
+        _index_item(table, pk_val, sk_val, old_item, add=False)
+        table["ItemCount"] = max(0, table.get("ItemCount", 0) - 1)
+        table["TableSizeBytes"] = table["ItemCount"] * 200
+    return old_item
+
+
+def _items_replaced(table):
+    """After table["items"] is swapped wholesale: recount and rebuild lazily."""
+    table.pop(_INDEX_MEMBERS, None)
+    _update_counts(table)
+
 
 def _update_counts(table):
     count = sum(len(v) for v in table["items"].values())
@@ -7421,6 +8114,7 @@ def reset():
         _pitr_settings.clear()
         _stream_records.clear()
         _stream_trimmed.clear()
+        _closed_streams.clear()
         _kinesis_destinations.clear()
         _backups.clear()
         _contributor_insights.clear()

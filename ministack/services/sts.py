@@ -12,12 +12,28 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import re
 import time
 from urllib.parse import parse_qs
+from xml.sax.saxutils import escape
 
 from ministack.core.arn import ArnParseError, parse_arn
-from ministack.core.iam_evaluator import CredentialResolutionError, resolve_credential
-from ministack.core.responses import get_account_id, json_response, new_uuid
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    is_root_access_key,
+    resolve_credential,
+)
+from ministack.core.responses import (
+    _account_from_sts_session,
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+    new_uuid,
+)
 from ministack.core.router import extract_access_key_id
 
 # Shared helpers — IAM and STS are a natural pair; STS is stateless
@@ -92,8 +108,40 @@ def _caller_identity(
 
 
 def _credential_error_response(error: CredentialResolutionError):
-    code = "ExpiredToken" if error.code == "ExpiredTokenException" else error.code
+    code = {"ExpiredTokenException": "ExpiredToken",
+            "UnrecognizedClientException": "InvalidClientTokenId"}.get(error.code, error.code)
     return _error(403, code, error.message, ns="sts")
+
+
+def _access_key_id_problems(key_id: str | None) -> list[str]:
+    """The constraint violations AWS reports for a GetAccessKeyInfo AccessKeyId."""
+    if key_id is None:
+        return ["Value null at 'accessKeyId' failed to satisfy constraint: Member must not be null"]
+    constraints = [
+        ("Member must satisfy regular expression pattern: [\\w]*", not re.fullmatch(r"\w*", key_id, re.ASCII)),
+        ("Member must have length greater than or equal to 16", len(key_id) < 16),
+        ("Member must have length less than or equal to 128", len(key_id) > 128),
+    ]
+    return [f"Value '{escape(key_id)}' at 'accessKeyId' failed to satisfy constraint: {c}"
+            for c, failed in constraints if failed]
+
+
+def _access_key_account(key_id: str) -> str | None:
+    """The account owning a known key, else the account AWS decodes from an AKIA/ASIA id, else None."""
+    if is_root_access_key(key_id):
+        return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+    try:
+        account = _account_from_sts_session(key_id) or find_iam_access_key_account(key_id)
+    except AmbiguousAccessKeyError:
+        account = None
+    if account:
+        return account
+    if key_id[:4] not in ("AKIA", "ASIA") or len(key_id) > 25:
+        return None
+    bits = 0
+    for char in key_id[4:14]:
+        bits = bits << 5 | max("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567".find(char), 0)
+    return f"{bits >> 9 & (1 << 40) - 1:012d}" if bits >> 49 else None
 
 
 def reset():
@@ -151,29 +199,24 @@ async def handle_request(method, path, headers, body, query_params):
     use_json = "amz-json" in content_type
 
     if action == "GetCallerIdentity":
-        auth = headers.get("authorization", "")
-        caller_arn = f"arn:aws:iam::{get_account_id()}:root"
-        caller_user_id = get_account_id()
-        if "Credential=" in auth:
-            try:
-                access_key = auth.split("Credential=")[1].split("/")[0]
-                if access_key in _sessions:
-                    session = _sessions[access_key]
-                    if _session_expired(session):
-                        return _error(403, "ExpiredToken",
-                                      "The security token included in the request is expired",
-                                      ns="sts")
-                    caller_arn = session["Arn"]
-                    caller_user_id = session["UserId"]
-            except Exception:
-                pass
+        access_key = extract_access_key_id(headers, query_params)
+        if access_key in _sessions and _session_expired(_sessions[access_key]):
+            return _error(403, "ExpiredToken",
+                          "The security token included in the request is expired",
+                          ns="sts")
+        caller = _caller_identity(headers, query_params)
+        if isinstance(caller, CredentialResolutionError):
+            return _credential_error_response(caller)
+        caller_arn = caller["userArn"]
+        caller_user_id = caller["userId"]
+        caller_account = caller["accountId"]
         if use_json:
-            return json_response({"Account": get_account_id(), "Arn": caller_arn, "UserId": caller_user_id})
+            return json_response({"Account": caller_account, "Arn": caller_arn, "UserId": caller_user_id})
         return _xml(200, "GetCallerIdentityResponse",
                     f"<GetCallerIdentityResult>"
                     f"<Arn>{caller_arn}</Arn>"
                     f"<UserId>{caller_user_id}</UserId>"
-                    f"<Account>{get_account_id()}</Account>"
+                    f"<Account>{caller_account}</Account>"
                     f"</GetCallerIdentityResult>",
                     ns="sts")
 
@@ -190,7 +233,7 @@ async def handle_request(method, path, headers, body, query_params):
         # When AUTH=true, validate role exists and trust policy permits the caller
         from ministack.app import AUTH
         if AUTH:
-            from ministack.core.iam_evaluator import evaluate_trust_policy
+            from ministack.core.iam_evaluator import EvalContext, evaluate_trust_policy
             from ministack.services import iam as iam_svc
             # Extract role name from ARN
             role_name = role_arn.split("/")[-1] if "/" in role_arn else ""
@@ -220,10 +263,22 @@ async def handle_request(method, path, headers, body, query_params):
             # Evaluate trust policy
             trust_doc = role.get("AssumeRolePolicyDocument", "{}")
             caller_arn = caller["userArn"]
-            if not evaluate_trust_policy(trust_doc, caller_arn):
-                return _error(403, "AccessDenied",
-                              f"User: {caller_arn} is not authorized to perform: "
-                              f"sts:AssumeRole on resource: {role_arn}", ns="sts")
+            trust_context = EvalContext(
+                principal_arn=caller_arn,
+                principal_type=caller["principalType"],
+                principal_account=caller["accountId"],
+                action="sts:AssumeRole", resource_arn=role_arn, region=get_region(),
+                service_context={
+                    "sts:externalid": _p(params, "ExternalId", None),
+                    "sts:rolesessionname": _p(params, "RoleSessionName", None),
+                },
+            )
+            if not evaluate_trust_policy(trust_doc, caller_arn, trust_context):
+                message = (f"User: {caller_arn} is not authorized to perform: "
+                           f"sts:AssumeRole on resource: {role_arn}")
+                if use_json:
+                    return error_response_json("AccessDenied", message, 403)
+                return _error(403, "AccessDenied", message, ns="sts")
 
         duration = int(_p(params, "DurationSeconds") or 3600)
         expiration = _future(duration)
@@ -356,11 +411,19 @@ async def handle_request(method, path, headers, body, query_params):
                     ns="sts")
 
     if action == "GetAccessKeyInfo":
+        key_id = _p(params, "AccessKeyId", None)
+        problems = _access_key_id_problems(key_id)
+        if problems:
+            count = f"{len(problems)} validation error{'s' if len(problems) > 1 else ''} detected"
+            return _error(400, "ValidationError", f"{count}: " + "; ".join(problems), ns="sts")
+        account = _access_key_account(key_id)
+        if account is None:
+            return _error(400, "ValidationError", "Access key ID is not valid.", ns="sts")
         if use_json:
-            return json_response({"Account": get_account_id()})
+            return json_response({"Account": account})
         return _xml(200, "GetAccessKeyInfoResponse",
                     f"<GetAccessKeyInfoResult>"
-                    f"<Account>{get_account_id()}</Account>"
+                    f"<Account>{account}</Account>"
                     f"</GetAccessKeyInfoResult>",
                     ns="sts")
 
