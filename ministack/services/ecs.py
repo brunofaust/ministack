@@ -1649,6 +1649,18 @@ def _build_task_containers(td, container_overrides):
     return containers
 
 
+def _task_limits(td):
+    """The v4 task-metadata ``Limits`` block for a task definition's cpu/memory, or {}."""
+    limits = {}
+    cpu = str(td.get("cpu") or "").strip()
+    memory = str(td.get("memory") or "").strip()
+    if cpu.isdigit():
+        limits["CPU"] = int(cpu) / 1024
+    if memory.isdigit():
+        limits["Memory"] = int(memory)
+    return {"Limits": limits} if limits else {}
+
+
 def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
                        host_mode, ministack_net_ip):
     """Inject ECS_CONTAINER_METADATA_URI_V4 into env and register the
@@ -1689,6 +1701,9 @@ def _register_metadata(task_arn, cluster_arn, td, cdef, launch_type, env,
             "KnownStatus": known,
             "AvailabilityZone": f"{get_region()}a",
             "LaunchType": launch_type,
+            # Real ECS v4 task metadata carries task-level Limits (CPU in vCPU,
+            # Memory in MiB) when the task definition sets them.
+            **_task_limits(td),
         },
         container_payload={
             "DockerId": "",
