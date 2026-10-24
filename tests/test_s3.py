@@ -11272,3 +11272,35 @@ def test_s3_copy_source_in_the_query_string_is_authorized_contract(auth_enabled,
             for item in s3.list_objects_v2(Bucket=bucket).get("Contents", []):
                 s3.delete_object(Bucket=bucket, Key=item["Key"])
             s3.delete_bucket(Bucket=bucket)
+
+
+def test_persisted_versioned_bodies_are_not_held_in_memory(monkeypatch, tmp_path):
+    """BD-3073: under S3_PERSIST the version index keeps metadata only; every
+    version's body is served from disk (object file while current, .versions file
+    once displaced), including after the current version is deleted."""
+    from ministack.services import s3 as s3mod
+    monkeypatch.setattr(s3mod, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(s3mod, "S3_PERSIST", True)
+    name = f"bd3073-ver-{uuid.uuid4().hex[:8]}"
+    s3mod._create_bucket(name, b"", {})
+    s3mod._put_bucket_versioning(
+        name, b'<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+              b"<Status>Enabled</Status></VersioningConfiguration>")
+    try:
+        bodies = [b"first-" * 1000, b"second-" * 1000, b"third-" * 1000]
+        vids = []
+        for body in bodies:
+            _, hdrs, _ = s3mod._put_object(name, "k", body, {})
+            vids.append(hdrs["x-amz-version-id"])
+        assert all(v["data"] is None for v in s3mod._object_versions[(name, "k")])
+        assert s3mod._buckets[name]["objects"]["k"]["body"] is None
+        for vid, body in zip(vids, bodies):
+            status, _, got = s3mod._get_object(name, "k", {}, {"versionId": vid})
+            assert (status, got) == (200, body)
+        s3mod._delete_object(name, "k", {}, {"versionId": vids[2]})
+        status, _, got = s3mod._get_object(name, "k", {}, {})
+        assert (status, got) == (200, bodies[1])
+    finally:
+        s3mod._buckets.pop(name, None)
+        s3mod._object_versions.pop((name, "k"), None)
+        s3mod._bucket_versioning.pop(name, None)

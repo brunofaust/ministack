@@ -5960,14 +5960,20 @@ def _object_record_from_version(v: dict) -> dict:
 
 
 def _version_entry_from_record(obj: dict, version_id: str, data) -> dict:
-    """A version-index entry projected from a current-object record."""
+    """A version-index entry projected from a current-object record.
+
+    With S3_PERSIST the body lives on disk (the object file while current, a
+    ``.versions`` file once displaced; ``_version_body`` reads whichever holds
+    it), so the entry keeps metadata only. Holding ``data`` here pinned every
+    version of every object on the heap although the object itself was spilled
+    (BD-3073: a versioned 794 MiB bucket stayed resident under S3_PERSIST=1)."""
     return {
         "version_id": version_id,
         "last_modified": obj["last_modified"],
         "etag": obj["etag"],
         "size": obj["size"],
         "is_latest": False,
-        "data": data,
+        "data": None if S3_PERSIST else data,
         "content_type": obj.get("content_type") or "application/octet-stream",
         "content_encoding": obj.get("content_encoding"),
         "metadata": obj.get("metadata", {}),
