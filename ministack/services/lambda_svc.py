@@ -560,6 +560,29 @@ def _read_code_blob(sha: str) -> bytes | None:
         return None
 
 
+def _store_code_zip(code):
+    """Spill function code to its content-addressed blob and return the
+    in-memory handle ``{"code_blob_ref": sha}``.
+
+    Function and version records keep only this handle, never the zip bytes
+    (BD-3073): a 40 MB package held by N functions pinned N x 40 MB of heap,
+    duplicating the S3 object it came from. ``None``/empty and values that are
+    already a handle pass through unchanged.
+    """
+    if isinstance(code, (bytes, bytearray)) and code:
+        return {_BLOB_REF_KEY: _write_code_blob(bytes(code))}
+    return code
+
+
+def resolve_code_zip(code) -> bytes | None:
+    """Return the zip bytes for a record's ``code_zip`` value: raw bytes pass
+    through, a blob handle is read from disk, ``None`` stays ``None``. The
+    bytes are transient; callers must not store them on a record or worker."""
+    if isinstance(code, dict) and _BLOB_REF_KEY in code:
+        return _read_code_blob(code[_BLOB_REF_KEY])
+    return code or None
+
+
 def _prune_orphan_code_blobs(referenced: set[str]) -> None:
     """Remove blob files whose sha is not in the ``referenced`` set. Called
     at the tail of ``get_state()`` so the on-disk set always reflects the
@@ -587,9 +610,8 @@ def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
     if not code:
         return
     if isinstance(code, bytes):
-        sha = _write_code_blob(code)
-        func["code_zip"] = {_BLOB_REF_KEY: sha}
-        referenced.add(sha)
+        func["code_zip"] = _store_code_zip(code)
+        referenced.add(func["code_zip"][_BLOB_REF_KEY])
     elif isinstance(code, dict) and _BLOB_REF_KEY in code:
         # Already a ref (e.g. ``get_state`` called twice without a restore
         # in between). Keep the file referenced.
@@ -600,15 +622,20 @@ def _externalize_code_zip(func: dict, referenced: set[str]) -> None:
 
 
 def _internalize_code_zip(func: dict) -> None:
-    """Replace a blob ref or legacy base64 string with bytes, in place."""
+    """Normalise a restored ``code_zip`` to a blob handle, in place. A handle
+    stays a handle (the bytes are read from disk when needed); a missing blob
+    degrades the function to no code, as before; legacy inline base64 is moved
+    into a blob."""
     code = func.get("code_zip")
     if not code:
         return
     if isinstance(code, dict) and _BLOB_REF_KEY in code:
-        func["code_zip"] = _read_code_blob(code[_BLOB_REF_KEY])
+        if not os.path.exists(os.path.join(CODE_BLOB_DIR, f"{code[_BLOB_REF_KEY]}.zip")):
+            logger.error("Lambda persistence: code blob %s missing", code[_BLOB_REF_KEY])
+            func["code_zip"] = None
     elif isinstance(code, str):
         # Legacy persistence shape (inline base64).
-        func["code_zip"] = base64.b64decode(code)
+        func["code_zip"] = _store_code_zip(base64.b64decode(code))
 
 
 def get_state():
@@ -2390,7 +2417,7 @@ def _create_function(data: dict):
 
     _functions[name] = {
         "config": config,
-        "code_zip": code_zip,
+        "code_zip": _store_code_zip(code_zip),
         "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
         "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
         "s3_object_ref": _s3_object_ref,
@@ -2419,7 +2446,7 @@ def _create_function(data: dict):
         ver_config["Version"] = str(ver_num)
         ver_record = {
             "config": ver_config,
-            "code_zip": code_zip,
+            "code_zip": _functions[name]["code_zip"],
         }
         _functions[name]["versions"][str(ver_num)] = ver_record
         if _stamp_snapstart_published_version(ver_config):
@@ -2547,7 +2574,7 @@ def serve_function_code(func_name: str, account_id: str | None = None, region: s
         func = _functions.get(func_name)
     if not func:
         return 404, {"Content-Type": "text/plain"}, b"Function not found"
-    zip_bytes = func.get("code_zip") or b""
+    zip_bytes = resolve_code_zip(func.get("code_zip")) or b""
     return 200, {"Content-Type": "application/zip"}, zip_bytes
 
 
@@ -2562,9 +2589,8 @@ def _get_account_settings():
     total_code_size = 0
     for _name in _functions.keys():
         fn = _functions[_name]
-        cz = fn.get("code_zip")
-        if cz:
-            total_code_size += len(cz)
+        if fn.get("code_zip"):
+            total_code_size += int(fn["config"].get("CodeSize") or 0)
     reserved_sum = 0
     for _name in _functions.keys():
         c = _functions[_name].get("concurrency")
@@ -2839,7 +2865,7 @@ def _update_code(name: str, data: dict):
     if err is not None:
         return err
     if code_zip:
-        func["code_zip"] = code_zip
+        func["code_zip"] = _store_code_zip(code_zip)
         func["config"]["CodeSize"] = len(code_zip)
         func["config"]["CodeSha256"] = base64.b64encode(
             hashlib.sha256(code_zip).digest(),
@@ -2911,7 +2937,7 @@ def _update_config(name: str, data: dict):
         layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
         if err:
             return err
-        err = _validate_total_unzipped_size(_functions[name].get("code_zip"), layers_cfg)
+        err = _validate_total_unzipped_size(resolve_code_zip(_functions[name].get("code_zip")), layers_cfg)
         if err:
             return err
         data = dict(data)
@@ -4515,7 +4541,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     if package_type == "Zip":
         if not code_zip:
             raise ValueError("Zip PackageType requires code_zip bytes")
-        code_dir = _docker_extracted_dir(code_zip, "code")
+        code_dir = _docker_extracted_dir(resolve_code_zip(code_zip), "code")
         for layer_ref in layers_list:
             layer_zip = _resolve_layer_zip(layer_ref)
             if not layer_zip:
@@ -4688,6 +4714,13 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
             "handler (or Rosetta) for real cross-architecture execution.",
             config.get("FunctionName"), docker_platform, reason)
         return _spawn_lambda_container(config, code_zip, _pin_platform=False)
+
+    # AWS gives an execution environment exactly its configured MemorySize and
+    # OOM-kills past it. Docker otherwise leaves the container uncapped, so a
+    # 256 MB function could grow without bound on the host. Set before the flags
+    # merge so an explicit `-m` in LAMBDA_DOCKER_FLAGS still wins. Applies to
+    # Zip and Image package types alike (both reach this spawn).
+    run_kwargs["mem_limit"] = f"{int(config.get('MemorySize', 128))}m"
 
     # Apply LAMBDA_DOCKER_FLAGS — merge parsed kwargs into run_kwargs
     if LAMBDA_DOCKER_FLAGS:
@@ -5522,7 +5555,7 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
     try:
         import http.server
         import socketserver
-        code_dir = _provided_runtime_code_dir(code_zip)
+        code_dir = _provided_runtime_code_dir(resolve_code_zip(code_zip))
         bootstrap_path = os.path.join(code_dir, "bootstrap")
         if not os.path.exists(bootstrap_path):
             return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
@@ -5696,7 +5729,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "code.zip")
             with open(zip_path, "wb") as f:
-                f.write(code_zip)
+                f.write(resolve_code_zip(code_zip))
             code_dir = os.path.join(tmpdir, "code")
             os.makedirs(code_dir)
             with zipfile.ZipFile(zip_path) as zf:

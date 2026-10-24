@@ -2423,7 +2423,7 @@ def _lambda_create(logical_id, props, stack_name):
             "SnapStart": _lambda_svc._snapstart_response(props.get("SnapStart")),
             "RevisionId": new_uuid(),
         },
-        "code_zip": code_zip,
+        "code_zip": _lambda_svc._store_code_zip(code_zip),
         "code_s3_bucket": code.get("S3Bucket"),
         "code_s3_key": code.get("S3Key"),
         "code_s3_object_version": code.get("S3ObjectVersion"),

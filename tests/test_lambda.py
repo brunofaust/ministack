@@ -9831,8 +9831,9 @@ def test_lambda_code_zip_round_trip_through_blob_storage(lambda_svc_isolated):
     svc.load_persisted_state(state)
 
     restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
-    assert restored["code_zip"] == code
-    assert isinstance(restored["code_zip"], bytes)
+    # Restored as a blob handle (BD-3073): the bytes stay on disk until needed.
+    assert isinstance(restored["code_zip"], dict)
+    assert lsvc.resolve_code_zip(restored["code_zip"]) == code
 
 
 def test_lambda_get_state_replaces_code_zip_with_blob_ref(lambda_svc_isolated):
@@ -9869,8 +9870,8 @@ def test_lambda_per_version_code_zip_also_externalized(lambda_svc_isolated):
     svc._functions._data.clear()
     svc.load_persisted_state(state)
     restored = svc._functions._data[("000000000000", svc.get_region(), "fn")]
-    assert restored["code_zip"] == v2
-    assert restored["versions"]["1"]["code_zip"] == v1
+    assert lsvc.resolve_code_zip(restored["code_zip"]) == v2
+    assert lsvc.resolve_code_zip(restored["versions"]["1"]["code_zip"]) == v1
 
 
 def test_lambda_identical_code_dedups_to_single_blob(lambda_svc_isolated):
@@ -9915,7 +9916,7 @@ def test_lambda_legacy_inline_base64_persistence_still_loads(lambda_svc_isolated
     svc.load_persisted_state(legacy)
 
     restored = svc._functions._data[("000000000000", svc.get_region(), "old-fn")]
-    assert restored["code_zip"] == code
+    assert lsvc.resolve_code_zip(restored["code_zip"]) == code
 
 
 def test_lambda_missing_blob_degrades_without_aborting_restore(lambda_svc_isolated):
@@ -15615,7 +15616,7 @@ def test_competing_updates_with_same_revision_have_one_winner(functions, monkeyp
     if first == "alias":
         assert record["aliases"]["live"]["Description"] == "winner"
     elif first == "code":
-        assert record["code_zip"] == b"winner"
+        assert lsvc.resolve_code_zip(record["code_zip"]) == b"winner"
         assert record["config"]["Description"] == "original"
     else:
         assert record["config"]["Description"] == "winner"
@@ -15682,3 +15683,81 @@ def test_lambda_function_url_event_and_response_follow_aws(lam):
         assert re.fullmatch(r"Root=1-[0-9a-f]{8}-[0-9a-f]{24};Parent=[0-9a-f]{16};Sampled=0;Lineage=1:[0-9a-f]{8}:0", trace)
     finally:
         lam.delete_function(FunctionName=name)
+
+# ──────────────────── BD-3073: memory (mem_limit, no resident zips) ────────────────────
+
+
+@pytest.mark.parametrize("package_type", ["Zip", "Image"])
+@pytest.mark.parametrize("memory_size", [128, 256, 1024])
+def test_lambda_container_mem_limit_equals_memory_size(monkeypatch, package_type, memory_size):
+    """AWS caps an execution environment at its MemorySize; so does the container."""
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566",
+        config_overrides={"MemorySize": memory_size, "PackageType": package_type,
+                          "ImageUri": "public.ecr.aws/lambda/python:3.12"},
+    )
+    assert captured["mem_limit"] == f"{memory_size}m"
+
+
+def test_lambda_container_explicit_docker_flag_memory_wins(monkeypatch):
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    captured = _spawn_capture_run_kwargs(
+        monkeypatch, endpoint="http://localhost:4566", docker_flags="-m 2g",
+        config_overrides={"MemorySize": 256},
+    )
+    assert captured["mem_limit"] == "2g"
+
+
+def test_function_records_hold_a_blob_handle_not_zip_bytes(monkeypatch, tmp_path):
+    """Create, update-code and publish keep the sha, never the bytes; the bytes
+    are read from the content-addressed blob only where they are needed."""
+    import base64 as _b64
+    import hashlib
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    monkeypatch.setattr(lsvc, "_functions", AccountRegionScopedDict())
+    code = _make_zip("def handler(e, c): return 1")
+    fname = f"nozip-{_uuid_mod.uuid4().hex[:8]}"
+    status, _, _ = lsvc._create_function({
+        "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Publish": True,
+        "Code": {"ZipFile": _b64.b64encode(code).decode()}})
+    assert status == 201
+    sha = hashlib.sha256(code).hexdigest()
+    rec = lsvc._functions[fname]
+    assert rec["code_zip"] == {"code_blob_ref": sha}
+    assert rec["versions"]["1"]["code_zip"] == {"code_blob_ref": sha}
+    assert (tmp_path / f"{sha}.zip").read_bytes() == code
+    assert lsvc.resolve_code_zip(rec["code_zip"]) == code
+    # GetFunction's Code.Location target serves the bytes from the blob.
+    assert lsvc.serve_function_code(fname)[2] == code
+
+    code2 = _make_zip("def handler(e, c): return 2")
+    lsvc._update_code(fname, {"ZipFile": _b64.b64encode(code2).decode()})
+    sha2 = hashlib.sha256(code2).hexdigest()
+    assert lsvc._functions[fname]["code_zip"] == {"code_blob_ref": sha2}
+    lsvc._publish_version(fname, {})
+    assert lsvc._functions[fname]["versions"]["2"]["code_zip"] == {"code_blob_ref": sha2}
+
+
+def test_worker_holds_a_blob_handle_and_reads_the_zip_at_spawn(monkeypatch, tmp_path):
+    """A worker never retains the zip; cold start reads it from the blob."""
+    from ministack.core.lambda_runtime import Worker, _resolve_code_zip
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    code = _make_zip("def handler(e, c): return 1")
+    handle = lsvc._store_code_zip(code)
+    w = Worker("w", {"Runtime": "python3.12", "Handler": "index.handler"}, handle)
+    assert w.code_zip == handle
+    assert _resolve_code_zip(w.code_zip) == code
+
+
+def test_test_suite_refuses_to_default_to_the_busydone_stack_port():
+    """BD-3073: the session reset_server fixture POSTs /_ministack/reset to
+    ENDPOINT. With no MINISTACK_ENDPOINT the suite used to target
+    localhost:4566 and reset BusyDone's running local e2e stack."""
+    import conftest
+    for unset in ({}, {"MINISTACK_ENDPOINT": ""}, {"MINISTACK_ENDPOINT": "  "}):
+        with pytest.raises(pytest.UsageError, match="MINISTACK_ENDPOINT is required"):
+            conftest._require_endpoint(unset)
+    assert conftest._require_endpoint({"MINISTACK_ENDPOINT": "http://localhost:4599"}) == "http://localhost:4599"
