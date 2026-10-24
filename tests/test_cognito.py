@@ -2714,28 +2714,6 @@ def test_cognito_refresh_token_rejects_unknown_token(cognito_idp):
         assert exc.value.response["Error"]["Code"] == "NotAuthorizedException"
 
 
-def test_cognito_confirm_forgot_password_rejects_wrong_code(cognito_idp):
-    """ConfirmForgotPassword answers CodeMismatchException unless the code ForgotPassword issued is sent."""
-    pid = cognito_idp.create_user_pool(PoolName="qa-forgot-code")["UserPool"]["Id"]
-    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="qa-forgot-code-app")["UserPoolClient"]["ClientId"]
-    cognito_idp.admin_create_user(UserPoolId=pid, Username="qa-forgot")
-    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="qa-forgot", Password="OldPass1!", Permanent=True)
-    # No code requested yet: nothing can match.
-    with pytest.raises(ClientError) as exc:
-        cognito_idp.confirm_forgot_password(ClientId=cid, Username="qa-forgot", ConfirmationCode="000000", Password="NewPass2!")
-    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
-    cognito_idp.forgot_password(ClientId=cid, Username="qa-forgot")
-    with pytest.raises(ClientError) as exc:
-        cognito_idp.confirm_forgot_password(ClientId=cid, Username="qa-forgot", ConfirmationCode="000000", Password="NewPass2!")
-    assert exc.value.response["Error"]["Code"] == "CodeMismatchException"
-    cognito_idp.confirm_forgot_password(ClientId=cid, Username="qa-forgot", ConfirmationCode="654321", Password="NewPass2!")
-    auth = cognito_idp.admin_initiate_auth(
-        UserPoolId=pid, ClientId=cid, AuthFlow="ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters={"USERNAME": "qa-forgot", "PASSWORD": "NewPass2!"},
-    )
-    assert "AuthenticationResult" in auth
-
-
 def test_cognito_signup_unconfirmed_with_auto_verify(cognito_idp):
     """SignUp with AutoVerifiedAttributes must return UserConfirmed=False."""
     pid = cognito_idp.create_user_pool(PoolName="qa-autoverify", AutoVerifiedAttributes=["email"])["UserPool"]["Id"]

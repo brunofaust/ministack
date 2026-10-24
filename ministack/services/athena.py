@@ -825,6 +825,12 @@ def _start_query_execution(data):
     ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
         "ResultConfiguration", {}
     ).get("OutputLocation")
+    managed = (
+        _workgroups.get(workgroup, {}).get("Configuration", {}).get("ManagedQueryResultsConfiguration") or {}
+    )
+    if not output_location and managed.get("Enabled"):
+        # Athena-managed results: AWS owns the storage and needs no location from the caller.
+        output_location = f"s3://aws-athena-query-results-{get_account_id()}-{get_region()}/"
     if not output_location:
         return error_response_json(
             "InvalidRequestException",

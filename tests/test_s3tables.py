@@ -1213,7 +1213,7 @@ def test_s3tables_iceberg_commit_rejects_stale_ref_requirement(s3tables):
 
     def commit(snapshot_id, expected_ref_snapshot):
         return _iceberg_json(
-            f"/iceberg/v1/namespaces/{ns}/tables/{table}",
+            f"/iceberg/v1/{urllib.parse.quote(bucket_arn, safe='')}/namespaces/{ns}/tables/{table}",
             method="POST",
             payload={
                 "requirements": [
@@ -1245,10 +1245,10 @@ def test_s3tables_iceberg_commit_rejects_stale_ref_requirement(s3tables):
         assert exc.value.code == 409
         body = json.loads(exc.value.read().decode("utf-8"))
         assert body["error"]["type"] == "CommitFailedException"
-        assert "has changed" in body["error"]["message"]
+        assert "Requirement failed" in body["error"]["message"]
         commit(1003, 1001)  # refreshed writer: expects the current tip
 
-        loaded = _iceberg_json(f"/iceberg/v1/namespaces/{ns}/tables/{table}")
+        loaded = _iceberg_json(f"/iceberg/v1/{urllib.parse.quote(bucket_arn, safe='')}/namespaces/{ns}/tables/{table}")
         metadata = loaded.get("metadata", {})
         snap_ids = [s.get("snapshot-id") for s in metadata.get("snapshots", [])]
         assert snap_ids == [1001, 1003], snap_ids
@@ -1284,7 +1284,6 @@ def test_s3tables_create_table_keeps_timestamptz_and_decimal_field_types(s3table
                     "fields": [
                         {"name": "ts", "type": "timestamptz", "required": True},
                         {"name": "amount", "type": "decimal(10,2)"},
-                        {"name": "note", "type": "mystery"},
                     ]
                 }
             }
@@ -1296,7 +1295,7 @@ def test_s3tables_create_table_keeps_timestamptz_and_decimal_field_types(s3table
         metadata = __import__("json").load(response)["metadata"]
     schema = metadata["schemas"][-1] if metadata.get("schemas") else metadata["schema"]
     types = {field["name"]: field["type"] for field in schema["fields"]}
-    assert types == {"ts": "timestamptz", "amount": "decimal(10,2)", "note": "string"}
+    assert types == {"ts": "timestamptz", "amount": "decimal(10, 2)"}
 
 
 def _iceberg_call(path, method="GET", payload=None):

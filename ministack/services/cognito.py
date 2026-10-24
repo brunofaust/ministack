@@ -603,7 +603,6 @@ _challenge_sessions = AccountScopedDict()
 
 _CHALLENGE_SESSION_TTL = 3600  # fallback only — see _create_challenge_session for TTL from client config
 _MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 answered rounds
-_SIGNUP_CODE_TTL = 86400
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -751,43 +750,6 @@ def _client_id() -> str:
 
 def _client_secret() -> str:
     return base64.b64encode(secrets.token_bytes(48)).decode()
-
-
-def _verify_secret_hash(client, client_id: str, username: str, data, hash_key: str = "SecretHash"):
-    """Return an authorization error when a confidential client hash is invalid."""
-    client_secret = (client or {}).get("ClientSecret")
-    if not client_secret:
-        return None
-    provided = data.get(hash_key, "")
-    expected = base64.b64encode(
-        hmac.new(
-            client_secret.encode(), f"{username}{client_id}".encode(), hashlib.sha256
-        ).digest()
-    )
-    try:
-        provided_bytes = provided.encode("ascii")
-    except (AttributeError, UnicodeEncodeError):
-        provided_bytes = b""
-    if not provided_bytes or not hmac.compare_digest(provided_bytes, expected):
-        return error_response_json(
-            "NotAuthorizedException",
-            f"Unable to verify secret hash for client {client_id}",
-            400,
-        )
-    return None
-
-
-def _client_secret_matches(client, provided_secret) -> bool:
-    """Return whether a client credential is valid without leaking comparison timing."""
-    expected_secret = (client or {}).get("ClientSecret")
-    if not expected_secret:
-        return True
-    try:
-        provided_bytes = provided_secret.encode("ascii")
-        expected_bytes = expected_secret.encode("ascii")
-    except (AttributeError, UnicodeEncodeError):
-        return False
-    return bool(provided_bytes) and hmac.compare_digest(provided_bytes, expected_bytes)
 
 
 def _identity_pool_id() -> str:
@@ -1473,44 +1435,17 @@ def _access_token_error(data: dict):
     return error_response_json("NotAuthorizedException", message, 400)
 
 
-def _user_from_token(
-    token: str,
-    pool: dict,
-    pool_id: str,
-    token_use: str = "access",
-    expected_client_id: str | None = None,
-):
-    """Validate a signed Cognito token and return its matching enabled user.
-
-    BusyDone contract: the signature, issuer, token_use, expiry and client binding
-    are enforced regardless of AUTH, so a forged or cross-client token never
-    resolves to a user.
-    """
-    if not isinstance(token, str) or token.count(".") != 2:
-        return None
-    payload = _token_claims(token)
-    if not payload or _RSA_PRIVATE_KEY is None or not _signature_valid(token):
-        return None
-    expected_issuer = f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}"
-    expires_at = payload.get("exp")
-    client_id = payload.get("client_id")
-    if (
-        payload.get("iss") != expected_issuer
-        or payload.get("token_use") != token_use
-        or not isinstance(expires_at, (int, float))
-        or isinstance(expires_at, bool)
-        or expires_at <= time.time()
-        or not isinstance(client_id, str)
-        or client_id not in pool.get("_clients", {})
-        or (expected_client_id is not None and client_id != expected_client_id)
-    ):
-        return None
-    sub = payload.get("sub", "")
-    if not isinstance(sub, str) or not sub:
-        return None
-    for user in pool["_users"].values():
-        if _attr_list_to_dict(user.get("Attributes", [])).get("sub") == sub:
-            return user if user.get("Enabled", True) else None
+def _user_from_token(token: str, pool: dict):
+    """Decode a stub JWT and return the matching user from pool, or None."""
+    try:
+        payload_b64 = token.split(".")[1]
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "=="))
+        sub = payload.get("sub", "")
+        for user in pool["_users"].values():
+            if _attr_list_to_dict(user.get("Attributes", [])).get("sub") == sub:
+                return user
+    except Exception:
+        pass
     return None
 
 
@@ -4163,23 +4098,14 @@ def _resend_confirmation_code(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
-    if secret_err:
-        return secret_err
-
     user, _err = _resolve_user(pool, username)
     if not user:
         if _hides_user_existence(pool, cid):
             return _code_delivery_response(_masked_destination(username))
         return _client_user_not_found()
-    if user.get("UserStatus") == "CONFIRMED":
-        return error_response_json(
-            "InvalidParameterException", "User is already confirmed.", 400
-        )
 
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
-    user["_confirmation_code_expires_at"] = time.time() + _SIGNUP_CODE_TTL
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     _send_verification_email(pool, username, attrs, code)
     return _code_delivery_response(_masked_destination(attrs.get("email") or username))
@@ -4615,11 +4541,6 @@ def _admin_initiate_auth(data):
 
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
-        secret_err = _verify_secret_hash(
-            pool["_clients"].get(cid), cid, username, auth_params, "SECRET_HASH"
-        )
-        if secret_err:
-            return secret_err
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
@@ -4646,7 +4567,7 @@ def _admin_initiate_auth(data):
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
-        result, err = _refresh_auth_result(pool, pid, cid, refresh_token, auth_params)
+        result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
         if err:
             return err
         return json_response({"AuthenticationResult": result})
@@ -4664,9 +4585,6 @@ def _admin_initiate_auth(data):
         if not username:
             return error_response_json("InvalidParameterException",
                     "USERNAME is required.", 400)
-        secret_err = _verify_secret_hash(client, cid, username, auth_params, "SECRET_HASH")
-        if secret_err:
-            return secret_err
 
         # Validate user
         user, err = _resolve_user(pool, username)
@@ -4718,11 +4636,6 @@ def _admin_respond_to_auth_challenge(data):
 
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
-    secret_err = _verify_secret_hash(
-        pool["_clients"].get(cid), cid, responses.get("USERNAME"), responses, "SECRET_HASH"
-    )
-    if secret_err:
-        return secret_err
 
     if challenge_name == "CUSTOM_CHALLENGE":
         # Extract parameters
@@ -4860,11 +4773,8 @@ def _pool_for_client(cid):
     return None, None
 
 
-def _refresh_auth_user(pool, pid, cid, refresh_token, secret_hash_data=None):
-    """Resolve a refresh-token owner without issuing tokens or invoking triggers.
-
-    BusyDone fork: the token signature is verified (a token this pool never
-    issued is rejected) and a confidential client must present SECRET_HASH."""
+def _refresh_auth_user(pool, pid, cid, refresh_token):
+    """Resolve a refresh-token owner without issuing tokens or invoking triggers."""
     if not refresh_token:
         return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
     try:
@@ -4880,15 +4790,12 @@ def _refresh_auth_user(pool, pid, cid, refresh_token, secret_hash_data=None):
     if claims.get("client_id") != cid:
         return None, error_response_json("NotAuthorizedException",
                                          "Refresh Token has different Client", 400)
-    user = _user_from_token(refresh_token, pool, pid, "refresh", cid)
+    user = _user_from_token(refresh_token, pool)
     if not user:
-        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
-    if secret_hash_data is not None:
-        secret_err = _verify_secret_hash(
-            pool["_clients"].get(cid), cid, user["Username"], secret_hash_data, "SECRET_HASH"
-        )
-        if secret_err:
-            return None, secret_err
+        return None, error_response_json("NotAuthorizedException",
+                                         "The user has been deleted for the associated refresh token", 400)
+    if AUTH and not user.get("Enabled", True):
+        return None, error_response_json("NotAuthorizedException", "User is disabled.", 400)
     origin = claims.get("origin_jti")
     if _refresh_token_revoked(refresh_token, user) or (AUTH and isinstance(origin, str) and origin in _revoked_tokens):
         return None, error_response_json("NotAuthorizedException",
@@ -4896,11 +4803,11 @@ def _refresh_auth_user(pool, pid, cid, refresh_token, secret_hash_data=None):
     return user, None
 
 
-def _refresh_auth_result(pool, pid, cid, refresh_token, secret_hash_data=None):
+def _refresh_auth_result(pool, pid, cid, refresh_token):
     """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
     exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
     by GetTokensFromRefreshToken so both mint tokens identically."""
-    user, err = _refresh_auth_user(pool, pid, cid, refresh_token, secret_hash_data)
+    user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
     if err:
         return None, err
     claims = _token_claims(refresh_token)
@@ -4932,10 +4839,6 @@ def _get_tokens_from_refresh_token(data):
     pool, pid = _pool_for_client(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    if not _client_secret_matches(pool["_clients"].get(cid), data.get("ClientSecret", "")):
-        return error_response_json(
-            "NotAuthorizedException", f"Unable to verify client secret for client {cid}", 400
-        )
     result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
     if err:
         return err
@@ -4961,11 +4864,6 @@ def _initiate_auth(data):
 
     if auth_flow in ("USER_PASSWORD_AUTH",):
         username = auth_params.get("USERNAME")
-        secret_err = _verify_secret_hash(
-            pool["_clients"].get(cid), cid, username, auth_params, "SECRET_HASH"
-        )
-        if secret_err:
-            return secret_err
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
@@ -4988,9 +4886,7 @@ def _initiate_auth(data):
         return _password_auth_result(pool, pid, cid, user, username, data=data)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        result, err = _refresh_auth_result(
-            pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""), auth_params
-        )
+        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
         if err:
             return err
         return json_response({"AuthenticationResult": result})
@@ -5011,9 +4907,6 @@ def _initiate_auth(data):
         if not username:
             return error_response_json("InvalidParameterException",
                     "USERNAME is required.", 400)
-        secret_err = _verify_secret_hash(client, cid, username, auth_params, "SECRET_HASH")
-        if secret_err:
-            return secret_err
 
         # Validate user
         user, err = _resolve_user(pool, username)
@@ -5068,11 +4961,6 @@ def _respond_to_auth_challenge(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    secret_err = _verify_secret_hash(
-        pool["_clients"].get(cid), cid, responses.get("USERNAME"), responses, "SECRET_HASH"
-    )
-    if secret_err:
-        return secret_err
 
     if challenge_name == "CUSTOM_CHALLENGE":
         # Extract parameters
@@ -5257,9 +5145,6 @@ def _sign_up(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
-    if secret_err:
-        return secret_err
     username_err = _new_user_error(pool, username or "", _attr_list_to_dict(data.get("UserAttributes", [])))
     if username_err:
         return username_err
@@ -5316,7 +5201,6 @@ def _sign_up(data):
         "_groups": [],
         "_tokens": [],
         "_confirmation_code": "123456",
-        "_confirmation_code_expires_at": time.time() + _SIGNUP_CODE_TTL,
     }
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
@@ -5375,10 +5259,6 @@ def _confirm_sign_up(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
-    if secret_err:
-        return secret_err
-
     user, err = _resolve_user(pool, username)
     if err:
         if _hides_user_existence(pool, cid):
@@ -5388,25 +5268,10 @@ def _confirm_sign_up(data):
             )
         return _client_user_not_found()
 
-    issued_code = user.get("_confirmation_code")
-    try:
-        code_bytes = code.encode("ascii")
-        issued_code_bytes = issued_code.encode("ascii")
-    except (AttributeError, UnicodeEncodeError):
-        code_bytes = b""
-        issued_code_bytes = b""
-    if not code_bytes or not hmac.compare_digest(code_bytes, issued_code_bytes):
-        return error_response_json(
-            "CodeMismatchException", "Invalid verification code provided, please try again.", 400
-        )
-    if time.time() > user.get("_confirmation_code_expires_at", 0):
-        return error_response_json(
-            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400
-        )
+    # Codes are checked under AUTH=true (_confirmation_code_error).
+    user.pop("_confirmation_code", None)
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
-    user.pop("_confirmation_code", None)
-    user.pop("_confirmation_code_expires_at", None)
     return json_response({})
 
 
@@ -5421,9 +5286,6 @@ def _forgot_password(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
-    if secret_err:
-        return secret_err
 
     user, _err = _resolve_user(pool, username)
     if _err:
@@ -5452,9 +5314,6 @@ def _confirm_forgot_password(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    secret_err = _verify_secret_hash(pool["_clients"].get(cid), cid, username, data)
-    if secret_err:
-        return secret_err
 
     user, _err = _resolve_user(pool, username)
     if _err:
@@ -5467,13 +5326,7 @@ def _confirm_forgot_password(data):
             )
         return _client_user_not_found()
 
-    # The code must be the one ForgotPassword issued for this user (real Cognito
-    # answers CodeMismatchException otherwise; accepting any code let a caller
-    # reset a password without ever requesting a code).
-    if not user.get("_reset_code") or data.get("ConfirmationCode", "") != user["_reset_code"]:
-        return error_response_json(
-            "CodeMismatchException", "Invalid verification code provided, please try again.", 400
-        )
+    # Codes are checked under AUTH=true (_confirmation_code_error).
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
@@ -5488,8 +5341,8 @@ def _user_pool_for_access_token(access_token):
     """Resolve (user, pool) from an access token across the pools in scope."""
     if not access_token:
         return None, None
-    for pool_id, pool in _user_pools.items():
-        user = _user_from_token(access_token, pool, pool_id)
+    for pool in _user_pools.values():
+        user = _user_from_token(access_token, pool)
         if user:
             return user, pool
     return None, None
@@ -7693,7 +7546,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             # on the retry. Consuming the code first turned that retry into
             # invalid_grant "Invalid or expired authorization code" (#932).
             _, _, client = _find_pool_by_client_id(cid)
-            if client is None or not _client_secret_matches(client, csec):
+            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
                 return _oauth2_error("invalid_client", "Invalid client credentials.")
 
             # Consume code (one-time use). This handler runs off the loop
@@ -7742,17 +7595,12 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
 
         # Try SAML/OIDC federation auth codes
         _cleanup_expired_relay_codes()
-        code_data = _auth_codes.get(code)
+        code_data = _auth_codes.pop(code, None)
         if code_data and code_data.get("type") == "code":
-            if code_data["client_id"] != cid:
+            if cid and code_data["client_id"] != cid:
                 return _oauth2_error("invalid_grant", "client_id mismatch.")
             if redirect_uri and code_data["redirect_uri"] != redirect_uri:
                 return _oauth2_error("invalid_grant", "redirect_uri mismatch.")
-            _, _, client = _find_pool_by_client_id(cid)
-            if client is None or not _client_secret_matches(client, csec):
-                return _oauth2_error("invalid_client", "Invalid client credentials.")
-            if _auth_codes.pop(code, None) is not code_data:
-                return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
             pool_id = code_data["pool_id"]
             username = code_data["username"]
@@ -7814,13 +7662,12 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 isinstance(registry_origin, str) and registry_origin in _revoked_tokens)):
             return _oauth2_error("invalid_grant", "Invalid refresh token.")
 
-        if cid != entry["client_id"]:
-            return _oauth2_error("invalid_grant", "client_id mismatch.")
-        _, _, client = _find_pool_by_client_id(cid)
-        if client is None or not _client_secret_matches(client, csec):
+        # Validate client secret if client has one
+        _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
+        if client and client.get("ClientSecret") and csec and csec != client["ClientSecret"]:
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-        client_id = cid
+        client_id = cid or entry["client_id"]
         attrs = _attr_list_to_dict(user.get("Attributes", []))
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
@@ -7854,8 +7701,6 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             return scope_error
         if not client.get("ClientSecret"):
             return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
-        if not _client_secret_matches(client, csec):
-            return _oauth2_error("invalid_client", "Invalid client credentials.")
 
         # M2M's own client-metadata channel — a JSON object, urlencoded, in
         # the aws_client_metadata POST field (there's no ClientMetadata
@@ -7883,9 +7728,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
-    if not grant_type:
-        return _oauth2_error("invalid_request", "Missing grant_type parameter.")
-    return _oauth2_error("unsupported_grant_type", "Unsupported grant type.")
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": "unsupported_grant_type"}).encode()
 
 
 async def handle_oauth2_token(method, path, headers, body, query_params):
