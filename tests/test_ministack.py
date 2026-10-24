@@ -389,8 +389,10 @@ def test_ministack_persist_lambda_roundtrip():
         _lam._functions.pop("persist-fn")
         _lam.load_persisted_state(state)
         assert "persist-fn" in _lam._functions
-        # code_zip is restored back to bytes.
-        assert _lam._functions["persist-fn"]["code_zip"] == code
+        # code_zip is restored as the blob handle (bytes stay on disk, BD-3073);
+        # resolving it yields the original bytes.
+        assert _lam._functions["persist-fn"]["code_zip"] == {"code_blob_ref": sha}
+        assert _lam.resolve_code_zip(_lam._functions["persist-fn"]["code_zip"]) == code
     finally:
         _lam._functions.pop("persist-fn", None)
         # Clean up the blob file written as a side effect of get_state.

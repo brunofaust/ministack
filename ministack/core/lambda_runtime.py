@@ -1114,8 +1114,15 @@ def _worker_script_extension(runtime: str) -> str:
     return ".py"
 
 
+def _resolve_code_zip(code) -> bytes | None:
+    """Zip bytes for a worker's code handle, read from disk only now (workers
+    hold the blob handle, never the bytes — BD-3073)."""
+    from ministack.services.lambda_svc import resolve_code_zip
+    return resolve_code_zip(code)
+
+
 class Worker:
-    def __init__(self, func_name: str, config: dict, code_zip: bytes):
+    def __init__(self, func_name: str, config: dict, code_zip: "bytes | dict"):
         self.func_name = func_name
         self.config = config
         self.code_zip = code_zip
@@ -1158,7 +1165,7 @@ class Worker:
         code_dir = os.path.join(self._tmpdir, "code")
         os.makedirs(code_dir)
         with open(os.path.join(self._tmpdir, "code.zip"), "wb") as f:
-            f.write(self.code_zip)
+            f.write(_resolve_code_zip(self.code_zip))
         with zipfile.ZipFile(os.path.join(self._tmpdir, "code.zip")) as zf:
             zf.extractall(code_dir)
 
@@ -2043,7 +2050,7 @@ class ProvidedWorker(Worker):
         # thread and listening socket — one leaked set per bootstrap crash.
         self._teardown()
 
-        code_dir = _provided_runtime_code_dir(self.code_zip)
+        code_dir = _provided_runtime_code_dir(_resolve_code_zip(self.code_zip))
         bootstrap_path = os.path.join(code_dir, "bootstrap")
         if not os.path.exists(bootstrap_path) or not os.access(bootstrap_path, os.X_OK):
             # "If the bootstrap file doesn't exist or isn't executable, your
