@@ -15616,7 +15616,7 @@ def test_competing_updates_with_same_revision_have_one_winner(functions, monkeyp
     if first == "alias":
         assert record["aliases"]["live"]["Description"] == "winner"
     elif first == "code":
-        assert record["code_zip"] == b"winner"
+        assert lsvc.resolve_code_zip(record["code_zip"]) == b"winner"
         assert record["config"]["Description"] == "original"
     else:
         assert record["config"]["Description"] == "winner"
@@ -15750,3 +15750,14 @@ def test_worker_holds_a_blob_handle_and_reads_the_zip_at_spawn(monkeypatch, tmp_
     w = Worker("w", {"Runtime": "python3.12", "Handler": "index.handler"}, handle)
     assert w.code_zip == handle
     assert _resolve_code_zip(w.code_zip) == code
+
+
+def test_test_suite_refuses_to_default_to_the_busydone_stack_port():
+    """BD-3073: the session reset_server fixture POSTs /_ministack/reset to
+    ENDPOINT. With no MINISTACK_ENDPOINT the suite used to target
+    localhost:4566 and reset BusyDone's running local e2e stack."""
+    import conftest
+    for unset in ({}, {"MINISTACK_ENDPOINT": ""}, {"MINISTACK_ENDPOINT": "  "}):
+        with pytest.raises(pytest.UsageError, match="MINISTACK_ENDPOINT is required"):
+            conftest._require_endpoint(unset)
+    assert conftest._require_endpoint({"MINISTACK_ENDPOINT": "http://localhost:4599"}) == "http://localhost:4599"

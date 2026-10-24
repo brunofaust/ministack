@@ -26,7 +26,23 @@ from ministack.core.responses import install_docker_hub_fallback
 # Fixtures that pull images themselves get the same Docker Hub fallback as the server.
 install_docker_hub_fallback()
 
-ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+def _require_endpoint(environ) -> str:
+    """The server the suite talks to. No default: the session-start
+    ``reset_server`` fixture POSTs ``/_ministack/reset`` there, and a silent
+    ``localhost:4566`` fallback hit whatever stack the machine publishes on that
+    port (BusyDone's local e2e stack, mid-run). Start a throwaway server on
+    another port and point ``MINISTACK_ENDPOINT`` at it."""
+    endpoint = environ.get("MINISTACK_ENDPOINT", "").strip()
+    if not endpoint:
+        raise pytest.UsageError(
+            "MINISTACK_ENDPOINT is required (e.g. http://localhost:4599 for a throwaway "
+            "`GATEWAY_PORT=4599 python -m ministack`). The suite resets the server it "
+            "targets and never defaults to localhost:4566."
+        )
+    return endpoint
+
+
+ENDPOINT = _require_endpoint(os.environ)
 ENDPOINT_HOST = urlparse(ENDPOINT).hostname
 # The port the services advertise themselves on, read the way they read it: an
 # `or` chain, so an empty string falls through exactly as it does in
