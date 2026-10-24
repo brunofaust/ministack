@@ -11,6 +11,7 @@ import contextvars
 import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -100,6 +101,23 @@ def set_request_region(region: str | None) -> None:
 def get_region() -> str:
     """Return the region for the current request."""
     return _request_region.get()
+
+
+# Request-scoped caller address, for records that report where a request came from.
+_request_client_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_client_ip",
+    default="127.0.0.1",
+)
+
+
+def set_request_client_ip(address: str) -> None:
+    """Set the caller's address for the current request."""
+    _request_client_ip.set(address)
+
+
+def get_request_client_ip() -> str:
+    """Return the caller's address for the current request."""
+    return _request_client_ip.get()
 
 
 @contextlib.contextmanager
@@ -531,6 +549,193 @@ class StreamingResponse:
         self.runner = runner
 
 
+# ---------------------------------------------------------------------------
+# Envelope Content-Type normalization
+#
+# Real AWS picks a response envelope's Content-Type from the *service's
+# protocol*, not from a generic default — and services disagree: DynamoDB
+# answers ``application/x-amz-json-1.0`` while Kinesis answers
+# ``application/x-amz-json-1.1``; query-protocol services answer
+# ``text/xml`` while EC2 answers ``text/xml;charset=UTF-8``. The botocore
+# service model carries everything needed to reproduce this: ``protocol``
+# and ``jsonVersion``. Small override tables cover wire quirks the model
+# does not declare.
+#
+# Evidence: real AWS wire captures diffed per service — error-path values
+# from a us-east-1 sweep, success-path values from a us-east-1/us-west-2/
+# eu-west-1/ap-southeast-2 sweep. The model values below matched the
+# captured Content-Type on every probed service.
+# ---------------------------------------------------------------------------
+
+# Ministack registry/service names that differ from the botocore client name.
+_BOTOCORE_NAME = {
+    "states": "stepfunctions",
+    "monitoring": "cloudwatch",
+    "elasticloadbalancing": "elbv2",
+    "airflow": "mwaa",
+    "elasticmapreduce": "emr",
+    "tagging": "resourcegroupstaggingapi",
+}
+
+# Wire-observed Content-Types that contradict what the model implies.
+#   sesv2 — rest-json service, but AWS emits application/x-amz-json-1.1 on
+#           errors (capture: get_email_identity 404). Error-path only: its
+#           successes answer application/json like any rest-json service,
+#           so this override does not apply to success envelopes.
+#   s3    — rest-xml, but S3 answers application/xml where the other
+#           rest-xml services (route53) answer text/xml.
+_WIRE_CT_OVERRIDE = {
+    "sesv2": "application/x-amz-json-1.1",
+    "s3": "application/xml",
+}
+
+# Success-path overrides. The s3 quirk holds on both paths; sesv2's does
+# not (see above), so it is absent here.
+#   monitoring — declared ``smithy-rpc-v2-cbor`` in newer botocore, but
+#              MiniStack also serves its query-compatible JSON mode,
+#              which AWS answers as application/x-amz-json-1.0 (real-AWS
+#              capture). Same-family scoping keeps the XML query path on
+#              the model-independent text/xml below.
+_WIRE_CT_SUCCESS_OVERRIDE = {
+    "s3": "application/xml",
+    "monitoring": "application/x-amz-json-1.0",
+}
+
+_JSON_FAMILY = {
+    "application/json",
+    "application/x-amz-json-1.0",
+    "application/x-amz-json-1.1",
+}
+_XML_FAMILY = {"application/xml", "text/xml"}
+
+
+@functools.lru_cache(maxsize=None)
+def _service_model(service: str):
+    """The botocore service model for a ministack service name, or None."""
+    try:
+        import botocore.session
+    except ImportError:
+        return None
+    name = _BOTOCORE_NAME.get(service, service)
+    try:
+        return botocore.session.get_session().get_service_model(name)
+    except Exception:
+        return None
+
+
+def _family_of(ct_base: str):
+    """The envelope family ``ct_base`` belongs to, or None for payload
+    types (``application/octet-stream``, ``image/*``, ``text/plain``, ...)."""
+    if ct_base in _JSON_FAMILY:
+        return _JSON_FAMILY
+    if ct_base in _XML_FAMILY:
+        return _XML_FAMILY
+    return None
+
+
+def _expected_envelope_content_type(service: str, emitted_ct: str,
+                                    overrides: dict) -> str | None:
+    """The Content-Type real AWS emits for this service's envelopes.
+
+    ``emitted_ct`` decides which family to correct within: a service that
+    answered an XML envelope gets the XML value for its protocol, a JSON
+    envelope gets the JSON value. ``overrides`` is the path-appropriate
+    wire-quirk table; an override only applies inside its own family (the
+    s3 override must not turn a JSON success/error into XML). Returns None
+    when there is nothing evidence-backed to enforce (unknown service,
+    non-envelope type, or a family the model does not wire-map — e.g. a
+    JSON body from a declared-cbor service served as query-compatible
+    JSON).
+    """
+    base = emitted_ct.split(";", 1)[0].strip().lower()
+    override = overrides.get(service)
+    if override is not None and _family_of(base) is _family_of(override):
+        return override
+
+    model = _service_model(service)
+    if model is None:
+        return None
+    protocol = model.metadata.get("protocol")
+
+    if base in _JSON_FAMILY:
+        if protocol == "json":
+            version = model.metadata.get("jsonVersion") or "1.0"
+            return f"application/x-amz-json-{version}"
+        if protocol == "rest-json":
+            return "application/json"
+        return None
+    if base in _XML_FAMILY:
+        # A declared-cbor service that emitted an XML envelope is serving
+        # its legacy Query API mode (cloudwatch is the case in point) —
+        # AWS's query endpoint answers text/xml there like any other
+        # query-protocol service.
+        if protocol in ("query", "smithy-rpc-v2-cbor"):
+            return "text/xml"
+        if protocol == "ec2":
+            return "text/xml;charset=UTF-8"
+        if protocol == "rest-xml":
+            return "text/xml"  # s3's application/xml is the override above
+    return None
+
+
+def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's error envelope."""
+    return _expected_envelope_content_type(service, emitted_ct, _WIRE_CT_OVERRIDE)
+
+
+def expected_success_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's success envelope.
+
+    An emitted ``text/xml`` is already wire-final and is never rewritten:
+    on an API envelope it is the correct value (route53, cloudfront), and
+    on e.g. an S3 object stored with a ``text/xml`` Content-Type it is
+    payload that the s3 override would otherwise corrupt to
+    ``application/xml``.
+    """
+    base = emitted_ct.split(";", 1)[0].strip().lower()
+    if base == "text/xml":
+        return None
+    return _expected_envelope_content_type(service, emitted_ct,
+                                           _WIRE_CT_SUCCESS_OVERRIDE)
+
+
+def fix_error_content_type(service: str, status: int, headers: dict) -> None:
+    """Rewrite ``headers['Content-Type']`` in place when an error envelope
+    carries the wrong wire value for the service's protocol.
+
+    Scoped to error responses: success payloads (e.g. an S3 object that
+    happens to be JSON) must never be rewritten by the error table.
+    """
+    if status < 400:
+        return
+    emitted = headers.get("Content-Type", "")
+    if not emitted:
+        return
+    expected = expected_error_content_type(service, emitted)
+    if expected and emitted != expected:
+        headers["Content-Type"] = expected
+
+
+def fix_success_content_type(service: str, status: int, headers: dict) -> None:
+    """Rewrite ``headers['Content-Type']`` in place when a success envelope
+    carries the wrong wire value for the service's protocol.
+
+    Scoped to non-error responses and, within them, to known envelope
+    Content-Types: binary/streaming/payload types
+    (``application/octet-stream``, ``text/plain``, ``image/*``, ...) are
+    never touched, and an emitted ``text/xml`` passes through untouched
+    (see ``expected_success_content_type``).
+    """
+    if status >= 400:
+        return
+    emitted = headers.get("Content-Type", "")
+    if not emitted:
+        return
+    expected = expected_success_content_type(service, emitted)
+    if expected and emitted != expected:
+        headers["Content-Type"] = expected
+
+
 def now_iso() -> str:
     """Current time in AWS ISO format."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
@@ -579,6 +784,64 @@ def apply_image_prefix(image: str) -> str:
     if image.startswith(prefix + "/"):
         return image
     return f"{prefix}/{image}"
+
+
+def _docker_hub_repository(repository: str) -> str | None:
+    """The Docker Hub path of ``repository`` (``library/x`` for official images),
+    or None when it names another registry."""
+    first, _, rest = repository.partition("/")
+    if rest and first in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+        repository = rest
+    elif rest and ("." in first or ":" in first or first == "localhost"):
+        return None
+    return repository if "/" in repository else f"library/{repository}"
+
+
+def docker_hub_mirrors(repository: str) -> list[str]:
+    """Public mirrors of a Docker Hub repository, tried when Docker Hub fails."""
+    hub = _docker_hub_repository(repository)
+    if hub is None:
+        return []
+    ecr = f"docker/{hub}" if hub.startswith("library/") else hub
+    return [f"public.ecr.aws/{ecr}", f"mirror.gcr.io/{hub}"]
+
+
+def install_docker_hub_fallback() -> None:
+    """Retry a failed Docker Hub pull from ECR Public, then mirror.gcr.io, and tag
+    the result with the name that was asked for. Covers every Docker client,
+    including the pull ``containers.run`` makes for a missing image."""
+    try:
+        from docker.errors import APIError
+        from docker.models.images import ImageCollection
+        from docker.utils import parse_repository_tag
+    except ImportError:
+        return
+    original = ImageCollection.pull
+    if getattr(original, "_ministack_fallback", False):
+        return
+
+    def pull(self, repository, tag=None, all_tags=False, **kwargs):
+        try:
+            return original(self, repository, tag=tag, all_tags=all_tags, **kwargs)
+        except APIError as hub_error:
+            repo, parsed_tag = parse_repository_tag(repository)
+            tag = tag or parsed_tag or "latest"
+            if all_tags or ":" in tag:  # digests cannot be re-tagged
+                raise
+            for mirror in docker_hub_mirrors(repo):
+                try:
+                    image = original(self, mirror, tag=tag, **kwargs)
+                except APIError:
+                    continue
+                image.tag(repo, tag)
+                logging.getLogger("ministack").warning(
+                    "Docker Hub pull of %s:%s failed (%s); pulled %s:%s instead",
+                    repo, tag, hub_error.explanation or hub_error, mirror, tag)
+                return image
+            raise
+
+    pull._ministack_fallback = True
+    ImageCollection.pull = pull
 
 
 def sha256_hash(data: bytes) -> str:

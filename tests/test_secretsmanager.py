@@ -7,6 +7,7 @@ import boto3
 import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from conftest import inprocess_iam_user, routed_request
 
 
 def _regional_sm(region_name):
@@ -541,6 +542,32 @@ def test_secretsmanager_delete_with_recovery(sm):
     resp = sm.get_secret_value(SecretId="sm-del-rec")
     assert resp["SecretString"] == "recoverable"
 
+def test_secretsmanager_force_delete_secret_scheduled_for_deletion(sm):
+    name = f"sm-force-pending-{_uuid_mod.uuid4().hex[:8]}"
+    arn = sm.create_secret(Name=name, SecretString="v")["ARN"]
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+
+    resp = sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    assert resp["ARN"] == arn
+    assert resp["Name"] == name
+    with pytest.raises(ClientError) as exc:
+        sm.describe_secret(SecretId=name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    sm.create_secret(Name=name, SecretString="reused")
+    assert sm.get_secret_value(SecretId=name)["SecretString"] == "reused"
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+def test_secretsmanager_delete_secret_scheduled_for_deletion_without_force(sm):
+    name = f"sm-delete-pending-{_uuid_mod.uuid4().hex[:8]}"
+    sm.create_secret(Name=name, SecretString="v")
+    sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+
+    with pytest.raises(ClientError) as exc:
+        sm.delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    assert exc.value.response["Error"]["Code"] == "InvalidRequestException"
+    assert "DeletedDate" in sm.describe_secret(SecretId=name)
+    sm.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
 def test_secretsmanager_put_value_version_stages_v2(sm):
     sm.create_secret(Name="sm-pvs-v2", SecretString="v1")
     sm.put_secret_value(SecretId="sm-pvs-v2", SecretString="v2")
@@ -962,6 +989,54 @@ def test_secretsmanager_force_delete_removes_resource_policy():
         "_secrets[name] AND _resource_policies[arn]."
     )
     sm.reset()
+
+
+def _policy_secret(effect, principal):
+    """A secret whose resource policy has one statement on GetSecretValue."""
+    sm = _sm_importlib.import_module("ministack.services.secretsmanager")
+    arn = sm.create_secret_in_process(f"rp-{_uuid_mod.uuid4().hex[:8]}", "v")
+    _sm_invoke_action(sm, "PutResourcePolicy", {"SecretId": arn, "ResourcePolicy": json.dumps({
+        "Version": "2012-10-17", "Statement": [{"Effect": effect, "Principal": {"AWS": principal},
+                                                "Action": "secretsmanager:GetSecretValue", "Resource": "*"}]})})
+    return arn
+
+
+def _get_secret_value(key, arn):
+    status, _headers, body = routed_request(
+        key, "secretsmanager", "POST", "/", json.dumps({"SecretId": arn}).encode(),
+        {"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.GetSecretValue"})
+    return status, json.loads(body).get("__type")
+
+
+_ALLOW_SECRETS = {"Statement": [{"Effect": "Allow", "Action": "secretsmanager:*", "Resource": "*"}]}
+
+
+def test_secret_policy_naming_the_user_allows_without_identity_policy(auth):
+    key, user = inprocess_iam_user()
+    assert _get_secret_value(key, _policy_secret("Allow", user)) == (200, None)
+
+
+def test_secret_policy_naming_the_account_needs_an_identity_policy(auth):
+    arn = _policy_secret("Allow", "arn:aws:iam::000000000000:root")
+    key, _user = inprocess_iam_user()
+    assert _get_secret_value(key, arn) == (403, "AccessDeniedException")
+    key, _user = inprocess_iam_user(_ALLOW_SECRETS)
+    assert _get_secret_value(key, arn) == (200, None)
+
+
+def test_secret_policy_deny_beats_an_identity_allow(auth):
+    key, user = inprocess_iam_user(_ALLOW_SECRETS)
+    arn = _policy_secret("Deny", user)
+    status, _headers, body = routed_request(
+        key, "secretsmanager", "POST", "/", json.dumps({"SecretId": arn}).encode(),
+        {"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.GetSecretValue"})
+    assert (status, json.loads(body)) == (403, {"__type": "AccessDeniedException", "message": (
+        f"User: {user} is not authorized to perform: secretsmanager:GetSecretValue on resource: {arn} "
+        "with an explicit deny in a resource-based policy")})
+    status, _headers, body = routed_request(
+        key, "secretsmanager", "POST", "/", json.dumps({"SecretIdList": [arn]}).encode(),
+        {"content-type": "application/x-amz-json-1.1", "x-amz-target": "secretsmanager.BatchGetSecretValue"})
+    assert json.loads(body)["Errors"][0]["Message"].endswith("with an explicit deny in a resource-based policy")
 
 
 def test_secretsmanager_arn_shaped_secret_name_does_not_bypass_scope_guard():

@@ -108,6 +108,7 @@ RDS_PG_CLUSTER_REPLICATION = os.environ.get(
 ).lower() in ("1", "true", "yes")
 
 _instances = AccountRegionScopedDict()
+_events = AccountRegionScopedDict()
 _clusters = AccountRegionScopedDict()
 _subnet_groups = AccountRegionScopedDict()
 _param_groups = AccountRegionScopedDict()
@@ -338,6 +339,7 @@ def get_state():
         clusters = copy.deepcopy(_clusters)
         state = {
             "instances": instances,
+            "events": copy.deepcopy(_events),
             "clusters": clusters,
             "subnet_groups": copy.deepcopy(_subnet_groups),
             "param_groups": copy.deepcopy(_param_groups),
@@ -374,6 +376,7 @@ def load_persisted_state(data) -> None:
 def _restore_state(data, *, resume_runtime=False):
     if not data:
         return
+    _events.update(data.get("events", {}))
     _clusters.update(data.get("clusters", {}))
     for key in list(_clusters._data):
         cluster = _clusters._data[key]
@@ -5113,7 +5116,6 @@ def _create_db_instance_impl(p):
         "ProcessorFeatures": [],
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
         "AssociatedRoles": [],
-        "MaxAllocatedStorage": int(_p(p, "MaxAllocatedStorage") or str(allocated_storage)),
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
@@ -5132,6 +5134,9 @@ def _create_db_instance_impl(p):
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
     }
+    # Only a request that turns storage autoscaling on sets the threshold.
+    if _p(p, "MaxAllocatedStorage"):
+        instance["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
     if parent and reader_launch:
         # A replicating reader keeps its own endpoint and container fields;
         # the marker excludes it from shared-container aliasing and makes
@@ -5487,13 +5492,16 @@ def _describe_db_instances(p):
                 return invalid_arn
             return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
         instances = [instance]
+        docdb_members = ""
     else:
         instances = list(_instances.values())
         filters = _parse_filters(p)
         if filters:
             instances = _apply_instance_filters(instances, filters)
+        from ministack.services import documentdb
+        docdb_members = documentdb.instance_members_xml(filters)
 
-    members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances)
+    members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances) + docdb_members
     return _xml(200, "DescribeDBInstancesResponse",
         f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
 
@@ -5634,6 +5642,9 @@ def _modify_db_instance(p):
             instance[instance_key] = val
         else:
             pending[instance_key] = val
+    # A threshold equal to the allocated storage turns storage autoscaling off.
+    if instance.get("MaxAllocatedStorage") == instance.get("AllocatedStorage"):
+        instance.pop("MaxAllocatedStorage", None)
 
     if new_pass:
         old_pass = instance.get("_MasterUserPassword", "password")
@@ -5693,9 +5704,150 @@ def _stop_db_instance(p):
 
 
 def _reboot_db_instance(p):
-    return _set_db_instance_status(
-        p, "available", "RebootDBInstanceResponse", "RebootDBInstanceResult",
-    )
+    # Offloaded requests can arrive concurrently; claim rebooting atomically.
+    with _shared_container_lock:
+        return _begin_instance_reboot(p)
+
+
+def _begin_instance_reboot(p):
+    db_id = _p(p, "DBInstanceIdentifier")
+    instance = _resolve_instance(db_id)
+    if not instance:
+        invalid_arn = _invalid_db_instance_identifier_error(db_id)
+        if invalid_arn:
+            return invalid_arn
+        return _error("DBInstanceNotFound", f"DBInstance {db_id} not found.", 404)
+    if instance.get("DBInstanceStatus") != "available":
+        return _error(
+            "InvalidDBInstanceState",
+            f"DBInstance {db_id} is in {instance.get('DBInstanceStatus')} state but expected "
+            "it to be one of available.",
+            400,
+        )
+    cluster_id = instance.get("_shared_cluster_id") or instance.get("DBClusterIdentifier")
+    cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
+    if cluster and (switch_error := _begin_mysql_global_instance_mutation(cluster)):
+        return switch_error
+    instance["DBInstanceStatus"] = "rebooting"
+    # Serialize the response before starting the worker: a fast local reboot
+    # must not race the response back to available.
+    response = _single_instance_response("RebootDBInstanceResponse", "RebootDBInstanceResult", instance)
+    context = contextvars.copy_context()
+    threading.Thread(
+        target=context.run, args=(_finish_instance_reboot, instance, cluster),
+        daemon=True,
+    ).start()
+    return response
+
+
+def _record_reboot_event(instance):
+    now = time.time()
+    with _shared_container_lock:
+        for key, event in list(_events.items()):
+            if event["Date"] < now - 14 * 86400:
+                del _events[key]
+        _events[new_uuid()] = {
+            "SourceIdentifier": instance["DBInstanceIdentifier"],
+            "SourceType": "db-instance", "SourceArn": instance.get("DBInstanceArn", ""),
+            "Message": "DB instance restarted.", "Date": now,
+            "EventCategories": ["availability"],
+        }
+
+
+def _describe_events(p):
+    now = time.time()
+    source = _p(p, "SourceIdentifier")
+    kind = _p(p, "SourceType")
+    if source and not kind:
+        return _error("InvalidParameterCombination", "SourceIdentifier requires SourceType.", 400)
+    if kind and kind not in ("db-instance", "db-parameter-group", "db-security-group", "db-snapshot", "db-cluster",
+                             "db-cluster-snapshot", "custom-engine-version", "db-proxy", "blue-green-deployment",
+                             "db-shard-group", "zero-etl"):
+        return _error("InvalidParameterValue", "Invalid SourceType.", 400)
+    def timestamp(value, default):
+        if not value:
+            return default
+        date = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if date.tzinfo is None:
+            date = date.replace(tzinfo=datetime.timezone.utc)
+        return date.timestamp()
+    try:
+        limit = int(_p(p, "MaxRecords", "100"))
+        duration = int(_p(p, "Duration", "60"))
+        start = timestamp(_p(p, "StartTime"), now - duration * 60)
+        end = timestamp(_p(p, "EndTime"), now)
+        if not 20 <= limit <= 100 or not 0 <= duration <= 20160 or start > end:
+            raise ValueError
+    except (ValueError, OverflowError):
+        return _error("InvalidParameterValue", "Invalid event time range, duration or MaxRecords.", 400)
+    categories = _parse_member_list(p, "EventCategories")
+    with _shared_container_lock:
+        events = sorted(
+            ((key, dict(event)) for key, event in _events.items()
+             if max(start, now - 14 * 86400) <= event["Date"] <= end
+             and (not source or event["SourceIdentifier"] == source)
+             and (not kind or event["SourceType"] == kind)
+             and (not categories or set(categories).intersection(event["EventCategories"]))),
+            key=lambda pair: (pair[1]["Date"], pair[0]),
+        )
+    marker = _p(p, "Marker")
+    if marker:
+        positions = [i for i, (key, _) in enumerate(events) if key == marker]
+        if not positions:
+            return _error("InvalidParameterValue", "Invalid event Marker.", 400)
+        events = events[positions[0] + 1:]
+    page = events[:limit]
+    members = ""
+    for _, event in page:
+        fields = "".join(f"<{field}>{_esc(event[field])}</{field}>" for field in ("SourceIdentifier", "SourceType", "SourceArn", "Message"))
+        categories_xml = "".join(f"<EventCategory>{_esc(category)}</EventCategory>" for category in event["EventCategories"])
+        members += f"<Event>{fields}<Date>{_format_time(event['Date'])}</Date><EventCategories>{categories_xml}</EventCategories></Event>"
+    next_marker = f"<Marker>{page[-1][0]}</Marker>" if len(events) > limit else ""
+    return _xml(200, "DescribeEventsResponse", f"<DescribeEventsResult><Events>{members}</Events>{next_marker}</DescribeEventsResult>")
+
+
+def _finish_instance_reboot(instance, cluster):
+    db_id = instance["DBInstanceIdentifier"]
+
+    def current():
+        return _instances.get(db_id) is instance and instance.get("DBInstanceStatus") == "rebooting"
+
+    try:
+        client = _get_docker()
+        container_id = instance.get("_docker_container_id")
+        if client and container_id:
+            container = client.containers.get(container_id)
+            container.stop(timeout=5)
+            if not current():
+                return
+            container.start()
+
+            def alive():
+                if not current():
+                    return False
+                container.reload()
+                return container.status not in ("exited", "dead", "removing")
+
+            endpoint = instance.get("Endpoint", {})
+            host = instance.get("_internal_address") or "127.0.0.1"
+            port = instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port")
+            if not _wait_for_database_ready(
+                host, port, instance.get("Engine", "mysql"),
+                instance.get("MasterUsername", "root"),
+                instance.get("_MasterUserPassword", "password"),
+                instance.get("DBName"), alive,
+            ):
+                raise RuntimeError("database stopped before reboot readiness")
+        if current():
+            _record_reboot_event(instance)
+            instance["DBInstanceStatus"] = "available"
+    except Exception:
+        logger.exception("RDS: reboot failed for %s", db_id)
+        if current():
+            instance["DBInstanceStatus"] = "failed"
+    finally:
+        if cluster:
+            _end_mysql_global_instance_mutation(cluster)
 
 
 # ---------------------------------------------------------------------------
@@ -5718,6 +5870,9 @@ def _create_read_replica(p):
 
     arn = f"arn:aws:rds:{get_region()}:{get_account_id()}:db:{replica_id}"
     replica = dict(source)
+    replica.pop("MaxAllocatedStorage", None)
+    if _p(p, "MaxAllocatedStorage"):
+        replica["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
     replica.update({
         "DBInstanceIdentifier": replica_id,
         "DBInstanceArn": arn,
@@ -6164,13 +6319,16 @@ def _describe_db_clusters(p):
                 return wrong_region
             return _error("DBClusterNotFoundFault", f"DBCluster {cluster_id} not found.", 404)
         clusters = [cluster]
+        docdb_members = ""
     else:
         clusters = list(_clusters.values())
         filters = _parse_filters(p)
         if filters:
             clusters = _apply_cluster_filters(clusters, filters)
+        from ministack.services import documentdb
+        docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters)
+    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters) + docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
@@ -9539,7 +9697,7 @@ def _instance_xml(i):
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
-        <MaxAllocatedStorage>{i.get('MaxAllocatedStorage',i.get('AllocatedStorage',20))}</MaxAllocatedStorage>
+        {f"<MaxAllocatedStorage>{i['MaxAllocatedStorage']}</MaxAllocatedStorage>" if i.get('MaxAllocatedStorage') else ""}
         <TagList>{tag_xml}</TagList>
         {cert_xml}
         <CustomerOwnedIpEnabled>{str(i.get('CustomerOwnedIpEnabled',False)).lower()}</CustomerOwnedIpEnabled>
@@ -11330,12 +11488,9 @@ def _xml(status, root_tag, inner):
 
 
 def _error(code, message, status):
-    # Real AWS Query-protocol responses include <Type>Sender|Receiver</Type>
-    # — Sender for 4xx (caller's fault), Receiver for 5xx. Most SDKs ignore
-    # this field but it's part of the documented AWS shape.
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
-    body = f"""<?xml version="1.0" encoding="UTF-8"?>
-<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
+    body = f"""<ErrorResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
     <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
     <RequestId>{new_uuid()}</RequestId>
 </ErrorResponse>""".encode("utf-8")
@@ -11354,6 +11509,7 @@ _ACTION_MAP = {
     "StartDBInstance": _start_db_instance,
     "StopDBInstance": _stop_db_instance,
     "RebootDBInstance": _reboot_db_instance,
+    "DescribeEvents": _describe_events,
     "CreateDBInstanceReadReplica": _create_read_replica,
     "RestoreDBInstanceFromDBSnapshot": _restore_from_snapshot,
     "CreateDBCluster": _create_db_cluster,
@@ -11476,6 +11632,7 @@ def reset():
                             e,
                         )
         _instances.clear()
+        _events.clear()
         _clusters.clear()
         _subnet_groups.clear()
         _param_groups.clear()
