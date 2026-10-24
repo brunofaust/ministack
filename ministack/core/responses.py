@@ -8,6 +8,7 @@ JSON responses (DynamoDB, Lambda, SecretsManager, CloudWatch Logs).
 
 import contextlib
 import contextvars
+import functools
 import hashlib
 import json
 import os
@@ -586,3 +587,30 @@ def sha256_hash(data: bytes) -> str:
 
 def new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+_BOTOCORE_NAME = {
+    "states": "stepfunctions",
+    "monitoring": "cloudwatch",
+    "elasticloadbalancing": "elbv2",
+    "airflow": "mwaa",
+    "elasticmapreduce": "emr",
+    "tagging": "resourcegroupstaggingapi",
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _service_model(service: str):
+    """The botocore service model for a ministack service name, or None.
+
+    Backported verbatim from upstream 9d33e22 (#2110), the one helper upstream
+    38f6d2d needs, so the BusyDone pin does not take that whole commit."""
+    try:
+        import botocore.session
+    except ImportError:
+        return None
+    name = _BOTOCORE_NAME.get(service, service)
+    try:
+        return botocore.session.get_session().get_service_model(name)
+    except Exception:
+        return None
