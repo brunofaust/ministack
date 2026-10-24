@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 
@@ -53,11 +54,18 @@ _uploads = AccountRegionScopedDict()
 # bytes value (older persisted state, tests) is still read as is.
 LAYER_BLOB_DIR = os.path.join(STATE_DIR, "ecr-blobs")
 _LAYER_REF_KEY = "ecr_blob_ref"
+# "write layer file + record its handle" and "drop handle + unlink file" must not
+# interleave, or a push can end up holding a handle whose file a delete removed.
+_layer_lock = threading.RLock()
+
+
+_LAYER_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 
 
 def _layer_path(digest: str) -> str:
-    # Callers pass only a digest that was just verified against the content's own
-    # sha256, so it is "sha256:<hex>" and safe as a file name.
+    # A digest from persisted state or a request is never trusted as a file name.
+    if not _LAYER_DIGEST_RE.fullmatch(digest):
+        raise ValueError(f"not a sha256 layer digest: {digest!r}")
     return os.path.join(LAYER_BLOB_DIR, digest.replace(":", "-"))
 
 
@@ -982,7 +990,8 @@ def _v2_start_blob_upload(name, query_params, body):
     if mount:
         src_blobs = _layer_blobs.get(src, {}) if src else {}
         if mount in src_blobs:
-            _layer_blobs.setdefault(name, {})[mount] = src_blobs[mount]
+            with _layer_lock:
+                _layer_blobs.setdefault(name, {})[mount] = src_blobs[mount]
             return _registry_ok(
                 201,
                 {
@@ -1004,7 +1013,8 @@ def _v2_start_blob_upload(name, query_params, body):
                 "provided digest did not match uploaded content",
                 {"expected": digest, "actual": actual},
             )
-        _layer_blobs.setdefault(name, {})[digest] = _store_layer(digest, body)
+        with _layer_lock:
+            _layer_blobs.setdefault(name, {})[digest] = _store_layer(digest, body)
         return _registry_ok(
             201,
             {
@@ -1111,7 +1121,8 @@ def _v2_complete_blob_upload(name, upload_uuid, query_params, body):
             {"expected": digest, "actual": actual},
         )
 
-    _layer_blobs.setdefault(name, {})[digest] = _store_layer(digest, buf)
+    with _layer_lock:
+        _layer_blobs.setdefault(name, {})[digest] = _store_layer(digest, buf)
     _uploads.get(name, {}).pop(upload_uuid, None)
 
     return _registry_ok(
@@ -1205,8 +1216,9 @@ def _v2_delete_blob(name, digest):
             "blob unknown to registry",
             {"digest": digest},
         )
-    blobs.pop(digest, None)
-    _drop_layer_file_if_unreferenced(digest)
+    with _layer_lock:
+        blobs.pop(digest, None)
+        _drop_layer_file_if_unreferenced(digest)
     return _registry_ok(202, {}, b"")
 
 

@@ -6021,12 +6021,15 @@ def _publish_version(name: str, data: dict):
     if data.get("Description"):
         ver_config["Description"] = data["Description"]
 
-    ver_record = {
-        "config": ver_config,
-        "code_zip": func.get("code_zip"),
-        "function_revision": func["config"].get("RevisionId"),
-    }
-    func["versions"][str(ver_num)] = ver_record
+    # A concurrent UpdateFunctionCode + get_state() prune must not delete the blob
+    # between reading the handle and recording the version that references it.
+    with _blob_registry_lock:
+        ver_record = {
+            "config": ver_config,
+            "code_zip": func.get("code_zip"),
+            "function_revision": func["config"].get("RevisionId"),
+        }
+        func["versions"][str(ver_num)] = ver_record
     if _stamp_snapstart_published_version(ver_config):
         _snapstart_provision_version_async(name, ver_record)
     return json_response(ver_config, 201)

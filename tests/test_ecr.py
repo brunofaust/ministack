@@ -857,3 +857,9 @@ def test_v2_delete_keeps_a_layer_file_another_repo_still_references(ecr_blob_sto
     assert path.exists() and ecr_svc._v2_get_blob("dst", digest)[2] == layer
     assert ecr_svc._v2_delete_blob("dst", digest)[0] == 202
     assert not path.exists()
+
+
+@pytest.mark.parametrize("digest", ["sha256:../../etc/passwd", "sha256:" + "A" * 64, "sha256:abc", "../x", ""])
+def test_layer_path_rejects_anything_but_a_sha256_digest(digest):
+    with pytest.raises(ValueError):
+        ecr_svc._layer_path(digest)

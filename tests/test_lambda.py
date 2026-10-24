@@ -15864,3 +15864,36 @@ def test_memory_size_inside_aws_range_is_accepted(monkeypatch, tmp_path, memory_
     assert status == 201
     status, _, _ = lsvc._update_config("mem-fine", {"MemorySize": memory_size})
     assert status == 200
+
+
+def test_invoke_with_a_vanished_code_blob_names_the_function_and_sha(monkeypatch, tmp_path):
+    """An invoke whose blob is gone fails with an error naming function and sha."""
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    sha = "cd" * 32
+    func = {
+        "config": {"FunctionName": "vanished", "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:vanished",
+                   "Runtime": "python3.12", "Handler": "index.handler", "MemorySize": 128, "Timeout": 5,
+                   "Version": "$LATEST"},
+        "code_zip": {"code_blob_ref": sha},
+    }
+    result = lsvc._execute_function(func, {})
+    assert result["error"] is True
+    assert "vanished" in str(result["body"]) and sha in str(result["body"])
+
+
+def test_publish_version_records_the_live_blob_handle(monkeypatch, tmp_path):
+    import base64 as _b64
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    monkeypatch.setattr(lsvc, "_functions", AccountRegionScopedDict())
+    code = _make_zip("def handler(e, c): return 1")
+    status, _, _ = lsvc._create_function({
+        "FunctionName": "pub-fn", "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Code": {"ZipFile": _b64.b64encode(code).decode()}})
+    assert status == 201
+    status, _, _ = lsvc._publish_version("pub-fn", {})
+    assert status == 201
+    handle = lsvc._functions["pub-fn"]["code_zip"]
+    assert lsvc._functions["pub-fn"]["versions"]["1"]["code_zip"] == handle
+    lsvc.get_state()  # the prune keeps a blob the version references
+    assert lsvc.resolve_code_zip(handle, "pub-fn") == code
