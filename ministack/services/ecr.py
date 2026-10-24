@@ -12,9 +12,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
+import uuid
 
 from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.persistence import STATE_DIR
 from ministack.core.responses import (
     AccountRegionScopedDict,
     AccountScopedDict,
@@ -42,6 +45,84 @@ _repo_policies = AccountRegionScopedDict()
 _layer_blobs = AccountRegionScopedDict()
 _manifest_blobs = AccountRegionScopedDict()
 _uploads = AccountRegionScopedDict()
+
+# Layer bytes live on disk, content-addressed under ${STATE_DIR}/ecr-blobs/, and
+# _layer_blobs keeps only a small {"ecr_blob_ref": digest} handle (BD-3083). The
+# dict used to hold every pushed layer as bytes: BusyDone's local-init pushes
+# ~600 MB of image layers, all of it resident for the container's lifetime. A raw
+# bytes value (older persisted state, tests) is still read as is.
+LAYER_BLOB_DIR = os.path.join(STATE_DIR, "ecr-blobs")
+_LAYER_REF_KEY = "ecr_blob_ref"
+
+
+def _layer_path(digest: str) -> str:
+    # Callers pass only a digest that was just verified against the content's own
+    # sha256, so it is "sha256:<hex>" and safe as a file name.
+    return os.path.join(LAYER_BLOB_DIR, digest.replace(":", "-"))
+
+
+def _store_layer(digest: str, data) -> dict:
+    """Write ``data`` (bytes-like) to its content-addressed file, return the handle."""
+    os.makedirs(LAYER_BLOB_DIR, exist_ok=True)
+    path = _layer_path(digest)
+    if not os.path.exists(path):
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    return {_LAYER_REF_KEY: digest}
+
+
+def _layer_size(value) -> int | None:
+    """Byte length of a stored layer, or None when its file is gone."""
+    if isinstance(value, dict):
+        try:
+            return os.path.getsize(_layer_path(value[_LAYER_REF_KEY]))
+        except OSError:
+            logger.error("ECR layer blob %s missing at %s", value[_LAYER_REF_KEY],
+                         _layer_path(value[_LAYER_REF_KEY]))
+            return None
+    return len(value)
+
+
+def _layer_bytes(value) -> bytes | None:
+    """Bytes of a stored layer, or None when its file is gone."""
+    if isinstance(value, dict):
+        try:
+            with open(_layer_path(value[_LAYER_REF_KEY]), "rb") as f:
+                return f.read()
+        except OSError:
+            logger.error("ECR layer blob %s missing at %s", value[_LAYER_REF_KEY],
+                         _layer_path(value[_LAYER_REF_KEY]))
+            return None
+    return value
+
+
+def _layer_missing(digest):
+    return _registry_error(
+        404,
+        "BLOB_UNKNOWN",
+        "blob content missing from the registry's blob store",
+        {"digest": digest},
+    )
+
+
+def _drop_layer_file_if_unreferenced(digest: str) -> None:
+    for repo_blobs in _layer_blobs._data.values():
+        for value in repo_blobs.values():
+            if isinstance(value, dict) and value.get(_LAYER_REF_KEY) == digest:
+                return
+    try:
+        os.remove(_layer_path(digest))
+    except OSError:
+        pass
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -708,6 +789,7 @@ def reset():
     _layer_blobs.clear()
     _manifest_blobs.clear()
     _uploads.clear()
+    shutil.rmtree(LAYER_BLOB_DIR, ignore_errors=True)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -749,7 +831,7 @@ def _registry_ok(status, headers, body):
     return (status, out, body if body is not None else b"")
 
 
-def _content_digest(data: bytes) -> str:
+def _content_digest(data: bytes | bytearray) -> str:
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
@@ -922,7 +1004,7 @@ def _v2_start_blob_upload(name, query_params, body):
                 "provided digest did not match uploaded content",
                 {"expected": digest, "actual": actual},
             )
-        _layer_blobs.setdefault(name, {})[digest] = bytes(body)
+        _layer_blobs.setdefault(name, {})[digest] = _store_layer(digest, body)
         return _registry_ok(
             201,
             {
@@ -1020,8 +1102,7 @@ def _v2_complete_blob_upload(name, upload_uuid, query_params, body):
     if body:
         buf.extend(body if isinstance(body, (bytes, bytearray)) else body.encode())
 
-    final = bytes(buf)
-    actual = _content_digest(final)
+    actual = _content_digest(buf)
     if actual != digest:
         return _registry_error(
             400,
@@ -1030,7 +1111,7 @@ def _v2_complete_blob_upload(name, upload_uuid, query_params, body):
             {"expected": digest, "actual": actual},
         )
 
-    _layer_blobs.setdefault(name, {})[digest] = final
+    _layer_blobs.setdefault(name, {})[digest] = _store_layer(digest, buf)
     _uploads.get(name, {}).pop(upload_uuid, None)
 
     return _registry_ok(
@@ -1064,18 +1145,21 @@ def _v2_head_blob(name, digest):
     err = _ensure_repo_exists(name)
     if err is not None:
         return err
-    blob = _layer_blobs.get(name, {}).get(digest)
-    if blob is None:
+    stored = _layer_blobs.get(name, {}).get(digest)
+    if stored is None:
         return _registry_error(
             404,
             "BLOB_UNKNOWN",
             "blob unknown to registry",
             {"digest": digest},
         )
+    size = _layer_size(stored)
+    if size is None:
+        return _layer_missing(digest)
     return _registry_ok(
         200,
         {
-            "Content-Length": str(len(blob)),
+            "Content-Length": str(size),
             "Docker-Content-Digest": digest,
             "Content-Type": "application/octet-stream",
         },
@@ -1087,14 +1171,17 @@ def _v2_get_blob(name, digest):
     err = _ensure_repo_exists(name)
     if err is not None:
         return err
-    blob = _layer_blobs.get(name, {}).get(digest)
-    if blob is None:
+    stored = _layer_blobs.get(name, {}).get(digest)
+    if stored is None:
         return _registry_error(
             404,
             "BLOB_UNKNOWN",
             "blob unknown to registry",
             {"digest": digest},
         )
+    blob = _layer_bytes(stored)
+    if blob is None:
+        return _layer_missing(digest)
     return _registry_ok(
         200,
         {
@@ -1119,6 +1206,7 @@ def _v2_delete_blob(name, digest):
             {"digest": digest},
         )
     blobs.pop(digest, None)
+    _drop_layer_file_if_unreferenced(digest)
     return _registry_ok(202, {}, b"")
 
 

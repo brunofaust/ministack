@@ -791,3 +791,69 @@ def test_ecr_tag_apis_reject_invalid_or_out_of_scope_repository_arns(resource_ar
 
     tags = _body(ecr_svc._list_tags_for_resource({"resourceArn": valid_arn}))["tags"]
     assert tags == [{"Key": "existing", "Value": "tag"}]
+
+
+# ──────────────────── BD-3083: layer bytes live on disk, not in the dict ────────────────────
+
+
+@pytest.fixture
+def ecr_blob_store(monkeypatch, tmp_path):
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(ecr_svc, "LAYER_BLOB_DIR", str(tmp_path / "ecr-blobs"))
+    monkeypatch.setattr(ecr_svc, "_layer_blobs", AccountRegionScopedDict())
+    monkeypatch.setattr(ecr_svc, "_uploads", AccountRegionScopedDict())
+    monkeypatch.setattr(ecr_svc, "_ensure_repo_exists", lambda name: None)
+    return tmp_path / "ecr-blobs"
+
+
+def test_v2_pushed_layer_is_a_disk_handle_and_round_trips(ecr_blob_store):
+    layer = os.urandom(4096)
+    digest = "sha256:" + hashlib.sha256(layer).hexdigest()
+    ecr_svc._uploads.setdefault("app", {})["u1"] = bytearray(layer[:1000])
+    status, _, _ = ecr_svc._v2_patch_blob_upload("app", "u1", layer[1000:2000])
+    assert status == 202
+    status, _, _ = ecr_svc._v2_complete_blob_upload("app", "u1", {"digest": [digest]}, layer[2000:])
+    assert status == 201
+
+    stored = ecr_svc._layer_blobs["app"][digest]
+    assert stored == {"ecr_blob_ref": digest}  # a handle, not the bytes
+    assert (ecr_blob_store / digest.replace(":", "-")).read_bytes() == layer
+    status, headers, body = ecr_svc._v2_get_blob("app", digest)
+    assert (status, body) == (200, layer)
+    status, headers, _ = ecr_svc._v2_head_blob("app", digest)
+    assert status == 200 and headers["Content-Length"] == str(len(layer))
+
+
+def test_v2_single_shot_push_and_raw_bytes_legacy_value(ecr_blob_store):
+    layer = b"single-shot-layer"
+    digest = "sha256:" + hashlib.sha256(layer).hexdigest()
+    status, _, _ = ecr_svc._v2_start_blob_upload("app", {"digest": [digest]}, layer)
+    assert status == 201
+    assert ecr_svc._v2_get_blob("app", digest)[2] == layer
+    # Older persisted state and in-process fixtures hold raw bytes; still served.
+    ecr_svc._layer_blobs["app"]["sha256:legacy"] = b"legacy"
+    assert ecr_svc._v2_get_blob("app", "sha256:legacy")[2] == b"legacy"
+
+
+def test_v2_missing_layer_file_is_a_loud_404_naming_the_digest(ecr_blob_store):
+    layer = b"soon-gone"
+    digest = "sha256:" + hashlib.sha256(layer).hexdigest()
+    ecr_svc._v2_start_blob_upload("app", {"digest": [digest]}, layer)
+    (ecr_blob_store / digest.replace(":", "-")).unlink()
+    for call in (ecr_svc._v2_get_blob, ecr_svc._v2_head_blob):
+        status, _, body = call("app", digest)
+        assert status == 404
+        assert b"BLOB_UNKNOWN" in body and digest.encode() in body and b"missing" in body
+
+
+def test_v2_delete_keeps_a_layer_file_another_repo_still_references(ecr_blob_store):
+    layer = b"shared-layer"
+    digest = "sha256:" + hashlib.sha256(layer).hexdigest()
+    ecr_svc._v2_start_blob_upload("src", {"digest": [digest]}, layer)
+    status, _, _ = ecr_svc._v2_start_blob_upload("dst", {"mount": [digest], "from": ["src"]}, b"")
+    assert status == 201
+    path = ecr_blob_store / digest.replace(":", "-")
+    assert ecr_svc._v2_delete_blob("src", digest)[0] == 202
+    assert path.exists() and ecr_svc._v2_get_blob("dst", digest)[2] == layer
+    assert ecr_svc._v2_delete_blob("dst", digest)[0] == 202
+    assert not path.exists()
