@@ -15761,3 +15761,106 @@ def test_test_suite_refuses_to_default_to_the_busydone_stack_port():
         with pytest.raises(pytest.UsageError, match="MINISTACK_ENDPOINT is required"):
             conftest._require_endpoint(unset)
     assert conftest._require_endpoint({"MINISTACK_ENDPOINT": "http://localhost:4599"}) == "http://localhost:4599"
+
+
+# ──────────────────── BD-3083: blob loudness, prune race, MemorySize range ────────────────────
+
+
+def test_missing_code_blob_raises_naming_function_and_sha(monkeypatch, tmp_path):
+    """A gone blob is a loud error carrying the function name and sha, not None."""
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    handle = {"code_blob_ref": "ab" * 32}
+    with pytest.raises(lsvc.LambdaCodeBlobMissing) as exc:
+        lsvc.resolve_code_zip(handle, "my-fn")
+    assert exc.value.sha == "ab" * 32
+    assert "my-fn" in str(exc.value) and "ab" * 32 in str(exc.value)
+
+
+def test_missing_code_blob_is_resource_not_found_over_the_api(monkeypatch, tmp_path):
+    import base64 as _b64
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    monkeypatch.setattr(lsvc, "_functions", AccountRegionScopedDict())
+    code = _make_zip("def handler(e, c): return 1")
+    fname = f"gone-{_uuid_mod.uuid4().hex[:8]}"
+    status, _, _ = lsvc._create_function({
+        "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Code": {"ZipFile": _b64.b64encode(code).decode()}})
+    assert status == 201
+    for blob in tmp_path.glob("*.zip"):
+        blob.unlink()
+
+    status, _, body = lsvc._update_config(fname, {"Layers": []})
+    assert status == 404
+    assert b"ResourceNotFoundException" in body or fname.encode() in body
+    assert fname.encode() in body
+    status, _, body = lsvc.serve_function_code(fname)
+    assert status == 404 and fname.encode() in body
+
+
+def test_blob_prune_cannot_race_function_creation(monkeypatch, tmp_path):
+    """A get_state() prune that lands between 'blob written' and 'record
+    inserted' must not delete the blob of the function being created."""
+    import base64 as _b64
+    import threading
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    monkeypatch.setattr(lsvc, "_functions", AccountRegionScopedDict())
+    code = _make_zip("def handler(e, c): return 1")
+    pruner = threading.Thread(target=lsvc.get_state)
+    real_store = lsvc._store_code_zip
+
+    def store_then_prune(value):
+        handle = real_store(value)
+        if isinstance(handle, dict):  # the blob is on disk, the record is not
+            pruner.start()
+            pruner.join(timeout=0.5)  # unfixed code finishes (and prunes) here
+        return handle
+
+    monkeypatch.setattr(lsvc, "_store_code_zip", store_then_prune)
+    fname = f"race-{_uuid_mod.uuid4().hex[:8]}"
+    status, _, _ = lsvc._create_function({
+        "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "Code": {"ZipFile": _b64.b64encode(code).decode()}})
+    assert status == 201
+    pruner.join(timeout=5)
+    assert not pruner.is_alive()
+    assert lsvc.resolve_code_zip(lsvc._functions[fname]["code_zip"], fname) == code
+
+
+@pytest.mark.parametrize("memory_size", [0, 64, 127, 10241, 20000])
+def test_memory_size_outside_aws_range_is_rejected(monkeypatch, tmp_path, memory_size):
+    import base64 as _b64
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    monkeypatch.setattr(lsvc, "_functions", AccountRegionScopedDict())
+    code = _make_zip("def handler(e, c): return 1")
+    base = {"Runtime": "python3.12", "Role": _LAMBDA_ROLE, "Handler": "index.handler",
+            "Code": {"ZipFile": _b64.b64encode(code).decode()}}
+    status, _, body = lsvc._create_function({**base, "FunctionName": "mem-bad", "MemorySize": memory_size})
+    assert status == 400
+    assert b"InvalidParameterValueException" in body or b"memorySize" in body
+    assert b"memorySize" in body and str(memory_size).encode() in body
+    assert "mem-bad" not in lsvc._functions
+
+    status, _, _ = lsvc._create_function({**base, "FunctionName": "mem-ok", "MemorySize": 128})
+    assert status == 201
+    status, _, body = lsvc._update_config("mem-ok", {"MemorySize": memory_size})
+    assert status == 400 and b"memorySize" in body
+    assert lsvc._functions["mem-ok"]["config"]["MemorySize"] == 128
+
+
+@pytest.mark.parametrize("memory_size", [128, 3008, 10240])
+def test_memory_size_inside_aws_range_is_accepted(monkeypatch, tmp_path, memory_size):
+    import base64 as _b64
+    from ministack.core.responses import AccountRegionScopedDict
+    monkeypatch.setattr(lsvc, "CODE_BLOB_DIR", str(tmp_path))
+    monkeypatch.setattr(lsvc, "_functions", AccountRegionScopedDict())
+    code = _make_zip("def handler(e, c): return 1")
+    status, _, _ = lsvc._create_function({
+        "FunctionName": "mem-fine", "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
+        "Handler": "index.handler", "MemorySize": memory_size,
+        "Code": {"ZipFile": _b64.b64encode(code).decode()}})
+    assert status == 201
+    status, _, _ = lsvc._update_config("mem-fine", {"MemorySize": memory_size})
+    assert status == 200

@@ -2423,7 +2423,7 @@ def _lambda_create(logical_id, props, stack_name):
             "SnapStart": _lambda_svc._snapstart_response(props.get("SnapStart")),
             "RevisionId": new_uuid(),
         },
-        "code_zip": _lambda_svc._store_code_zip(code_zip),
+        "code_zip": None,  # blob stored under the registry lock at insert
         "code_s3_bucket": code.get("S3Bucket"),
         "code_s3_key": code.get("S3Key"),
         "code_s3_object_version": code.get("S3ObjectVersion"),
@@ -2447,7 +2447,9 @@ def _lambda_create(logical_id, props, stack_name):
     if props.get("CapacityProviderConfig"):
         func["config"]["CapacityProviderConfig"] = props["CapacityProviderConfig"]
     replaced = name in _lambda_svc._functions
-    _lambda_svc._functions[name] = func
+    with _lambda_svc._blob_registry_lock:
+        func["code_zip"] = _lambda_svc._store_code_zip(code_zip)
+        _lambda_svc._functions[name] = func
     # On a stack UPDATE this re-provisions over an existing function; recycle the
     # warm worker + docker pool so the new code/config load on the next invoke
     # (#897). No-op on first create (no worker spawned yet).

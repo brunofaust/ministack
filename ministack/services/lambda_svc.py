@@ -518,6 +518,13 @@ def _sweep_extract_cache() -> None:
 CODE_BLOB_DIR = os.path.join(STATE_DIR, "lambda-blobs")
 _BLOB_REF_KEY = "code_blob_ref"
 
+# A blob sits on disk from ``_store_code_zip`` until the record that references
+# it is inserted. ``get_state()`` snapshots references and then prunes the
+# unreferenced files, so a prune landing in that window deleted the blob of a
+# function still being created. Writers hold this lock across "store blob +
+# publish record"; ``get_state()`` holds it across "snapshot + prune".
+_blob_registry_lock = threading.RLock()
+
 
 def _write_code_blob(code_zip: bytes) -> str:
     """Write ``code_zip`` to a content-addressed file. Returns the sha256
@@ -544,20 +551,37 @@ def _write_code_blob(code_zip: bytes) -> str:
     return sha
 
 
-def _read_code_blob(sha: str) -> bytes | None:
-    """Read a blob by sha256. Returns ``None`` and logs an error when the
-    file is missing or unreadable — restore should degrade the affected
-    function rather than abort the whole load."""
+class LambdaCodeBlobMissing(Exception):
+    """A function's content-addressed code blob is absent or unreadable.
+
+    Surfaces as a ResourceNotFoundException naming the function and sha instead
+    of a silent ``None`` that later fails as an opaque ``TypeError``/empty zip.
+    """
+
+    def __init__(self, sha: str, func_name: str | None = None, reason: str = "missing"):
+        self.sha = sha
+        self.func_name = func_name
+        who = f"function {func_name!r}" if func_name else "a function"
+        super().__init__(f"Lambda code blob {sha} for {who} is {reason} in {CODE_BLOB_DIR}")
+
+
+def _blob_missing_response(exc: LambdaCodeBlobMissing):
+    return error_response_json("ResourceNotFoundException", str(exc), 404)
+
+
+def _read_code_blob(sha: str, func_name: str | None = None) -> bytes:
+    """Read a blob by sha256. Raises ``LambdaCodeBlobMissing`` (naming the
+    function and sha) when the file is missing or unreadable."""
     path = os.path.join(CODE_BLOB_DIR, f"{sha}.zip")
     try:
         with open(path, "rb") as f:
             return f.read()
     except FileNotFoundError:
         logger.error("Lambda persistence: code blob %s missing at %s", sha, path)
-        return None
+        raise LambdaCodeBlobMissing(sha, func_name) from None
     except OSError as e:
         logger.error("Lambda persistence: failed to read code blob %s: %s", sha, e)
-        return None
+        raise LambdaCodeBlobMissing(sha, func_name, f"unreadable ({e})") from e
 
 
 def _store_code_zip(code):
@@ -574,12 +598,13 @@ def _store_code_zip(code):
     return code
 
 
-def resolve_code_zip(code) -> bytes | None:
+def resolve_code_zip(code, func_name: str | None = None) -> bytes | None:
     """Return the zip bytes for a record's ``code_zip`` value: raw bytes pass
-    through, a blob handle is read from disk, ``None`` stays ``None``. The
-    bytes are transient; callers must not store them on a record or worker."""
+    through, a blob handle is read from disk (``LambdaCodeBlobMissing`` when the
+    file is gone), ``None`` stays ``None``. The bytes are transient; callers
+    must not store them on a record or worker."""
     if isinstance(code, dict) and _BLOB_REF_KEY in code:
-        return _read_code_blob(code[_BLOB_REF_KEY])
+        return _read_code_blob(code[_BLOB_REF_KEY], func_name)
     return code or None
 
 
@@ -648,15 +673,16 @@ def get_state():
     state round-trips per (account, region, name)."""
     funcs = AccountRegionScopedDict()
     referenced: set[str] = set()
-    # Iterate _data directly to capture ALL accounts and regions, not just
-    # current request context.
-    for scoped_key, func in _functions._data.items():
-        f = copy.deepcopy(func)
-        _externalize_code_zip(f, referenced)
-        for ver in f.get("versions", {}).values():
-            _externalize_code_zip(ver, referenced)
-        funcs._data[scoped_key] = f
-    _prune_orphan_code_blobs(referenced)
+    with _blob_registry_lock:
+        # Iterate _data directly to capture ALL accounts and regions, not just
+        # current request context.
+        for scoped_key, func in list(_functions._data.items()):
+            f = copy.deepcopy(func)
+            _externalize_code_zip(f, referenced)
+            for ver in f.get("versions", {}).values():
+                _externalize_code_zip(ver, referenced)
+            funcs._data[scoped_key] = f
+        _prune_orphan_code_blobs(referenced)
     return {
         "functions": funcs,
         "layers": copy.deepcopy(_layers),
@@ -1208,6 +1234,33 @@ def _validate_destination_config(destination_config: dict | None):
         if err:
             return err
     return None
+
+
+# AWS documented MemorySize range for Lambda (MB). The floor also keeps the
+# Docker mem_limit (= MemorySize) above Docker's 6 MiB minimum.
+_MEMORY_SIZE_MIN_MB = 128
+_MEMORY_SIZE_MAX_MB = 10240
+
+
+def _validate_memory_size(value):
+    """AWS-shaped 400 when MemorySize is outside 128-10240 MB (or not an
+    integer), else None. None means the caller did not supply it."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        bound = f"greater than or equal to {_MEMORY_SIZE_MIN_MB}"
+    elif value < _MEMORY_SIZE_MIN_MB:
+        bound = f"greater than or equal to {_MEMORY_SIZE_MIN_MB}"
+    elif value > _MEMORY_SIZE_MAX_MB:
+        bound = f"less than or equal to {_MEMORY_SIZE_MAX_MB}"
+    else:
+        return None
+    return error_response_json(
+        "InvalidParameterValueException",
+        f"1 validation error detected: Value '{value}' at 'memorySize' failed to "
+        f"satisfy constraint: Member must have value {bound}",
+        400,
+    )
 
 
 def _validate_dead_letter_config(dead_letter_config: dict | None):
@@ -2367,6 +2420,9 @@ def _create_function(data: dict):
             400,
         )
 
+    err = _validate_memory_size(data.get("MemorySize"))
+    if err:
+        return err
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
     if err:
         return err
@@ -2415,27 +2471,28 @@ def _create_function(data: dict):
         if code_data.get("S3ObjectVersion"):
             _s3_object_ref["S3ObjectVersion"] = code_data["S3ObjectVersion"]
 
-    _functions[name] = {
-        "config": config,
-        "code_zip": _store_code_zip(code_zip),
-        "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
-        "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
-        "s3_object_ref": _s3_object_ref,
-        # Whether the caller explicitly chose an architecture, as distinct from
-        # the stored x86_64 default. The wire shape is identical either way;
-        # only the Docker executor reads this, to pin the container platform
-        # for functions that actually declared one.
-        "architectures_declared": "Architectures" in data,
-        "versions": {},
-        "next_version": 1,
-        "tags": data.get("Tags", {}),
-        "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
-        "event_invoke_config": None,
-        "event_invoke_configs": {},
-        "aliases": {},
-        "concurrency": None,
-        "provisioned_concurrency": {},
-    }
+    with _blob_registry_lock:
+        _functions[name] = {
+            "config": config,
+            "code_zip": _store_code_zip(code_zip),
+            "s3_object_storage_mode": code_data.get("S3ObjectStorageMode"),
+            "source_kms_key_arn": code_data.get("SourceKMSKeyArn"),
+            "s3_object_ref": _s3_object_ref,
+            # Whether the caller explicitly chose an architecture, as distinct from
+            # the stored x86_64 default. The wire shape is identical either way;
+            # only the Docker executor reads this, to pin the container platform
+            # for functions that actually declared one.
+            "architectures_declared": "Architectures" in data,
+            "versions": {},
+            "next_version": 1,
+            "tags": data.get("Tags", {}),
+            "policy": {"Version": "2012-10-17", "Id": "default", "Statement": []},
+            "event_invoke_config": None,
+            "event_invoke_configs": {},
+            "aliases": {},
+            "concurrency": None,
+            "provisioned_concurrency": {},
+        }
 
     # Publishing leaves $LATEST unpublished; the response carries the published number.
     response = config
@@ -2574,7 +2631,10 @@ def serve_function_code(func_name: str, account_id: str | None = None, region: s
         func = _functions.get(func_name)
     if not func:
         return 404, {"Content-Type": "text/plain"}, b"Function not found"
-    zip_bytes = resolve_code_zip(func.get("code_zip")) or b""
+    try:
+        zip_bytes = resolve_code_zip(func.get("code_zip"), func_name) or b""
+    except LambdaCodeBlobMissing as exc:
+        return 404, {"Content-Type": "text/plain"}, str(exc).encode()
     return 200, {"Content-Type": "application/zip"}, zip_bytes
 
 
@@ -2865,7 +2925,8 @@ def _update_code(name: str, data: dict):
     if err is not None:
         return err
     if code_zip:
-        func["code_zip"] = _store_code_zip(code_zip)
+        with _blob_registry_lock:
+            func["code_zip"] = _store_code_zip(code_zip)
         func["config"]["CodeSize"] = len(code_zip)
         func["config"]["CodeSha256"] = base64.b64encode(
             hashlib.sha256(code_zip).digest(),
@@ -2930,6 +2991,9 @@ def _update_config(name: str, data: dict):
     err = _check_revision(_functions[name]["config"], data)
     if err is not None:
         return err
+    err = _validate_memory_size(data.get("MemorySize"))
+    if err:
+        return err
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
     if err:
         return err
@@ -2937,7 +3001,11 @@ def _update_config(name: str, data: dict):
         layers_cfg, err = _normalize_layer_attachments(data.get("Layers"))
         if err:
             return err
-        err = _validate_total_unzipped_size(resolve_code_zip(_functions[name].get("code_zip")), layers_cfg)
+        try:
+            current_zip = resolve_code_zip(_functions[name].get("code_zip"), name)
+        except LambdaCodeBlobMissing as exc:
+            return _blob_missing_response(exc)
+        err = _validate_total_unzipped_size(current_zip, layers_cfg)
         if err:
             return err
         data = dict(data)
@@ -4541,7 +4609,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     if package_type == "Zip":
         if not code_zip:
             raise ValueError("Zip PackageType requires code_zip bytes")
-        code_dir = _docker_extracted_dir(resolve_code_zip(code_zip), "code")
+        code_dir = _docker_extracted_dir(resolve_code_zip(code_zip, config.get("FunctionName")), "code")
         for layer_ref in layers_list:
             layer_zip = _resolve_layer_zip(layer_ref)
             if not layer_zip:
@@ -5555,7 +5623,7 @@ def _execute_function_provided(func: dict, event: dict, request_id: str) -> dict
     try:
         import http.server
         import socketserver
-        code_dir = _provided_runtime_code_dir(resolve_code_zip(code_zip))
+        code_dir = _provided_runtime_code_dir(resolve_code_zip(code_zip, config.get("FunctionName")))
         bootstrap_path = os.path.join(code_dir, "bootstrap")
         if not os.path.exists(bootstrap_path):
             return {"body": {"statusCode": 200, "body": "Mock response - no bootstrap binary found"}}
@@ -5729,7 +5797,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = os.path.join(tmpdir, "code.zip")
             with open(zip_path, "wb") as f:
-                f.write(resolve_code_zip(code_zip))
+                f.write(resolve_code_zip(code_zip, config.get("FunctionName")))
             code_dir = os.path.join(tmpdir, "code")
             os.makedirs(code_dir)
             with zipfile.ZipFile(zip_path) as zf:
