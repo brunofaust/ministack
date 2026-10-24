@@ -4564,7 +4564,7 @@ def test_ec2_describe_images_filters_apply_to_the_stubs(ec2):
         public = ec2.describe_images(
             Filters=[{"Name": "is-public", "Values": ["true"]}])["Images"]
         assert {i["ImageId"] for i in public} == {
-            "ami-0abcdef1234567890", "ami-0123456789abcdef0", "ami-0fedcba9876543210"}
+            "ami-0abcdef1234567890", "ami-0c2023a1b2c3d4e5f", "ami-0123456789abcdef0", "ami-0fedcba9876543210"}
 
         private = ec2.describe_images(
             Filters=[{"Name": "is-public", "Values": ["false"]}])["Images"]
@@ -4742,3 +4742,15 @@ def test_ec2_cross_account_ami_sharing():
     assert f"Not authorized for image:{ami}" in exc.value.response["Error"]["Message"]
 
     owner.deregister_image(ImageId=ami)
+
+
+def test_ec2_describe_instances_validates_id_format_before_existence(ec2):
+    """AWS rejects a malformed instance ID before checking existence —
+    evidence: real AWS wire capture answered InvalidInstanceID.Malformed."""
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-0000000000000000x"])
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.Malformed"
+
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-00000000000000000"])
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceID.NotFound"

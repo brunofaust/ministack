@@ -44,8 +44,11 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 import zipfile
+import zlib
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any
 from urllib.parse import quote, unquote
 
@@ -54,6 +57,7 @@ from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import esm_wake, run_reentrant, spawn_background
 from ministack.core.lambda_runtime import (
     DURABLE_ENV_VARS,
+    HOST_PREFIX_ENV,
     INVOKE_DEPTH_BOOTSTRAP,
     INVOKE_DEPTH_ENV,
     INVOKE_DEPTH_HEADER,
@@ -75,6 +79,7 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
+    get_request_client_ip,
     json_response,
     new_uuid,
 )
@@ -1244,6 +1249,26 @@ def _rewrite_host_for_container(url: str) -> str:
     return url
 
 
+def s3_code_region_message(bucket: str, layer: bool = False) -> str | None:
+    """Lambda reads S3 code from the function's own region. For a bucket homed
+    elsewhere, the message AWS returns (observed 2026-10-12); layers word the
+    S3 part differently from functions. None when the bucket is local or absent."""
+    from ministack.services import s3 as s3_svc
+
+    home = s3_svc.bucket_region(bucket)
+    if home is None or home == get_region():
+        return None
+    s3_message = (f"The bucket is in this region: {home}. Please use this region to retry the request" if layer
+                  else "The bucket you are attempting to access must be addressed using the specified endpoint. "
+                       "Please send all future requests to this endpoint.")
+    return f"Error occurred while GetObject. S3 Error Code: PermanentRedirect. S3 Error Message: {s3_message}"
+
+
+def _s3_code_region_error(bucket: str, layer: bool = False):
+    message = s3_code_region_message(bucket, layer)
+    return error_response_json("InvalidParameterValueException", message, 400) if message else None
+
+
 def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) -> bytes | None:
     """Fetch Lambda code zip from the in-memory S3 service.
 
@@ -1348,7 +1373,6 @@ def invoke_durable_resume(function_name: str, durable_arn: str, original_event: 
     func = _functions.get(canonical)
     if not func:
         return
-    config = func.get("config") or func
     # Set the durable context to the SAME ARN/token so the SDK reads the
     # accumulated operations as InitialExecutionState (replay path).
     _durable_ctx.set({
@@ -1708,45 +1732,35 @@ def _layer_access_denied(layer_arn: str):
     )
 
 
-# The extensions AWS publishes from its own accounts and grants
-# lambda:GetLayerVersion on to everyone. Keyed by LAYER NAME, not by publisher
-# account: the name is stable while the account differs in every region, so one
-# short list replaces ~190 account ids that go stale as regions are added.
-_AWS_PUBLISHED_LAYER_PREFIXES = (
-    "LambdaInsightsExtension",
-    "AWS-Parameters-and-Secrets-Lambda-Extension",
-    "AWS-AppConfig-Extension",
-    "AWSOpenTelemetryDistro",
-    "aws-otel-",
-    "AWSSDKPandas-",
+# A layer version ARN that can exist on AWS.
+_POSSIBLE_LAYER_VERSION_ARN_RE = re.compile(
+    r"arn:aws:lambda:[a-z0-9-]+:[0-9]{12}:layer:[a-zA-Z0-9-_]{1,140}:[1-9][0-9]*"
 )
 
 
-def _is_aws_published_layer(layer_name: str) -> bool:
-    return layer_name.startswith(_AWS_PUBLISHED_LAYER_PREFIXES)
-
-
 def _resolve_cross_account_layer(layer_arn: str, spec, name_and_version):
-    """Another account's layer through its grant; an unknown account passes by
-    name, and the bytes are not available offline (CodeSize 0, does not run)."""
+    """Another account's layer: through its grant if MiniStack holds it, else an empty version."""
     if spec.region != get_region():
         return _layer_access_denied(layer_arn)
     layer_name, version = name_and_version
-    vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
-    if vc is not None and _layer_policy_allows(vc, get_account_id()):
-        return vc, None
-    if vc is None and _is_aws_published_layer(layer_name):
-        logger.warning(
-            "Layer %s is an AWS-published extension: the reference resolves so "
-            "the stack deploys, but the bytes are not available offline and the "
-            "extension will not run", layer_arn,
-        )
-        return {
-            "LayerVersionArn": layer_arn,
-            "Version": version,
-            "Content": {"CodeSize": 0},
-        }, None
-    return _layer_access_denied(layer_arn)
+    if not _POSSIBLE_LAYER_VERSION_ARN_RE.fullmatch(layer_arn):
+        return _layer_access_denied(layer_arn)
+    if _layers.get_scoped(spec.account_id, spec.region, layer_name) is not None:
+        vc, _ = _find_layer_version(layer_name, version, spec.account_id, spec.region)
+        if vc is not None and _layer_policy_allows(vc, get_account_id()):
+            return vc, None
+        return _layer_access_denied(layer_arn)
+    logger.warning(
+        "Layer %s is not held by MiniStack: the reference resolves so the stack "
+        "deploys, but the bytes are not available offline and the layer will not run",
+        layer_arn,
+    )
+    return {
+        "LayerArn": layer_arn.rsplit(":", 1)[0],
+        "LayerVersionArn": layer_arn,
+        "Version": version,
+        "Content": {"CodeSize": 0},
+    }, None
 
 
 def _resolve_layer_version_for_attachment(layer_arn: str):
@@ -2089,7 +2103,7 @@ async def handle_request(method: str, path: str, headers: dict, body: bytes, que
                             layer_name, ver_num, policy_sid, query_params
                         )
                 if method == "GET":
-                    return _get_layer_version(layer_name, ver_num)
+                    return _layer_name_too_long(layer_name) or _get_layer_version(layer_name, ver_num)
                 if method == "DELETE":
                     return _delete_layer_version(layer_name, ver_num)
 
@@ -2306,6 +2320,9 @@ def _create_function(data: dict):
     elif "ZipFile" in code_data:
         code_zip = base64.b64decode(code_data["ZipFile"])
     elif "S3Bucket" in code_data and "S3Key" in code_data:
+        err = _s3_code_region_error(code_data["S3Bucket"])
+        if err is not None:
+            return err
         code_zip = _fetch_code_from_s3(
             code_data["S3Bucket"],
             code_data["S3Key"],
@@ -2393,6 +2410,8 @@ def _create_function(data: dict):
         "provisioned_concurrency": {},
     }
 
+    # Publishing leaves $LATEST unpublished; the response carries the published number.
+    response = config
     if data.get("Publish"):
         ver_num = _functions[name]["next_version"]
         _functions[name]["next_version"] = ver_num + 1
@@ -2405,12 +2424,12 @@ def _create_function(data: dict):
         _functions[name]["versions"][str(ver_num)] = ver_record
         if _stamp_snapstart_published_version(ver_config):
             _snapstart_provision_version_async(name, ver_record)
-        config["Version"] = str(ver_num)
+        response = {**config, "Version": str(ver_num)}
 
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     runtime_or_image = config.get("Runtime") or ("image=" + image_uri if image_uri else "?")
     logger.info("Lambda function created: %s (%s)", name, runtime_or_image)
-    return json_response(config, 201)
+    return json_response(response, 201)
 
 
 def _get_function(name: str, qualifier: str | None = None):
@@ -2743,6 +2762,42 @@ def _delete_function(name: str, query_params: dict, path_qualifier: str | None =
     return 204, {}, b""
 
 
+# One lock per function (code and configuration share a revision) or alias.
+_revision_locks = weakref.WeakValueDictionary()
+_revision_locks_guard = threading.Lock()
+
+
+def _serialized_revision_update(*, alias=False):
+    def decorate(operation):
+        @wraps(operation)
+        def guarded(*args, **kwargs):
+            name = args[0] if args else kwargs["func_name" if alias else "name"]
+            alias_name = (args[1] if len(args) > 1 else kwargs["alias_name"]) if alias else None
+            key = (get_account_id(), get_region(), name, alias_name)
+            with _revision_locks_guard:
+                lock = _revision_locks.get(key)
+                if lock is None:
+                    lock = threading.RLock()
+                    _revision_locks[key] = lock
+            with lock:
+                return operation(*args, **kwargs)
+        return guarded
+    return decorate
+
+
+def _check_revision(current: dict, data: dict):
+    if "RevisionId" in data and data["RevisionId"] != current.get("RevisionId"):
+        logger.debug("Rejected Lambda update with a stale RevisionId")
+        return error_response_json(
+            "PreconditionFailedException",
+            "The RevisionId provided does not match the latest RevisionId for the Lambda function or alias. "
+            "Call the GetFunction or the GetAlias API to retrieve the latest RevisionId for your resource.",
+            412,
+        )
+    return None
+
+
+@_serialized_revision_update()
 def _update_code(name: str, data: dict):
     if name not in _functions:
         return error_response_json(
@@ -2751,6 +2806,9 @@ def _update_code(name: str, data: dict):
             404,
         )
     func = _functions[name]
+    err = _check_revision(func["config"], data)
+    if err is not None:
+        return err
     code_zip = None
     # UpdateFunctionCode is where AWS lets the architecture change (the
     # UpdateFunctionConfiguration model has no Architectures member).
@@ -2763,6 +2821,9 @@ def _update_code(name: str, data: dict):
     elif "ZipFile" in data:
         code_zip = base64.b64decode(data["ZipFile"])
     elif "S3Bucket" in data and "S3Key" in data:
+        err = _s3_code_region_error(data["S3Bucket"])
+        if err is not None:
+            return err
         code_zip = _fetch_code_from_s3(
             data["S3Bucket"],
             data["S3Key"],
@@ -2827,11 +2888,12 @@ def _update_code(name: str, data: dict):
         func["versions"][str(ver_num)] = ver_record
         if _stamp_snapstart_published_version(ver_config):
             _snapstart_provision_version_async(name, ver_record)
-        func["config"]["Version"] = str(ver_num)
+        return json_response({**func["config"], "Version": str(ver_num)})
 
     return json_response(func["config"])
 
 
+@_serialized_revision_update()
 def _update_config(name: str, data: dict):
     if name not in _functions:
         return error_response_json(
@@ -2839,6 +2901,9 @@ def _update_config(name: str, data: dict):
             f"Function not found: {_func_arn(name)}",
             404,
         )
+    err = _check_revision(_functions[name]["config"], data)
+    if err is not None:
+        return err
     err = _validate_dead_letter_config(data.get("DeadLetterConfig"))
     if err:
         return err
@@ -4172,7 +4237,7 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", cop
         extra_hosts.setdefault(host, "host-gateway")
     if not os.path.exists(cert_path):
         return
-    # NODE_EXTRA_CA_CERTS adds to node's roots; the other two replace the store.
+    # NODE_EXTRA_CA_CERTS adds to node's roots; the others replace the store.
     bundle = _tls.ca_bundle_path(cert_path)
 
     def trust(target, source):
@@ -4185,7 +4250,7 @@ def _wire_cognito_issuer_host(run_kwargs, container_env, mounts, runtime="", cop
     container_env.setdefault("NODE_EXTRA_CA_CERTS", _CONTAINER_CA_PATH)
     if bundle:
         trust(_CONTAINER_BUNDLE_PATH, bundle)
-        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE"):
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
             container_env.setdefault(var, _CONTAINER_BUNDLE_PATH)
     # A JVM reads none of the above, and announces JAVA_TOOL_OPTIONS on stderr.
     if runtime.startswith("java"):
@@ -4250,7 +4315,7 @@ def handler(event, context):
 
 _JS_CTX_ARN_SHIM = '''\
 // MiniStack shim: hand user code the control-plane ARN in its context, and
-// reach the gateway over plain HTTP (without USE_SSL) when a library insists on HTTPS.
+// reach the gateway port when a library insists on HTTPS (over plain HTTP without USE_SSL).
 const path = require("path");
 const fs = require("fs");
 const http = require("http");
@@ -4300,8 +4365,15 @@ try {
     if (!PLAIN_HOSTS.has(host) || (rawPort && rawPort !== "443" && rawPort !== EP_PORT)) {
       return origHttpsRequest.apply(https, original);
     }
-    // USE_SSL: the gateway serves only HTTPS, so a request to it keeps TLS.
-    if (EP.protocol === "https:") return origHttpsRequest.apply(https, original);
+    // USE_SSL: the gateway serves only HTTPS, so a request to it keeps TLS and
+    // only the https default port becomes the gateway port.
+    if (EP.protocol === "https:") {
+      if (rawPort && rawPort !== "443") return origHttpsRequest.apply(https, original);
+      opts.protocol = "https:";
+      opts.hostname = host;
+      opts.port = EP_PORT;
+      return origHttpsRequest.call(https, opts, callback);
+    }
     opts.protocol = "http:";
     opts.hostname = host;
     opts.host = host + ":" + EP_PORT;
@@ -4472,6 +4544,7 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     # /opt/bin) — no _LAMBDA_LAYERS_DIRS shim here (the official RIE bootstrap
     # ignores it anyway).
     container_env.update(env_vars)
+    container_env.setdefault(HOST_PREFIX_ENV, "true")
     # Per-invocation durable-execution overlay (no-op when the call isn't
     # inside a durable function).
     container_env.update(_durable_env_overlay())
@@ -4551,7 +4624,6 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
     run_kwargs: dict = {
         "image": image,
         "environment": container_env,
-        "ports": {"8080/tcp": None},
         "detach": True,
         "stdin_open": False,
         "labels": container_reaper.own_labels("lambda"),
@@ -4589,6 +4661,9 @@ def _spawn_lambda_container_impl(config: dict, code_zip: bytes | None,
         run_kwargs["mounts"] = mounts
     if LAMBDA_DOCKER_NETWORK:
         run_kwargs["network"] = LAMBDA_DOCKER_NETWORK
+    else:
+        # The runtime is reached on its network address when there is one; otherwise on loopback only.
+        run_kwargs["ports"] = {"8080/tcp": ("127.0.0.1", None)}
 
     # AWS runs a function on the architecture it declares. Docker otherwise
     # picks the host's, so an arm64 function on an x86_64 host quietly ran as
@@ -4955,12 +5030,10 @@ def _emit_lambda_logs(func: dict, request_id: str, log_text: str,
                 lines.append(_report())
         else:
             lines = [start, *(log_text.splitlines() if log_text else []), end, _report()]
-        for line in lines:
-            stream["events"].append({"timestamp": now_ms, "message": line, "ingestionTime": now_ms})
-        if stream["firstEventTimestamp"] is None:
-            stream["firstEventTimestamp"] = now_ms
-        stream["lastEventTimestamp"] = now_ms
-        stream["lastIngestionTime"] = now_ms
+        _cwl._append_log_events(stream, [
+            {"timestamp": now_ms, "message": line, "ingestionTime": now_ms}
+            for line in lines
+        ])
         # Forward to any subscription filters on this group (e.g. Lambda log
         # processor pattern), matching AWS (#896).
         _cwl._fanout_to_subscription_filters(
@@ -5365,6 +5438,7 @@ def _provided_worker_env(config: dict, code_dir: str, port: int) -> dict:
     })
     proc_env.update(execution_credentials(config))
     proc_env.update(env_vars)
+    proc_env.setdefault(HOST_PREFIX_ENV, "true")
     proc_env.update(_durable_env_overlay())
     # Override AWS_ENDPOINT_URL *after* function env vars so Lambda binaries
     # always call back to this MiniStack instance.
@@ -5710,6 +5784,7 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
             if endpoint:
                 env["AWS_ENDPOINT_URL"] = endpoint
             env.update(env_vars)
+            env.setdefault(HOST_PREFIX_ENV, "true")
             env.update(_durable_env_overlay())
             # X-Ray active tracing — one-shot subprocess, env is per-invocation
             # so a fresh trace ID per call is safe (unlike the pooled RIE).
@@ -5788,6 +5863,9 @@ def _execute_function_local(func: dict, event: dict, request_id: str) -> dict:
 def _resolve_layer_zip(attachment: str | dict) -> bytes | None:
     """Return attached content, including versions deleted since attachment."""
     if isinstance(attachment, dict):
+        if attachment.get("CodeSize") == 0:
+            # An empty layer never loads content published under its ARN later.
+            return None
         attachment = attachment.get("Arn", "")
     try:
         spec = parse_arn(attachment)
@@ -5943,6 +6021,7 @@ def _get_alias(func_name: str, alias_name: str):
     return json_response(alias)
 
 
+@_serialized_revision_update(alias=True)
 def _update_alias(func_name: str, alias_name: str, data: dict):
     if func_name not in _functions:
         return error_response_json(
@@ -5957,6 +6036,9 @@ def _update_alias(func_name: str, alias_name: str, data: dict):
             f"Alias not found: {_func_arn(func_name)}:{alias_name}",
             404,
         )
+    err = _check_revision(alias, data)
+    if err is not None:
+        return err
     for key in ("FunctionVersion", "Description"):
         if key in data:
             alias[key] = data[key]
@@ -6129,6 +6211,15 @@ def _remove_permission(
     return 204, {}, b""
 
 
+def function_policy_for_arn(resource_arn: str) -> tuple[dict, str] | None:
+    """The function's resource policy and owner account, for the identity check."""
+    _, sep, ref = resource_arn.partition(":function:")
+    func = _functions.get(_resolve_request_scoped_name(unquote(ref))) if sep else None
+    if func is None:
+        return None
+    return func["policy"], get_account_id()
+
+
 def _get_policy(
     func_name: str,
     query_params: dict | None = None,
@@ -6293,6 +6384,11 @@ def _publish_layer_version(layer_name: str, data: dict):
             "CompatibleArchitectures list length exceeds maximum allowed length of 2.",
             400,
         )
+    content = data.get("Content", {})
+    if "S3Bucket" in content and "S3Key" in content:
+        err = _s3_code_region_error(content["S3Bucket"], layer=True)
+        if err is not None:
+            return err
 
     if layer_name not in _layers:
         _layers[layer_name] = {"versions": [], "next_version": 1}
@@ -6375,6 +6471,18 @@ def _list_layer_versions(layer_name: str, query_params: dict):
     if start + max_items < len(all_versions):
         result["NextMarker"] = str(page[-1]["Version"]) if page else ""
     return json_response(result)
+
+
+def _layer_name_too_long(layer_name: str):
+    """GetLayerVersion's 140-character LayerName limit, checked before the version."""
+    if len(layer_name) <= 140:
+        return None
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value '{layer_name}' at 'layerName' failed to "
+        "satisfy constraint: Member must have length less than or equal to 140",
+        400,
+    )
 
 
 def _get_layer_version(layer_name: str, version: int):
@@ -7901,7 +8009,7 @@ def _create_function_url_config(func_name: str, data: dict, qualifier: str | Non
             "ResourceConflictException", f"Function URL config already exists for {func_name}", 409
         )
     cfg = {
-        "FunctionUrl": f"https://{new_uuid()}.lambda-url.{get_region()}.on.aws/",
+        "FunctionUrl": f"https://{_new_function_url_id()}.lambda-url.{get_region()}.on.aws/",
         "FunctionArn": _func_arn(func_name),
         "AuthType": data.get("AuthType", "NONE"),
         "InvokeMode": data.get("InvokeMode", "BUFFERED"),
@@ -7971,6 +8079,15 @@ _STREAM_PRELUDE_SEPARATOR = b"\x00" * 8
 # Content types a Function URL delivers to the handler as a UTF-8 string rather
 # than base64. Function URLs use payload format 2.0, same rule as HTTP API v2.
 _FUNCTION_URL_TEXT_TYPES = ("application/json", "application/xml", "application/javascript")
+
+
+def _new_function_url_id() -> str:
+    # AWS's URL ids are 32 lowercase letters and digits.
+    return "".join(secrets.choice("abcdefghijklmnopqrstuvwxyz0123456789") for _ in range(32))
+
+
+def _function_url_trace_root() -> str:
+    return "Root=1-%08x-%s" % (int(time.time()), secrets.token_hex(12))
 
 
 def _function_url_id(function_url: str) -> str:
@@ -8061,6 +8178,9 @@ def _build_function_url_event(
     headers: dict,
     body: bytes,
     query_params: dict,
+    source_ip: str = "127.0.0.1",
+    anonymous: bool = False,
+    trace_root: str = "",
 ) -> dict:
     """Build the payload-format-2.0 event a Function URL delivers.
 
@@ -8080,14 +8200,28 @@ def _build_function_url_event(
         req_body, is_base64 = None, False
 
     domain_name = f"{url_id}.lambda-url.{region}.on.aws"
+    # The fields the Function URL front end sets: X-Forwarded-For keeps only the
+    # first address it was sent, or names the caller.
+    event_headers = {k.lower(): v for k, v in headers.items()}
+    first_hop = (event_headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    event_headers.update({
+        "host": domain_name,
+        "x-amzn-tls-cipher-suite": "TLS_AES_128_GCM_SHA256",
+        "x-amzn-tls-version": "TLSv1.3",
+        "x-amzn-trace-id": trace_root or _function_url_trace_root(),
+        "x-forwarded-for": first_hop or source_ip,
+        "x-forwarded-port": "443",
+        "x-forwarded-proto": "https",
+    })
     event = {
         "version": "2.0",
         "routeKey": "$default",
         "rawPath": path,
         "rawQueryString": raw_qs,
-        "headers": dict(headers),
+        "headers": event_headers,
         "requestContext": {
-            "accountId": account_id,
+            # A URL with AuthType NONE reports the caller's account as "anonymous".
+            "accountId": "anonymous" if anonymous else account_id,
             "apiId": url_id,
             "domainName": domain_name,
             "domainPrefix": url_id,
@@ -8095,7 +8229,7 @@ def _build_function_url_event(
                 "method": method,
                 "path": path,
                 "protocol": "HTTP/1.1",
-                "sourceIp": "127.0.0.1",
+                "sourceIp": source_ip,
                 "userAgent": headers.get("user-agent", ""),
             },
             "requestId": new_uuid(),
@@ -8117,7 +8251,7 @@ def _build_function_url_event(
 
 async def handle_function_url_request(
     url_id: str, method: str, path: str, headers: dict, body: bytes, query_params: dict,
-    resolved: tuple | None = None,
+    resolved: tuple | None = None, source_ip: str | None = None,
 ) -> tuple:
     """Serve a Lambda Function URL data-plane request.
 
@@ -8135,24 +8269,35 @@ async def handle_function_url_request(
     if method == "OPTIONS" and cfg.get("Cors"):
         return 200, cors_headers, b""
 
+    request_id = new_uuid()
     if cfg.get("AuthType") == "AWS_IAM" and not _function_url_is_signed(headers, query_params):
-        return 403, {"Content-Type": "application/json", **cors_headers}, json.dumps({"Message": "Forbidden"}).encode()
+        return 403, {"Content-Type": "application/json", "x-amzn-RequestId": request_id,
+                     "x-amzn-ErrorType": "AccessDeniedException", **cors_headers}, b'{"Message":"Forbidden"}'
 
     function_ref = f"{func_name}:{qualifier}" if qualifier else func_name
     func_data, func_config, _ = _get_func_record_for_ref_in_scope(function_ref, account_id=account_id, region=region)
     if func_data is None or func_config is None:
         return error_response_json("ResourceNotFoundException", f"Function not found: {func_name}", 404)
 
-    event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params)
+    trace_root = _function_url_trace_root()
+    event = _build_function_url_event(url_id, account_id, region, method, path, headers, body, query_params,
+                                      source_ip=source_ip or get_request_client_ip(),
+                                      anonymous=cfg.get("AuthType") == "NONE", trace_root=trace_root)
+    event["requestContext"]["requestId"] = request_id
     exec_record = _execution_record_for_config(func_data, func_config)
     result = await run_reentrant(_execute_function_with_config_scope, exec_record, event,
                                  thread_name="ministack-lambda-url")
 
+    lineage = "%08x" % zlib.crc32(func_config.get("FunctionArn", func_name).encode())
+    invoke_headers = {"x-amzn-RequestId": request_id,
+                      "X-Amzn-Trace-Id": f"{trace_root};Parent={secrets.token_hex(8)};Sampled=0;Lineage=1:{lineage}:0"}
     if cfg.get("InvokeMode") == "RESPONSE_STREAM" and not result.get("error") and not result.get("throttle"):
-        return _function_url_stream_response(result, cors_headers)
-
-    proxy_response, _ = lambda_execute_result_to_api_proxy_response(result)
-    return _function_url_proxy_response(proxy_response, cors_headers)
+        status, resp_headers, data = _function_url_stream_response(result, cors_headers)
+    else:
+        proxy_response, _ = lambda_execute_result_to_api_proxy_response(result)
+        status, resp_headers, data = _function_url_proxy_response(proxy_response, cors_headers)
+    _apply_headers_case_insensitively(resp_headers, invoke_headers)
+    return status, resp_headers, data
 
 
 def _apply_headers_case_insensitively(base: dict, overrides: dict) -> None:

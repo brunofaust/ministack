@@ -27,14 +27,24 @@ import json
 import logging
 import os
 import random
+import re
 import socket
 import string
 import time
+import warnings
 from urllib.parse import parse_qs, urlencode
+from xml.sax.saxutils import escape as _esc
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.concurrency import run_reentrant
-from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    get_request_client_ip,
+    new_uuid,
+)
 
 logger = logging.getLogger("alb")
 
@@ -342,7 +352,17 @@ def _parse_conditions(params, prefix="Conditions"):
         field = _p(params, f"{base}.Field")
         if not field:
             break
-        conditions.append({"Field": field, "Values": _parse_condition_values(params, base)})
+        condition = {"Field": field, "Values": _parse_condition_values(params, base)}
+        if field == "http-header":
+            values, j = [], 1
+            while value := _p(params, f"{base}.HttpHeaderConfig.Values.member.{j}"):
+                values.append(value)
+                j += 1
+            condition["HttpHeaderConfig"] = {
+                "HttpHeaderName": _p(params, f"{base}.HttpHeaderConfig.HttpHeaderName"),
+                "Values": values,
+            }
+        conditions.append(condition)
         i += 1
     return conditions
 
@@ -396,10 +416,11 @@ def _empty(action):
 
 
 def _error(code, message, status=400):
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     body = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
         f'<ErrorResponse xmlns="{NS}">'
-        f'<Error><Code>{code}</Code><Message>{message}</Message></Error>'
+        f'<Error><Type>{"Sender" if status < 500 else "Receiver"}</Type>'
+        f'<Code>{code}</Code><Message>{_esc(message, {chr(34): "&quot;"})}</Message></Error>'
         f'<RequestId>{new_uuid()}</RequestId>'
         f'</ErrorResponse>'
     ).encode("utf-8")
@@ -508,17 +529,66 @@ def _action_xml(a):
     return f"<member>{inner}</member>"
 
 
+# Security policy for HTTPS/TLS listeners created without one: the AWS docs
+# name ELBSecurityPolicy-2016-08 as the default for listeners created through
+# the API, CLI or CloudFormation (the console uses a newer one).
+_DEFAULT_SSL_POLICY = "ELBSecurityPolicy-2016-08"
+_SECURE_PROTOCOLS = ("HTTPS", "TLS")
+
+
 def _listener_xml(l):
     acts = "".join(_action_xml(a) for a in l.get("DefaultActions", []))
+    certs = "".join(
+        f"<member><CertificateArn>{_esc(arn)}</CertificateArn></member>"
+        for arn in l.get("Certificates", [])
+    )
+    certs_xml = f"<Certificates>{certs}</Certificates>" if certs else ""
+    policy_xml = f"<SslPolicy>{_esc(l['SslPolicy'])}</SslPolicy>" if l.get("SslPolicy") else ""
+    # Member order follows the botocore Listener shape.
     return (
         f"<member>"
         f"<ListenerArn>{l['ListenerArn']}</ListenerArn>"
         f"<LoadBalancerArn>{l['LoadBalancerArn']}</LoadBalancerArn>"
         f"<Port>{l.get('Port',80)}</Port>"
         f"<Protocol>{l.get('Protocol','HTTP')}</Protocol>"
+        f"{certs_xml}{policy_xml}"
         f"<DefaultActions>{acts}</DefaultActions>"
         f"</member>"
     )
+
+
+def _parse_certificate_arns(params, prefix="Certificates"):
+    arns, i = [], 1
+    while _p(params, f"{prefix}.member.{i}.CertificateArn"):
+        arns.append(_p(params, f"{prefix}.member.{i}.CertificateArn"))
+        i += 1
+    return arns
+
+
+def _default_certificate(params):
+    """The listener's default certificate from ``Certificates``, which takes
+    exactly one entry. Returns ``(arns, error)``."""
+    certs = _parse_certificate_arns(params)
+    if len(certs) > 1:
+        return None, _error(
+            "TooManyCertificates",
+            f"Up to '1' certificate ARNs can be specified, but '{len(certs)}' were specified")
+    return certs, None
+
+
+def _apply_tls_settings(listener, certs, policy):
+    """Store ``SslPolicy`` and the default certificate on an HTTPS/TLS
+    listener, defaulting the policy when none is set. Any other protocol keeps
+    no TLS settings, so a listener moved to HTTP/TCP loses them."""
+    if listener.get("Protocol") not in _SECURE_PROTOCOLS:
+        listener.pop("SslPolicy", None)
+        listener.pop("Certificates", None)
+        return
+    if certs:
+        listener["Certificates"] = certs
+    if policy:
+        listener["SslPolicy"] = policy
+    listener.setdefault("SslPolicy", _DEFAULT_SSL_POLICY)
 
 
 def _condition_xml(c):
@@ -535,12 +605,219 @@ def _condition_xml(c):
     config_key = _CONDITION_VALUE_KEYS.get(c.get("Field"))
     if config_key:
         xml += f"<{config_key}><Values>{members}</Values></{config_key}>"
+    header = c.get("HttpHeaderConfig")
+    if header:
+        header_values = "".join(f"<member>{_esc(v)}</member>" for v in header.get("Values", []))
+        xml += (f"<HttpHeaderConfig><HttpHeaderName>{_esc(header.get('HttpHeaderName', ''))}</HttpHeaderName>"
+                f"<Values>{header_values}</Values></HttpHeaderConfig>")
     return xml + "</member>"
 
 
-def _rule_xml(r):
+# Rule transforms, stored and returned in the RuleTransform shape. The data
+# plane does not apply them: requests reach targets unrewritten. Codes,
+# messages and check order are as captured against AWS in us-east-1.
+_TRANSFORM_CONFIG_KEYS = {
+    "url-rewrite": "UrlRewriteConfig",
+    "host-header-rewrite": "HostHeaderRewriteConfig",
+}
+_REWRITE_MAX_LEN = 1024
+# Members in the order AWS lists their "validation error detected" messages.
+_TRANSFORM_MODEL_CONFIGS = (("HostHeaderRewriteConfig", "hostHeaderRewriteConfig"),
+                            ("UrlRewriteConfig", "urlRewriteConfig"))
+# Groups AWS refuses that Python's re accepts: lookarounds, atomic groups,
+# comments, conditionals and named backreferences.
+_REGEX_REFUSED_GROUPS = ("(?=", "(?!", "(?<=", "(?<!", "(?>", "(?#", "(?(", "(?P=", "(?|")
+
+
+def _parse_transforms(params, prefix="Transforms"):
+    """Read Transforms.member.N from Query params into
+    [{"Type", "UrlRewriteConfig"|"HostHeaderRewriteConfig": {"Rewrites": [{"Regex", "Replace"}]}}].
+    Returns None when the request carries no Transforms, and [] for an empty
+    list (a blank ``Transforms=``). An absent Type, Regex or Replace is None,
+    and a config is present when any of its keys is, even a blank ``Rewrites=``."""
+    members = {}
+    head = re.compile(rf"^{re.escape(prefix)}\.member\.(\d+)\.(.+)$")
+    for key in params:
+        m = head.match(key)
+        if m:
+            members.setdefault(int(m.group(1)), {})[m.group(2)] = _p(params, key)
+    if not members:
+        return [] if prefix in params else None
+    transforms = []
+    for i in sorted(members):
+        fields = members[i]
+        transform = {"Type": fields.get("Type")}
+        for config in _TRANSFORM_CONFIG_KEYS.values():
+            rewrites = {}
+            # A rewrite member exists when any of its keys does, even one AWS ignores.
+            rw = re.compile(rf"^{config}\.Rewrites\.member\.(\d+)\.(.+)$")
+            for field, value in fields.items():
+                m = rw.match(field)
+                if m:
+                    rewrites.setdefault(int(m.group(1)), {})[m.group(2)] = value
+            if rewrites or any(f.startswith(f"{config}.") for f in fields):
+                transform[config] = {"Rewrites": [
+                    {"Regex": rewrites[j].get("Regex"), "Replace": rewrites[j].get("Replace")}
+                    for j in sorted(rewrites)
+                ]}
+        transforms.append(transform)
+    return transforms
+
+
+def _transforms_model_error(transforms):
+    """The request-model check AWS runs before anything else: Type is set and
+    in the enum, and every rewrite has a Regex and a Replace. AWS lists at
+    most ten problems."""
+    errors = []
+    for i, transform in enumerate(transforms, 1):
+        member = f"transforms.{i}.member"
+        for config, path in _TRANSFORM_MODEL_CONFIGS:
+            for j, rewrite in enumerate((transform.get(config) or {}).get("Rewrites", []), 1):
+                for field in ("Regex", "Replace"):
+                    if rewrite.get(field) is None:
+                        errors.append(f"Value null at '{member}.{path}.rewrites.{j}.member.{field.lower()}' "
+                                      "failed to satisfy constraint: Member must not be null")
+        t_type = transform.get("Type")
+        if t_type is None:
+            errors.append(f"Value null at '{member}.type' failed to satisfy constraint: Member must not be null")
+        elif t_type not in _TRANSFORM_CONFIG_KEYS:
+            errors.append(f"Value '{t_type}' at '{member}.type' failed to satisfy constraint: "
+                          "Member must satisfy enum value set: [url-rewrite, host-header-rewrite]")
+    if not errors:
+        return None
+    errors = errors[:10]
+    return (f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+            + "; ".join(errors))
+
+
+def _regex_invalid(regex):
+    """Whether AWS refuses a rewrite Regex as invalid. Python's re checks the
+    syntax once the AWS spellings it lacks are rewritten: (?<name>...),
+    \\x{41}, \\z, (?R) and the inline flags i, m, s, x, u and U anywhere. AWS
+    refuses whitespace, backreferences, \\Z and a "{" that opens no {n} or
+    {n,m}, and accepts stacked quantifiers such as a** or a{2}{3}."""
+    if any(ch.isspace() for ch in regex):
+        return True
+    out, i, n, class_start = [], 0, len(regex), None
+    while i < n:
+        c = regex[i]
+        if c == "\\":
+            e = regex[i + 1:i + 2]
+            if not e or e in "0123456789kZ":
+                return True
+            m = re.match(r"\{([0-9A-Fa-f]{1,8})\}", regex[i + 2:]) if e == "x" else None
+            if m:
+                out.append(f"\\U{int(m.group(1), 16):08x}")
+                i += 2 + len(m.group(0))
+                continue
+            out.append("\\Z" if e == "z" and class_start is None else regex[i:i + 2])
+            i += 2
+            continue
+        if class_start is not None:
+            # A "]" right after "[" or "[^" is a literal; "[:alpha:]" is a POSIX class.
+            posix = re.match(r"\[:\^?[A-Za-z]*:\]", regex[i:]) if c == "[" else None
+            if posix:
+                out.append(posix.group(0))
+                i += len(posix.group(0))
+                continue
+            if c == "]" and i > class_start + 1 and not (i == class_start + 2 and regex[class_start + 1] == "^"):
+                class_start = None
+            out.append(c)
+            i += 1
+            continue
+        if c == "[":
+            class_start = i
+        elif regex.startswith(_REGEX_REFUSED_GROUPS, i):
+            return True
+        elif regex.startswith("(?R)", i):
+            i += 4
+            continue
+        elif regex.startswith("(?<", i):
+            out.append("(?P<")
+            i += 3
+            continue
+        elif c == "(" and (m := re.match(r"\(\?([a-zA-Z-]*)([:)])", regex[i:])):
+            # The flags AWS accepted; it refused Q, z, q, a, L, n, J and an empty (?).
+            if m.group(2) == ")" and not m.group(1) or set(m.group(1)) - set("imsxuU-"):
+                return True
+            out.append("(?:" if m.group(2) == ":" else "")
+            i += len(m.group(0))
+            continue
+        elif c == "{" and not re.match(r"\{\d+(?:,\d*)?\}", regex[i:]):
+            return True
+        out.append(c)
+        i += 1
+    if class_start is not None:
+        return True
+    # AWS accepts a quantifier stacked on another (a**, a{2}{3}); re refuses it,
+    # so drop each one re points at and look for any other error.
+    pattern = "".join(out)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        while True:
+            try:
+                re.compile(pattern)
+                return False
+            except re.error as exc:
+                if exc.msg != "multiple repeat" or exc.pos is None:
+                    return True
+                stacked = re.match(r"\{\d+(?:,\d*)?\}|[*+?]", pattern[exc.pos:])
+                if not stacked:
+                    return True
+                pattern = pattern[:exc.pos] + pattern[exc.pos + len(stacked.group(0)):]
+
+
+def _transforms_problem(transforms):
+    """Why AWS refuses a list of transforms that passed the model check, or None."""
+    types = [t["Type"] for t in transforms]
+    if len(set(types)) != len(types):
+        return "A rule can only have one transform of each type"
+    for transform in transforms:
+        t_type = transform["Type"]
+        config = _TRANSFORM_CONFIG_KEYS[t_type]
+        if config not in transform:
+            return f"For transforms of type '{t_type}', you must specify the following field(s): '{config}'"
+        other = [c for c in _TRANSFORM_CONFIG_KEYS.values() if c != config and c in transform]
+        if other:
+            return f"A transform of type '{t_type}' does not support the following field(s): '{other[0]}'"
+        rewrites = transform[config]["Rewrites"]
+        if len(rewrites) != 1:
+            return "Rule transforms must have exactly one Rewrite"
+        regex, replace = rewrites[0]["Regex"], rewrites[0]["Replace"]
+        if len(replace) > _REWRITE_MAX_LEN:
+            return "A transform rewrite Replace value must be between 0 and 1024 characters in length"
+        if not all("!" <= ch <= "~" for ch in replace):
+            return ("A transform rewrite Replace value may only consist of non-whitespace "
+                    "printable ASCII characters")
+        if not regex or len(regex) > _REWRITE_MAX_LEN:
+            return "A transform rewrite Regex value must be between 1 and 1024 characters in length"
+        if not regex.isascii():
+            return ("Transform rewrite regex values can not be empty, and can only contain "
+                    "non-whitespace ASCII 128 characters")
+        if _regex_invalid(regex):
+            return "One or more provided transform rewrite Regex values are invalid"
+    return None
+
+
+def _transform_xml(t):
+    inner = ""
+    for config in _TRANSFORM_CONFIG_KEYS.values():
+        if config in t:
+            rewrites = "".join(
+                f"<member><Regex>{_esc(r.get('Regex', ''))}</Regex>"
+                f"<Replace>{_esc(r.get('Replace', ''))}</Replace></member>"
+                for r in t[config].get("Rewrites", [])
+            )
+            inner += f"<{config}><Rewrites>{rewrites}</Rewrites></{config}>"
+    return f"<member>{inner}<Type>{_esc(t['Type'])}</Type></member>"
+
+
+def _rule_xml(r, with_transforms=True):
     conds = "".join(_condition_xml(c) for c in r.get("Conditions", []))
     acts = "".join(_action_xml(a) for a in r.get("Actions", []))
+    # SetRulePriorities' rules carry no Transforms element on AWS.
+    transforms = ("<Transforms>" + "".join(_transform_xml(t) for t in r.get("Transforms", []))
+                  + "</Transforms>") if with_transforms else ""
     return (
         f"<member>"
         f"<RuleArn>{r['RuleArn']}</RuleArn>"
@@ -548,6 +825,7 @@ def _rule_xml(r):
         f"<Conditions>{conds}</Conditions>"
         f"<Actions>{acts}</Actions>"
         f"<IsDefault>{str(r.get('IsDefault',False)).lower()}</IsDefault>"
+        f"{transforms}"
         f"</member>"
     )
 
@@ -597,6 +875,16 @@ def _describe_lbs(params):
         if not results:
             return _error("LoadBalancerNotFound", "One or more load balancers not found", 400)
     if name_filter:
+        # AWS validates the name before checking existence — evidence: real
+        # AWS wire capture answered ValidationError for a name over 32
+        # chars.
+        for name in name_filter:
+            if len(name) > 32:
+                return _error(
+                    "ValidationError",
+                    f"The load balancer name '{name}' cannot be longer than '32' characters",
+                    400,
+                )
         results = [lb for lb in results if lb["LoadBalancerName"] in name_filter]
         if not results:
             return _error("LoadBalancerNotFound", "One or more load balancers not found", 400)
@@ -779,6 +1067,9 @@ def _create_listener(params):
     lb_arn = _p(params, "LoadBalancerArn")
     if lb_arn not in _lbs:
         return _error("LoadBalancerNotFound", f"Load balancer '{lb_arn}' not found.")
+    certs, err = _default_certificate(params)
+    if err:
+        return err
     lid = _short_id()
     lb = _lbs[lb_arn]
     lb_name = lb["LoadBalancerName"]
@@ -797,6 +1088,7 @@ def _create_listener(params):
         "Protocol": _p(params, "Protocol", "HTTP"),
         "DefaultActions": actions,
     }
+    _apply_tls_settings(listener, certs, _p(params, "SslPolicy"))
     _listeners[l_arn] = listener
     _listener_attrs[l_arn] = [
         {"Key": "routing.http.response.server.enabled", "Value": "true"},
@@ -831,12 +1123,16 @@ def _modify_listener(params):
     listener = _listeners.get(arn)
     if not listener:
         return _error("ListenerNotFound", f"Listener '{arn}' not found.")
+    certs, err = _default_certificate(params)
+    if err:
+        return err
     port = _p(params, "Port")
     if port:
         listener["Port"] = int(port)
     protocol = _p(params, "Protocol")
     if protocol:
         listener["Protocol"] = protocol
+    _apply_tls_settings(listener, certs, _p(params, "SslPolicy"))
     actions = _parse_actions(params, "DefaultActions")
     if actions:
         listener["DefaultActions"] = actions
@@ -897,8 +1193,26 @@ def _modify_listener_attrs(params):
 # Rule handlers
 # ---------------------------------------------------------------------------
 
+def _load_balancer_missing(arn):
+    """Whether a listener or rule ARN names a load balancer that doesn't
+    exist. AWS answers ListenerNotFound or RuleNotFound for that right after
+    the model check; on a load balancer that exists, a missing listener or
+    rule is only reported after every other check."""
+    m = re.match(r"^(arn:[^:]+:elasticloadbalancing:[^:]*:[^:]*:)listener(?:-rule)?/([^/]+/[^/]+/[^/]+)/", arn)
+    return bool(m) and f"{m.group(1)}loadbalancer/{m.group(2)}" not in _lbs
+
+
 def _create_rule(params):
     l_arn = _p(params, "ListenerArn")
+    transforms = _parse_transforms(params) or []
+    problem = _transforms_model_error(transforms)
+    if problem:
+        return _error("ValidationError", problem)
+    if _load_balancer_missing(l_arn):
+        return _error("ListenerNotFound", f"Listener '{l_arn}' not found.")
+    problem = _transforms_problem(transforms)
+    if problem:
+        return _error("ValidationError", problem)
     if l_arn not in _listeners:
         return _error("ListenerNotFound", f"Listener '{l_arn}' not found.")
     listener = _listeners[l_arn]
@@ -915,6 +1229,7 @@ def _create_rule(params):
         "Conditions": _parse_conditions(params),
         "Actions": _parse_actions(params, "Actions"),
         "IsDefault": False,
+        "Transforms": transforms,
     }
     _rules[rule_arn] = rule
     _tags[rule_arn] = _parse_tags(params)
@@ -934,15 +1249,36 @@ def _describe_rules(params):
 
 def _modify_rule(params):
     arn = _p(params, "RuleArn")
+    transforms = _parse_transforms(params)
+    reset_transforms = _p(params, "ResetTransforms").lower() == "true"
+    problem = _transforms_model_error(transforms or [])
+    if problem:
+        return _error("ValidationError", problem)
+    if _load_balancer_missing(arn):
+        return _error("RuleNotFound", f"Rule '{arn}' not found.")
+    # An empty Transforms list counts as given here, but changes nothing below.
+    if transforms is not None and reset_transforms:
+        return _error("ValidationError", "Transforms cannot be provided when resetting transforms")
+    problem = _transforms_problem(transforms or [])
+    if problem:
+        return _error("ValidationError", problem)
+    conds = _parse_conditions(params)
+    acts = _parse_actions(params, "Actions")
+    if not (conds or acts or transforms or reset_transforms):
+        return _error("ValidationError", "You must provide either conditions, actions, or transforms")
     rule = _rules.get(arn)
     if not rule:
         return _error("RuleNotFound", f"Rule '{arn}' not found.")
-    conds = _parse_conditions(params)
+    if rule.get("IsDefault"):
+        return _error("OperationNotPermitted", f"Default rule '{arn}' cannot be modified")
     if conds:
         rule["Conditions"] = conds
-    acts = _parse_actions(params, "Actions")
     if acts:
         rule["Actions"] = acts
+    if transforms:
+        rule["Transforms"] = transforms
+    elif reset_transforms:
+        rule["Transforms"] = []
     return _xml(200, "ModifyRule", f"<Rules>{_rule_xml(rule)}</Rules>")
 
 
@@ -967,7 +1303,7 @@ def _set_rule_priorities(params):
             updated.append(_rules[arn])
         i += 1
     return _xml(200, "SetRulePriorities",
-                f"<Rules>{''.join(_rule_xml(r) for r in updated)}</Rules>")
+                f"<Rules>{''.join(_rule_xml(r, with_transforms=False) for r in updated)}</Rules>")
 
 
 # ---------------------------------------------------------------------------
@@ -1193,8 +1529,13 @@ async def handle_request(method, path, headers, body, query_params):
     params = dict(query_params)
     if method == "POST" and body:
         raw = body if isinstance(body, str) else body.decode("utf-8", errors="replace")
-        for k, v in parse_qs(raw).items():
-            params[k] = v
+        # Blank values are kept for Transforms only: an empty Replace, Regex,
+        # Rewrites or Transforms list is a different request from an absent one.
+        for k, v in parse_qs(raw, keep_blank_values=True).items():
+            if not k.startswith("Transforms"):
+                v = [x for x in v if x]
+            if v:
+                params[k] = v
     action = _p(params, "Action")
     handler = _ACTION_MAP.get(action)
     if not handler:
@@ -1228,6 +1569,11 @@ def _find_lb_by_name(name):
 # Data-plane: rule matching
 # ---------------------------------------------------------------------------
 
+def _header_value_matches(actual, pattern):
+    regex = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
+    return re.fullmatch(regex, actual, re.IGNORECASE | re.DOTALL) is not None
+
+
 def _match_condition(cond, method, path, headers, query_params):
     field = cond.get("Field", "")
     values = cond.get("Values", [])
@@ -1258,11 +1604,12 @@ def _match_condition(cond, method, path, headers, query_params):
         return True
 
     if field == "http-header":
-        cfg = cond.get("HttpHeaderConfig", {})
-        hname = cfg.get("HttpHeaderName", "").lower()
-        hvals = cfg.get("Values", values)
-        actual = headers.get(hname, "")
-        return any(fnmatch.fnmatch(actual, v) for v in hvals)
+        # Case-insensitive name and values; only * and ? are wildcards.
+        cfg = cond.get("HttpHeaderConfig") or {}
+        actual = headers.get(cfg.get("HttpHeaderName", "").lower())
+        if actual is None:
+            return False
+        return any(_header_value_matches(actual, v) for v in cfg.get("Values") or values)
 
     # source-ip is not implemented (no real network in emulator) — always matches.
     # Unknown condition types also always match to avoid silently dropping traffic.
@@ -1846,8 +2193,8 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     ip target groups, or any resolvable hostname for instance target
     groups (an emulator has no EC2 metadata to resolve instance ids
     against, so a hostname is the useful interpretation). Mirrors ALB
-    behavior: hop-by-hop headers are stripped, X-Forwarded-* and
-    X-Amzn-Trace-Id are injected, target HTTP errors pass through, and
+    behavior: hop-by-hop headers are stripped (dispatch_request has already
+    set X-Forwarded-* and X-Amzn-Trace-Id), target HTTP errors pass through, and
     connection failures surface as 502.
     """
     import http.client
@@ -1860,14 +2207,7 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 
     hop_by_hop = {"host", "content-length", "connection", "transfer-encoding",
                   "accept-encoding"}
-    fwd = {k: v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
-    fwd["X-Forwarded-For"] = (headers or {}).get("x-forwarded-for") or "127.0.0.1"
-    fwd.setdefault("X-Forwarded-Proto", "http")
-    fwd.setdefault("X-Forwarded-Port", "80")
-    fwd["X-Amzn-Trace-Id"] = "Root=1-%08x-%s" % (
-        int(time.time()),
-        "".join(random.choices("0123456789abcdef", k=24)),
-    )
+    fwd = {k.lower(): v for k, v in (headers or {}).items() if k.lower() not in hop_by_hop}
 
     data = body if isinstance(body, (bytes, bytearray)) else (body.encode() if body else None)
 
@@ -1875,8 +2215,9 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
     # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-troubleshooting.html#http-504-issues
     from ministack.core.responses import StreamingResponse
 
+    conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
+
     def _open():
-        conn = http.client.HTTPConnection(host, port, timeout=TARGET_CONNECT_TIMEOUT)
         try:
             conn.connect()
             sock = conn.sock
@@ -1886,10 +2227,18 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
         except Exception as e:
             with contextlib.suppress(Exception):
                 conn.close()
-            return None, None, None, e
-        return conn, resp, sock, None
+            return None, None, e
+        return resp, sock, None
 
-    conn, resp, sock, err = await asyncio.to_thread(_open)
+    opening = asyncio.ensure_future(asyncio.to_thread(_open))
+    try:
+        resp, sock, err = await asyncio.shield(opening)
+    except asyncio.CancelledError:
+        # The caller gave up: unblock the read and close once the thread returns.
+        with contextlib.suppress(Exception):
+            conn.sock.shutdown(socket.SHUT_RDWR)
+        opening.add_done_callback(lambda _: conn.close())
+        raise
     if resp is None:
         return (502, {"Content-Type": "application/json"},
                 json.dumps({"message": f"Target {host}:{port} connect error: {err}"}).encode())
@@ -1949,7 +2298,43 @@ async def _proxy_http_target(target, tg, method, path, headers, body, query_para
 # Data-plane: main dispatcher
 # ---------------------------------------------------------------------------
 
-async def dispatch_request(lb, method, path, headers, body, query_params, port=80):
+def _trace_id():
+    return "1-%08x-%s" % (int(time.time()), "".join(random.choices("0123456789abcdef", k=24)))
+
+
+def _lb_attr(lb_arn, key, default):
+    return next((a["Value"] for a in _lb_attrs.get(lb_arn, []) if a.get("Key") == key), default)
+
+
+def _target_headers(lb_arn, listener, headers, client_ip):
+    """The request fields a target receives: X-Forwarded-* and X-Amzn-Trace-Id set by the load balancer.
+
+    https://docs.aws.amazon.com/elasticloadbalancing/latest/application/x-forwarded-headers.html
+    https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-request-tracing.html
+    """
+    out = {k.lower(): v for k, v in (headers or {}).items()}
+    mode = _lb_attr(lb_arn, "routing.http.xff_header_processing.mode", "append")
+    xff = out.pop("x-forwarded-for", None)
+    if mode == "preserve" and xff:
+        out["x-forwarded-for"] = xff
+    elif mode == "append":
+        # An IPv6 address appended to an existing header is bracketed.
+        out["x-forwarded-for"] = f"{xff}, [{client_ip}]" if xff and ":" in client_ip else (
+            f"{xff}, {client_ip}" if xff else client_ip)
+    out["x-forwarded-proto"] = (listener.get("Protocol") or "HTTP").lower()
+    out["x-forwarded-port"] = str(listener.get("Port", 80))
+    fields = [f.strip() for f in (out.get("x-amzn-trace-id") or "").split(";") if f.strip()]
+    if any(f.startswith("Self=") for f in fields):
+        fields = [f"Self={_trace_id()}" if f.startswith("Self=") else f for f in fields]
+    elif any(f.startswith("Root=") for f in fields):
+        fields.insert(0, f"Self={_trace_id()}")
+    else:
+        fields.insert(0, f"Root={_trace_id()}")
+    out["x-amzn-trace-id"] = ";".join(fields)
+    return out
+
+
+async def dispatch_request(lb, method, path, headers, body, query_params, port=80, client_ip=None):
     lb_arn = lb["LoadBalancerArn"]
 
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
@@ -1977,8 +2362,10 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
             if actions:
+                target_headers = _target_headers(lb_arn, listener, headers,
+                                                 client_ip or get_request_client_ip())
                 return await _execute_actions(actions, method, path,
-                                              headers, body, query_params, port,
+                                              target_headers, body, query_params, port,
                                               lb_arn=lb.get("LoadBalancerArn", ""))
 
     return (502, {"Content-Type": "application/json"},
