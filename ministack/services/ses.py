@@ -15,6 +15,7 @@ v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             ListConfigurationSets, CreateConfigurationSetEventDestination,
             UpdateConfigurationSetEventDestination,
             DeleteConfigurationSetEventDestination,
+            PutConfigurationSetDeliveryOptions,
             CreateTemplate, GetTemplate, DeleteTemplate,
             ListTemplates, UpdateTemplate, GetIdentityDkimAttributes,
             SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled,
@@ -178,6 +179,7 @@ async def handle_request(method, path, headers, body, query_params):
         "CreateConfigurationSetEventDestination": _create_configuration_set_event_destination,
         "UpdateConfigurationSetEventDestination": _update_configuration_set_event_destination,
         "DeleteConfigurationSetEventDestination": _delete_configuration_set_event_destination,
+        "PutConfigurationSetDeliveryOptions": _put_configuration_set_delivery_options,
         "CreateTemplate": _create_template,
         "GetTemplate": _get_template,
         "DeleteTemplate": _delete_template,
@@ -974,12 +976,29 @@ def _describe_configuration_set(params):
         return _config_set_missing(name)
     result = f"<ConfigurationSet><Name>{cs['Name']}</Name></ConfigurationSet>"
     attr_names = _collect_list(params, "ConfigurationSetAttributeNames.member")
+    if "deliveryOptions" in attr_names and cs.get("DeliveryOptions"):
+        result += (f"<DeliveryOptions><TlsPolicy>{cs['DeliveryOptions']['TlsPolicy']}"
+                   f"</TlsPolicy></DeliveryOptions>")
     if "eventDestinations" in attr_names:
         destinations = cs.get("EventDestinations", {})
         members = "".join(_event_destination_xml(d) for d in destinations.values())
         result += f"<EventDestinations>{members}</EventDestinations>"
     return _xml(200, "DescribeConfigurationSetResponse",
                 f"<DescribeConfigurationSetResult>{result}</DescribeConfigurationSetResult>")
+
+
+def _put_configuration_set_delivery_options(params):
+    name = _p(params, "ConfigurationSetName")
+    cs = _configuration_sets.get(name)
+    if not cs:
+        return _config_set_missing(name)
+    tls = _p(params, "DeliveryOptions.TlsPolicy", "Optional")
+    if tls not in ("Require", "Optional"):
+        return _error("ValidationError",
+                      f"Invalid TlsPolicy {tls}; expected Require or Optional", 400)
+    cs["DeliveryOptions"] = {"TlsPolicy": tls}
+    return _xml(200, "PutConfigurationSetDeliveryOptionsResponse",
+                "<PutConfigurationSetDeliveryOptionsResult/>")
 
 
 def _list_configuration_sets(params):
