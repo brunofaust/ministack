@@ -1862,6 +1862,11 @@ def test_ecs_container_secret_ssm_valuefrom_is_region_scoped():
         # Full ARN resolves by the ARN's region regardless of request region.
         arn_cdef = {"secrets": [{"name": "DB_PASS", "valueFrom": east_arn}]}
         assert ecs_service._resolve_container_secrets(arn_cdef) == {"DB_PASS": "east-secret"}
+
+        # A SecureString reaches the container decrypted, as on AWS.
+        ssm_service._put_parameter({"Name": f"{name}-secure", "Type": "SecureString", "Value": "s3cr3t"})
+        assert ecs_service._resolve_container_secrets(
+            {"secrets": [{"name": "DB_PASS", "valueFrom": f"{name}-secure"}]}) == {"DB_PASS": "s3cr3t"}
     finally:
         ssm_service.reset()
         set_request_account_id(original_account)
@@ -4467,8 +4472,12 @@ def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
     fargate = [{"capacityProvider": "FARGATE", "weight": 1}]
     ecs.create_cluster(clusterName=cluster)
     ecs.create_cluster(clusterName=bare)
-    ecs.put_cluster_capacity_providers(cluster=cluster, capacityProviders=["FARGATE", "FARGATE_SPOT"],
-                                       defaultCapacityProviderStrategy=fargate)
+    put = ecs.put_cluster_capacity_providers(cluster=cluster, capacityProviders=["FARGATE", "FARGATE_SPOT"],
+                                             defaultCapacityProviderStrategy=fargate)["cluster"]
+    # #2455, captured on AWS: the cluster's default strategy also comes back with base 0.
+    with_base = [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
+    assert put["defaultCapacityProviderStrategy"] == with_base
+    assert ecs.describe_clusters(clusters=[cluster])["clusters"][0]["defaultCapacityProviderStrategy"] == with_base
     ecs.register_task_definition(family=cluster, requiresCompatibilities=["FARGATE"], networkMode="awsvpc",
                                  cpu="256", memory="512",
                                  containerDefinitions=[{"name": "app", "image": "nginx:alpine", "essential": True}])
@@ -4477,13 +4486,16 @@ def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
         created = ecs.create_service(cluster=cluster, serviceName="given", taskDefinition=cluster, desiredCount=0,
                                      capacityProviderStrategy=fargate, networkConfiguration=net)["service"]
         described = ecs.describe_services(cluster=cluster, services=["given"])["services"][0]
-        for svc in (created, described, created["deployments"][0]):
-            assert svc["capacityProviderStrategy"] == fargate
+        # #2455, captured on AWS: a strategy item without base is returned with base 0, in the service and its deployments.
+        for svc in (created, described, created["deployments"][0], described["deployments"][0]):
+            assert svc["capacityProviderStrategy"] == [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
             assert "launchType" not in svc
+        updated = ecs.update_service(cluster=cluster, service="given", capacityProviderStrategy=fargate)["service"]
+        assert updated["capacityProviderStrategy"] == [{"capacityProvider": "FARGATE", "weight": 1, "base": 0}]
 
         default = ecs.create_service(cluster=cluster, serviceName="default", taskDefinition=cluster,
                                      desiredCount=0, networkConfiguration=net)["service"]
-        assert default["capacityProviderStrategy"] == fargate and "launchType" not in default
+        assert default["capacityProviderStrategy"] == with_base and "launchType" not in default
         plain = ecs.create_service(cluster=bare, serviceName="plain", taskDefinition=cluster, desiredCount=0)["service"]
         assert plain["launchType"] == "EC2" and "capacityProviderStrategy" not in plain
 
@@ -4508,3 +4520,66 @@ def test_ecs_service_capacity_provider_strategy_replaces_the_launch_type(ecs):
                     ecs.delete_service(cluster=c, service=name, force=True)
                 except ClientError:
                     pass
+
+
+
+def test_ecs_runs_a_held_ecr_image_without_pulling(monkeypatch):
+    """A task image from this MiniStack's ECR is loaded into Docker and never pulled from the real registry."""
+    from unittest.mock import MagicMock
+
+    from ministack.services import ecr, ecs
+
+    uri = "111122223333.dkr.ecr.us-east-2.amazonaws.com/held:v1"
+    monkeypatch.setattr(ecr, "_held_image", lambda image: ("111122223333", "us-east-2", "held", "v1")
+                        if image == uri else None)
+    monkeypatch.setattr(ecr, "held_image_readable", lambda image, principal: True)
+    monkeypatch.setattr(ecr, "held_image_archive",
+                        lambda image, arch: (b"archive", "sha256:cfg") if arch == "arm64" else None)
+    client = MagicMock()
+    client.info.return_value = {"Architecture": "aarch64"}
+    ecs._run_docker_container(client, {"image": uri}, {}, refresh_image=True)
+    client.images.load.assert_called_once_with(b"archive")
+    client.images.pull.assert_not_called()
+    client.containers.run.assert_called_once_with(uri)
+
+    other = MagicMock(info=MagicMock(return_value={"Architecture": "x86_64"}))
+    with pytest.raises(ecs._ImagePullError):  # no image for this platform
+        ecs._run_docker_container(other, {"image": uri}, {}, refresh_image=True)
+    monkeypatch.setattr(ecr, "held_image_readable", lambda image, principal: False)
+    with pytest.raises(ecs._ImagePullError, match="repository policy"):
+        ecs._run_docker_container(client, {"image": uri}, {}, refresh_image=True)
+    other.images.pull.assert_not_called()
+
+
+@pytest.mark.auth_contract
+def test_ecr_held_image_from_another_account_needs_its_repository_policy(auth_enabled, monkeypatch):
+    """Under AUTH=true a task reads another account's MiniStack ECR image only when the repository policy
+    allows it, as on AWS; its own account's images and AUTH=false are always readable."""
+    from ministack.core.responses import request_scope
+    from ministack.services import ecr
+
+    monkeypatch.setattr("ministack.app.AUTH", True)
+    with request_scope("222233334444", "us-east-1"):
+        ecr._repositories["shared"] = {"repositoryName": "shared"}
+    uri = "222233334444.dkr.ecr.us-east-1.amazonaws.com/shared:v1"
+    reader = "arn:aws:iam::111122223333:role/exec"
+    try:
+        with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is False
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repo_policies["shared"] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                "Action": "ecr:BatchGetImage"}]})
+            assert ecr.held_image_readable(uri, "arn:aws:iam::222233334444:root") is True
+        with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is False  # layers need GetDownloadUrlForLayer too
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repo_policies["shared"] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"},
+                "Action": ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]}]})
+        with request_scope("111122223333", "us-east-1"):
+            assert ecr.held_image_readable(uri, reader) is True
+    finally:
+        with request_scope("222233334444", "us-east-1"):
+            ecr._repositories.pop("shared", None)
+            ecr._repo_policies.pop("shared", None)

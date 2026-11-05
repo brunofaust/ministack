@@ -128,6 +128,9 @@ _olap_requests: dict[tuple[str, str], dict] = {}
 _olap_requests_lock = threading.Lock()
 _OBJECT_LAMBDA_ALIAS_SUFFIX = "--ol-s3"
 
+# Account-level public access block, per account (it applies in every region): {"config": {flags}}.
+_account_public_access_block = AccountScopedDict()
+
 
 def object_lambda_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
     return f"arn:aws:s3-object-lambda:{region or get_region()}:{account_id or get_account_id()}:accesspoint/{name}"
@@ -434,6 +437,7 @@ _PERSISTED_BUCKET_DICTS = {
     "mrap_operations": _mrap_operations,
     "access_points": _access_points,
     "object_lambda_access_points": _object_lambda_access_points,
+    "account_public_access_block": _account_public_access_block,
 }
 
 
@@ -1016,6 +1020,23 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     return _read_body(bucket_name, key, obj)
 
 
+def _get_object_data_for_caller(bucket_name: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Object bytes as the current account may read them, or None.
+
+    A bucket name identifies one bucket for every account. A bucket that another
+    account owns answers only when the owner's ACLs or bucket policy allow the
+    caller's GetObject, as for an S3 request."""
+    owner = _bucket_owner_for_caller(bucket_name)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return _get_object_data(bucket_name, key, version_id)
+    query_params = {"versionId": version_id} if version_id else {}
+    if not _foreign_bucket_allows(owner, bucket_name, key, "GET", query_params, caller):
+        return None
+    with request_scope(owner, get_region()):
+        return _get_object_data(bucket_name, key, version_id)
+
+
 _ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
 # The permissions that answer an object read, FULL_CONTROL included.
 _ACL_READ_PERMS = ("READ", "FULL_CONTROL")
@@ -1048,7 +1069,9 @@ def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str,
 
 
 def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
-    """Whether the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    """Whether the account's, the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    if (_account_public_access_block.get_scoped(owner_account, None, "config") or {}).get(setting):
+        return True
     access_point = _request_access_point.get()
     # An access point's BlockPublicPolicy does not cover the bucket's policy.
     if access_point and access_point["Bucket"] == bucket_name and setting != "BlockPublicPolicy" and \
@@ -1084,10 +1107,17 @@ def _bucket_owner_account(name: str) -> str | None:
     within a partition" — so a name identifies one bucket, whoever asks. The
     store stays account-scoped; this is the index over it.
     """
-    for account_id, bucket_name in _buckets._data:
+    # A copy of the keys: internal reads call this from worker threads.
+    for account_id, bucket_name in list(_buckets._data):
         if bucket_name == name:
             return account_id
     return None
+
+
+def _bucket_owner_for_caller(name: str) -> str | None:
+    """The account whose bucket *name* the current caller reads: its own, else the owner, or None."""
+    caller = get_account_id()
+    return caller if _buckets.contains_scoped(caller, None, name) else _bucket_owner_account(name)
 
 
 # A Multi-Region Access Point or an object through it: arn:aws:s3::<account>:accesspoint/<alias>[/object/<key>].
@@ -1253,6 +1283,15 @@ def bucket_region(name: str) -> str | None:
     if record is None:
         return None
     return record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _bucket_region_for_caller(name: str) -> str | None:
+    """Home region of the bucket *name* that the current caller reads, in the account that owns it."""
+    owner = _bucket_owner_for_caller(name)
+    if owner is None:
+        return None
+    with request_scope(owner, get_region()):
+        return bucket_region(name)
 
 
 _REGION_LABEL_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+$")
@@ -1434,8 +1473,8 @@ def _validate_bucket_name(name: str) -> bool:
     return True
 
 
-def _upload_error(code: str, message: str, status: int, **fields) -> tuple:
-    """Error envelope observed on real S3 PutObject (Osaka, 2026-10-16)."""
+def _object_error(code: str, message: str, status: int, **fields) -> tuple:
+    """Error envelope observed on real S3 PUT/GET/DELETE (Osaka, 2026-10-16/18/23)."""
     request_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
     host_id = base64.b64encode(os.urandom(57)).decode()
     root = Element("Error")
@@ -1446,27 +1485,61 @@ def _upload_error(code: str, message: str, status: int, **fields) -> tuple:
                     "x-amz-id-2": host_id}, _xml_body(root)
 
 
-def validate_upload_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
-    """Before IAM, check ordinary header-signed uploads in S3's observed order.
+def is_standard_object_request(method: str, path: str, headers: dict, query_params: dict) -> bool:
+    """Limit error precedence changes to ordinary header-signed bucket/object calls."""
+    bucket, key = _parse_bucket_key(path, headers)
+    return (method in {"PUT", "GET", "HEAD", "DELETE"} and bool(bucket) and (bool(key) or method == "HEAD")
+            and "x-amz-copy-source" not in headers and not query_params.keys() - {"x-id"}
+            and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            and not bucket.endswith((_ACCESS_POINT_ALIAS_SUFFIX, _OBJECT_LAMBDA_ALIAS_SUFFIX)))
+
+
+def format_head_response(path: str, headers: dict, response: tuple) -> tuple:
+    """HEAD observations from real S3, Osaka, 2026-10-23: no error body or length.
+
+    Run after IAM as well as preflight so a HeadBucket denial exposes location,
+    without granting access. Successful HeadObject retains its object metadata.
+    """
+    bucket, key = _parse_bucket_key(path, headers)
+    status, response_headers, _ = response
+    response_headers = {k: v for k, v in response_headers.items()
+                        if k.lower() != "content-length" or (key and status in {200, 206})}
+    if status == 301 or status >= 400:
+        response_headers["Content-Type"] = "application/xml"
+    # Preflight already supplies S3 IDs. Normal handlers may supply a UUID,
+    # and IAM denials may supply none: normalize only those request IDs while
+    # retaining an existing HostId and any already compatible RequestId.
+    if not re.fullmatch(r"[A-Z0-9]{16}", response_headers.get("x-amz-request-id", "")):
+        response_headers["x-amz-request-id"] = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    if not response_headers.get("x-amz-id-2"):
+        response_headers["x-amz-id-2"] = base64.b64encode(os.urandom(57)).decode()
+    owner = _bucket_owner_account(bucket) if _validate_bucket_name(bucket) else None
+    if not key and owner is not None:
+        record = _buckets.get_scoped(owner, None, bucket)
+        response_headers["x-amz-bucket-region"] = record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        if status == 200:
+            response_headers["x-amz-bucket-arn"] = f"arn:aws:s3:::{bucket}"
+    return status, response_headers, b""
+
+
+def validate_object_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
+    """Before IAM, check ordinary header-signed object calls in S3's observed order.
 
     Called only with AUTH=true. Regional hosts distinguish the endpoint region
     from the signing region. The handler still enforces the bucket's home
-    region for bare local endpoints. Copy, multipart, presigned and
-    bucket-subresource requests keep their existing validation paths.
+    region for bare local endpoints. GET checks the signing region before the
+    bucket's home; PUT, HEAD and DELETE check the home first. Copy, multipart, presigned and
+    subresource requests keep their existing validation paths.
     """
     from ministack.core.iam_actions import _auth_failure
     from ministack.core.iam_evaluator import AuthError, authenticate
     from ministack.core.sigv4 import parse_header_signature
 
     bucket, key = _parse_bucket_key(path, headers)
-    if (method != "PUT" or not key or "x-amz-copy-source" in headers
-            or query_params.keys() - {"x-id"}
-            or not headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
+    if not is_standard_object_request(method, path, headers, query_params):
         return None
-    if bucket.endswith((_ACCESS_POINT_ALIAS_SUFFIX, _OBJECT_LAMBDA_ALIAS_SUFFIX)):
-        return None  # The S3 handler resolves access point aliases before bucket lookup.
     if not _validate_bucket_name(bucket):
-        return _upload_error("InvalidBucketName", "The specified bucket is not valid.", 400, BucketName=bucket)
+        return _object_error("InvalidBucketName", "The specified bucket is not valid.", 400, BucketName=bucket)
     signature = parse_header_signature(headers)
     if isinstance(signature, tuple):
         return None  # Keep the shared malformed-signature handling.
@@ -1476,17 +1549,25 @@ def validate_upload_request(method: str, path: str, headers: dict, query_params:
     regional = re.search(r"(?:^|\.)s3[.-]([a-z]{2}(?:-[a-z]+)+-\d+)\.(.+)$", host)
     if regional:
         endpoint_region, suffix = regional.groups()
+        if method == "GET" and signature.region != endpoint_region:
+            return _object_error(
+                "AuthorizationHeaderMalformed", "The authorization header is malformed; "
+                f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
+            )
         bucket_region = (record or {}).get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
         if record is not None and bucket_region != endpoint_region:
-            response = _upload_error(
+            endpoint = f"{bucket}.s3.{bucket_region}.{suffix}"
+            fields = ({"Bucket": bucket, "Endpoint": endpoint} if method == "GET"
+                      else {"Endpoint": endpoint, "Bucket": bucket})
+            response = _object_error(
                 "PermanentRedirect", "The bucket you are attempting to access must be addressed using the specified "
                 "endpoint. Please send all future requests to this endpoint.", 301,
-                Endpoint=f"{bucket}.s3.{bucket_region}.{suffix}", Bucket=bucket,
+                **fields,
             )
             response[1]["x-amz-bucket-region"] = bucket_region
             return response
         if signature.region != endpoint_region:
-            return _upload_error(
+            return _object_error(
                 "AuthorizationHeaderMalformed", "The authorization header is malformed; "
                 f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
             )
@@ -1496,9 +1577,9 @@ def validate_upload_request(method: str, path: str, headers: dict, query_params:
         fields = denied.details
         if code == "InvalidAccessKeyId":
             fields = {"AWSAccessKeyId": signature.access_key_id}
-        return _upload_error(code, message, status, **fields)
+        return _object_error(code, message, status, **fields)
     if record is None:
-        return _upload_error("NoSuchBucket", "The specified bucket does not exist", 404, BucketName=bucket)
+        return _object_error("NoSuchBucket", "The specified bucket does not exist", 404, BucketName=bucket)
     return None
 
 
@@ -2261,9 +2342,9 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     signature, or None when the request is not a SigV4 presigned URL (header-
     signed and anonymous requests are handled elsewhere / left lax).
 
-    MiniStack resolves root, IAM-user, and STS credentials before recomputing
-    the signature. Temporary credentials must include the exact session token
-    STS issued.
+    Expiry is checked in both AUTH modes. Under AUTH=true MiniStack resolves
+    root, IAM-user, and STS credentials before recomputing the signature, and
+    temporary credentials must include the exact session token STS issued.
     """
     signature = _qp(query_params, "X-Amz-Signature", "") or _qp(query_params, "x-amz-signature", "")
     if not signature:
@@ -2325,8 +2406,8 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
     session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
         query_params, "x-amz-security-token", ""
     )
-    # S3 presigned requests verify credentials even with AUTH disabled.
-    # Resolve their tenant here, without changing routing for other requests.
+    # Resolve the tenant of a presigned request here, without changing routing
+    # for other requests.
     try:
         owner = find_iam_access_key_account(_akid)
     except AmbiguousAccessKeyError:
@@ -2340,6 +2421,11 @@ def _verify_presigned_sigv4(method, path, headers, query_params):
         )
     if owner:
         set_request_account_id(owner)
+    from ministack.app import AUTH
+    if not AUTH:
+        # With AUTH off a presigned URL is trusted like a header-signed request:
+        # its key selects the tenant, and the credential and signature are not checked.
+        return None
     credential = resolve_credential(_akid, get_account_id(), session_token)
     if isinstance(credential, CredentialResolutionError):
         # S3's own error table: ExpiredToken and InvalidToken are 400, while
@@ -5062,12 +5148,17 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        # A new object: an overwritten one's tags do not carry over.
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
     elif grant_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
+    else:
+        _object_acl.pop((bucket_name, key, obj.get("version_id")), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -5468,8 +5559,12 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, version_id), None)
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    else:
+        _object_acl.pop((bucket_name, key, version_id), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -5627,12 +5722,16 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
-        status, err_headers, err_body = _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        # The response shape AWS gives a header-signed GET, whatever MiniStack's AUTH setting.
+        if (not query_params.keys() - {"x-id"}
+                and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
+            status, err_headers, err_body = _object_error(
+                "NoSuchKey", "The specified key does not exist.", 404, Key=key,
+            )
+        else:
+            status, err_headers, err_body = _error(
+                "NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}",
+            )
         # A key hidden by a delete marker announces the marker on its 404.
         err_headers.update(_delete_marker_404_headers(bucket_name, key))
         return status, err_headers, err_body
@@ -8668,6 +8767,15 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     if csum_err:
         return csum_err
 
+    # x-amz-tagging is validated here, as PutObject does, and stored on the
+    # upload until CompleteMultipartUpload cuts the object's version.
+    tags = None
+    tagging_header = headers.get("x-amz-tagging", "")
+    if tagging_header:
+        tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
+        if len(tags) > 10:
+            return _error("BadRequest", "Object tags cannot be greater than 10", 400)
+
     upload_id = new_uuid()
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
@@ -8690,6 +8798,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "requested_sse": headers.get("x-amz-server-side-encryption"),
         "storage_class": storage_class,
         "checksum_algorithm": checksum_algorithm,
+        "tags": tags,
         "created": now_iso(),
     }
 
@@ -9057,7 +9166,8 @@ def _complete_multipart_upload(
 
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
-    _maybe_replicate(bucket_name, key, obj, combined)
+    tags = upload.get("tags")
+    _maybe_replicate(bucket_name, key, obj, combined, tags)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -9070,8 +9180,19 @@ def _complete_multipart_upload(
         version_id=version_id,
     )
 
+    # The tags given at create time replace any the overwritten object had.
+    if tags:
+        _object_tags[(bucket_name, key, obj.get("version_id"))] = dict(tags)
+        if obj.get("_replica"):
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
+
     # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
+    # carry the version_id assigned above (#1058), and the tags.
     if S3_PERSIST:
         _persist_object(bucket_name, key, obj)
 
@@ -9252,25 +9373,79 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 # ---------------------------------------------------------------------------
 
 
-def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
-    """Resolve the on-disk path for an object and verify it lives under DATA_DIR.
+# A key is stored at its own path (so Athena and Glue can read the bytes) when a
+# file can hold it there; otherwise under this reserved directory, by an encoded
+# name. Keys a path cannot hold: a trailing or doubled slash, "." or ".."
+# segments, a key under another key's file or a file over another key's folder.
+_ENCODED_KEYS_DIR = ".ministack-keys"
 
-    Returns None if the resolved path escapes DATA_DIR (e.g. key contains `..`
-    or absolute path). Callers must treat None as "skip operation".
-    """
-    if account_id is None:
-        account_id = get_account_id()
-    root = os.path.realpath(DATA_DIR)
-    candidate = os.path.realpath(os.path.join(DATA_DIR, account_id, bucket, key))
+
+def _plain_path_key(key: str) -> bool:
+    if not key or "\x00" in key:
+        return False
+    parts = key.split("/")
+    return (parts[0] != _ENCODED_KEYS_DIR
+            and all(p not in ("", ".", "..") and len(p.encode()) <= 200
+                    and not p.endswith((".meta.json", ".tmp")) for p in parts))
+
+
+def _encoded_key_name(key: str) -> str:
+    # No "/" or "." survives, so the name is one path component and never a sidecar or temp name.
+    name = url_quote(key, safe="").replace(".", "%2E")
+    return name if len(name) <= 200 else "sha256-" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _under(root: str, candidate: str) -> bool:
     try:
-        if os.path.commonpath([root, candidate]) != root:
-            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-            return None
+        return candidate != root and os.path.commonpath([root, candidate]) == root
     except ValueError:
         # commonpath raises on mixed drives / unrelated paths — treat as escape.
-        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-        return None
-    return candidate
+        return False
+
+
+def _key_disk_path(base: str, key: str) -> str | None:
+    """Where ``key`` lives under ``base``: its own path, or its encoded name when
+    a file cannot hold it there (or it is already stored that way)."""
+    root = os.path.realpath(base)
+    encoded = os.path.join(root, _ENCODED_KEYS_DIR, _encoded_key_name(key))
+    if not _plain_path_key(key):
+        return encoded
+    plain = os.path.join(root, key)
+    if not _under(root, os.path.realpath(plain)):
+        return encoded
+    if os.path.isfile(plain) or os.path.isfile(plain + ".meta.json"):
+        return plain
+    if os.path.isfile(encoded) or os.path.isfile(encoded + ".meta.json"):
+        return encoded
+    parent = os.path.dirname(plain)
+    while parent != root:
+        if os.path.isfile(parent):
+            return encoded
+        parent = os.path.dirname(parent)
+    return encoded if os.path.isdir(plain) else plain
+
+
+def _other_key_disk_path(base: str, key: str, fpath: str) -> str | None:
+    """The key's other possible location, so a write to one clears a stale copy in the other."""
+    root = os.path.realpath(base)
+    encoded = os.path.join(root, _ENCODED_KEYS_DIR, _encoded_key_name(key))
+    if fpath != encoded:
+        return encoded
+    plain = os.path.join(root, key)
+    return plain if _plain_path_key(key) and _under(root, os.path.realpath(plain)) else None
+
+
+def _remove_key_files(fpath: str | None):
+    for path in (fpath, fpath and fpath + ".meta.json"):
+        if path and os.path.isfile(path):
+            os.remove(path)
+
+
+def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
+    """The on-disk path of an object, always under DATA_DIR."""
+    if account_id is None:
+        account_id = get_account_id()
+    return _key_disk_path(os.path.join(DATA_DIR, account_id, bucket), key)
 
 
 def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
@@ -9319,12 +9494,14 @@ def _persist_object(bucket: str, key: str, obj):
             data = obj.get("body")
             if data is not None:
                 _atomic_write(fpath, data)
-            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key)}
+            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key), "key": key}
             _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
             # Drop body from in-memory record to save RAM
             obj["body"] = None
         else:
             _atomic_write(fpath, obj)
+            _atomic_write(fpath + ".meta.json", json.dumps({"key": key}), text=True)
+        _remove_key_files(_other_key_disk_path(os.path.join(DATA_DIR, get_account_id(), bucket), key, fpath))
     except Exception as e:
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
 
@@ -9348,6 +9525,7 @@ def _persist_delete_marker(bucket_name: str, key: str, marker: dict):
             "version_id": marker.get("version_id"),
             "last_modified": marker.get("last_modified", ""),
             **_key_history_meta(bucket_name, key),
+            "key": key,
         }
         _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
     except Exception as e:
@@ -9392,16 +9570,10 @@ _VERSIONS_DIR = ".versions"
 def _version_disk_path(bucket: str, key: str, version_id: str, account_id: str = None) -> str | None:
     if account_id is None:
         account_id = get_account_id()
-    root = os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id))
-    candidate = os.path.realpath(os.path.join(root, key))
-    try:
-        if candidate == root or os.path.commonpath([root, candidate]) != root:
-            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-            return None
-    except ValueError:
-        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
+    base = os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id)
+    if not _under(os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket)), os.path.realpath(base)):
         return None
-    return candidate
+    return _key_disk_path(base, key)
 
 
 def _version_file_exists(bucket_name: str, key: str, version_id: str, account_id: str = None) -> bool:
@@ -9481,11 +9653,8 @@ def _delete_persisted_object(bucket_name: str, key: str):
         fpath = _object_disk_path(bucket_name, key)
         if fpath is None:
             return
-        if os.path.exists(fpath):
-            os.remove(fpath)
-        meta_path = fpath + ".meta.json"
-        if os.path.exists(meta_path):
-            os.remove(meta_path)
+        _remove_key_files(fpath)
+        _remove_key_files(_other_key_disk_path(os.path.join(DATA_DIR, get_account_id(), bucket_name), key, fpath))
     except Exception as e:
         logger.warning("Failed to delete persisted S3 object %s/%s: %s", bucket_name, key, e)
 
@@ -9569,92 +9738,106 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
             "region": None,
         }
     bucket = _buckets._data[scoped_key]
-    for dirpath, _dirnames, filenames in os.walk(bucket_path):
-        for fname in filenames:
-            if fname.endswith(".meta.json"):
-                continue
-            abs_path = os.path.join(dirpath, fname)
-            key = os.path.relpath(abs_path, bucket_path)
-            meta_path = abs_path + ".meta.json"
-            meta = {}
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path) as mf:
-                        meta = json.load(mf)
-                except Exception:
-                    pass
-            # A delete marker's sidecar stands in for the object it hides: the
-            # data file belongs to the version underneath, not to the current
-            # key. Rebuild the marker (and the version it covers) instead of
-            # resurrecting the object as current.
-            if meta.get("is_delete_marker"):
-                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
-                continue
-            # Body stays on disk — only load metadata into memory.
-            # Compute size/etag from meta sidecar; fall back to reading
-            # the file only when the sidecar is missing or incomplete.
-            size = meta.get("size")
-            etag = meta.get("etag")
-            if size is None or not etag:
-                with open(abs_path, "rb") as f:
-                    data = f.read()
-                size = len(data)
-                etag = etag or f'"{md5_hash(data)}"'
-            bucket["objects"][key] = {
-                "body": None,
-                "content_type": meta.get("content_type", "application/octet-stream"),
-                "content_encoding": meta.get("content_encoding"),
-                "etag": etag,
-                "last_modified": meta.get("last_modified") or now_iso(),
-                "size": size,
-                "metadata": meta.get("metadata", {}),
-                "preserved_headers": meta.get("preserved_headers", {}),
-                "storage_class": meta.get("storage_class", "STANDARD"),
-                "checksums": meta.get("checksums", {}),
-            }
-            if meta.get("version_id"):
-                bucket["objects"][key]["version_id"] = meta["version_id"]
-            if "versions" in meta or "tags" in meta or "acl" in meta:
-                _load_persisted_history(account_id, bucket, bucket_name, key, meta)
-            elif meta.get("version_id"):
-                vkey = (bucket_name, key)
-                scoped_vkey = (account_id, vkey)
-                if scoped_vkey not in _object_versions._data:
-                    _object_versions._data[scoped_vkey] = []
-                _object_versions._data[scoped_vkey].append(
-                    {
-                        "version_id": meta["version_id"],
-                        "last_modified": meta.get("last_modified") or now_iso(),
-                        "etag": etag,
-                        "size": size,
-                        "is_latest": True,
-                        "data": None,
-                        "content_type": meta.get("content_type", "application/octet-stream"),
-                        "content_encoding": meta.get("content_encoding"),
-                        "metadata": meta.get("metadata", {}),
-                        "preserved_headers": meta.get("preserved_headers", {}),
-                        "storage_class": meta.get("storage_class", "STANDARD"),
-                        "checksums": meta.get("checksums", {}),
-                    }
-                )
-    # Delete markers whose data file is gone (a key that never held a body, or
-    # whose version was purged) live on as a lone sidecar.
-    for dirpath, _dirnames, filenames in os.walk(bucket_path):
-        for fname in filenames:
-            if not fname.endswith(".meta.json"):
-                continue
-            meta_path = os.path.join(dirpath, fname)
-            data_path = meta_path[: -len(".meta.json")]
-            if os.path.exists(data_path):
-                continue  # handled with its data file above
+    for abs_path, key in _persisted_key_files(bucket_path, sidecars=False):
+        meta_path = abs_path + ".meta.json"
+        meta = {}
+        if os.path.exists(meta_path):
             try:
                 with open(meta_path) as mf:
                     meta = json.load(mf)
             except Exception:
-                continue
-            if meta.get("is_delete_marker"):
-                key = os.path.relpath(data_path, bucket_path)
-                _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+                pass
+        # A delete marker's sidecar stands in for the object it hides: the
+        # data file belongs to the version underneath, not to the current
+        # key. Rebuild the marker (and the version it covers) instead of
+        # resurrecting the object as current.
+        if meta.get("is_delete_marker"):
+            _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+            continue
+        # Body stays on disk — only load metadata into memory.
+        # Compute size/etag from meta sidecar; fall back to reading
+        # the file only when the sidecar is missing or incomplete.
+        size = meta.get("size")
+        etag = meta.get("etag")
+        if size is None or not etag:
+            with open(abs_path, "rb") as f:
+                data = f.read()
+            size = len(data)
+            etag = etag or f'"{md5_hash(data)}"'
+        bucket["objects"][key] = {
+            "body": None,
+            "content_type": meta.get("content_type", "application/octet-stream"),
+            "content_encoding": meta.get("content_encoding"),
+            "etag": etag,
+            "last_modified": meta.get("last_modified") or now_iso(),
+            "size": size,
+            "metadata": meta.get("metadata", {}),
+            "preserved_headers": meta.get("preserved_headers", {}),
+            "storage_class": meta.get("storage_class", "STANDARD"),
+            "checksums": meta.get("checksums", {}),
+        }
+        if meta.get("version_id"):
+            bucket["objects"][key]["version_id"] = meta["version_id"]
+        if "versions" in meta or "tags" in meta or "acl" in meta:
+            _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+        elif meta.get("version_id"):
+            vkey = (bucket_name, key)
+            scoped_vkey = (account_id, vkey)
+            if scoped_vkey not in _object_versions._data:
+                _object_versions._data[scoped_vkey] = []
+            _object_versions._data[scoped_vkey].append(
+                {
+                    "version_id": meta["version_id"],
+                    "last_modified": meta.get("last_modified") or now_iso(),
+                    "etag": etag,
+                    "size": size,
+                    "is_latest": True,
+                    "data": None,
+                    "content_type": meta.get("content_type", "application/octet-stream"),
+                    "content_encoding": meta.get("content_encoding"),
+                    "metadata": meta.get("metadata", {}),
+                    "preserved_headers": meta.get("preserved_headers", {}),
+                    "storage_class": meta.get("storage_class", "STANDARD"),
+                    "checksums": meta.get("checksums", {}),
+                }
+            )
+    # Delete markers whose data file is gone (a key that never held a body, or
+    # whose version was purged) live on as a lone sidecar.
+    for meta_path, key in _persisted_key_files(bucket_path, sidecars=True):
+        data_path = meta_path[: -len(".meta.json")]
+        if os.path.exists(data_path):
+            continue  # handled with its data file above
+        try:
+            with open(meta_path) as mf:
+                meta = json.load(mf)
+        except Exception:
+            continue
+        if meta.get("is_delete_marker"):
+            _load_persisted_delete_marker(account_id, bucket, bucket_name, meta.get("key") or key, meta)
+
+
+def _persisted_key_files(bucket_path, sidecars):
+    """(file, key) for a bucket's data files, or sidecars: plain paths first, then encoded names."""
+    for dirpath, dirnames, filenames in os.walk(bucket_path):
+        if dirpath == bucket_path and _ENCODED_KEYS_DIR in dirnames:
+            dirnames.remove(_ENCODED_KEYS_DIR)
+        for fname in filenames:
+            if fname.endswith(".meta.json") == sidecars and not fname.endswith(".tmp"):
+                path = os.path.join(dirpath, fname)
+                key = os.path.relpath(path[: -len(".meta.json")] if sidecars else path, bucket_path)
+                yield path, key
+    encoded_dir = os.path.join(bucket_path, _ENCODED_KEYS_DIR)
+    for fname in sorted(os.listdir(encoded_dir)) if os.path.isdir(encoded_dir) else []:
+        if fname.endswith(".meta.json") != sidecars or fname.endswith(".tmp"):
+            continue
+        path = os.path.join(encoded_dir, fname)
+        meta_path = path if sidecars else path + ".meta.json"
+        try:
+            with open(meta_path) as mf:
+                key = json.load(mf).get("key")
+        except Exception:
+            key = None
+        yield path, key or url_unquote(fname[: -len(".meta.json")] if sidecars else fname)
 
 
 def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):
@@ -10275,6 +10458,56 @@ def handle_access_point_control(method: str, path: str, headers: dict, body: byt
 
 
 # ---------------------------------------------------------------------------
+# S3 Control: account-level public access block
+# ---------------------------------------------------------------------------
+_ACCOUNT_PAB_PATH = "/v20180820/configuration/publicAccessBlock"
+
+_ACCOUNT_PAB_ACTIONS = {
+    "PUT": "s3:PutAccountPublicAccessBlock",
+    "GET": "s3:GetAccountPublicAccessBlock",
+    "DELETE": "s3:PutAccountPublicAccessBlock",
+}
+
+_ACCOUNT_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+def is_account_public_access_block_path(path: str) -> bool:
+    return path.rstrip("/") == _ACCOUNT_PAB_PATH
+
+
+def handle_account_public_access_block(method: str, path: str, body: bytes) -> tuple:
+    """The request account's public access block."""
+    if method == "PUT":
+        root = None
+        if body:
+            try:
+                raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+                root = fromstring(raw)
+            except ParseError:
+                root = None
+        _account_public_access_block["config"] = {
+            field: _child_text(root, field, "false").lower() == "true" for field in _ACCOUNT_PAB_FIELDS}
+        return 200, {}, b""
+    if method == "GET":
+        cfg = _account_public_access_block.get("config")
+        if cfg is None:
+            return s3control_error(
+                "NoSuchPublicAccessBlockConfiguration",
+                "The public access block configuration was not found", 404,
+                {"AccountId": get_account_id()})
+        # The real wire xmlns is http://, not https:// (observed us-east-2 2026-10-30).
+        out = Element("PublicAccessBlockConfiguration", xmlns="http://awss3control.amazonaws.com/doc/2018-08-20/")
+        for field in _ACCOUNT_PAB_FIELDS:
+            SubElement(out, field).text = str(bool(cfg.get(field))).lower()
+        return _s3control_response(out)
+    if method == "DELETE":
+        _account_public_access_block.pop("config", None)
+        return 204, {}, b""
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405,
+                           {"Method": method, "ResourceType": "ACCOUNT_PUBLIC_ACCESS_BLOCK"})
+
+
+# ---------------------------------------------------------------------------
 # S3 Control: Object Lambda Access Points
 # ---------------------------------------------------------------------------
 
@@ -10536,6 +10769,7 @@ def reset():
         _mrap_operations,
         _access_points,
         _object_lambda_access_points,
+        _account_public_access_block,
         _olap_requests,
     ):
         d.clear()

@@ -256,12 +256,15 @@ def _run_backend_container(identifier):
             "POSTGRES_DB": "postgres",
             "POSTGRES_HOST_AUTH_METHOD": "trust",
         },
-        ports={"5432/tcp": None},  # docker-assigned host port
         name=name,
         labels=container_reaper.own_labels("dsql", cluster_id=identifier),
     )
     if ms_network:
         container_kwargs["network"] = ms_network
+    else:
+        # Only a host-run MiniStack dials a published port. The backend is a
+        # passwordless superuser, so it must never listen beyond loopback.
+        container_kwargs["ports"] = {"5432/tcp": ("127.0.0.1", None)}
     if DSQL_PERSIST:
         container_kwargs["volumes"] = {
             f"ministack-dsql-{identifier}-data": {
@@ -275,16 +278,14 @@ def _run_backend_container(identifier):
         }
 
     container = docker_client.containers.run(**container_kwargs)
+    _backend_containers[identifier] = getattr(container, "id", None)
     container.reload()
 
-    host = port = None
     if ms_network:
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-        container_ip = networks.get(ms_network, {}).get("IPAddress", "")
-        if container_ip:
-            host, port = container_ip, 5432
-    if host is None:
-        host, port = "localhost", _published_port(container)
+        host, port = networks.get(ms_network, {}).get("IPAddress", ""), 5432
+    else:
+        host, port = "127.0.0.1", _published_port(container)
 
     def _container_alive():
         try:
@@ -296,15 +297,26 @@ def _run_backend_container(identifier):
     # TCP readiness is not enough: docker-proxy accepts connections while the
     # postgres entrypoint is still running initdb, then drops them. Poll a
     # real authenticated connection (trust auth, so no password) like RDS does.
-    if not rds._wait_for_database_ready(
+    if not host or not rds._wait_for_database_ready(
         host, port, "postgres", "postgres", "", "postgres", _container_alive
     ):
+        _backend_containers.pop(identifier, None)
+        try:  # metadata-only from here: nothing keeps the container
+            container.remove(v=True, force=True)
+        except Exception as e:
+            logger.warning("DSQL: could not remove the unready backend for %s: %s", identifier, e)
         raise RuntimeError(f"backend at {host}:{port} did not become ready")
     return host, port
 
 
+# Backends of live clusters; any other stopped dsql container is the reaper's.
+_backend_containers: dict = {}
+container_reaper.register_live_ids("dsql", lambda: set(_backend_containers.values()) - {None})
+
+
 def _remove_container(identifier):
     """Best-effort blocking removal of a cluster's backend container."""
+    _backend_containers.pop(identifier, None)
     if not _docker_available():
         return
     try:
@@ -1217,6 +1229,7 @@ def reset():
                         logger.warning("reset: failed to remove container %s: %s", c.name, e)
         except Exception as e:
             logger.warning("reset: DSQL container sweep failed: %s", e)
+    _backend_containers.clear()
     _clusters.clear()
     _client_tokens.clear()
     _tags.clear()

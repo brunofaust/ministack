@@ -2025,6 +2025,67 @@ def test_dynamodb_transact_write_condition_cancel(ddb):
     resp = ddb.get_item(TableName="qa-ddb-transact", Key={"pk": {"S": "new-item"}})
     assert "Item" not in resp
 
+def test_dynamodb_transact_write_condition_checked_before_update_expression(ddb):
+    """A failed condition on a missing item cancels with ConditionalCheckFailed, as
+    UpdateItem does, even when the update expression reads an attribute the
+    missing item does not have. Reasons and their order match real DynamoDB."""
+    table = "qa-ddb-transact-cond-order"
+    ddb.create_table(
+        TableName=table,
+        KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"}],
+        AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"}],
+        BillingMode="PAY_PER_REQUEST",
+    )
+    update = {
+        "TableName": table,
+        "Key": {"pk": {"S": "missing"}},
+        "UpdateExpression": "SET #c = #c + :one",
+        "ConditionExpression": "attribute_exists(#pk)",
+        "ExpressionAttributeNames": {"#c": "count", "#pk": "pk"},
+        "ExpressionAttributeValues": {":one": {"N": "1"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        ddb.update_item(**update)
+    assert exc.value.response["Error"]["Code"] == "ConditionalCheckFailedException"
+
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": update}])
+    assert exc.value.response["Error"]["Code"] == "TransactionCanceledException"
+    assert [r["Code"] for r in exc.value.response["CancellationReasons"]] == ["ConditionalCheckFailed"]
+    assert "Item" not in ddb.get_item(TableName=table, Key={"pk": {"S": "missing"}})
+
+    # An update-expression error on another member does not hide the failed condition.
+    no_condition = {
+        "TableName": table,
+        "Key": {"pk": {"S": "missing2"}},
+        "UpdateExpression": "SET #c = #c + :one",
+        "ExpressionAttributeNames": {"#c": "count"},
+        "ExpressionAttributeValues": {":one": {"N": "1"}},
+    }
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": update}, {"Update": no_condition}])
+    assert [r["Code"] for r in exc.value.response["CancellationReasons"]] == ["ConditionalCheckFailed", "ValidationError"]
+
+    # A wrong-typed key still cancels before any condition is evaluated.
+    wrong_key = {**no_condition, "Key": {"pk": {"N": "1"}}}
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": wrong_key}, {"Update": update}])
+    assert [r["Code"] for r in exc.value.response["CancellationReasons"]] == ["ValidationError", "None"]
+
+    # A missing table is reported before the update-expression error.
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"Update": no_condition}, {"Update": {**no_condition, "TableName": f"{table}-missing"}}])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert ddb.scan(TableName=table)["Count"] == 0
+
+    # begins_with with a number operand is a ValidationException, not an internal error.
+    ddb.put_item(TableName=table, Item={"pk": {"S": "e"}, "count": {"S": "x"}})
+    with pytest.raises(ClientError) as exc:
+        ddb.transact_write_items(TransactItems=[{"ConditionCheck": {
+            "TableName": table, "Key": {"pk": {"S": "e"}}, "ConditionExpression": "begins_with(#c, :n)",
+            "ExpressionAttributeNames": {"#c": "count"}, "ExpressionAttributeValues": {":n": {"N": "1"}}}}])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
 def test_dynamodb_transact_write_multiple_failures_all_returned(ddb):
     """TransactWriteItems returns CancellationReasons for ALL failed conditions, not just the first."""
     table = "qa-ddb-transact"
@@ -5047,6 +5108,154 @@ def test_dynamodb_update_nested_set_updated_new(ddb):
         # The attribute `m` is the one that changed; AWS returns it in
         # full as the projected new-value tree.
         assert "m" in r.get("Attributes", {})
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_one_value_for_two_set_paths_is_copied(ddb):
+    """One ExpressionAttributeValue SET at two paths stores two independent
+    values: a later nested write to one leaves the other alone (#2566)."""
+    name = f"u-shared-val-{_uuid_mod.uuid4().hex[:8]}"
+    _basic_table(ddb, name)
+    try:
+        key = {"pk": {"S": "1"}}
+        ddb.update_item(
+            TableName=name, Key=key,
+            UpdateExpression="SET a = :empty, b = :empty",
+            ExpressionAttributeValues={":empty": {"M": {}}},
+        )
+        ddb.update_item(
+            TableName=name, Key=key,
+            UpdateExpression="SET a.x = :one",
+            ExpressionAttributeValues={":one": {"S": "only-a"}},
+        )
+        item = ddb.get_item(TableName=name, Key=key)["Item"]
+        assert item["a"] == {"M": {"x": {"S": "only-a"}}}
+        assert item["b"] == {"M": {}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_one_source_path_for_two_set_paths_is_copied(ddb):
+    """`SET a = src, b = src` and `list_append(:l, :l)` store independent
+    copies, so a nested write to one target doesn't show up in another."""
+    name = f"u-shared-path-{_uuid_mod.uuid4().hex[:8]}"
+    _basic_table(ddb, name)
+    try:
+        key = {"pk": {"S": "1"}}
+        ddb.put_item(TableName=name, Item={**key, "src": {"M": {}}})
+        ddb.update_item(
+            TableName=name, Key=key,
+            UpdateExpression="SET a = src, b = src, l = list_append(:l, :l)",
+            ExpressionAttributeValues={":l": {"L": [{"M": {}}]}},
+        )
+        ddb.update_item(
+            TableName=name, Key=key,
+            UpdateExpression="SET a.x = :v, l[0].x = :v",
+            ExpressionAttributeValues={":v": {"S": "v"}},
+        )
+        item = ddb.get_item(TableName=name, Key=key)["Item"]
+        assert item["a"] == {"M": {"x": {"S": "v"}}}
+        assert item["b"] == {"M": {}}
+        assert item["l"] == {"L": [{"M": {"x": {"S": "v"}}}, {"M": {}}]}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_list_append_of_one_path_twice_is_copied(ddb):
+    """`list_append(l, l)` builds a list whose two elements are independent
+    values."""
+    name = f"u-la-path-{_uuid_mod.uuid4().hex[:8]}"
+    _basic_table(ddb, name)
+    try:
+        key = {"pk": {"S": "1"}}
+        ddb.put_item(TableName=name, Item={**key, "l": {"L": [{"M": {}}]}})
+        ddb.update_item(TableName=name, Key=key, UpdateExpression="SET l2 = list_append(l, l)")
+        ddb.update_item(
+            TableName=name, Key=key, UpdateExpression="SET l2[0].x = :v",
+            ExpressionAttributeValues={":v": {"S": "v"}},
+        )
+        item = ddb.get_item(TableName=name, Key=key)["Item"]
+        assert item["l2"] == {"L": [{"M": {"x": {"S": "v"}}}, {"M": {}}]}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_update_if_not_exists_for_two_set_paths_is_copied(ddb):
+    """`if_not_exists` stores a copy whether it takes the default or the
+    existing value."""
+    name = f"u-ine-{_uuid_mod.uuid4().hex[:8]}"
+    _basic_table(ddb, name)
+    try:
+        default_key = {"pk": {"S": "default"}}
+        ddb.update_item(
+            TableName=name, Key=default_key,
+            UpdateExpression="SET a = if_not_exists(a, :e), b = if_not_exists(b, :e)",
+            ExpressionAttributeValues={":e": {"M": {}}},
+        )
+        existing_key = {"pk": {"S": "existing"}}
+        ddb.put_item(TableName=name, Item={**existing_key, "src": {"M": {}}})
+        ddb.update_item(
+            TableName=name, Key=existing_key,
+            UpdateExpression="SET a = if_not_exists(src, :e), b = if_not_exists(src, :e)",
+            ExpressionAttributeValues={":e": {"M": {}}},
+        )
+        for key in (default_key, existing_key):
+            ddb.update_item(
+                TableName=name, Key=key, UpdateExpression="SET a.x = :v",
+                ExpressionAttributeValues={":v": {"S": "v"}},
+            )
+            item = ddb.get_item(TableName=name, Key=key)["Item"]
+            assert item["a"] == {"M": {"x": {"S": "v"}}}
+            assert item["b"] == {"M": {}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_transact_update_one_value_for_two_set_paths_is_copied(ddb):
+    """A TransactWriteItems Update stores one placeholder at two paths as two values."""
+    name = f"u-txn-shared-{_uuid_mod.uuid4().hex[:8]}"
+    _basic_table(ddb, name)
+    try:
+        key = {"pk": {"S": "1"}}
+        ddb.transact_write_items(TransactItems=[{"Update": {
+            "TableName": name, "Key": key, "UpdateExpression": "SET a = :e, b = :e",
+            "ExpressionAttributeValues": {":e": {"M": {}}},
+        }}])
+        ddb.update_item(
+            TableName=name, Key=key, UpdateExpression="SET a.x = :v",
+            ExpressionAttributeValues={":v": {"S": "v"}},
+        )
+        item = ddb.get_item(TableName=name, Key=key)["Item"]
+        assert item["a"] == {"M": {"x": {"S": "v"}}}
+        assert item["b"] == {"M": {}}
+    finally:
+        ddb.delete_table(TableName=name)
+
+
+def test_dynamodb_partiql_update_copies_a_source_path(ddb):
+    """PartiQL `UPDATE ... SET a = src` stores a copy of `src`, through
+    ExecuteStatement and ExecuteTransaction, and for two SET clauses."""
+    name = f"pq-copy-{_uuid_mod.uuid4().hex[:8]}"
+    _basic_table(ddb, name)
+    try:
+        for pk in ("one", "txn", "two"):
+            ddb.put_item(TableName=name, Item={"pk": {"S": pk}, "src": {"M": {}}})
+        ddb.execute_statement(Statement=f"UPDATE \"{name}\" SET a = src WHERE pk = 'one'")
+        ddb.execute_transaction(TransactStatements=[
+            {"Statement": f"UPDATE \"{name}\" SET a = src WHERE pk = 'txn'"}])
+        ddb.execute_statement(
+            Statement=f"UPDATE \"{name}\" SET a = src SET b = src WHERE pk = 'two'")
+        for pk in ("one", "txn", "two"):
+            key = {"pk": {"S": pk}}
+            ddb.update_item(
+                TableName=name, Key=key, UpdateExpression="SET a.x = :v",
+                ExpressionAttributeValues={":v": {"S": "v"}},
+            )
+            item = ddb.get_item(TableName=name, Key=key)["Item"]
+            assert item["a"] == {"M": {"x": {"S": "v"}}}
+            assert item["src"] == {"M": {}}
+        assert ddb.get_item(TableName=name, Key={"pk": {"S": "two"}})["Item"]["b"] == {"M": {}}
     finally:
         ddb.delete_table(TableName=name)
 

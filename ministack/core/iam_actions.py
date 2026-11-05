@@ -1168,6 +1168,11 @@ def extract_resource_arn(service: str, method: str, path: str,
             # keys — the key is recovered from the ciphertext.
             key_id = _kms_key_id_from_ciphertext(
                 _safe_json_field(body, "CiphertextBlob"))
+            if key_id:
+                # The ciphertext names its key by id; it may belong to another account.
+                from ministack.services.kms import ciphertext_key_arn
+
+                return ciphertext_key_arn(key_id)
         if key_id:
             # KeyId can be an ARN, alias, or key ID
             if key_id.startswith("arn:"):
@@ -1250,7 +1255,8 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "kinesis":
-        arn = _safe_json_field(body, "StreamARN")
+        # The resource-policy operations name their stream or consumer as ResourceARN.
+        arn = _safe_json_field(body, "ResourceARN") or _safe_json_field(body, "StreamARN")
         if arn:
             return arn
         name = _safe_json_field(body, "StreamName")
@@ -1405,6 +1411,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudformation":
+        set_name = _query_param(query_params, "StackSetName")
+        if set_name and _query_param(query_params, "Action") in ("DescribeStackSet", "ListStackInstances"):
+            # A StackSet's ARN ends in its StackSetId, whether named by name or by ID.
+            from ministack.services.cloudformation import _stack_sets
+            rec = next((r for r in _stack_sets.values_scoped(account_id, region) if r["StackSetId"] == set_name
+                        or (r["StackSetName"] == set_name and r["Status"] == "ACTIVE")), None)
+            return f"arn:aws:cloudformation:{region}:{account_id}:stackset/{rec['StackSetId'] if rec else set_name}"
         name = _query_param(query_params, "StackName")
         if name:
             if name.startswith("arn:"):
@@ -2352,13 +2365,22 @@ def access_denied_response(service: str, action: str, principal_arn: str,
     catching AccessDenied misses it. `headers` lets the services that accept
     more than one encoding answer in the one the request arrived in.
     """
-    if service in {"ssm", "logs"} and not error_code:
-        # SSM and Logs authorization denials are HTTP 400, JSON 1.1, with a
-        # capitalized Message naming the resource, as observed on live AWS.
+    if service in {"ssm", "logs", "kinesis"} and not error_code:
+        # SSM, Logs and Kinesis authorization denials are HTTP 400, JSON 1.1,
+        # with a capitalized Message naming the resource, as observed on live AWS.
         message = identity_denial_message(action, principal_arn, resource_arn, explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
+        )
+    if service == "kms" and not error_code and not explicit_deny:
+        # KMS denials no policy allows are HTTP 400 and name the key (an alias resolved to its key), as recorded on AWS.
+        from ministack.services.kms import key_arn_for_request
+
+        message = identity_denial_message(action, principal_arn, key_arn_for_request(resource_arn), explicit_deny)
+        return (
+            400, {"Content-Type": "application/x-amz-json-1.1"},
+            json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),
         )
     if service == "iot-data":
         # The IoT data plane answers every refusal ForbiddenException: "Forbidden"

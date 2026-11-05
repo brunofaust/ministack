@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import threading
 import time
 
@@ -1387,6 +1388,34 @@ def test_glue_spark_skips_docker_when_image_missing(glue):
     ), f"Job should reach terminal state without Docker image. Got: {run['JobRunState']}"
 
 
+_USER_IDS = {"--JOB_NAME": "user-value", "--JOB_RUN_ID": "user-value"}
+_DEFAULT_IDS = {"--JOB_NAME": "default-value", "--JOB_RUN_ID": "default-value"}
+_GLUE_IDS = {"--JOB_NAME": "my-job", "--JOB_RUN_ID": "jr_1"}
+
+
+@pytest.mark.parametrize("command,default_arguments,run_arguments,expected", [
+    ("glueetl", {}, {}, _GLUE_IDS),
+    ("glueetl", {}, _USER_IDS, _USER_IDS),
+    ("glueetl", _DEFAULT_IDS, {}, _GLUE_IDS),
+    ("gluestreaming", {}, {}, _GLUE_IDS),
+    ("gluestreaming", {}, _USER_IDS, _USER_IDS),
+    ("gluestreaming", _DEFAULT_IDS, {}, _GLUE_IDS),
+    ("pythonshell", {}, {}, {}),
+    ("pythonshell", {}, _USER_IDS, _USER_IDS),
+    ("pythonshell", _DEFAULT_IDS, {}, _DEFAULT_IDS),
+], ids=["etl", "etl-run-args", "etl-default-args", "streaming", "streaming-run-args", "streaming-default-args",
+        "shell", "shell-run-args", "shell-default-args"])
+def test_glue_script_args_job_name_and_run_id(command, default_arguments, run_arguments, expected):
+    """A Spark script gets --JOB_NAME and --JOB_RUN_ID from Glue. They replace DefaultArguments, and the run's
+    Arguments replace them. A pythonshell script gets only the arguments that the caller gave."""
+    from ministack.services import glue as _glue
+
+    job = {"Command": {"Name": command}, "DefaultArguments": {"--extra": "x", **default_arguments}}
+    args = _glue._script_args(job, "my-job", "jr_1", run_arguments)
+
+    assert args == {"--extra": "x", **expected}
+
+
 def test_glue_spark_image_for_version_maps_to_official_aws_image():
     """`GlueVersion: 4.0` and `3.0` map to the canonical `amazon/aws-glue-libs`
     images real AWS Glue uses for Spark. Override via `GLUE_DOCKER_IMAGE`."""
@@ -1817,6 +1846,7 @@ def test_bd_1138_glue_reset_clears_every_store_across_regions():
         "workflow_runs",
         "user_defined_functions",
         "table_column_statistics",
+        "table_optimizers",
         "partition_column_statistics",
     }
 
@@ -2790,6 +2820,140 @@ def test_glue_spark_container_env_points_sdk_at_ministack(tmp_path, monkeypatch)
     assert run["JobRunState"] == "SUCCEEDED"
 
 
+def test_glue_spark_submit_tracks_magic_commits_in_memory(tmp_path, monkeypatch):
+    """spark-submit fetches s3:// --py-files before Spark starts. Without in-memory tracking on every
+    S3A filesystem, Glue 5's magicv2 committer never completes a write to that bucket."""
+    from ministack.services import glue as _glue
+
+    monkeypatch.setattr(_glue, "_ministack_network", "")
+    monkeypatch.delenv("MINISTACK_HOST", raising=False)
+
+    created = {}
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            pass
+
+        def start(self):
+            pass
+
+        def wait(self, timeout=None):
+            return {"StatusCode": 0}
+
+        def logs(self, tail=None):
+            return b""
+
+        def remove(self, force=False, v=False):
+            pass
+
+    class _FakeContainers:
+        def get(self, name):
+            raise RuntimeError("no such container")
+
+        def create(self, **kwargs):
+            created.update(kwargs)
+            return _FakeContainer()
+
+    class _FakeDocker:
+        containers = _FakeContainers()
+
+    script = tmp_path / "job.py"
+    script.write_text("print('hi')")
+    args = {"--extra-py-files": "s3://out-bucket/deps.zip"}
+    _glue._execute_spark_docker({"Id": "jr_magic"}, {"Timeout": 1}, "magicjob", args, str(script), _FakeDocker())
+
+    command = created["command"]
+    setting = "spark.hadoop.fs.s3a.committer.magic.track.commits.in.memory.enabled=true"
+    assert setting in command
+    assert command[command.index(setting) - 1] == "--conf"
+
+
+# A small stand-in for botocore: create_client returns the endpoint_url it gets.
+_FAKE_BOTOCORE_SESSION = (
+    "ORIGIN = {origin!r}\n"
+    "class Session:\n"
+    "    def create_client(self, service, endpoint_url=None):\n"
+    "        return endpoint_url\n"
+)
+
+
+def _write_fake_botocore(root, origin):
+    (root / "botocore").mkdir(parents=True)
+    (root / "botocore" / "__init__.py").write_text("")
+    (root / "botocore" / "session.py").write_text(_FAKE_BOTOCORE_SESSION.format(origin=origin))
+
+
+def _run_glue_boot(tmp_path, script, pythonpath):
+    """Run the boot shim with the host Python, as spark-submit runs it, and return the job script's stdout."""
+    import subprocess
+    import sys
+
+    from ministack.services.glue import _GLUE_BOOT_SCRIPT
+
+    job = tmp_path / "job.py"
+    job.write_text(script)
+    boot = tmp_path / "_ministack_boot.py"
+    boot.write_text(_GLUE_BOOT_SCRIPT.format(script=str(job)))
+    env = {**os.environ, "AWS_ENDPOINT_URL": "http://ministack:4566", "PYTHONPATH": pythonpath}
+    proc = subprocess.run([sys.executable, str(boot)], capture_output=True, text=True, env=env, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_glue_boot_patches_botocore_that_the_script_loads_after_it_swaps_its_deps_zip(tmp_path):
+    """A job that swaps its --py-files zip for an extracted folder gets botocore from the folder, with the patch."""
+    import zipfile
+
+    _write_fake_botocore(tmp_path / "zipped", "zip")
+    deps_zip = tmp_path / "glue-deps.zip"
+    with zipfile.ZipFile(deps_zip, "w") as zf:
+        for name in ("__init__.py", "session.py"):
+            zf.write(tmp_path / "zipped" / "botocore" / name, f"botocore/{name}")
+    _write_fake_botocore(tmp_path / "extracted", "folder")
+    script = (
+        "import sys\n"
+        f"sys.path.remove({str(deps_zip)!r})\n"
+        f"sys.path.insert(0, {str(tmp_path / 'extracted')!r})\n"
+        "import botocore.session\n"
+        "print(botocore.session.ORIGIN, botocore.session.Session().create_client('s3'))\n"
+    )
+
+    assert _run_glue_boot(tmp_path, script, str(deps_zip)) == "folder http://ministack:4566"
+
+
+@pytest.mark.parametrize("call,expected", [
+    ("create_client('s3')", "http://ministack:4566"),
+    ("create_client('s3', endpoint_url='http://custom:9000')", "http://custom:9000"),
+], ids=["default-endpoint", "caller-endpoint"])
+def test_glue_boot_sets_the_endpoint_only_when_the_caller_does_not(tmp_path, call, expected):
+    """botocore is not loaded before the script runs, and the patch keeps an endpoint_url that the caller sets."""
+    _write_fake_botocore(tmp_path / "site", "site")
+    script = (
+        "import sys\n"
+        "loaded_early = 'botocore' in sys.modules\n"
+        "import botocore.session\n"
+        f"print(loaded_early, botocore.session.Session().{call})\n"
+    )
+
+    assert _run_glue_boot(tmp_path, script, str(tmp_path / "site")) == f"False {expected}"
+
+
+def test_glue_boot_patches_botocore_after_a_find_spec_probe_and_a_reload(tmp_path):
+    """A find_spec check before the import does not use up the patch, and a reload is patched too."""
+    _write_fake_botocore(tmp_path / "site", "site")
+    script = (
+        "import importlib\n"
+        "import importlib.util\n"
+        "importlib.util.find_spec('botocore.session')\n"
+        "import botocore.session\n"
+        "first = botocore.session.Session().create_client('s3')\n"
+        "importlib.reload(botocore.session)\n"
+        "print(first, botocore.session.Session().create_client('s3'))\n"
+    )
+
+    assert _run_glue_boot(tmp_path, script, str(tmp_path / "site")) == "http://ministack:4566 http://ministack:4566"
+
+
 def test_glue_translate_loopback_conf_rewrites_only_gateway_loopbacks():
     from ministack.services.glue import _translate_loopback_conf
 
@@ -2912,3 +3076,206 @@ def test_federated_catalog_round_trip(glue):
     with pytest.raises(ClientError) as excinfo:
         glue.get_catalog(CatalogId="s3tablescatalog")
     assert excinfo.value.response["Error"]["Code"] == "EntityNotFoundException"
+
+
+# ---- Table optimizers: shapes, defaults and messages from real-AWS captures (eu-west-2, us-east-1) ----
+
+_GLUE_SUFFIX = re.compile(r" \(Service: glue; Status Code: (\d+); Error Code: (\w+); Request ID: [0-9a-f-]{36}; Proxy: null\)$")
+
+
+def _optimizer_tables(glue, s3, sort_fields=()):
+    import uuid
+
+    db = f"opt{uuid.uuid4().hex[:8]}"
+    bucket = f"opt-wh-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="t/metadata/00000.metadata.json", Body=json.dumps({
+        "format-version": 2, "default-sort-order-id": 1,
+        "sort-orders": [{"order-id": 1, "fields": list(sort_fields)}]}).encode())
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(DatabaseName=db, TableInput={
+        "Name": "t", "TableType": "EXTERNAL_TABLE", "StorageDescriptor": {"Location": f"s3://{bucket}/t"},
+        "Parameters": {"table_type": "ICEBERG", "metadata_location": f"s3://{bucket}/t/metadata/00000.metadata.json"}})
+    glue.create_table(DatabaseName=db, TableInput={"Name": "plain", "TableType": "EXTERNAL_TABLE",
+                                                   "StorageDescriptor": {"Location": f"s3://{bucket}/plain"}})
+    glue.create_table(DatabaseName=db, TableInput={"Name": "nolocation", "TableType": "EXTERNAL_TABLE"})
+    return db
+
+
+def _optimizer_role(db, bucket_of_t):
+    """A role with the access AWS requires of an optimizer role (Glue table access and its S3 location)."""
+    import uuid
+
+    from conftest import make_client
+
+    iam = make_client("iam")
+    name = f"opt-role-{uuid.uuid4().hex[:8]}"
+    arn = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "glue.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    iam.put_role_policy(RoleName=name, PolicyName="p", PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["glue:GetTable", "glue:UpdateTable"], "Resource": "*"},
+        {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket_of_t}"},
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+         "Resource": f"arn:aws:s3:::{bucket_of_t}/*"}]}))
+    return {"roleArn": arn, "enabled": False}
+
+
+def _optimizer_setup(glue, s3, **kwargs):
+    db = _optimizer_tables(glue, s3, **kwargs)
+    bucket = glue.get_table(DatabaseName=db, Name="t")["Table"]["StorageDescriptor"]["Location"].split("/")[2]
+    return db, _optimizer_role(db, bucket)
+
+
+def _optimizer_error(call):
+    """(code, message without Glue's suffix, status inside the suffix)."""
+    with pytest.raises(ClientError) as exc:
+        call()
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    match = _GLUE_SUFFIX.search(err["Message"])
+    assert match and match.group(2) == err["Code"], err["Message"]
+    return err["Code"], err["Message"][:match.start()], int(match.group(1))
+
+
+def test_glue_table_optimizer_lifecycle_and_defaults(glue, s3):
+    db, _ROLE = _optimizer_setup(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    assert "TableOptimizer" not in glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=_ROLE)
+    got = glue.get_table_optimizer(**ids, Type="compaction")
+    assert {k: got[k] for k in ("CatalogId", "DatabaseName", "TableName")} == ids
+    assert got["TableOptimizer"] == {"type": "compaction", "configurationSource": "table", "configuration": {
+        **_ROLE, "compactionConfiguration": {"icebergConfiguration": {"strategy": "binpack"}}}}
+
+    glue.create_table_optimizer(**ids, Type="orphan_file_deletion", TableOptimizerConfiguration=_ROLE)
+    assert glue.get_table_optimizer(**ids, Type="orphan_file_deletion")["TableOptimizer"]["configuration"][
+        "orphanFileDeletionConfiguration"] == {"icebergConfiguration": {"runRateInHours": 24}}
+
+    glue.create_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"numberOfSnapshotsToRetain": 3}}})
+    assert glue.get_table_optimizer(**ids, Type="retention")["TableOptimizer"]["configuration"][
+        "retentionConfiguration"] == {"icebergConfiguration": {
+            "numberOfSnapshotsToRetain": 3, "cleanExpiredFiles": True, "runRateInHours": 24}}
+    # Update replaces the configuration (fields left out are dropped) and does not check the run rate.
+    glue.update_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": 1}}})
+    assert glue.get_table_optimizer(**ids, Type="retention")["TableOptimizer"]["configuration"] == {
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"cleanExpiredFiles": True, "runRateInHours": 1}}}
+
+    assert glue.list_table_optimizer_runs(**ids, Type="compaction")["TableOptimizerRuns"] == []
+    glue.delete_table_optimizer(**ids, Type="orphan_file_deletion")
+    assert _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="orphan_file_deletion")) == (
+        "EntityNotFoundException", "No optimizer of type orphan_file_deletion found for the table: t", 404)
+
+
+def test_glue_table_optimizer_errors(glue, s3):
+    db, _ROLE = _optimizer_setup(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=_ROLE)
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=_ROLE)) == (
+        "AlreadyExistsException", "An optimizer of type compaction already exists on table with name: t", 400)
+    assert _optimizer_error(lambda: glue.update_table_optimizer(
+        **ids, Type="retention", TableOptimizerConfiguration=_ROLE)) == (
+        "EntityNotFoundException", "No optimizer of type retention found for the table: t", 404)
+    assert _optimizer_error(lambda: glue.delete_table_optimizer(**ids, Type="orphan_file_deletion")) == (
+        "EntityNotFoundException", "An optimizer of type orphan_file_deletion does not exist on table t", 404)
+    assert _optimizer_error(lambda: glue.list_table_optimizer_runs(**ids, Type="retention")) == (
+        "EntityNotFoundException", "No optimizer of type retention found for the table: t", 404)
+    rate_message = "Request Validation Failed with error: Run rate for ICEBERG tables must be between 3 and 168 hours"
+    for rate in (1, 200):
+        assert _optimizer_error(lambda: glue.create_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+            **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": rate}}})) == (
+            "InvalidInputException", rate_message, 400)
+    # The run rate is refused before an existing optimizer; the table's location before the run rate.
+    assert _optimizer_error(lambda: glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration={
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": 1}}}))[1] == rate_message
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **{**ids, "TableName": "nolocation"}, Type="retention", TableOptimizerConfiguration={
+            **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": 1}}})) == (
+        "InvalidInputException", "Glue table storage warehouse location is null", 400)
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **{**ids, "TableName": "plain"}, Type="compaction", TableOptimizerConfiguration=_ROLE)) == (
+        "InvalidInputException", "Glue table metadata filepath is null", 400)
+    sort = {**_ROLE, "compactionConfiguration": {"icebergConfiguration": {"strategy": "sort"}}}
+    no_sort_order = ("InvalidInputException", "Sort order is not present in metadata", 400)
+    assert _optimizer_error(lambda: glue.update_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=sort)) == no_sort_order
+    glue.delete_table_optimizer(**ids, Type="compaction")
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=sort)) == no_sort_order
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=_ROLE)
+    assert glue.get_table_optimizer(**ids, Type="compaction")["TableOptimizer"]["configuration"][
+        "compactionConfiguration"] == {"icebergConfiguration": {"strategy": "binpack"}}
+
+    batch = glue.batch_get_table_optimizer(Entries=[
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "t", "type": "compaction"},
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "t", "type": "retention"},
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "plain", "type": "compaction"}])
+    assert [o["tableOptimizer"]["type"] for o in batch["TableOptimizers"]] == ["compaction"]
+    assert [(f["tableName"], f["error"]) for f in batch["Failures"]] == [
+        ("t", {"ErrorCode": "EntityNotFoundException",
+               "ErrorMessage": "No optimizer of type retention found for the table: t"}),
+        ("plain", {"ErrorCode": "InvalidInputException",
+                   "ErrorMessage": "Request Validation Failed: Unsupported Table type"})]
+
+    glue.delete_table(DatabaseName=db, Name="t")
+    code, message, status = _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="compaction"))
+    assert (code, status) == ("EntityNotFoundException", 404)
+    assert re.fullmatch(r"Entity Not Found \(Service: AmazonDataCatalog; Status Code: 400; Error Code: "
+                        r"EntityNotFoundException; Request ID: [0-9a-f-]{36}; Proxy: null\)", message)
+
+
+def test_glue_table_optimizer_sort_strategy_with_a_sort_order(glue, s3):
+    db, _ROLE = _optimizer_setup(glue, s3, sort_fields=[{"source-id": 1, "transform": "identity",
+                                                         "direction": "asc", "null-order": "nulls-first"}])
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration={
+        **_ROLE, "compactionConfiguration": {"icebergConfiguration": {"strategy": "sort"}}})
+    assert glue.get_table_optimizer(**ids, Type="compaction")["TableOptimizer"]["configuration"][
+        "compactionConfiguration"] == {"icebergConfiguration": {"strategy": "sort"}}
+
+
+@pytest.mark.auth_contract
+def test_glue_table_optimizer_role_needs_table_and_s3_access(auth_enabled, glue, s3):
+    """Under AUTH=true the optimizer role must read the table (else AWS's role refusal) and reach its S3
+    location (else "Access denied"), as captured on AWS; under AUTH=false any role is accepted."""
+    import uuid
+
+    from conftest import make_client
+
+    iam = make_client("iam")
+    db = _optimizer_tables(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    location = glue.get_table(DatabaseName=db, Name="t")["Table"]["StorageDescriptor"]["Location"]
+    bucket = location.split("/")[2]
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {
+        "Service": "glue.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    table_arns = [f"arn:aws:glue:us-east-1:000000000000:table/{db}/t", f"arn:aws:glue:us-east-1:000000000000:database/{db}",
+                  "arn:aws:glue:us-east-1:000000000000:catalog"]
+    roles = {}
+    for name, statements in (
+            ("none", []),
+            ("glue", [{"Effect": "Allow", "Action": ["glue:GetTable", "glue:UpdateTable"], "Resource": table_arns}]),
+            ("full", [{"Effect": "Allow", "Action": ["glue:GetTable", "glue:UpdateTable"], "Resource": table_arns},
+                      {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}"},
+                      {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                       "Resource": f"arn:aws:s3:::{bucket}/*"}])):
+        role = f"opt-{name}-{uuid.uuid4().hex[:6]}"
+        roles[name] = iam.create_role(RoleName=role, AssumeRolePolicyDocument=trust)["Role"]["Arn"]
+        if statements:
+            iam.put_role_policy(RoleName=role, PolicyName="p",
+                                PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": statements}))
+
+    def create(name):
+        return glue.create_table_optimizer(**ids, Type="compaction",
+                                           TableOptimizerConfiguration={"roleArn": roles[name], "enabled": False})
+
+    if auth_enabled:
+        assert _optimizer_error(lambda: create("none")) == (
+            "AccessDeniedException", f"The provided IAM Role: {roles['none']} does not have the proper IAM "
+            "permissions to call Glue APIs. Please update the role's IAM permissions to allow access to the table", 403)
+        assert _optimizer_error(lambda: create("glue")) == ("AccessDeniedException", "Access denied", 403)
+    else:
+        create("none")
+        glue.delete_table_optimizer(**ids, Type="compaction")
+    create("full")

@@ -49,7 +49,7 @@ from ministack.core.responses import (
     now_iso,
     request_scope,
 )
-from ministack.services import ecs_metadata, secretsmanager
+from ministack.services import ecr, ecs_metadata, secretsmanager
 
 logger = logging.getLogger("ecs")
 
@@ -526,7 +526,7 @@ def _put_cluster(data):
             {"name": "containerInsights", "value": "disabled"},
         ],
         "capacityProviders": data.get("capacityProviders", []),
-        "defaultCapacityProviderStrategy": data.get("defaultCapacityProviderStrategy", []),
+        "defaultCapacityProviderStrategy": _service_strategy(data.get("defaultCapacityProviderStrategy")) or [],
         "statistics": [],
         "attachments": [],
         "attachmentsStatus": "",
@@ -1358,6 +1358,13 @@ _BOTH_LAUNCH_CHOICES = ("Specifying both a launch type and capacity provider str
 _FARGATE_PROVIDERS = ("FARGATE", "FARGATE_SPOT")
 
 
+def _service_strategy(strategy):
+    """A capacityProviderStrategy as AWS returns it (service or cluster default): each item with its base, 0 when not given."""
+    if not strategy:
+        return None
+    return [{**item, "base": item.get("base", 0)} for item in strategy]
+
+
 def _launch_choice(data, cluster):
     """(launchType, capacityProviderStrategy, error): a strategy omits the launch type, and with
     neither the cluster's default strategy applies, else EC2."""
@@ -1366,7 +1373,7 @@ def _launch_choice(data, cluster):
     if strategy and launch_type:
         return None, None, error_response_json("InvalidParameterException", _BOTH_LAUNCH_CHOICES, 400)
     if strategy or launch_type:
-        return launch_type, strategy, None
+        return launch_type, _service_strategy(strategy), None
     default = (cluster or {}).get("defaultCapacityProviderStrategy") or None
     return (None, default, None) if default else ("EC2", None, None)
 
@@ -1614,7 +1621,7 @@ def _update_service(data):
         svc["loadBalancers"] = data["loadBalancers"]
     if "capacityProviderStrategy" in data:
         # An empty strategy moves the service back to a launch type.
-        strategy = data["capacityProviderStrategy"] or None
+        strategy = _service_strategy(data["capacityProviderStrategy"])
         svc["capacityProviderStrategy"] = strategy
         svc["launchType"] = None if strategy else (svc.get("launchType") or "EC2")
 
@@ -1997,7 +2004,7 @@ def _resolve_container_secrets(cdef):
         else:
             # SSM Parameter Store reference (ARN or bare name).
             from ministack.services import ssm
-            value = ssm.resolve_parameter_value(value_from)
+            value = ssm.resolve_parameter_value(value_from, decrypt=True)  # ECS injects SecureStrings decrypted
         if value is None:
             raise _SecretResolutionError(
                 f"unable to retrieve secret {value_from} for environment "
@@ -2321,8 +2328,12 @@ def _prepare_service_images(task, td, docker_client):
             continue
         image = cdef["image"]
         digest = image.split("@", 1)[1] if "@" in image else None
+        held = not digest and ecr._held_image(image) is not None
+        if held:  # this MiniStack's own ECR: never ask the real registry
+            principal = td.get("executionRoleArn") or f"arn:aws:iam::{get_account_id()}:root"
+            digest = ecr.held_image_digest(image) if ecr.held_image_readable(image, principal) else None
         auth_config = _resolve_repository_credentials(cdef) if not digest else None
-        for _ in range(3):
+        for _ in range(0 if held else 3):
             if not _task_is_active(task["taskArn"], task):
                 return None
             if digest:
@@ -2362,10 +2373,37 @@ class _ImagePullError(Exception):
     """An image pull failed and the launch type has no usable cache."""
 
 
+_DOCKER_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
+
+
+def _load_held_image(docker_client, image, platform, principal_arn=None):
+    """Load an image held in this MiniStack's ECR into the daemon; return the reference to run, or None when
+    the image belongs to another registry. Raises _ImagePullError when the repository has no such image."""
+    from ministack.services import ecr
+    if ecr._held_image(image) is None:
+        return None
+    if not ecr.held_image_readable(image, principal_arn or f"arn:aws:iam::{get_account_id()}:root"):
+        raise _ImagePullError(f"{image}: the repository policy does not allow this account to pull it")
+    if platform:
+        architecture = platform.rsplit("/", 1)[-1]
+    else:
+        reported = (docker_client.info() or {}).get("Architecture", "")
+        architecture = _DOCKER_ARCHITECTURES.get(reported, reported)
+    built = ecr.held_image_archive(image, architecture)
+    if built is None:
+        raise _ImagePullError(f"{image}: not found in this MiniStack's ECR for linux/{architecture}")
+    archive, config_digest = built
+    docker_client.images.load(archive)
+    return config_digest if "@" in image.rsplit("/", 1)[-1] else image
+
+
 def _run_docker_container(
         docker_client, cdef, run_kwargs, *, refresh_image=False, allow_cached=True,
-        cache_image=None, fallback_image=None, auth_config=None):
+        cache_image=None, fallback_image=None, auth_config=None, execution_role=None):
     def run():
+        held = _load_held_image(docker_client, cdef["image"], run_kwargs.get("platform"), execution_role)
+        if held:
+            return docker_client.containers.run(held, **run_kwargs)
         create_image = cdef["image"]
         if refresh_image:
             try:
@@ -2566,6 +2604,7 @@ def _start_task_worker(task, td, container_overrides, docker_client):
                          else None),
             fallback_image=cdef["image"] if digest and "@" not in cdef["image"] else None,
             auth_config=_resolve_repository_credentials(cdef) if deployment else None,
+            execution_role=td.get("executionRoleArn"),
         )
 
         if not _attach_started_container(
@@ -3144,7 +3183,7 @@ def _put_cluster_capacity_providers(data):
         return error_response_json("ClusterNotFoundException", "Cluster not found.", 400)
 
     cluster["capacityProviders"] = data.get("capacityProviders", [])
-    cluster["defaultCapacityProviderStrategy"] = data.get("defaultCapacityProviderStrategy", [])
+    cluster["defaultCapacityProviderStrategy"] = _service_strategy(data.get("defaultCapacityProviderStrategy")) or []
 
     return json_response({"cluster": cluster})
 

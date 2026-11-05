@@ -794,10 +794,14 @@ _RESOURCE_POLICY_LOOKUPS = {
     "ecr": ("ecr", "repository_policy_for_arn"),
     "kms": ("kms", "key_policy_for_arn"),
     "apigateway": ("apigateway_v1", "rest_api_policy_for_arn"),
+    "kinesis": ("kinesis", "stream_policy_for_arn"),
 }
 
 # A key policy must allow even the owner's own users and roles.
 _POLICY_REQUIRED = frozenset({"kms"})
+
+# What the bucket owner's root can still do when the bucket policy denies everyone.
+_ROOT_BUCKET_POLICY_ACTIONS = frozenset({"s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"})
 
 
 def _resource_policy(service: str, resource_arn: str) -> tuple | None:
@@ -1686,13 +1690,43 @@ def enforce(access_key_id: str, iam_action: str, service: str,
     if isinstance(principal, AuthError):
         return principal
 
-    # Root principal: allow everything
-    if principal.policies is None:
-        return None
-
     context = {key.lower(): value for key, value in (service_context or {}).items()}
     # A request that names no tags has no aws:TagKeys.
     context.setdefault("aws:tagkeys", None)
+
+    # Root principal: no identity policy limits it, but an explicit Deny in a bucket policy does,
+    # except on the bucket policy itself for the bucket owner's root (captured on AWS).
+    if service == "kms" and resource_arn.startswith("arn:aws:kms:"):
+        # KMS answers these itself, as on AWS: a key that does not exist is NotFoundException before any
+        # permission check, and a key policy in another account that does not allow the caller is refused
+        # in KMS's own words. What is left is the usual identity check, for a key in another account too.
+        from ministack.services import kms
+
+        resource_arn = kms.key_arn_for_request(resource_arn)
+        found = _resource_policy(service, resource_arn)
+        if found is None:
+            return None
+        owner, rec = kms._foreign_key(resource_arn)
+        if owner and not kms.key_policy_allows_caller(rec, iam_action.split(":", 1)[1], principal.arn):
+            return None
+        if principal.policies is None:
+            return None
+    if principal.policies is None:
+        if service != "s3" or "s3:dataaccesspointarn" in context:
+            return None
+        found = _resource_policy(service, resource_arn)
+        if found is None or (iam_action in _ROOT_BUCKET_POLICY_ACTIONS and found[1] in (None, principal.account)):
+            return None
+        root_ctx = EvalContext(principal_arn=principal.arn, principal_type=principal.type,
+                               principal_account=principal.account, action=iam_action, resource_arn=resource_arn,
+                               region=region, service_context=context, principal_keys=principal.keys)
+        denied = evaluate_resource_policy(found[0], root_ctx)
+        if denied.decision != "Deny":
+            return None
+        denied.resource_policy_arn = resource_arn
+        denied.principal_arn = principal.arn
+        return denied
+
     if _names_condition_key(principal.policies, "aws:resourcetag/"):
         from ministack.services.tagging import resource_tags
         for name, value in (resource_tags(resource_arn) or {}).items():

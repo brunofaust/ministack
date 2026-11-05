@@ -846,7 +846,7 @@ def test_cloudfront_function_create_publish_describe_get_delete(cloudfront):
 
     pub = cloudfront.publish_function(Name=name, IfMatch=dev_etag)
     assert pub["FunctionSummary"]["FunctionMetadata"]["Stage"] == "LIVE"
-    live_etag = _cf_resp_etag(pub)
+    live_etag = _cf_resp_etag(cloudfront.describe_function(Name=name, Stage="LIVE"))
     assert live_etag
 
     d_dev = cloudfront.describe_function(Name=name, Stage="DEVELOPMENT")
@@ -933,11 +933,116 @@ def test_cloudfront_function_update_keeps_the_published_live_stage(cloudfront):
     )
 
 
+def test_cloudfront_function_stage_defaults_and_etags_follow_aws(cloudfront):
+    """Captured on AWS (us-east-1, 2026-10-28): DescribeFunction and GetFunction
+    without Stage answer the DEVELOPMENT stage, a bad Stage is MalformedXML,
+    PublishFunction gives LIVE the DEVELOPMENT ETag, and GetFunction is
+    application/octet-stream."""
+    name = f"fn-stage-{_uuid_mod.uuid4().hex[:8]}"
+    v1 = b"function handler(event) { return event.request; }"
+    v2 = b"function handler(event) { var r = event.request; return r; }"
+    cr = cloudfront.create_function(Name=name, FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+                                    FunctionCode=v1)
+    etag = _cf_resp_etag(cr)
+    assert re.fullmatch(r"E[A-Z0-9]{12,13}", etag)
+    try:
+        d = cloudfront.describe_function(Name=name)
+        assert (d["FunctionSummary"]["FunctionMetadata"]["Stage"], d["FunctionSummary"]["Status"]) == (
+            "DEVELOPMENT", "UNPUBLISHED")
+        g = cloudfront.get_function(Name=name)
+        assert g["ContentType"] == "application/octet-stream"
+        assert g["FunctionCode"].read() == v1
+        for call in (cloudfront.describe_function, cloudfront.get_function):
+            with pytest.raises(ClientError) as exc:
+                call(Name=name, Stage="BOGUS")
+            assert exc.value.response["Error"]["Code"] == "MalformedXML"
+            assert exc.value.response["Error"]["Message"] == (
+                "1 validation error detected: Value 'BOGUS' at 'stage' failed to satisfy constraint: "
+                "Member must satisfy enum value set: [LIVE, DEVELOPMENT]")
+
+        cloudfront.publish_function(Name=name, IfMatch=etag)
+        live = cloudfront.describe_function(Name=name, Stage="LIVE")
+        assert _cf_resp_etag(live) == etag
+        assert live["FunctionSummary"]["Status"] == "UNASSOCIATED"
+        assert _cf_resp_etag(cloudfront.describe_function(Name=name)) == etag
+
+        upd = cloudfront.update_function(Name=name, IfMatch=etag,
+                                         FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-2.0"},
+                                         FunctionCode=v2)
+        # AWS sends UpdateFunction's ETag in a header named ETtag, which is where botocore reads it.
+        headers = upd["ResponseMetadata"]["HTTPHeaders"]
+        assert upd["ETag"] == headers["ettag"] and "etag" not in headers
+        etag = upd["ETag"]
+        assert _cf_resp_etag(cloudfront.describe_function(Name=name)) == etag
+        assert cloudfront.get_function(Name=name)["FunctionCode"].read() == v2
+        assert cloudfront.get_function(Name=name, Stage="LIVE")["FunctionCode"].read() == v1
+        with pytest.raises(ClientError) as exc:
+            cloudfront.describe_function(Name=f"{name}-missing")
+        assert exc.value.response["Error"]["Code"] == "NoSuchFunctionExists"
+    finally:
+        cloudfront.delete_function(Name=name, IfMatch=etag)
+
+
+def test_cloudfront_function_live_stage_counts_its_own_versions(cloudfront):
+    """#2481, captured on AWS: each stage counts its own versions, so LIVE's ETag follows its publish count;
+    PublishFunction has no ETag header, a stale If-Match is AWS's PreconditionFailed message, and a function a
+    distribution uses can't be deleted."""
+    name = f"fn-live-ver-{_uuid_mod.uuid4().hex[:8]}"
+    cfg = {"Comment": "", "Runtime": "cloudfront-js-2.0"}
+
+    def code(i):
+        return f"function handler(event) {{ var v{i} = 1; return event.request; }}".encode()
+
+    def etag(stage):
+        return _cf_resp_etag(cloudfront.describe_function(Name=name, Stage=stage))
+
+    v1 = _cf_resp_etag(cloudfront.create_function(Name=name, FunctionConfig=cfg, FunctionCode=code(0)))
+    v2 = cloudfront.update_function(Name=name, IfMatch=v1, FunctionConfig=cfg, FunctionCode=code(1))["ETag"]
+    published = cloudfront.publish_function(Name=name, IfMatch=v2)
+    assert "etag" not in published["ResponseMetadata"]["HTTPHeaders"]
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v2, v1)
+    v3 = cloudfront.update_function(Name=name, IfMatch=v2, FunctionConfig=cfg, FunctionCode=code(2))["ETag"]
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v3, v1)
+    cloudfront.publish_function(Name=name, IfMatch=v3)
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v3, v2)
+    cloudfront.publish_function(Name=name, IfMatch=v3)
+    assert (etag("DEVELOPMENT"), etag("LIVE")) == (v3, v3)
+
+    for call in (lambda: cloudfront.publish_function(Name=name, IfMatch=v1),
+                 lambda: cloudfront.delete_function(Name=name, IfMatch=v1)):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "PreconditionFailed"
+        assert exc.value.response["Error"]["Message"] == (
+            "The request failed because it didn't meet the preconditions in one or more request-header fields.")
+
+    fn_arn = cloudfront.describe_function(Name=name, Stage="LIVE")["FunctionSummary"]["FunctionMetadata"]["FunctionARN"]
+    dist_cfg = copy.deepcopy(_CF_DIST_CONFIG)
+    dist_cfg["CallerReference"] = f"cf-fn-inuse-{_uuid_mod.uuid4().hex[:12]}"
+    dist_cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {
+        "Quantity": 1, "Items": [{"FunctionARN": fn_arn, "EventType": "viewer-request"}]}
+    dist = cloudfront.create_distribution(DistributionConfig=dist_cfg)
+    try:
+        with pytest.raises(ClientError) as exc:
+            cloudfront.delete_function(Name=name, IfMatch=v3)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+        err = exc.value.response["Error"]
+        assert (err["Code"], err["Message"]) == (
+            "FunctionInUse", f"Cannot delete function {name}, it is in use by 1 distributions")
+    finally:
+        dist_cfg["Enabled"] = False
+        dist_cfg["DefaultCacheBehavior"]["FunctionAssociations"] = {"Quantity": 0}
+        disabled = cloudfront.update_distribution(Id=dist["Distribution"]["Id"], IfMatch=dist["ETag"],
+                                                  DistributionConfig=dist_cfg)
+        cloudfront.delete_distribution(Id=dist["Distribution"]["Id"], IfMatch=disabled["ETag"])
+    cloudfront.delete_function(Name=name, IfMatch=v3)
+
+
 def test_cloudfront_function_development_status_follows_publish_and_association(cloudfront):
-    """The DEVELOPMENT stage reports UNPUBLISHED only while it holds changes that
-    were never published, then UNASSOCIATED, or DEPLOYED while a cache
-    behavior references the function. Terraform's aws_cloudfront_function.status
-    reads this stage."""
+    """UNPUBLISHED until the first publish, then UNASSOCIATED, or DEPLOYED while a
+    cache behavior references the function; an update does not go back to
+    UNPUBLISHED (AWS, us-east-1, 2026-10-28). Terraform's
+    aws_cloudfront_function.status reads the DEVELOPMENT stage."""
     name = f"fn-status-{_uuid_mod.uuid4().hex[:8]}"
 
     def dev_status():
@@ -965,9 +1070,9 @@ def test_cloudfront_function_development_status_follows_publish_and_association(
         FunctionConfig={"Comment": "v2", "Runtime": "cloudfront-js-2.0"},
         FunctionCode=b"function handler(event) { return event.request; } // v2",
     )
-    assert upd["FunctionSummary"]["Status"] == "UNPUBLISHED"
-    assert dev_status() == "UNPUBLISHED"
-    assert listed_dev_status() == "UNPUBLISHED"
+    assert upd["FunctionSummary"]["Status"] == "UNASSOCIATED"
+    assert dev_status() == "UNASSOCIATED"
+    assert listed_dev_status() == "UNASSOCIATED"
 
     cloudfront.publish_function(Name=name, IfMatch=_cf_resp_etag(upd))
     assert dev_status() == "UNASSOCIATED"
@@ -1011,20 +1116,6 @@ def test_cloudfront_function_duplicate_name(cloudfront):
         )
     assert exc.value.response["Error"]["Code"] == "FunctionAlreadyExists"
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
-
-
-def test_cloudfront_function_describe_requires_stage(cloudfront):
-    """DescribeFunction without Stage query param — AWS requires Stage; MiniStack returns InvalidArgument."""
-    name = f"fn-nostage-{_uuid_mod.uuid4().hex[:8]}"
-    cloudfront.create_function(
-        Name=name,
-        FunctionConfig={"Comment": "", "Runtime": "cloudfront-js-1.0"},
-        FunctionCode=b"//",
-    )
-    with pytest.raises(ClientError) as exc:
-        cloudfront.describe_function(Name=name)
-    assert exc.value.response["Error"]["Code"] == "InvalidArgument"
-    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_cloudfront_sdk_compat_injects_origin_groups():
@@ -5066,6 +5157,122 @@ def test_routes_by_distribution_domain(cf_stack):
     assert json.loads(body)["path"] == "/hello"
 
 
+def _alias_distribution(cloudfront, origin_domain, aliases, origin_path):
+    # A minimal distribution; its OriginPath is echoed back, so the response names the distribution that served it.
+    suffix = _uuid_mod.uuid4().hex[:10]
+    config = {
+        "CallerReference": f"cf-alias-{suffix}",
+        "Comment": "alias routing",
+        "Enabled": True,
+        "Aliases": {"Quantity": len(aliases), "Items": aliases},
+        "Origins": {"Quantity": 1, "Items": [{
+            "Id": "o", "DomainName": origin_domain, "OriginPath": origin_path,
+            "CustomOriginConfig": {
+                "HTTPPort": int(GATEWAY_PORT), "HTTPSPort": 443, "OriginProtocolPolicy": "http-only",
+                "OriginSslProtocols": {"Quantity": 1, "Items": ["TLSv1.2"]},
+            },
+        }]},
+        "DefaultCacheBehavior": {
+            "TargetOriginId": "o", "ViewerProtocolPolicy": "allow-all", "CachePolicyId": _CACHING_DISABLED,
+        },
+    }
+    _ALIAS_DISTRIBUTIONS.append(cloudfront.create_distribution(DistributionConfig=config)["Distribution"]["Id"])
+
+
+_ALIAS_DISTRIBUTIONS = []
+
+
+@pytest.fixture(autouse=True)
+def _delete_alias_distributions(cloudfront):
+    yield
+    while _ALIAS_DISTRIBUTIONS:
+        dist_id = _ALIAS_DISTRIBUTIONS.pop()
+        cfg = cloudfront.get_distribution_config(Id=dist_id)
+        etag = cloudfront.update_distribution(Id=dist_id, IfMatch=cfg["ETag"],
+                                              DistributionConfig={**cfg["DistributionConfig"], "Enabled": False})["ETag"]
+        cloudfront.delete_distribution(Id=dist_id, IfMatch=etag)
+
+
+def test_routes_by_alternate_domain_name(cloudfront, cf_backend):
+    # Developer Guide, "Using custom URLs by adding alternate domain names (CNAMEs)".
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["alias-exact.example.test"], "/exact")
+    status, headers, body = _get("Alias-Exact.Example.Test", "/hello")
+    assert status == 200
+    assert "X-Cache" in headers
+    assert json.loads(body)["path"] == "/exact/hello"
+
+
+def _served_by(host):
+    return json.loads(_get(host, "/hello")[2])["path"]
+
+
+# Behaviours below recorded on AWS 2026-10-29: the Host header picks the distribution; an exact alias beats every
+# wildcard; `*.S` covers any depth below S but not S itself; the longest matching wildcard wins; creation order is moot.
+@pytest.mark.parametrize("exact_first", [True, False])
+def test_exact_alias_beats_wildcard_alias(cloudfront, cf_backend, exact_first):
+    o = cf_backend["origin_domain"]
+    dom = f"ex{int(exact_first)}.example.test"
+    pair = [([f"x.{dom}"], "/exact"), ([f"*.{dom}"], "/wild")]
+    for aliases, path in pair if exact_first else reversed(pair):
+        _alias_distribution(cloudfront, o, aliases, path)
+    assert _served_by(f"x.{dom}") == "/exact/hello"
+    assert _served_by(f"y.{dom}") == "/wild/hello"
+
+
+def test_wildcard_alias_covers_any_depth_but_not_its_suffix(cloudfront, cf_backend):
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["*.deep.example.test"], "/wild")
+    assert _served_by("a.deep.example.test") == "/wild/hello"
+    assert _served_by("a.b.deep.example.test") == "/wild/hello"
+    assert "X-Cache" not in _get("deep.example.test", "/hello")[1]
+
+
+@pytest.mark.parametrize("specific_first", [True, False])
+def test_longest_wildcard_alias_wins(cloudfront, cf_backend, specific_first):
+    o = cf_backend["origin_domain"]
+    dom = f"lw{int(specific_first)}.example.test"
+    pair = [([f"*.s.{dom}"], "/specific"), ([f"*.{dom}"], "/broad")]
+    for aliases, path in pair if specific_first else reversed(pair):
+        _alias_distribution(cloudfront, o, aliases, path)
+    assert _served_by(f"a.s.{dom}") == "/specific/hello"
+    assert _served_by(f"a.b.s.{dom}") == "/specific/hello"
+    assert _served_by(f"a.t.{dom}") == "/broad/hello"
+
+
+def test_signed_api_call_is_not_alias_viewer_traffic(cloudfront, cf_backend):
+    # An alias covering the host SDKs reach MiniStack by must not swallow their (SigV4-signed) API calls.
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["*.sig.example.test"], "/wild")
+    assert "X-Cache" in _get("api.sig.example.test", "/hello")[1]
+    signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20261030/us-east-1/s3/aws4_request, "
+                               "SignedHeaders=host, Signature=00"}
+    assert "X-Cache" not in _get("api.sig.example.test", "/hello", extra_headers=signed)[1]
+
+
+def test_function_event_host_is_lower_cased_without_port():
+    # Captured on AWS (cases 3, 9a, 9b): X.D and x.D:443 reach the viewer function as x.D.
+    from ministack.services.cloudfront import _build_function_event
+
+    for sent in ("X.Example.Test", "x.example.test:443", "x.example.test:80"):
+        event = _build_function_event("viewer-request", "E1", "d1.cloudfront.net", "r", "GET", "/", {},
+                                      {"host": sent}, "127.0.0.1")
+        assert event["request"]["headers"]["host"] == {"value": "x.example.test"}
+
+
+def test_alias_yields_to_an_api_gateway_custom_domain(cloudfront, apigw, cf_backend):
+    # On AWS DNS sends a registered custom domain to API Gateway; here the Host is the only signal.
+    name = "api.cdy.example.test"
+    _alias_distribution(cloudfront, cf_backend["origin_domain"], ["*.cdy.example.test"], "/wild")
+    api_id = cf_backend["origin_domain"].split(".")[0]
+    apigw.create_domain_name(DomainName=name)
+    try:
+        apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="$default", ApiMappingKey="v1")
+        status, headers, body = _get(name, "/v1/hello")
+        assert status == 200 and "X-Cache" not in headers
+        assert json.loads(body)["path"] == "/hello"
+        assert _served_by("other.cdy.example.test") == "/wild/hello"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+
+
 def test_path_pattern_without_leading_slash_matches_as_if_it_had_one(cf_stack):
     # PathPattern "api/*" (no leading /) — CloudFront Developer Guide,
     # "Path pattern": "CloudFront treats the path the same with or without
@@ -5866,6 +6073,7 @@ class _RawHeaderCaptureServer:
         self.sock.bind(("127.0.0.1", 0))
         self.sock.listen(5)
         self.port = self.sock.getsockname()[1]
+        self.last_request_line = ""
         self.last_header_lines: list = []
         self._stop = False
         self.thread = threading.Thread(target=self._serve, daemon=True)
@@ -5890,7 +6098,8 @@ class _RawHeaderCaptureServer:
                     data += chunk
                 head, _, _rest = data.partition(b"\r\n\r\n")
                 lines = head.decode("latin-1").split("\r\n")
-                self.last_header_lines = lines[1:]  # drop the request line
+                self.last_request_line = lines[0]
+                self.last_header_lines = lines[1:]
                 body = b"ok"
                 conn.sendall(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "
@@ -6159,7 +6368,8 @@ def test_untrusted_origin_certificate_answers_502(cloudfront, untrusted_https_or
 # ---------------------------------------------------------------------------
 
 
-def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, read_timeout: int = 30) -> str:
+def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, read_timeout: int = 30,
+                     origin_request_policy_id: str | None = None) -> str:
     suffix = _uuid_mod.uuid4().hex[:10]
     origin = {
         "Id": "alb-origin",
@@ -6185,6 +6395,8 @@ def _alb_origin_dist(cloudfront, lb_dns: str, port: int, custom_headers: list, r
             "CachePolicyId": _CACHING_DISABLED,
         },
     }
+    if origin_request_policy_id:
+        dist_config["DefaultCacheBehavior"]["OriginRequestPolicyId"] = origin_request_policy_id
     return cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]["DomainName"]
 
 
@@ -6227,11 +6439,34 @@ def test_registered_alb_origin_is_served_through_its_listener_rules(cloudfront, 
     assert (status, body) == (403, b"denied")
 
 
+def test_registered_alb_origin_in_another_region_is_served_through_its_listener(cloudfront):
+    """An origin naming a load balancer outside MINISTACK_REGION reaches that load
+    balancer's listener (#2581)."""
+    import boto3
+
+    elbv2 = boto3.client("elbv2", endpoint_url=ENDPOINT, region_name="us-east-2",
+                         aws_access_key_id="test", aws_secret_access_key="test")
+    lb = elbv2.create_load_balancer(Name=f"cf-alb2-{_uuid_mod.uuid4().hex[:8]}")["LoadBalancers"][0]
+    try:
+        listener_arn = elbv2.create_listener(
+            LoadBalancerArn=lb["LoadBalancerArn"], Protocol="HTTP", Port=80,
+            DefaultActions=[_alb_fixed("200", "alb-in-us-east-2")],
+        )["Listeners"][0]["ListenerArn"]
+        try:
+            status, _headers, body = _get(_alb_origin_dist(cloudfront, lb["DNSName"], 80, []), "/anything")
+            assert (status, body) == (200, b"alb-in-us-east-2")
+        finally:
+            elbv2.delete_listener(ListenerArn=listener_arn)
+    finally:
+        elbv2.delete_load_balancer(LoadBalancerArn=lb["LoadBalancerArn"])
+
+
 def test_registered_alb_origin_without_a_listener_on_the_origin_port_answers_502(cloudfront, alb_origin):
     dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 8080, [])
     status, headers, _body = _get(dist_host, "/anything")
     assert status == 502
     assert headers.get("X-Cache") == "Error from cloudfront"
+    assert {k.lower(): v for k, v in headers.items()}["server"] == "CloudFront"
 
 
 def test_unregistered_alb_hostname_is_still_refused(cloudfront):
@@ -6262,6 +6497,27 @@ def test_registered_alb_origin_relays_an_ip_target_response(cloudfront, elbv2, a
         assert len(xff_lines) == 1
         # CloudFront appends the viewer, then the load balancer appends CloudFront's address.
         assert xff_lines[0].split(":", 1)[1].strip() == "203.0.113.5, 127.0.0.1, 127.0.0.1"
+    finally:
+        elbv2.delete_target_group(TargetGroupArn=tg_arn)
+
+
+def test_registered_alb_origin_forwards_the_query_string_as_the_viewer_sent_it(
+    cloudfront, elbv2, alb_origin, raw_header_server,
+):
+    tg_arn = elbv2.create_target_group(
+        Name=f"cf-alb-{_uuid_mod.uuid4().hex[:8]}", Protocol="HTTP", Port=raw_header_server.port,
+        VpcId="vpc-00000001", TargetType="ip",
+    )["TargetGroups"][0]["TargetGroupArn"]
+    try:
+        elbv2.register_targets(TargetGroupArn=tg_arn, Targets=[{"Id": "127.0.0.1", "Port": raw_header_server.port}])
+        elbv2.modify_listener(ListenerArn=alb_origin["listener_arn"],
+                              DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}])
+        dist_host = _alb_origin_dist(cloudfront, alb_origin["dns"], 80, [],
+                                     origin_request_policy_id=_MANAGED_ALL_VIEWER_EXCEPT_HOST_ID)
+
+        status, _headers, _body = _get(dist_host, "/search?a=1&b=2&a=3&flag")
+        assert status == 200
+        assert raw_header_server.last_request_line == "GET /search?a=1&b=2&a=3&flag HTTP/1.1"
     finally:
         elbv2.delete_target_group(TargetGroupArn=tg_arn)
 
@@ -6325,7 +6581,7 @@ def test_streamed_alb_body_idle_past_the_read_timeout_is_an_origin_timeout():
 
 
 def _function_url_dist(cloudfront, url_host: str, protocol_policy: str = "https-only",
-                       origin_request_policy: str = _ALL_VIEWER_EXCEPT_HOST) -> str:
+                       origin_request_policy: str = _ALL_VIEWER_EXCEPT_HOST, response_function_arn: str = "") -> str:
     origin = {
         "Id": "url-origin", "DomainName": url_host,
         "CustomHeaders": {"Quantity": 1, "Items": [{"HeaderName": "X-Origin-Verify", "HeaderValue": "origin-token"}]},
@@ -6345,6 +6601,9 @@ def _function_url_dist(cloudfront, url_host: str, protocol_policy: str = "https-
             "CachePolicyId": _CACHING_DISABLED, "OriginRequestPolicyId": origin_request_policy,
         },
     }
+    if response_function_arn:
+        dist_config["DefaultCacheBehavior"]["FunctionAssociations"] = {
+            "Quantity": 1, "Items": [{"FunctionARN": response_function_arn, "EventType": "viewer-response"}]}
     return cloudfront.create_distribution(DistributionConfig=dist_config)["Distribution"]["DomainName"]
 
 
@@ -6404,3 +6663,42 @@ def test_function_url_origin_over_http_is_unreachable(cloudfront, function_url_o
 def test_unregistered_function_url_hostname_is_still_refused(cloudfront):
     host = f"{_uuid_mod.uuid4()}.lambda-url.us-east-1.on.aws"
     assert _get(_function_url_dist(cloudfront, host), "/hello")[0] == 502
+
+
+def test_distribution_adds_no_request_id_headers_of_its_own(cf_raw_origin_stack):
+    """CloudFront adds Via, X-Amz-Cf-Id, X-Amz-Cf-Pop and X-Cache; an origin that sends no request id gets none."""
+    status, headers, _body = _get(cf_raw_origin_stack, "/hello")
+    assert status == 200
+    names = {name.lower() for name in headers}
+    assert "x-amz-cf-id" in names
+    assert not names & {"x-amzn-requestid", "x-amz-request-id"}
+    # The origin's own Server passes through.
+    assert {k.lower(): v for k, v in headers.items()}["server"].startswith("BaseHTTP")
+
+
+def test_request_id_has_cloudfronts_shape(cf_raw_origin_stack):
+    """X-Amz-Cf-Id is 40 random bytes in URL-safe base64 with its padding, as CloudFront sends it."""
+    status, headers, _body = _get(cf_raw_origin_stack, "/hello")
+    assert status == 200
+    lowered = {name.lower(): value for name, value in headers.items()}
+    assert re.fullmatch(r"[A-Za-z0-9_-]{54}==", lowered["x-amz-cf-id"]), lowered["x-amz-cf-id"]
+    assert re.fullmatch(r"1\.1 [0-9a-f]{32}\.cloudfront\.net \(CloudFront\)", lowered["via"]), lowered["via"]
+
+
+def test_function_url_origin_response_headers_follow_aws(cloudfront, function_url_origin):
+    """Captured on AWS: no Server from an origin that sends none, and one request id, the Function URL's own."""
+    status, headers, _body = _get(_function_url_dist(cloudfront, function_url_origin["open"]), "/hello")
+    assert status == 200
+    names = [k.lower() for k in headers]
+    assert "server" not in names
+    assert names.count("x-amzn-requestid") == 1 and "x-amz-request-id" not in names
+
+
+def test_viewer_response_function_adds_cloudfront_server_when_the_origin_sends_none(cloudfront, function_url_origin):
+    _skip_without_node()
+    fn_arn = _create_function(cloudfront, f"cf-dp-server-{_uuid_mod.uuid4().hex[:8]}",
+                              b"function handler(event) { return event.response; }")
+    dist_host = _function_url_dist(cloudfront, function_url_origin["open"], response_function_arn=fn_arn)
+    status, headers, _body = _get(dist_host, "/hello")
+    assert status == 200
+    assert {k.lower(): v for k, v in headers.items()}["server"] == "CloudFront"

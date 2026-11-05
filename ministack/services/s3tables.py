@@ -186,6 +186,11 @@ def _set_bucket_region_value(store, bucket_arn, key, value):
     store.set_scoped(spec.account_id, spec.region, key, value)
 
 
+def _pop_bucket_region_value(store, bucket_arn, key):
+    spec = parse_arn(bucket_arn)
+    store.pop_scoped(spec.account_id, spec.region, key, None)
+
+
 _ICEBERG_V2_PRIMITIVES = {
     "boolean", "int", "long", "float", "double", "date", "time", "timestamp", "timestamptz", "string", "uuid", "binary",
 }
@@ -220,6 +225,64 @@ def _iceberg_field_type(kind):
     if match := _FIXED_TYPE_RE.fullmatch(lowered):
         return f"fixed[{int(match.group(1))}]"
     raise ValueError(kind)
+
+
+def _highest_field_id(fields):
+    """Highest Iceberg field id in a list of struct fields, nested ids included:
+    a struct's fields, a list's element-id, a map's key-id and value-id."""
+    highest = 0
+
+    def visit(kind):
+        nonlocal highest
+        if not isinstance(kind, dict):
+            return
+        if kind.get("type") == "struct":
+            for f in kind.get("fields", []):
+                highest = max(highest, f.get("id", 0))
+                visit(f.get("type"))
+        elif kind.get("type") == "list":
+            highest = max(highest, kind.get("element-id", 0))
+            visit(kind.get("element"))
+        elif kind.get("type") == "map":
+            highest = max(highest, kind.get("key-id", 0), kind.get("value-id", 0))
+            visit(kind.get("key"))
+            visit(kind.get("value"))
+
+    visit({"type": "struct", "fields": fields})
+    return highest
+
+
+def _assign_fresh_ids(fields):
+    """Renumber field ids from 1 as Iceberg's assignFreshIds does: a struct's fields first, then
+    their nested types. Returns the new fields and the old-to-new id map."""
+    counter, ids = [0], {}
+
+    def fresh(old):
+        counter[0] += 1
+        ids.setdefault(old, counter[0])
+        return counter[0]
+
+    def struct(old_fields):
+        new_fields = [{**f, "id": fresh(f.get("id"))} for f in old_fields]
+        for new, old in zip(new_fields, old_fields):
+            new["type"] = nested(old.get("type"))
+        return new_fields
+
+    def nested(kind):
+        if not isinstance(kind, dict):
+            return kind
+        if kind.get("type") == "struct":
+            return {**kind, "fields": struct(kind.get("fields", []))}
+        if kind.get("type") == "list":
+            element_id = fresh(kind.get("element-id"))
+            return {**kind, "element-id": element_id, "element": nested(kind.get("element"))}
+        if kind.get("type") == "map":
+            key_id, value_id = fresh(kind.get("key-id")), fresh(kind.get("value-id"))
+            return {**kind, "key-id": key_id, "value-id": value_id,
+                    "key": nested(kind.get("key")), "value": nested(kind.get("value"))}
+        return kind
+
+    return struct(fields), ids
 
 
 def _initial_iceberg_metadata(table_name, schema_fields, location):
@@ -676,8 +739,8 @@ def _iceberg_error(message, exc_type, code):
     ``ErrorModel`` (``{"error": {"message", "type", "code"}}``). This is the
     shape spec-compliant REST clients (DuckDB, Spark, Trino) require, and is
     distinct from the AWS ``{"__type", "message"}`` shape the S3 Tables control
-    plane returns. A client hitting LoadTable on a not-yet-created table must
-    receive a proper ``NoSuchTableException`` so it proceeds to create it."""
+    plane returns. Clients decide on the 404, so loadTable and loadNamespace can
+    answer AWS's own types (``no_such_table``, ``no_such_namespace``)."""
     body = json.dumps({"error": {"message": message, "type": exc_type, "code": code}}).encode("utf-8")
     return code, {"Content-Type": "application/json"}, body
 
@@ -751,13 +814,73 @@ def _iceberg_create_namespace(data, allow_cross_region, bucket_filter=None):
     return json_response({"namespace": [ns_name], "properties": data.get("properties", {})})
 
 
+def _iceberg_namespaces(namespace, allow_cross_region, bucket_filter=None):
+    return _iceberg_values(
+        _namespaces,
+        lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
+        allow_cross_region)
+
+
+def _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter=None):
+    return _iceberg_values(
+        _tables,
+        lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
+                       and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
+        allow_cross_region)
+
+
 def _iceberg_get_namespace(namespace, allow_cross_region, bucket_filter=None):
-    if _iceberg_values(
-            _namespaces,
-            lambda ns: _namespace_name(ns) == namespace and _in_bucket(ns.get("tableBucketARN", ""), bucket_filter),
-            allow_cross_region):
+    if _iceberg_namespaces(namespace, allow_cross_region, bucket_filter):
         return json_response({"namespace": [namespace], "properties": {}})
-    return _iceberg_error(f"Namespace {namespace} not found", "NoSuchNamespaceException", 404)
+    return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
+
+
+# dropTable, dropNamespace and HEAD below follow responses recorded on AWS (us-east-1, an
+# Organizations member account, 2026-10-30).
+def _iceberg_head_namespace(namespace, allow_cross_region, bucket_filter=None):
+    return (204 if _iceberg_namespaces(namespace, allow_cross_region, bucket_filter) else 404), {}, b""
+
+
+def _iceberg_drop_namespace(namespace, allow_cross_region, bucket_filter=None):
+    """DELETE .../namespaces/{ns}: AWS refuses a namespace that still holds tables."""
+    matches = _iceberg_namespaces(namespace, allow_cross_region, bucket_filter)
+    if not matches:
+        return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
+    bucket_arn = matches[0]["tableBucketARN"]
+    if _iceberg_values(
+            _tables,
+            lambda table: _namespace_name(table) == namespace and table.get("tableBucketARN") == bucket_arn,
+            allow_cross_region):
+        return _iceberg_error("The namespace that you tried to delete is not empty.", "namespace_not_empty", 400)
+    _pop_bucket_region_value(_namespaces, bucket_arn, _ns_key(bucket_arn, namespace))
+    return 204, {}, b""
+
+
+def _iceberg_drop_table(namespace, table_name, purge, allow_cross_region, bucket_filter=None):
+    """DELETE .../namespaces/{ns}/tables/{table}: S3 Tables only drops a table with a purge, and says so
+    before it looks the table up. A purge removes the table's files, so a table created again under the
+    same name starts empty."""
+    if not purge:
+        return _iceberg_error(
+            "DropTable operation failed. S3 Tables only supports dropping tables with purge enabled.",
+            "purge_enabled", 400)
+    if not _iceberg_namespaces(namespace, allow_cross_region, bucket_filter):
+        return _iceberg_error("The specified namespace does not exist.", "no_such_namespace", 404)
+    matches = _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter)
+    if not matches:
+        return _iceberg_error("The specified table does not exist.", "no_such_table", 404)
+    bucket_arn = matches[0]["tableBucketARN"]
+    _pop_bucket_region_value(_tables, bucket_arn, _table_key(bucket_arn, namespace, table_name))
+    # The metadata and data files live under the table's prefix in the bucket that commits write to.
+    import ministack.services.s3 as _s3
+
+    bucket_name = bucket_arn.rsplit("/", 1)[-1]
+    bucket = _s3._ensure_bucket(bucket_name)
+    if bucket:
+        prefix = f"{namespace}/{table_name}/"
+        for key in [k for k in bucket.get("objects", {}) if k.startswith(prefix)]:
+            _s3._delete_object(bucket_name, key)
+    return 204, {}, b""
 
 
 def _iceberg_list_tables(namespace, allow_cross_region, bucket_filter=None):
@@ -892,7 +1015,7 @@ def _iceberg_load_table(namespace, table_name, allow_cross_region, bucket_filter
                 },
             }
         )
-    return _iceberg_error(f"Table {namespace}.{table_name} not found", "NoSuchTableException", 404)
+    return _iceberg_error("The specified table does not exist.", "no_such_table", 404)
 
 
 def _apply_iceberg_updates(metadata, updates):
@@ -934,11 +1057,11 @@ def _apply_iceberg_updates(metadata, updates):
             if not any(s.get("schema-id") == new_schema.get("schema-id") for s in existing):
                 existing.append(new_schema)
             # Advance last-column-id to the highest field ID in the new
-            # schema, so a client allocating the next column's ID (e.g.
-            # DuckDB ALTER TABLE ADD COLUMN) doesn't collide with these.
-            field_ids = [f["id"] for f in new_schema.get("fields", []) if "id" in f]
-            if field_ids:
-                metadata["last-column-id"] = max(metadata.get("last-column-id", 0), max(field_ids))
+            # schema, nested ids included, so a client allocating the next
+            # column's ID (e.g. DuckDB or Trino ADD COLUMN) doesn't collide.
+            metadata["last-column-id"] = max(
+                metadata.get("last-column-id", 0), _highest_field_id(new_schema.get("fields", []))
+            )
         elif action == "set-current-schema":
             schema_id = update.get("schema-id", 0)
             if schema_id == -1:
@@ -1044,6 +1167,9 @@ def _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucke
 
 
 def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=None):
+    # S3 Tables requires stage-create, which the Iceberg REST spec leaves optional.
+    if data.get("stage-create") is None:
+        return _iceberg_error("stage-create is a required field and cannot be null", "required_field_is_null", 400)
     table_name = data.get("name", "")
     schema = data.get("schema", {})
     bucket_arn = None
@@ -1073,21 +1199,35 @@ def _iceberg_create_table(namespace, data, allow_cross_region, bucket_filter=Non
     ]
 
     bucket_name = bucket_arn.rsplit("/", 1)[-1]
-    location = data.get("location", f"s3://{bucket_name}/{namespace}/{table_name}")
+    # S3 Tables assigns the location; a client's, null or not, is ignored.
+    location = f"s3://{bucket_name}/{namespace}/{table_name}"
     iceberg_metadata = _initial_iceberg_metadata(table_name, schema_fields, location)
     # Honor a format-version from the client's request or properties.
     fmt_ver = data.get("format-version") or data.get("properties", {}).get("format-version")
     if fmt_ver is not None:
         iceberg_metadata["format-version"] = int(fmt_ver)
+    ids = {}
     if schema:
-        iceberg_metadata["schemas"] = [schema]
+        # Field ids are renumbered from 1, and the partition spec and sort order follow.
+        fields, ids = _assign_fresh_ids(schema.get("fields", []))
+        iceberg_metadata["schemas"] = [{**schema, "fields": fields}]
+        iceberg_metadata["last-column-id"] = _highest_field_id(fields)
+
+    def remap(spec_fields):
+        return [{**f, "source-id": ids.get(f.get("source-id"), f.get("source-id"))} for f in spec_fields]
+
     partition_spec = data.get("partition-spec")
     if partition_spec:
-        # Echo back the client's requested partition spec as the default, so a
-        # later commit initialized from this response matches it instead of
-        # asserting an empty spec back at us.
+        partition_spec = {**partition_spec, "fields": remap(partition_spec.get("fields", []))}
         iceberg_metadata["partition-specs"] = [partition_spec]
         iceberg_metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
+        iceberg_metadata["last-partition-id"] = max(
+            [999, *(f.get("field-id", 0) for f in partition_spec["fields"])])
+    write_order = data.get("write-order")
+    if write_order and write_order.get("fields"):
+        write_order = {**write_order, "fields": remap(write_order["fields"])}
+        iceberg_metadata["sort-orders"] = [write_order]
+        iceberg_metadata["default-sort-order-id"] = write_order.get("order-id", 1)
     metadata_location = f"s3://{bucket_name}/{namespace}/{table_name}/metadata/v0.metadata.json"
     arn = _table_arn(bucket_arn, namespace, table_name)
 
@@ -1290,6 +1430,10 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
         return _iceberg_create_namespace(data, allow_cross_region, bucket_filter)
     if len(rest) == 1 and method == "GET":
         return _iceberg_get_namespace(rest[0], allow_cross_region, bucket_filter)
+    if len(rest) == 1 and method == "HEAD":
+        return _iceberg_head_namespace(rest[0], allow_cross_region, bucket_filter)
+    if len(rest) == 1 and method == "DELETE":
+        return _iceberg_drop_namespace(rest[0], allow_cross_region, bucket_filter)
     if len(rest) >= 2 and rest[1] == "tables":
         namespace = rest[0]
         table_rest = rest[2:]
@@ -1307,14 +1451,12 @@ async def _handle_iceberg_request(method, path, headers, body, query_params):
                 data = json.loads(body) if body else {}
                 return _iceberg_commit_table(namespace, table_name, data, allow_cross_region, bucket_filter)
             if method == "HEAD":
-                if _iceberg_values(
-                    _tables,
-                    lambda table: (_namespace_name(table) == namespace and table["name"] == table_name
-                                   and _in_bucket(table.get("tableBucketARN", ""), bucket_filter)),
-                    allow_cross_region,
-                ):
-                    return 200, {}, b""
-                return 404, {}, b""
+                found = _iceberg_tables(namespace, table_name, allow_cross_region, bucket_filter)
+                return (204 if found else 404), {}, b""
+            if method == "DELETE":
+                purge = (query_params or {}).get("purgeRequested") or [""]
+                purge = (purge[0] if isinstance(purge, list) else purge).lower() == "true"
+                return _iceberg_drop_table(namespace, table_name, purge, allow_cross_region, bucket_filter)
     return None
 
 

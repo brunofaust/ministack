@@ -41,6 +41,7 @@ clients can call DescribeDBInstances and other operations without ``Action=`` qu
 parameters.
 """
 
+import contextlib
 import contextvars
 import copy
 import datetime
@@ -56,6 +57,7 @@ import socket
 import tarfile
 import threading
 import time
+import uuid
 from urllib.parse import parse_qs
 from xml.sax.saxutils import escape as _esc
 
@@ -69,6 +71,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 from ministack.services import secretsmanager
 from ministack.services.rds_iam_plugin import (
@@ -258,7 +261,7 @@ AURORA_MYSQL_ENGINE_VERSIONS = [
 AURORA_MYSQL_ENGINE_VERSION_SET = {version for version, _ in AURORA_MYSQL_ENGINE_VERSIONS}
 
 # Aurora PostgreSQL versions are the creatable set returned by AWS RDS as of
-# 2026-08-06 (single source of truth for both the catalog and create-time
+# 2026-10-29 (single source of truth for both the catalog and create-time
 # validation). Refresh with:
 #   aws rds describe-db-engine-versions --engine aurora-postgresql \
 #     --query 'DBEngineVersions[].[EngineVersion,DBParameterGroupFamily]' \
@@ -281,6 +284,7 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
     ("14.20", "aurora-postgresql14"),
     ("14.22", "aurora-postgresql14"),
     ("14.23", "aurora-postgresql14"),
+    ("14.24", "aurora-postgresql14"),
     ("15.10", "aurora-postgresql15"),
     ("15.12", "aurora-postgresql15"),
     ("15.13", "aurora-postgresql15"),
@@ -288,6 +292,7 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
     ("15.15", "aurora-postgresql15"),
     ("15.17", "aurora-postgresql15"),
     ("15.18", "aurora-postgresql15"),
+    ("15.19", "aurora-postgresql15"),
     ("16.4-limitless", "aurora-postgresql16"),
     ("16.6-limitless", "aurora-postgresql16"),
     ("16.8", "aurora-postgresql16"),
@@ -301,14 +306,17 @@ AURORA_POSTGRESQL_ENGINE_VERSIONS = [
     ("16.13", "aurora-postgresql16"),
     ("16.13-limitless", "aurora-postgresql16"),
     ("16.14", "aurora-postgresql16"),
+    ("16.15", "aurora-postgresql16"),
     ("17.4", "aurora-postgresql17"),
     ("17.5", "aurora-postgresql17"),
     ("17.6", "aurora-postgresql17"),
     ("17.7", "aurora-postgresql17"),
     ("17.9", "aurora-postgresql17"),
     ("17.10", "aurora-postgresql17"),
+    ("17.11", "aurora-postgresql17"),
     ("18.3", "aurora-postgresql18"),
     ("18.4", "aurora-postgresql18"),
+    ("18.6", "aurora-postgresql18"),
 ]
 AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
     version for version, _ in AURORA_POSTGRESQL_ENGINE_VERSIONS
@@ -319,7 +327,7 @@ AURORA_POSTGRESQL_ENGINE_VERSION_SET = {
 #     --engine-version <major> --default-only
 AURORA_POSTGRESQL_DEFAULT_ENGINE_VERSIONS = {
     "16": "16.11",
-    "17": "17.7",
+    "17": "17.9",
 }
 
 AURORA_MYSQL_IMAGE_MAP = {
@@ -901,6 +909,8 @@ def _restore_state(data, *, resume_runtime=False):
                             cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
+                    if authenticated_ready:
+                        _apply_deferred_global_writer_alias(cluster)
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
                         cluster,
                     ):
@@ -1341,23 +1351,26 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     # {'EndpointsConfig': ...} — fails that check and the aliases vanish without
     # an error. network= also sets host_config's network_mode, so removing it
     # breaks the container outright.
-    endpoint_aliases = (
-        _cluster_endpoint_aliases(cluster)
-        if _network_supports_aliases(container_kwargs.get("network"))
-        else []
+    aliasable = _network_supports_aliases(container_kwargs.get("network"))
+    endpoint_aliases = _cluster_endpoint_aliases(cluster) if aliasable else []
+    network_aliases = (
+        endpoint_aliases + _global_writer_endpoint_aliases(cluster) if aliasable else []
     )
-    if endpoint_aliases:
+    if network_aliases:
         # The endpoint config is written out directly rather than through
         # docker_client.api.create_endpoint_config, which returns exactly this
         # dict. Reaching for .api also reaches past the test doubles this module
         # is exercised with, and they have no such attribute.
         container_kwargs["networking_config"] = {
-            container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
+            container_kwargs["network"]: {"Aliases": network_aliases},
         }
     try:
         container = _run_rds_container(
             docker_client, engine, container_kwargs,
-            tls_names=list(endpoint_aliases) + [container_kwargs.get("name") or ""],
+            # The first name becomes the CN, so the global name goes last.
+            tls_names=list(endpoint_aliases)
+            + [container_kwargs.get("name") or ""]
+            + (_global_member_certificate_names(cluster) if aliasable else []),
         )
     except Exception as e:
         cluster["_shared_container_ready"] = False
@@ -1573,13 +1586,8 @@ def _start_pg_reader_container(db_id, cluster):
         ports={f"{container_port}/tcp": host_port},
         name=_rds_docker_name(db_id),
         network=ms_network,
-        labels={
-            "ministack": "rds",
-            "db_id": db_id,
-            "cluster_id": cluster_id,
-            "account_id": get_account_id(),
-            "region": get_region(),
-        },
+        labels=container_reaper.own_labels(
+            "rds", db_id=db_id, cluster_id=cluster_id, account_id=get_account_id(), region=get_region()),
     )
     volume_name = None
     if RDS_PERSIST:
@@ -1595,7 +1603,8 @@ def _start_pg_reader_container(db_id, cluster):
         container = _run_rds_container(
             docker_client, engine, container_kwargs,
             tls_names=_cluster_endpoint_aliases(cluster)
-            + [container_kwargs.get("name") or ""],
+            + [container_kwargs.get("name") or ""]
+            + _global_member_certificate_names(cluster),
         )
     except Exception as e:
         logger.warning(
@@ -4022,7 +4031,7 @@ def _refresh_cluster_status(cluster_id):
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return
-    if cluster.get("Status") in ("stopping", "stopped", "deleting"):
+    if cluster.get("Status") in ("stopping", "stopped", "deleting", "upgrading"):
         return
     member_ids = {
         m.get("DBInstanceIdentifier")
@@ -4115,6 +4124,299 @@ def _cluster_endpoint_aliases(cluster):
             aliases.append(value.replace(".cluster-", ".cluster-ro-", 1))
         return aliases
     return []
+
+
+_GLOBAL_ENDPOINT_SUFFIX = ".global.rds.amazonaws.com"
+
+
+def _global_writer_endpoint_aliases(cluster):
+    """The global writer endpoint, while this cluster is its global cluster's writer.
+
+    DescribeGlobalClusters hands out ``<id>.global-<token>.global.rds.amazonaws.com``
+    and on AWS that name resolves to the primary cluster's writer. Only the
+    writer member's container may carry it: Docker answers a name shared by
+    several containers with all of their addresses.
+    """
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if global_cluster and member and member.get("IsWriter"):
+        return [_global_cluster_endpoint(global_cluster)]
+    return []
+
+
+def _global_member_certificate_names(cluster):
+    """The global endpoint while this cluster is any member of a global cluster, whatever its role."""
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if not (global_cluster and member):
+        return []
+    name = _global_cluster_endpoint(global_cluster)
+    return [name] if name.isascii() else []  # a non-ASCII identifier can't be signed into a certificate
+
+
+def _global_writer_alias_rejoin(cluster, global_endpoint, is_writer):
+    """What has to rejoin the network for this cluster's container to carry the
+    global writer endpoint exactly when ``is_writer``: ``(docker_client,
+    network_name, container)``, or None when nothing has to change or there is
+    no container on an aliasable network.
+    """
+    found = _cluster_container_on_alias_network(cluster)
+    if not found or (global_endpoint in _container_network_aliases(*found[1:])) == is_writer:
+        return None
+    return found
+
+
+def _cluster_container_on_alias_network(cluster):
+    """``(docker_client, network_name, container)`` for a cluster's container on
+    a network that takes aliases, or None."""
+    container_id = cluster.get("_shared_container_id")
+    docker_client = _get_docker() if container_id else None
+    if not docker_client:
+        return None
+    network_name = _get_ministack_network(docker_client)
+    if not _network_supports_aliases(network_name):
+        return None
+    try:
+        container = docker_client.containers.get(container_id)
+    except Exception as e:
+        logger.warning(
+            "RDS: cannot check the network aliases of cluster %s: %s",
+            cluster.get("DBClusterIdentifier", "unknown"), e,
+        )
+        return None
+    return docker_client, network_name, container
+
+
+def _container_network_aliases(network_name, container):
+    return list(
+        (container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {})
+        .get("Aliases") or []
+    )
+
+
+def _refresh_cluster_internal_address(cluster, container, network_name):
+    """Follow a container that rejoined the network to its address. True when it moved."""
+    try:
+        container.reload()
+    except Exception:
+        return False
+    address = (
+        container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        .get(network_name, {}).get("IPAddress", "")
+    )
+    previous = cluster.get("_shared_internal_address")
+    if not (address and previous) or address == previous:
+        return False
+    cluster["_shared_internal_address"] = address
+    endpoint = cluster.get("_shared_endpoint") or {}
+    # Without endpoint aliases the reported endpoint is the address itself.
+    reported_moved = endpoint.get("Address") == previous
+    if reported_moved:
+        endpoint["Address"] = address
+    for instance in _cluster_member_instances(cluster):
+        if instance.get("_internal_address"):
+            instance["_internal_address"] = address
+        if reported_moved and (instance.get("Endpoint") or {}).get("Address") == previous:
+            instance["Endpoint"]["Address"] = address
+    # The reader endpoint can publish the internal address even when the
+    # writer publishes a name.
+    _sync_cluster_endpoints(cluster)
+    return True
+
+
+def _rejoin_with_global_writer_alias(cluster, global_endpoint, is_writer, docker_client, network_name, container):
+    """Move a container off the network and back on with or without the global name.
+
+    Docker fixes a container's aliases when it joins a network, so this is the
+    only way to change them. The container may come back on another address;
+    internal wiring is refreshed to it, and MySQL global replicas are pointed at
+    the writer's new address. Returns whether the aliases now match ``is_writer``.
+    """
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    previous = _container_network_aliases(network_name, container)
+    aliases = _cluster_endpoint_aliases(cluster) + ([global_endpoint] if is_writer else [])
+    network = None
+    disconnected = False
+    try:
+        network = docker_client.networks.get(network_name)
+        network.disconnect(container)
+        disconnected = True
+        network.connect(container, aliases=aliases)
+    except Exception as e:
+        logger.error(
+            "RDS: failed to move global writer endpoint %s on cluster %s: %s",
+            global_endpoint, cluster_id, e,
+        )
+        if disconnected:
+            # Put the container back as it was rather than leave its cluster
+            # endpoint unreachable.
+            try:
+                network.connect(container, aliases=previous)
+            except Exception as restore_error:
+                logger.error(
+                    "RDS: could not reconnect cluster %s to %s: %s",
+                    cluster_id, network_name, restore_error,
+                )
+        if _refresh_cluster_internal_address(cluster, container, network_name) and is_writer:
+            _repoint_global_replicas(cluster)
+        return False
+    if _refresh_cluster_internal_address(cluster, container, network_name) and is_writer:
+        _repoint_global_replicas(cluster)
+    return True
+
+
+def _repoint_global_replicas(cluster):
+    """Point MySQL global replicas at a writer whose container changed address."""
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    try:
+        _configure_or_defer_mysql_replication(cluster_id, cluster)
+    except Exception as e:
+        # The writer change this follows has already been committed.
+        logger.warning(
+            "RDS: failed to re-point MySQL replicas for cluster %s: %s",
+            cluster_id, e,
+        )
+
+
+def _cluster_container_starting(cluster):
+    """A readiness probe is polling this cluster's container at its launch address.
+
+    Stopped or failed containers have no probe, so they can move at once.
+    """
+    if cluster.get("_shared_container_ready") and not any(
+        instance.get("DBInstanceStatus") == "rebooting"
+        for instance in _cluster_member_instances(cluster)
+    ):
+        return False
+    # Cluster "creating" is derived from member statuses and stays set when a
+    # member failed, so the members decide; "starting" is StartDBCluster's own.
+    if cluster.get("Status") == "starting":
+        return True
+    # A reboot restarts the container and probes the address it had before.
+    return any(
+        instance.get("DBInstanceStatus") in ("creating", "starting", "rebooting")
+        for instance in _cluster_member_instances(cluster)
+    )
+
+
+def _move_global_writer_alias(global_endpoint, targets):
+    """Give each ``(cluster, is_writer)`` the global writer endpoint exactly when it is the writer.
+
+    Targets are applied in order, so non-writers go first and the name is
+    dropped from the old writer before the new one takes it.
+    """
+    with _shared_container_lock:
+        moves = []
+        for cluster, is_writer in targets:
+            rejoin = _global_writer_alias_rejoin(cluster, global_endpoint, is_writer)
+            if rejoin:
+                moves.append((cluster, is_writer, rejoin))
+        starting = [
+            cluster.get("DBClusterIdentifier", "unknown")
+            for cluster, _is_writer, _rejoin in moves
+            if _cluster_container_starting(cluster)
+        ]
+        if starting:
+            # The readiness probe holds the launch address, and rejoining the
+            # network can change it. The move is applied once the container is
+            # ready (_apply_deferred_global_writer_alias).
+            logger.info(
+                "RDS: deferring global writer endpoint %s until %s is ready",
+                global_endpoint, ", ".join(starting),
+            )
+            return
+        stranded = [
+            cluster.get("DBClusterIdentifier", "unknown")
+            for cluster, _is_writer, _rejoin in moves
+            if any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster))
+        ]
+        if stranded:
+            # Hot-standby readers stream from the writer's address, and rejoining
+            # the network can change it. Moving only some of the containers would
+            # leave the name on two of them, so none moves.
+            logger.error(
+                "RDS: not moving global writer endpoint %s: the readers of %s "
+                "replicate from the current address",
+                global_endpoint, ", ".join(stranded),
+            )
+            return
+        for cluster, is_writer, rejoin in moves:
+            moved = _rejoin_with_global_writer_alias(cluster, global_endpoint, is_writer, *rejoin)
+            if not moved and not is_writer:
+                # The name is still on this container; giving it to the writer
+                # as well would make it answer with two addresses.
+                logger.error(
+                    "RDS: global writer endpoint %s left where it was after cluster %s failed to drop it",
+                    global_endpoint, cluster.get("DBClusterIdentifier", "unknown"),
+                )
+                return
+
+
+def _sync_global_writer_endpoint_aliases(global_cluster):
+    """Keep the global writer endpoint on the current writer member's container only."""
+    if not global_cluster:
+        return
+    # Read the members under the lock, so a concurrent writer change cannot
+    # hand this sync a stale writer.
+    with _shared_container_lock:
+        members = sorted(
+            global_cluster.get("GlobalClusterMembers", []),
+            key=lambda member: bool(member.get("IsWriter")),
+        )
+        targets = []
+        for member in members:
+            cluster = _resolve_global_member_cluster(member)
+            if cluster:
+                targets.append((cluster, bool(member.get("IsWriter"))))
+        _move_global_writer_alias(_global_cluster_endpoint(global_cluster), targets)
+
+
+def _apply_deferred_global_writer_alias(cluster):
+    """Bring the global writer endpoint in line once a cluster's container has
+    finished starting, whether it became ready or failed: moves held back while
+    it was starting, and global names a member container no longer owns (kept
+    across a restart, or left on a non-writer by a rename during the hold)."""
+    # One lock for the sync and the drops: a writer change in between would
+    # let a drop strip the name the sync just gave the new writer.
+    with _shared_container_lock:
+        global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+        clusters = [cluster]
+        if global_cluster:
+            _sync_global_writer_endpoint_aliases(global_cluster)
+            for member in global_cluster.get("GlobalClusterMembers", []):
+                other = _resolve_global_member_cluster(member)
+                if other is not None and other is not cluster:
+                    clusters.append(other)
+        for target in clusters:
+            _drop_stale_global_writer_aliases(target)
+
+
+def _drop_stale_global_writer_aliases(cluster):
+    """Rejoin without global endpoints that are not its global cluster's current
+    name: one kept across a restart after the cluster left or renamed its global
+    cluster. Whether the current name belongs here is the sync's call, which
+    holds it on the old writer until the new one can take it."""
+    with _shared_container_lock:
+        if _cluster_container_starting(cluster):
+            return
+        global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+        current = _global_cluster_endpoint(global_cluster) if global_cluster else None
+        found = _cluster_container_on_alias_network(cluster)
+        if not found:
+            return
+        aliases = _container_network_aliases(*found[1:])
+        stale = [a for a in aliases if a.endswith(_GLOBAL_ENDPOINT_SUFFIX) and a != current]
+        if not stale:
+            return
+        if any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster)):
+            logger.error(
+                "RDS: not dropping global endpoint %s from cluster %s: its readers "
+                "replicate from the current address",
+                ", ".join(stale), cluster.get("DBClusterIdentifier", "unknown"),
+            )
+            return
+        keeps_current = current in aliases
+        _rejoin_with_global_writer_alias(
+            cluster, current if keeps_current else ", ".join(stale), keeps_current, *found,
+        )
 
 
 def _next_port():
@@ -5134,6 +5436,9 @@ def _create_db_instance_impl(p):
         "_internal_port": internal_port,
         "_MasterUserPassword": master_pass,
     }
+    _set_performance_insights(instance, p)
+    if parent and parent.get("_PerformanceInsightsManaged"):
+        _inherit_performance_insights(instance, parent)
     # Only a request that turns storage autoscaling on sets the threshold.
     if _p(p, "MaxAllocatedStorage"):
         instance["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
@@ -5273,6 +5578,7 @@ def _create_db_instance_impl(p):
                         cluster["_shared_container_ready"] = False
                         _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
+                        _apply_deferred_global_writer_alias(cluster)
                         return
 
                     cluster["_shared_storage_initialized"] = True
@@ -5287,6 +5593,7 @@ def _create_db_instance_impl(p):
                         cluster["_shared_container_ready"] = False
                         _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
+                        _apply_deferred_global_writer_alias(cluster)
                         return
                     if pending_rotation:
                         cluster.pop("_pending_master_password_rotation", None)
@@ -5301,6 +5608,7 @@ def _create_db_instance_impl(p):
                             cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
+                    _apply_deferred_global_writer_alias(cluster)
                     if _aurora_mysql_8_replication_enabled(cluster):
                         _configure_or_defer_mysql_replication(cluster_id, cluster)
                     for member in cluster.get("DBClusterMembers", []):
@@ -5848,6 +6156,7 @@ def _finish_instance_reboot(instance, cluster):
     finally:
         if cluster:
             _end_mysql_global_instance_mutation(cluster)
+            _apply_deferred_global_writer_alias(cluster)
 
 
 # ---------------------------------------------------------------------------
@@ -5977,6 +6286,46 @@ def _restore_from_snapshot(p):
 # ---------------------------------------------------------------------------
 # DB Clusters
 # ---------------------------------------------------------------------------
+
+_PERFORMANCE_INSIGHTS_FIELDS = (
+    "PerformanceInsightsEnabled", "PerformanceInsightsRetentionPeriod",
+    "PerformanceInsightsKMSKeyId",
+)
+
+
+def _set_performance_insights(resource, params):
+    """Apply explicit PI policy; omission preserves legacy instance management."""
+    if not any(name in params for name in (
+        "EnablePerformanceInsights", "PerformanceInsightsRetentionPeriod",
+        "PerformanceInsightsKMSKeyId",
+    )):
+        return False
+    enabled = _p(params, "EnablePerformanceInsights")
+    if enabled:
+        resource["PerformanceInsightsEnabled"] = enabled == "true"
+    if not resource.get("PerformanceInsightsEnabled"):
+        resource.pop("PerformanceInsightsRetentionPeriod", None)
+        resource.pop("PerformanceInsightsKMSKeyId", None)
+        return True
+    resource["PerformanceInsightsRetentionPeriod"] = int(
+        _p(params, "PerformanceInsightsRetentionPeriod")
+        or resource.get("PerformanceInsightsRetentionPeriod", 7)
+    )
+    key = _p(params, "PerformanceInsightsKMSKeyId") or resource.get("PerformanceInsightsKMSKeyId")
+    if not key or key == "alias/aws/rds":
+        key_id = uuid.uuid5(uuid.NAMESPACE_URL, f"rds:{get_account_id()}:{get_region()}")
+        key = f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
+    resource["PerformanceInsightsKMSKeyId"] = key
+    return True
+
+
+def _inherit_performance_insights(instance, cluster):
+    for field in _PERFORMANCE_INSIGHTS_FIELDS:
+        if field in cluster:
+            instance[field] = cluster[field]
+        else:
+            instance.pop(field, None)
+
 
 def _serverlessv2_from_params(p):
     """Read ServerlessV2ScalingConfiguration.{Min,Max}Capacity from query params.
@@ -6191,7 +6540,8 @@ def _create_db_cluster_impl(p):
         "DBClusterMembers": [],
         "VpcSecurityGroups": vpc_sg_list,
         "DBSubnetGroup": _p(p, "DBSubnetGroupName") or "default",
-        "DBClusterParameterGroup": _p(p, "DBClusterParameterGroupName") or f"default.{engine}",
+        "DBClusterParameterGroup": (_p(p, "DBClusterParameterGroupName")
+                                    or f"default.{_aurora_cluster_family(engine, engine_version) or engine}"),
         "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
         "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
         "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
@@ -6225,7 +6575,21 @@ def _create_db_cluster_impl(p):
         "_shared_container_epoch": 0,
         "_shared_storage_initialized": False,
     }
+    if _set_performance_insights(cluster, p):
+        cluster["_PerformanceInsightsManaged"] = True
+        cluster["DatabaseInsightsMode"] = "standard"
     _prepare_mysql_gtid_history(cluster)
+    if (RDS_PUBLIC_ENDPOINT and _get_docker()
+            and _docker_image_for_engine(engine, engine_version, master_user, master_pass, "mydb")[0]):
+        # Report the published endpoint from create on; the container reuses this port.
+        host_port = _next_port()
+        cluster.update({
+            "_shared_host_port": host_port,
+            "Endpoint": _MINISTACK_HOST,
+            "ReaderEndpoint": _MINISTACK_HOST,
+            "Port": host_port,
+        })
+    _cluster_param_group(cluster["DBClusterParameterGroup"])  # a default group exists once a cluster uses it
     _clusters[cluster_id] = cluster
     if global_cluster:
         is_first_member = not global_cluster.get("GlobalClusterMembers")
@@ -6309,6 +6673,32 @@ def _delete_db_cluster(p):
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
 
+def _password_reset_view(c, advance):
+    """*c* as AWS shows it during a master password reset: pending, then resetting, then settled, one describe each.
+    ``_password_reset_describes`` is only reassigned (3 = settled), never popped, for concurrent get_state()."""
+    seen = c.get("_password_reset_describes")
+    if seen is None or seen > 2:
+        return c
+    if advance:
+        c["_password_reset_describes"] = seen + 1
+        if seen == 2:
+            return c
+    view = {**c, "PendingModifiedValues": {"MasterUserPassword": "****"}}
+    if advance and seen == 1 and c.get("Status") == "available":
+        view["Status"] = "resetting-master-credentials"
+    return view
+
+
+def _cluster_view(c, advance):
+    """*c* with both a pending password reset and a pending major upgrade shown. Each view
+    advances the stored cluster, so both run on it and their changes are merged."""
+    upgrade, reset = _upgrade_view(c, advance), _password_reset_view(c, advance)
+    if reset is c:
+        return upgrade
+    return {**upgrade, "Status": reset["Status"] if reset["Status"] != c.get("Status") else upgrade["Status"],
+            "PendingModifiedValues": {**(upgrade.get("PendingModifiedValues") or {}), **reset["PendingModifiedValues"]}}
+
+
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
@@ -6328,7 +6718,7 @@ def _describe_db_clusters(p):
         from ministack.services import documentdb
         docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters) + docdb_members
+    members = "".join(f"<DBCluster>{_cluster_xml(_cluster_view(c, True))}</DBCluster>" for c in clusters) + docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
@@ -6521,6 +6911,13 @@ def _modify_db_cluster_impl(p):
     )
     if global_version_conflict:
         return global_version_conflict
+    old_family = _aurora_cluster_family(cluster.get("Engine"), cluster.get("EngineVersion"))
+    new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
+    if (old_family and new_family and old_family != new_family
+            and _p(p, "AllowMajorVersionUpgrade").lower() != "true"):
+        # AWS Aurora user guide, in-place upgrade tutorial.
+        return _error("InvalidParameterCombination",
+                      "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.", 400)
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(
@@ -6535,7 +6932,16 @@ def _modify_db_cluster_impl(p):
                 "MasterUserPassword must be changed on the global writer.",
                 400,
             )
+        if cluster.get("Status") == "stopped":
+            # Verbatim from real AWS (captured, us-west-2).
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"Db cluster {cluster_id} cannot be in the stopped state.",
+                400,
+            )
         _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
+        if cluster.get("Status") == "available":
+            cluster["_password_reset_describes"] = 0
     if _p(p, "RotateMasterUserPassword") == "true":
         master_user_secret = cluster.get("MasterUserSecret")
         if not master_user_secret:
@@ -6572,7 +6978,7 @@ def _modify_db_cluster_impl(p):
             )
         _apply_cluster_master_password_change(cluster, new_pass)
     if engine_version:
-        cluster["EngineVersion"] = engine_version
+        _set_cluster_engine_version(cluster, engine_version)
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -6597,6 +7003,7 @@ def _modify_db_cluster_impl(p):
         cluster["CopyTagsToSnapshot"] = _p(p, "CopyTagsToSnapshot") == "true"
     if _p(p, "DBClusterParameterGroupName"):
         cluster["DBClusterParameterGroup"] = _p(p, "DBClusterParameterGroupName")
+        _cluster_param_group(cluster["DBClusterParameterGroup"])
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
     if vpc_sgs:
@@ -6604,8 +7011,15 @@ def _modify_db_cluster_impl(p):
             {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
         ]
 
+    if _set_performance_insights(cluster, p):
+        cluster["_PerformanceInsightsManaged"] = True
+        cluster.setdefault("DatabaseInsightsMode", "standard")
+        for instance in _instances.values():
+            if instance.get("DBClusterIdentifier") == cluster["DBClusterIdentifier"]:
+                _inherit_performance_insights(instance, cluster)
+
     return _xml(200, "ModifyDBClusterResponse",
-        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
+        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_cluster_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6983,10 +7397,103 @@ def _create_db_cluster_param_group(p):
         </DBClusterParameterGroup></CreateDBClusterParameterGroupResult>""")
 
 
+def _upgrade_view(c, advance):
+    """*c* as AWS shows it during a major upgrade: old version pending, then upgrading (stored), then settled."""
+    pending = c.get("_major_upgrade_pending")
+    if pending is None:
+        return c
+    if advance:
+        if pending["seen"]:
+            c.pop("_major_upgrade_pending", None)  # concurrent describes may both settle it
+            if c.get("Status") == "upgrading":
+                c["Status"] = "available"
+                _refresh_cluster_status(c.get("DBClusterIdentifier"))  # members restarting after a restore
+            return c
+        pending["seen"] = 1
+        if c.get("Status") == "available":
+            c["Status"] = "upgrading"
+    view = {**c, "EngineVersion": pending["EngineVersion"],
+            "PendingModifiedValues": {"EngineVersion": c["EngineVersion"]}}
+    if pending["DBClusterParameterGroup"]:
+        view["DBClusterParameterGroup"] = pending["DBClusterParameterGroup"]
+    return view
+
+
+def _aurora_cluster_family(engine, engine_version):
+    """The DB parameter group family AWS reports for an Aurora engine version, or None."""
+    catalog = {"aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
+               "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS}.get(engine, [])
+    # A dot-boundary prefix ("17", "8.0") resolves to the family of the versions it prefixes.
+    return next((fam for ver, fam in catalog
+                 if engine_version and (ver == engine_version or ver.startswith(engine_version + "."))), None)
+
+
+def _set_cluster_engine_version(cluster, engine_version):
+    """Set a cluster's engine version; a major upgrade moves default groups to the new family's."""
+    old_version, old_group = cluster.get("EngineVersion"), cluster.get("DBClusterParameterGroup")
+    engine = cluster.get("Engine")
+    old_family = _aurora_cluster_family(engine, old_version)
+    new_family = _aurora_cluster_family(engine, engine_version)
+    major = bool(new_family and old_family and new_family != old_family)
+    if major and old_group and old_group == f"default.{old_family}":
+        cluster["DBClusterParameterGroup"] = f"default.{new_family}"
+    cluster["EngineVersion"] = engine_version
+    if not major:
+        return
+    # A global member may live in another Region or account than this request.
+    arn = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+    with request_scope(arn[0].account_id, arn[0].region) if arn else contextlib.nullcontext():
+        _cluster_param_group(cluster.get("DBClusterParameterGroup"))
+        old_instance_defaults = {f"default.{old_family}", f"default.{engine}{(old_version or '').split('.')[0]}"}
+        for instance in _instances.values():
+            if instance.get("DBClusterIdentifier") != cluster.get("DBClusterIdentifier"):
+                continue
+            instance["EngineVersion"] = engine_version
+            groups = instance.get("DBParameterGroups") or []
+            if groups and groups[0].get("DBParameterGroupName") in old_instance_defaults:
+                groups[0]["DBParameterGroupName"] = f"default.{new_family}"
+    cluster["_major_upgrade_pending"] = {
+        "seen": 0, "EngineVersion": old_version, "DBClusterParameterGroup": old_group}
+
+
+def _default_cluster_param_group(family):
+    name = f"default.{family}"
+    return {
+        "DBClusterParameterGroupName": name,
+        "DBParameterGroupFamily": family,
+        "Description": f"Default cluster parameter group for {family}",
+        "DBClusterParameterGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}",
+        "Parameters": {},
+    }
+
+
+def _cluster_param_group(name):
+    """AWS has a default cluster parameter group per Aurora family; it joins the account once described or used."""
+    pg = _db_cluster_param_groups.get(name)
+    if pg or not _is_default_cluster_param_group(name):
+        return pg
+    pg = _db_cluster_param_groups[name] = _default_cluster_param_group(name[len("default."):])
+    return pg
+
+
+def _is_default_cluster_param_group(name):
+    return bool(name) and name.startswith("default.") and name[len("default."):] in {
+        f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}
+
+
+def _default_cluster_param_group_refusal(name, action):
+    """AWS refuses to modify or delete a default cluster parameter group (captured); a reset succeeds."""
+    if not _is_default_cluster_param_group(name):
+        return None
+    if action == "modify":
+        return _error("InvalidParameterValue", "Cannot modify a default parameter group.", 400)
+    return _error("InvalidDBParameterGroupState", f"Default DBClusterParameterGroup cannot be deleted: {name}", 400)
+
+
 def _describe_db_cluster_param_groups(p):
     name = _p(p, "DBClusterParameterGroupName")
     if name:
-        pg = _db_cluster_param_groups.get(name)
+        pg = _cluster_param_group(name)
         if not pg:
             return _error("DBParameterGroupNotFound",
                 f"DB cluster parameter group {name} not found.", 404)
@@ -7006,10 +7513,11 @@ def _describe_db_cluster_param_groups(p):
 
 def _delete_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if refusal := _default_cluster_param_group_refusal(name, "delete"):
+        return refusal
     pg = _db_cluster_param_groups.pop(name, None)
     if not pg:
-        return _error("DBParameterGroupNotFound",
-            f"DB cluster parameter group {name} not found.", 404)
+        return _error("DBParameterGroupNotFound", f"DBClusterParameterGroup not found: {name}", 404)
     _tags.pop(pg.get("DBClusterParameterGroupArn", ""), None)
     return _xml(200, "DeleteDBClusterParameterGroupResponse", "")
 
@@ -7017,7 +7525,7 @@ def _delete_db_cluster_param_group(p):
 def _describe_db_cluster_parameters(p):
     name = _p(p, "DBClusterParameterGroupName")
     source_filter = _p(p, "Source")
-    pg = _db_cluster_param_groups.get(name)
+    pg = _cluster_param_group(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
@@ -7028,6 +7536,8 @@ def _describe_db_cluster_parameters(p):
 
 def _modify_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if refusal := _default_cluster_param_group_refusal(name, "modify"):
+        return refusal
     pg = _db_cluster_param_groups.get(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
@@ -7049,7 +7559,7 @@ def _modify_db_cluster_param_group(p):
 
 def _reset_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
-    pg = _db_cluster_param_groups.get(name)
+    pg = _cluster_param_group(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
@@ -7509,6 +8019,7 @@ def _start_db_cluster(p):
                 cluster["Status"] = "stopped"
                 for inst in _cluster_member_instances(cluster):
                     inst["DBInstanceStatus"] = "stopped"
+                _apply_deferred_global_writer_alias(cluster)
 
             start_failed = False
             pending_rotation = cluster.get("_pending_master_password_rotation")
@@ -7539,6 +8050,7 @@ def _start_db_cluster(p):
                         cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
+                _apply_deferred_global_writer_alias(cluster)
                 if _aurora_mysql_8_replication_enabled(cluster):
                     if compute_recreated:
                         # A new container has a new hostname, while the
@@ -7620,6 +8132,8 @@ def _stop_db_cluster(p):
     # Publish the transitional status before touching compute so concurrent
     # reader bootstrap workers can tell a stop-in-progress from a genuinely
     # dead container and park instead of destroying preserved compute.
+    if "_password_reset_describes" in cluster:
+        cluster["_password_reset_describes"] = 3  # settled; reassigned, not popped (see _password_reset_view)
     cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
@@ -8132,7 +8646,7 @@ def _create_global_cluster(p):
     deletion_protection = _p(p, "DeletionProtection") == "true"
 
     arn = f"arn:aws:rds::{get_account_id()}:global-cluster:{gc_id}"
-    resource_id = f"cluster-{new_uuid().replace('-', '')[:20].lower()}"
+    resource_id = f"cluster-{new_uuid().replace('-', '')[:16].lower()}"
 
     source_cluster = None
     if source_cluster_id:
@@ -8186,12 +8700,16 @@ def _create_global_cluster(p):
         "DeletionProtection": deletion_protection,
         "GlobalClusterMembers": [],
         "DatabaseName": _p(p, "DatabaseName") or "",
+        "EngineLifecycleSupport": _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support",
         "TagList": _parse_tags(p),
+        "_EndpointToken": _global_endpoint_token(),
     }
     if source_cluster:
         _attach_cluster_to_global(gc, source_cluster, is_writer=True)
     _global_clusters[gc_id] = gc
     _tags[arn] = list(gc["TagList"])
+    if source_cluster:
+        _sync_global_writer_endpoint_aliases(gc)
     return _xml(200, "CreateGlobalClusterResponse",
         f"<CreateGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></CreateGlobalClusterResult>")
 
@@ -8303,6 +8821,7 @@ def _remove_from_global_cluster(p):
         if cluster:
             cluster.pop("GlobalClusterIdentifier", None)
             cluster.pop("GlobalWriteForwardingStatus", None)
+            _move_global_writer_alias(_global_cluster_endpoint(gc), [(cluster, False)])
             if not member.get("IsWriter"):
                 _clear_mysql_replication_metadata(cluster)
                 if not cluster.get("DBClusterMembers"):
@@ -8370,7 +8889,11 @@ def _modify_global_cluster_impl(p):
         for member in gc.get("GlobalClusterMembers", []):
             member_cluster = _resolve_cluster(member["DBClusterArn"])
             if member_cluster:
-                member_cluster["EngineVersion"] = engine_version
+                _set_cluster_engine_version(member_cluster, engine_version)
+
+    if new_id and new_id != gc_id:
+        # The writer's container rejoins with the new global name in place of the old one.
+        _sync_global_writer_endpoint_aliases(gc)
 
     return _xml(200, "ModifyGlobalClusterResponse",
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
@@ -9345,6 +9868,7 @@ def _switchover_global_cluster(p):
     result = _planned_mysql_global_writer_switch(p)
     if isinstance(result, tuple):
         return result
+    _sync_global_writer_endpoint_aliases(_global_clusters.get(result["GlobalClusterIdentifier"]))
     return _xml(200, "SwitchoverGlobalClusterResponse",
         f"<SwitchoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></SwitchoverGlobalClusterResult>")
 
@@ -9372,6 +9896,7 @@ def _failover_global_cluster(p):
         result = _planned_mysql_global_writer_switch(p)
     if isinstance(result, tuple):
         return result
+    _sync_global_writer_endpoint_aliases(_global_clusters.get(result["GlobalClusterIdentifier"]))
     return _xml(200, "FailoverGlobalClusterResponse",
         f"<FailoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></FailoverGlobalClusterResult>")
 
@@ -9408,6 +9933,17 @@ def _disable_http_endpoint(p):
     return _error("DBClusterNotFoundFault", f"Cluster with ARN {arn} not found.", 404)
 
 
+def _global_endpoint_token():
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(stdlib_secrets.choice(alphabet) for _ in range(12))
+
+
+def _global_cluster_endpoint(gc):
+    """<id>.global-<12 lowercase alphanumerics>.global.rds.amazonaws.com, present with no members (AWS capture)."""
+    token = gc.setdefault("_EndpointToken", _global_endpoint_token())
+    return f"{gc['GlobalClusterIdentifier']}.global-{token}{_GLOBAL_ENDPOINT_SUFFIX}"
+
+
 def _global_cluster_xml(gc):
     _refresh_global_cluster_readers(gc)
     tag_xml = "".join(
@@ -9439,11 +9975,14 @@ def _global_cluster_xml(gc):
         <Engine>{gc['Engine']}</Engine>
         <EngineVersion>{gc['EngineVersion']}</EngineVersion>
         <Status>{gc['Status']}</Status>
-        <DatabaseName>{gc.get('DatabaseName', '')}</DatabaseName>
+        {f"<EngineLifecycleSupport>{gc['EngineLifecycleSupport']}</EngineLifecycleSupport>" if gc.get('EngineLifecycleSupport') else ""}
+        {f"<DatabaseName>{_esc(gc['DatabaseName'])}</DatabaseName>" if gc.get('DatabaseName') else ""}
         <StorageEncrypted>{str(gc.get('StorageEncrypted', False)).lower()}</StorageEncrypted>
+        <StorageEncryptionType>{"sse-kms" if gc.get('StorageEncrypted') else "sse-rds"}</StorageEncryptionType>
         <DeletionProtection>{str(gc.get('DeletionProtection', False)).lower()}</DeletionProtection>
         {failover_state_xml}
         <GlobalClusterMembers>{member_xml}</GlobalClusterMembers>
+        <Endpoint>{_global_cluster_endpoint(gc)}</Endpoint>
         <TagList>{tag_xml}</TagList>"""
 
 
@@ -9692,7 +10231,8 @@ def _instance_xml(i):
         <DBInstanceArn>{i['DBInstanceArn']}</DBInstanceArn>
         <IAMDatabaseAuthenticationEnabled>{str(i.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
         <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
-        <PerformanceInsightsRetentionPeriod>{i.get('PerformanceInsightsRetentionPeriod',7)}</PerformanceInsightsRetentionPeriod>
+        {_performance_insights_details_xml(i)}
+        {_database_insights_mode_xml(i)}
         <EnabledCloudwatchLogsExports/>
         <ProcessorFeatures/>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
@@ -9716,6 +10256,22 @@ def _serverlessv2_xml(c):
         f"<MinCapacity>{cfg.get('MinCapacity', 0.5)}</MinCapacity>"
         f"<MaxCapacity>{cfg.get('MaxCapacity', 1.0)}</MaxCapacity>"
         "</ServerlessV2ScalingConfiguration>"
+    )
+
+
+def _database_insights_mode_xml(resource):
+    # Observed on Aurora only
+    if not str(resource.get("Engine", "")).startswith("aurora"):
+        return ""
+    return f"<DatabaseInsightsMode>{resource.get('DatabaseInsightsMode', 'standard')}</DatabaseInsightsMode>"
+
+
+def _performance_insights_details_xml(resource):
+    if not resource.get("PerformanceInsightsEnabled"):
+        return ""
+    return (
+        f"<PerformanceInsightsRetentionPeriod>{resource.get('PerformanceInsightsRetentionPeriod', 7)}</PerformanceInsightsRetentionPeriod>"
+        f"<PerformanceInsightsKMSKeyId>{_esc(resource.get('PerformanceInsightsKMSKeyId', ''))}</PerformanceInsightsKMSKeyId>"
     )
 
 
@@ -9754,6 +10310,13 @@ def _cluster_xml(c):
         f"<GlobalClusterIdentifier>{global_cluster_id}</GlobalClusterIdentifier>"
         if global_cluster_id else ""
     )
+    pending = c.get("PendingModifiedValues")
+    pending_xml = (
+        "<PendingModifiedValues>"
+        + "".join(f"<{k}>{v}</{k}>" for k, v in pending.items())
+        + "</PendingModifiedValues>"
+        if pending else ""
+    )
     global_write_forwarding = c.get("GlobalWriteForwardingStatus")
     global_write_forwarding_xml = (
         f"<GlobalWriteForwardingStatus>{global_write_forwarding}</GlobalWriteForwardingStatus>"
@@ -9782,6 +10345,7 @@ def _cluster_xml(c):
         <EngineMode>{c.get('EngineMode','provisioned')}</EngineMode>
         {_serverlessv2_xml(c)}
         <Status>{c['Status']}</Status>
+        {pending_xml}
         <MasterUsername>{c.get('MasterUsername','admin')}</MasterUsername>
         {db_name_xml}
         <Endpoint>{c.get('Endpoint','')}</Endpoint>
@@ -9803,6 +10367,9 @@ def _cluster_xml(c):
         <KmsKeyId>{c.get('KmsKeyId','')}</KmsKeyId>
         <DeletionProtection>{str(c.get('DeletionProtection',False)).lower()}</DeletionProtection>
         <IAMDatabaseAuthenticationEnabled>{str(c.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
+        <PerformanceInsightsEnabled>{str(c.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
+        {_performance_insights_details_xml(c)}
+        {_database_insights_mode_xml(c)}
         <HttpEndpointEnabled>{str(c.get('HttpEndpointEnabled',False)).lower()}</HttpEndpointEnabled>
         <CopyTagsToSnapshot>{str(c.get('CopyTagsToSnapshot',False)).lower()}</CopyTagsToSnapshot>
         <CrossAccountClone>{str(c.get('CrossAccountClone',False)).lower()}</CrossAccountClone>
@@ -10124,7 +10691,7 @@ def _format_time(ts):
 def _default_engine_version(engine):
     defaults = {
         "postgres": "15.3", "mysql": "8.0.33", "mariadb": "10.6.14",
-        "aurora-postgresql": "17.7", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
+        "aurora-postgresql": "17.9", "aurora-mysql": "8.0.mysql_aurora.3.10.3",
     }
     return defaults.get(engine, "15.3")
 
