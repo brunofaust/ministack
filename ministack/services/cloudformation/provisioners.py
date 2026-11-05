@@ -8,13 +8,16 @@ import base64
 import contextvars
 import copy
 import hashlib
+import html
 import io
 import json
 import logging
+import math
 import os
 import random
 import re
 import string
+import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -25,6 +28,7 @@ import ministack.services.apigateway as _apigw_v2
 import ministack.services.apigateway_v1 as _apigw_v1
 import ministack.services.appconfig as _appconfig
 import ministack.services.appsync as _appsync
+import ministack.services.athena as _athena
 import ministack.services.autoscaling as _asg
 import ministack.services.backup as _backup
 import ministack.services.cloudfront as _cf
@@ -691,6 +695,7 @@ _CUSTOM_NAME_REPLACEMENT = {
     # Domain is required, so a pool move under the same Domain fails on the
     # name, as the replacement's CreateUserPoolDomain does.
     "AWS::Cognito::UserPoolDomain": {"name": "Domain", "exists": "Domain already exists"},
+    "AWS::Events::Archive": {"name": "ArchiveName"},
     "AWS::Pipes::Pipe": {
         "name": "Name",
         "requires_replacement": _requires_replacement_pipes,
@@ -2436,6 +2441,8 @@ def _lambda_create(logical_id, props, stack_name):
         "aliases": {},
         "concurrency": None,
         "provisioned_concurrency": {},
+        # As CreateFunction: only a template naming an architecture pins the container platform.
+        "architectures_declared": "Architectures" in props,
     }
     if is_image:
         # Mirror the Lambda API's image response: ImageUri echoed on the config,
@@ -2544,6 +2551,12 @@ def _lambda_update(physical_id, old_props, new_props, stack_name, logical_id=Non
     resp = _lambda_svc._update_config(name, config_data)
     if resp[0] >= 400:
         raise ValueError(f"AWS::Lambda::Function configuration update failed: {resp[2]!r}")
+    # The template is the whole desired state: an update declares what a create of it would.
+    func["architectures_declared"] = "Architectures" in new_props
+    if not func["architectures_declared"]:
+        # A container spawned while the flag read True would stay pooled pinned.
+        _lambda_svc.invalidate_worker(name, qualifier="$LATEST")
+        _lambda_svc._pool_kill_function(get_account_id(), name)
     _reconcile_tag_map(func.setdefault("tags", {}), old_props, new_props)
     return name, {"Arn": func["config"]["FunctionArn"]}
 
@@ -3958,6 +3971,10 @@ def _eb_rule_create(logical_id, props, stack_name):
     key = _eb._rule_key(name, bus)
     # The service's own ARN shape: a default-bus rule has no bus segment.
     arn = _eb._rule_arn(name, bus)
+    targets = props.get("Targets", []) or []
+    for resp in (*map(_eb._validate_target_arn, targets), _eb._validate_event_bus_targets(bus, targets)):
+        if resp:
+            raise ValueError(f"AWS::Events::Rule PutTargets failed: {resp[2]!r}")
 
     _eb._rules[key] = {
         "Name": name,
@@ -3970,7 +3987,6 @@ def _eb_rule_create(logical_id, props, stack_name):
         "RoleArn": props.get("RoleArn", ""),
     }
 
-    targets = props.get("Targets", [])
     _eb._targets[key] = []
     for t in targets:
         _eb._targets[key].append(t)
@@ -4402,6 +4418,179 @@ def _eb_event_bus_delete(physical_id, props):
 
 
 
+# --- EventBridge Archive ---
+
+_EB_ARCHIVE_SETTINGS = ("Description", "EventPattern", "RetentionDays")
+
+
+def _java_hash_map_order(value):
+    """``value`` with its keys in java.util.HashMap order, as CloudFormation hands EventBridge an EventPattern."""
+    if isinstance(value, list):
+        return [_java_hash_map_order(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    capacity = 16
+    while len(value) > capacity * 3 // 4:
+        capacity *= 2
+
+    def bucket(key):
+        h = 0
+        units = key.encode("utf-16-be")
+        for i in range(0, len(units), 2):
+            h = (31 * h + int.from_bytes(units[i:i + 2], "big")) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (capacity - 1)
+
+    ordered = sorted(enumerate(value), key=lambda item: (bucket(item[1]), item[0]))
+    return {key: _java_hash_map_order(value[key]) for _, key in ordered}
+
+
+def _eb_archive_settings(props):
+    """The archive settings the template sets, in the API's shapes. A setting
+    left out of the template keeps the archive's value, KmsKeyIdentifier too;
+    an empty KmsKeyIdentifier clears the key (measured)."""
+    data = {}
+    if "Description" in props:
+        data["Description"] = _template_string(props["Description"])
+    if "EventPattern" in props:
+        # Compact, with non-ASCII characters as written, as DescribeArchive returns it.
+        data["EventPattern"] = json.dumps(_java_hash_map_order(props["EventPattern"]),
+                                          separators=(",", ":"), ensure_ascii=False)
+    if "RetentionDays" in props:
+        data["RetentionDays"] = int(props["RetentionDays"])
+    if "KmsKeyIdentifier" in props:
+        data["KmsKeyIdentifier"] = _template_string(props["KmsKeyIdentifier"])
+    return data
+
+
+# The resource schema's properties, as CloudFormation's validation checks them:
+# (JSON type, minLength, maxLength, pattern). Its "pattern" is unanchored there.
+_EB_ARCHIVE_SCHEMA = {
+    "ArchiveName": ("string", 1, 48, r"[\.\-_A-Za-z0-9]+"),
+    "SourceArn": ("string", None, None, None),
+    "Description": ("string", None, None, None),
+    "EventPattern": ("object", None, None, None),
+    "RetentionDays": ("integer", None, None, None),
+    "KmsKeyIdentifier": ("string", 0, 2048, None),
+}
+_EB_ARCHIVE_SOURCE_ARN_PATTERN = r"^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:.+\/.+$"
+
+
+def eb_archive_schema_errors(props):
+    """(path, reason) for each AWS::Events::Archive schema error, in Early Validation's order; None is unchecked."""
+    errors = [(key, f"Unsupported property [{key}]") for key in props if key not in _EB_ARCHIVE_SCHEMA]
+    if "SourceArn" not in props:
+        errors.append(("", "Required property [SourceArn] not found"))
+    for key, value in props.items():
+        if key not in _EB_ARCHIVE_SCHEMA or value is None:
+            continue
+        kind, min_length, max_length, pattern = _EB_ARCHIVE_SCHEMA[key]
+        if kind == "object":
+            if not isinstance(value, dict):
+                errors.append((key, f"Property [{key}] expected type: JSONObject, found: {_schema_type(value)}"))
+        elif kind == "integer":
+            found = _schema_integer_type(value)
+            if found:
+                errors.append((key, f"Property [{key}] expected type: Integer, found: {found}"))
+        elif isinstance(value, (dict, list)):
+            errors.append((key, f"Property [{key}] expected type: String, found: {_schema_type(value)}"))
+        else:
+            text = _template_string(value)
+            if min_length is not None and len(text) < min_length:
+                errors.append((key, f"#/{key}: expected minLength: {min_length}, actual: {len(text)}"))
+            if max_length is not None and len(text) > max_length:
+                errors.append((key, f"#/{key}: expected maxLength: {max_length}, actual: {len(text)}"))
+            if pattern and not re.search(pattern, text):
+                errors.append((key, f"Property value [{text}] does not match pattern: {pattern}"))
+    return errors
+
+
+def eb_archive_name_conflict(name):
+    """The NAME_CONFLICT_VALIDATION message for an archive name that already exists, or None."""
+    if name not in _eb._archives:
+        return None
+    return f"Resource of type 'AWS::Events::Archive' with identifier '{name}' already exists."
+
+
+def _eb_archive_handler_error(message, code="InvalidRequest"):
+    return ValueError(f'Resource handler returned message: "{message}" '
+                      f"(RequestToken: {new_uuid()}, HandlerErrorCode: {code})")
+
+
+# The handler's codes for the EventBridge errors it relays (measured); any other is InvalidRequest.
+_EB_ARCHIVE_HANDLER_CODES = {"ResourceAlreadyExistsException": "AlreadyExists",
+                             "ResourceNotFoundException": "NotFound"}
+
+
+def _eb_archive_service_error(resp):
+    """The handler's message for an EventBridge error response: the service's
+    message with the SDK's suffix."""
+    body = json.loads(resp[2])
+    code = _EB_ARCHIVE_HANDLER_CODES.get(body.get("__type"), "InvalidRequest")
+    return _eb_archive_handler_error(_sdk_error(body.get("message", ""), "EventBridge", resp[0]), code)
+
+
+def _eb_archive_check_request(props, creating):
+    """The checks the handler makes before it calls EventBridge, with its
+    messages and in its order (measured). The name and source are checked on
+    create only: an update cannot change them."""
+    violations = []
+    retention = props.get("RetentionDays")
+    if _schema_integer_type(retention) is None and int(retention) < 0:
+        violations.append(f"Value '{int(retention)}' at 'retentionDays' failed to satisfy "
+                          f"constraint: Member must have value greater than or equal to 0")
+    source = _template_string(props.get("SourceArn", ""))
+    if creating and not re.fullmatch(_EB_ARCHIVE_SOURCE_ARN_PATTERN, source):
+        violations.append(f"Value '{source}' at 'eventSourceArn' failed to satisfy constraint: Member must "
+                          f"satisfy regular expression pattern: {_EB_ARCHIVE_SOURCE_ARN_PATTERN}")
+    name = _template_string(props.get("ArchiveName", ""))
+    if creating and not re.fullmatch(_EB_ARCHIVE_SCHEMA["ArchiveName"][3], name):
+        violations.append(f"Value '{name}' at 'archiveName' failed to satisfy constraint: Member must satisfy "
+                          f"regular expression pattern: {_EB_ARCHIVE_SCHEMA['ArchiveName'][3]}")
+    if violations:
+        count = f"{len(violations)} validation error{'s' if len(violations) > 1 else ''} detected"
+        raise _eb_archive_handler_error(f"Invalid request provided: {count}: {'; '.join(violations)}")
+    if props.get("KmsKeyIdentifier") and _kms._resolve_key(_template_string(props["KmsKeyIdentifier"])) is None:
+        raise _eb_archive_handler_error(
+            "Invalid request provided: The provided KMS key does not exist. Please ensure that the key "
+            "identifier is correct and your key exists in the same region as the event source.")
+
+
+def _eb_archive_attrs(name):
+    return {"Arn": _eb._archives[name]["ArchiveArn"]}
+
+
+def _eb_archive_create(logical_id, props, stack_name):
+    """Ref is the archive name. A generated name is the logical id, cut to 35
+    characters, then - and 12 random letters and digits: 48, the API's limit."""
+    suffix = "".join(random.choices(string.ascii_letters + string.digits, k=12))
+    name = _template_string(props.get("ArchiveName") or f"{logical_id[:35]}-{suffix}")
+    _eb_archive_check_request({**props, "ArchiveName": name}, creating=True)
+    resp = _eb._create_archive({
+        "ArchiveName": name,
+        "EventSourceArn": _template_string(props.get("SourceArn", "")),
+        **_eb_archive_settings(props),
+    })
+    if resp[0] >= 400:
+        raise _eb_archive_service_error(resp)
+    return name, _eb_archive_attrs(name)
+
+
+def _eb_archive_update(physical_id, old_props, new_props, stack_name):
+    if not any(key in new_props for key in _EB_ARCHIVE_SETTINGS):
+        raise _eb_archive_handler_error(
+            "Invalid request provided: At least one of EventPattern, RetentionDays or Description must be provided.")
+    _eb_archive_check_request(new_props, creating=False)
+    resp = _eb._update_archive({"ArchiveName": physical_id, **_eb_archive_settings(new_props)})
+    if resp[0] >= 400:
+        raise _eb_archive_service_error(resp)
+    return physical_id, _eb_archive_attrs(physical_id)
+
+
+def _eb_archive_delete(physical_id, props):
+    if physical_id in _eb._archives:
+        _eb._delete_archive({"ArchiveName": physical_id})
+
+
 # --- Kinesis Stream ---
 
 def _kinesis_stream_create(logical_id, props, stack_name):
@@ -4719,7 +4908,7 @@ def _cfn_noop_delete(physical_id, props):
 
 # --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
 
-def _check_nested_stack_capabilities(parent_stack_name, template):
+def _check_nested_stack_capabilities(parent_stack_name, template, capabilities=None):
     """Refuse a nested stack's template whose IAM resources the parent did
     not acknowledge. AWS asks for the capabilities on the parent ("For nested
     stacks that contain IAM resources, you must acknowledge IAM capabilities",
@@ -4740,7 +4929,9 @@ def _check_nested_stack_capabilities(parent_stack_name, template):
     required = _required_iam_capabilities(template)
     if _uses_macro(template):
         required.append("CAPABILITY_AUTO_EXPAND")
-    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)), required)
+    if capabilities is None:
+        capabilities = _parent_capabilities(parent_stack_name)
+    missing = _missing_capabilities(set(capabilities), required)
     if missing:
         raise ValueError(_insufficient_capabilities_message(missing))
 
@@ -4762,8 +4953,10 @@ def _inherited_capabilities(parent_stack_name):
 
 
 def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
-                             previous_physical_id=None, previous_props=None):
-    """Provision an `AWS::CloudFormation::Stack` nested-stack resource.
+                             previous_physical_id=None, previous_props=None,
+                             template_body=None, child_name=None, capabilities=None):
+    """Provision an `AWS::CloudFormation::Stack` nested-stack resource, or a
+    StackSet's instance (its own ``template_body``, ``child_name`` and ``capabilities``).
 
     Mirrors the synchronous core of `stacks._deploy_stack_async` but runs
     inline so the parent's deploy loop can read the child's Outputs (exposed
@@ -4792,20 +4985,22 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
     from ministack.services.cloudformation.stacks import _add_event, _resource_policy
 
     template_url = props.get("TemplateURL")
-    if not template_url:
+    if template_body is None and not template_url:
         raise ValueError(
             "AWS::CloudFormation::Stack requires TemplateURL "
             "(inline TemplateBody is not supported by real AWS either)"
         )
 
-    template_body, err = _resolve_template({"TemplateURL": [template_url]})
+    err = None
+    if template_body is None:
+        template_body, err = _resolve_template({"TemplateURL": [template_url]})
     if err is not None:
         raise ValueError(f"Failed to fetch nested-stack template: {template_url}")
     if not template_body:
         raise ValueError(f"Nested-stack template empty at {template_url}")
 
     template = _parse_template(template_body)
-    _check_nested_stack_capabilities(parent_stack_name, template)
+    _check_nested_stack_capabilities(parent_stack_name, template, capabilities)
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
@@ -4825,7 +5020,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         child_name = previous_physical_id
         previous_stack_snapshot = copy.deepcopy(_stacks[child_name])
     else:
-        child_name = f"{parent_stack_name}-{logical_id}-{new_uuid()[:12]}"
+        child_name = child_name or f"{parent_stack_name}-{logical_id}-{new_uuid()[:12]}"
         previous_stack_snapshot = None
 
     child_stack_id = (
@@ -4868,7 +5063,8 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         # child of this child reads the same set. Only the check needs it, so
         # it is recorded only where the check runs: elsewhere a child's
         # DescribeStacks reports what it reported before, nothing.
-        "Capabilities": _inherited_capabilities(parent_stack_name),
+        "Capabilities": (_inherited_capabilities(parent_stack_name)
+                         if capabilities is None else list(capabilities)),
     }
     _stacks[child_name] = child_stack
     _stack_events.setdefault(child_stack_id, [])
@@ -5118,6 +5314,76 @@ def _cfn_nested_stack_delete(physical_id, props):
     # Leave the stack entry in _stacks so DescribeStacks on the child id still
     # returns DELETE_COMPLETE, matching real AWS behaviour for nested stacks
     # whose parents are torn down.
+
+
+# --- CloudFormation StackSet: one SELF_MANAGED instance in the stack's own account and Region, as a nested stack ---
+
+_STACK_SET_PROPERTIES = frozenset({
+    "StackSetName", "PermissionModel", "StackInstancesGroup", "TemplateBody", "Parameters",
+    "Capabilities", "Description", "Tags", "AdministrationRoleARN", "ExecutionRoleName",
+    "ManagedExecution", "OperationPreferences"})
+_STACK_SET_NAMES = threading.Lock()
+
+
+def _stack_set_instance(props):
+    """The instance's nested-stack properties; refuses a StackSet MiniStack does not deploy."""
+    from ministack.core.responses import get_account_id, get_region
+    local = [{"DeploymentTargets": {"Accounts": [get_account_id()]}, "Regions": [get_region()]}]
+    unsupported = sorted(set(props) - _STACK_SET_PROPERTIES)
+    if (unsupported or not isinstance(props.get("StackSetName"), str)
+            or props.get("PermissionModel") != "SELF_MANAGED"
+            or props.get("StackInstancesGroup") != local
+            or not isinstance(props.get("TemplateBody"), str)):
+        raise ValueError(
+            "MiniStack does not emulate this AWS::CloudFormation::StackSet: it deploys only one with a "
+            "StackSetName, PermissionModel SELF_MANAGED, an inline TemplateBody and one StackInstancesGroup "
+            "whose DeploymentTargets.Accounts and Regions are this stack's own account and Region"
+            + (f"; unsupported properties: {', '.join(unsupported)}" if unsupported else ""))
+    return {"Parameters": {p["ParameterKey"]: p["ParameterValue"] for p in props.get("Parameters") or []},
+            "Tags": props.get("Tags") or []}
+
+
+def _stack_set_create(logical_id, props, stack_name):
+    from ministack.core.responses import new_uuid
+    from ministack.services.cloudformation import _stack_sets
+    instance = _stack_set_instance(props)
+    name = props["StackSetName"]
+    stack_set_id = f"{name}:{new_uuid()}"
+    record = {"StackSetId": stack_set_id, "StackSetName": name, "Status": "ACTIVE",
+              "Properties": props, "InstanceStack": f"StackSet-{name}-{new_uuid()}"}
+    with _STACK_SET_NAMES:  # held only to reserve the name, not across the deploy
+        if any(r["StackSetName"] == name and r["Status"] == "ACTIVE" for r in _stack_sets.values()):
+            raise ValueError(f"StackSet {name} already exists")
+        _stack_sets[stack_set_id] = record
+    try:
+        _cfn_nested_stack_deploy(logical_id, instance, stack_name, template_body=props["TemplateBody"],
+                                 child_name=record["InstanceStack"], capabilities=props.get("Capabilities") or [])
+    except Exception:
+        # The failed resource is not recorded, so the stack's rollback cannot delete it.
+        _cfn_nested_stack_delete(record["InstanceStack"], {})
+        _stack_sets.pop(stack_set_id, None)
+        raise
+    return stack_set_id, {"StackSetId": stack_set_id}
+
+
+def _stack_set_update(physical_id, old_props, new_props, stack_name):
+    from ministack.services.cloudformation import _stack_sets
+    instance = _stack_set_instance(new_props)
+    record = _stack_sets[physical_id]
+    # AWS stores the new properties before the instance is updated.
+    record["Properties"] = new_props
+    _cfn_nested_stack_deploy(physical_id, instance, stack_name, previous_physical_id=record["InstanceStack"],
+                             template_body=new_props["TemplateBody"],
+                             capabilities=new_props.get("Capabilities") or [])
+    return physical_id, {"StackSetId": physical_id}
+
+
+def _stack_set_delete(physical_id, props):
+    from ministack.services.cloudformation import _stack_sets
+    record = _stack_sets.get(physical_id)
+    if record:
+        _cfn_nested_stack_delete(record["InstanceStack"], props)
+        record["Status"] = "DELETED"
 
 
 # --- CloudFormation Custom Resource ---
@@ -5969,12 +6235,13 @@ def _apigw_domain_name_create(logical_id, props, stack_name):
         raise ValueError(f"AWS::ApiGateway::DomainName create failed: {body!r}")
     domain = json.loads(body)
     domain_name = domain["domainName"]
+    record = _apigw_v1._domain_names[domain_name]
     attrs = {
-        "DistributionDomainName": domain["distributionDomainName"],
-        "DistributionHostedZoneId": domain["distributionHostedZoneId"],
-        "DomainNameArn": f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}",
-        "RegionalDomainName": domain["regionalDomainName"],
-        "RegionalHostedZoneId": domain["regionalHostedZoneId"],
+        "DistributionDomainName": record["distributionDomainName"],
+        "DistributionHostedZoneId": record["distributionHostedZoneId"],
+        "DomainNameArn": domain["domainNameArn"],
+        "RegionalDomainName": record["regionalDomainName"],
+        "RegionalHostedZoneId": record["regionalHostedZoneId"],
     }
     return domain_name, attrs
 
@@ -6170,24 +6437,28 @@ def _lambda_esm_create(logical_id, props, stack_name):
     esm_id = new_uuid()
     func_arn = resource_arn if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
 
+    source_arn = props.get("EventSourceArn", "")
+    is_sqs = source_arn.startswith("arn:") and source_arn.split(":")[2:3] == ["sqs"]
+    enabled = _cfn_bool(props.get("Enabled", True))
     esm = {
         "UUID": esm_id,
-        "EventSourceArn": props.get("EventSourceArn", ""),
+        "EventSourceArn": source_arn,
         # resource_arn from _lambda_function_for_cfn_ref already carries the
         # qualifier — do not re-append it (that double-suffixed ":live:live").
         "FunctionArn": func_arn,
         "FunctionName": func_name,
         "Qualifier": qualifier,
-        "State": "Enabled",
-        "StateTransitionReason": "USER_INITIATED",
-        "BatchSize": int(props.get("BatchSize", 10)),
+        "State": "Enabled" if enabled else "Disabled",
+        **_lambda_svc.esm_source_defaults(is_sqs),
         "MaximumBatchingWindowInSeconds": int(props.get("MaximumBatchingWindowInSeconds", 0)),
-        "LastModified": int(time.time()),
-        "LastProcessingResult": "No records processed",
-        "StartingPosition": props.get("StartingPosition", "LATEST"),
-        "Enabled": props.get("Enabled", True),
+        "LastModified": time.time(),
+        "Enabled": enabled,
         "FunctionResponseTypes": props.get("FunctionResponseTypes", []),
     }
+    if props.get("BatchSize") is not None:
+        esm["BatchSize"] = int(props["BatchSize"])
+    if not is_sqs:
+        esm["StartingPosition"] = props.get("StartingPosition", "LATEST")
     # Preserve every optional ESM property the API create/update path round-trips,
     # so a CloudFormation-created mapping reads back without drift. Previously only
     # FilterCriteria was kept; DestinationConfig, ParallelizationFactor, the retry/age
@@ -6202,13 +6473,15 @@ def _lambda_esm_create(logical_id, props, stack_name):
         "MaximumRecordAgeInSeconds",
         "BisectBatchOnFunctionError",
         "ScalingConfig",
+        "TumblingWindowInSeconds",
     ):
         if props.get(_opt) is not None:
             esm[_opt] = props[_opt]
     _lambda_svc._esms[esm_id] = esm
     # Anchor a DynamoDB-stream ESM's LATEST position at create time, matching the
     # API CreateEventSourceMapping path; no-op for SQS/Kinesis sources (#936).
-    _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
+    if not is_sqs:
+        _lambda_svc._init_stream_position(esm_id, esm["EventSourceArn"], esm["StartingPosition"])
     _lambda_svc._ensure_poller()
     return esm_id, _lambda_esm_attrs(esm_id)
 
@@ -6242,19 +6515,20 @@ def _lambda_esm_update(physical_id, old_props, new_props, stack_name):
         "DestinationConfig",
         "FilterCriteria",
         "ScalingConfig",
+        "TumblingWindowInSeconds",
     ):
         if key in new_props:
             esm[key] = new_props[key]
     if "Enabled" in new_props:
-        esm["Enabled"] = new_props["Enabled"]
-        esm["State"] = "Enabled" if new_props["Enabled"] else "Disabled"
+        esm["Enabled"] = _cfn_bool(new_props["Enabled"])
+        esm["State"] = "Enabled" if esm["Enabled"] else "Disabled"
     if "FunctionName" in new_props:
         func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(new_props["FunctionName"])
         func = _lambda_svc._functions.get(func_name)
         func_arn = func["config"]["FunctionArn"] if func else f"arn:aws:lambda:{get_region()}:{get_account_id()}:function:{func_name}"
         esm["FunctionName"] = func_name
         esm["FunctionArn"] = func_arn + (f":{qualifier}" if qualifier else "")
-    esm["LastModified"] = int(time.time())
+    esm["LastModified"] = time.time()
     return physical_id, _lambda_esm_attrs(physical_id)
 
 
@@ -7560,6 +7834,64 @@ def _cognito_user_pool_domain_delete(physical_id, props):
         _cognito._delete_user_pool_domain({"UserPoolId": pid, "Domain": domain})
 
 
+def _cognito_branding_numbers(settings, defaults):
+    """A template's Settings with each string a number or boolean where Cognito's own setting is one,
+    as CloudFormation passes a String parameter's "8.0" on as 8.0 and "true" as true."""
+    if isinstance(settings, dict) and isinstance(defaults, dict):
+        return {k: _cognito_branding_numbers(v, defaults.get(k)) for k, v in settings.items()}
+    if not isinstance(settings, str):
+        return settings
+    if isinstance(defaults, bool):
+        return {"true": True, "false": False}.get(settings.lower(), settings)
+    if isinstance(defaults, (int, float)):
+        try:
+            number = float(settings)
+        except ValueError:
+            return settings
+        return number if math.isfinite(number) else settings
+    return settings
+
+
+def _cognito_managed_login_branding_values(props):
+    values = {k: props[k] for k in ("Settings", "Assets") if k in props}
+    if "Settings" in values:
+        values["Settings"] = _cognito_branding_numbers(values["Settings"], _cognito.DEFAULT_SETTINGS)
+    if "UseCognitoProvidedValues" in props:
+        values["UseCognitoProvidedValues"] = _cfn_bool(props["UseCognitoProvidedValues"])
+    return values
+
+
+def _cognito_managed_login_branding_create(logical_id, props, stack_name):
+    """Ref is "{UserPoolId}|{ManagedLoginBrandingId}" and GetAtt
+    ManagedLoginBrandingId the id alone, as on AWS."""
+    pid = props.get("UserPoolId", "")
+    status, _, body = _cognito._create_managed_login_branding({
+        "UserPoolId": pid, "ClientId": props.get("ClientId", ""),
+        **_cognito_managed_login_branding_values(props),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::ManagedLoginBranding create failed: {body!r}")
+    bid = json.loads(body)["ManagedLoginBranding"]["ManagedLoginBrandingId"]
+    return f"{pid}|{bid}", {"ManagedLoginBrandingId": bid}
+
+
+def _cognito_managed_login_branding_update(physical_id, old_props, new_props, stack_name):
+    """Update in place; the engine replaces the branding for a new ClientId or UserPoolId."""
+    pid, _, bid = physical_id.partition("|")
+    status, _, body = _cognito._update_managed_login_branding({
+        "UserPoolId": pid, "ManagedLoginBrandingId": bid,
+        **_cognito_managed_login_branding_values(new_props),
+    })
+    if status >= 400:
+        raise ValueError(f"AWS::Cognito::ManagedLoginBranding update failed: {body!r}")
+    return physical_id, {"ManagedLoginBrandingId": bid}
+
+
+def _cognito_managed_login_branding_delete(physical_id, props):
+    pid, _, bid = physical_id.partition("|")
+    _cognito._delete_managed_login_branding({"UserPoolId": pid, "ManagedLoginBrandingId": bid})
+
+
 # ===========================================================================
 # --- ECR resource provisioners ---
 
@@ -8233,9 +8565,9 @@ def _ec2_sg_permissions(rules):
             "PrefixListIds": [],
             "UserIdGroupPairs": [],
         }
-        if "FromPort" in rule:
+        if "FromPort" in rule and not _ec2._ignores_ports(perm["IpProtocol"]):
             perm["FromPort"] = int(rule["FromPort"])
-        if "ToPort" in rule:
+        if "ToPort" in rule and not _ec2._ignores_ports(perm["IpProtocol"]):
             perm["ToPort"] = int(rule["ToPort"])
         described = {"Description": rule["Description"]} if rule.get("Description") else {}
         if "CidrIp" in rule:
@@ -8272,7 +8604,7 @@ def _ec2_sg_reconcile(store, old_perms, new_perms):
         return
 
     def key(perm):
-        return json.dumps(_ec2._strip_descriptions(perm), sort_keys=True)
+        return json.dumps(_ec2._rule_match_form(perm), sort_keys=True)
 
     keys = {key(p) for p in old_perms} | {key(p) for p in new_perms}
     store[:] = [p for p in store if key(p) not in keys] + new_perms
@@ -8539,8 +8871,8 @@ def _ecs_cluster_create(logical_id, props, stack_name):
         "tags": tags,
         "settings": _pascal_to_camel(props.get("ClusterSettings") or []),
         "capacityProviders": props.get("CapacityProviders", []),
-        "defaultCapacityProviderStrategy": _pascal_to_camel(
-            props.get("DefaultCapacityProviderStrategy") or []),
+        "defaultCapacityProviderStrategy": _ecs._service_strategy(_pascal_to_camel(
+            props.get("DefaultCapacityProviderStrategy") or [])) or [],
         "configuration": _pascal_to_camel(props.get("Configuration") or {}),
     })
     if old:
@@ -8560,8 +8892,8 @@ def _ecs_cluster_update(physical_id, old_props, new_props, stack_name, logical_i
     if replaced is not None:
         return replaced
     cluster["capacityProviders"] = new_props.get("CapacityProviders", [])
-    cluster["defaultCapacityProviderStrategy"] = _pascal_to_camel(
-        new_props.get("DefaultCapacityProviderStrategy") or [])
+    cluster["defaultCapacityProviderStrategy"] = _ecs._service_strategy(_pascal_to_camel(
+        new_props.get("DefaultCapacityProviderStrategy") or [])) or []
     # Settings or configuration dropped from the template stay on the cluster.
     if new_props.get("ClusterSettings"):
         cluster["settings"] = _pascal_to_camel(new_props["ClusterSettings"])
@@ -8583,26 +8915,30 @@ def _cfn_to_camel(key):
     return key[0].lower() + key[1:]
 
 
+# ECS API names that are not the template name with a lower-case first letter (botocore ecs model).
+_ECS_API_NAMES = {"EFSVolumeConfiguration": "efsVolumeConfiguration", "FilesystemId": "fileSystemId",
+                  "IAM": "iam", "FSxWindowsFileServerVolumeConfiguration": "fsxWindowsFileServerVolumeConfiguration",
+                  "ProxyConfigurationProperties": "properties"}
+# Map-typed fields whose keys are the user's own (dockerLabels, log/firelens options, docker volume opts).
+_ECS_USER_MAPS = frozenset(("dockerLabels", "options", "driverOpts", "labels"))
+
+
+def _ecs_api_form(value):
+    """A task definition property in the ECS API's camelCase, at every depth, user-keyed maps untouched."""
+    if isinstance(value, list):
+        return [_ecs_api_form(v) for v in value]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            name = _ECS_API_NAMES.get(k) or _cfn_to_camel(k)
+            out[name] = v if name in _ECS_USER_MAPS else _ecs_api_form(v)
+        return out
+    return value
+
+
 def _normalize_container_defs(cdefs):
     """Convert CF PascalCase container definitions to camelCase for ECS API."""
-    result = []
-    for cdef in cdefs:
-        normalized = {}
-        for k, v in cdef.items():
-            camel = _cfn_to_camel(k)
-            if camel == "portMappings" and isinstance(v, list):
-                v = [{_cfn_to_camel(pk): pv for pk, pv in pm.items()} for pm in v]
-            elif camel == "environment" and isinstance(v, list):
-                v = [{_cfn_to_camel(ek): ev for ek, ev in e.items()} for e in v]
-            elif camel == "mountPoints" and isinstance(v, list):
-                v = [{_cfn_to_camel(mk): mv for mk, mv in m.items()} for m in v]
-            elif camel == "volumesFrom" and isinstance(v, list):
-                v = [{_cfn_to_camel(vk): vv for vk, vv in vf.items()} for vf in v]
-            elif camel == "logConfiguration" and isinstance(v, dict):
-                v = {_cfn_to_camel(lk): lv for lk, lv in v.items()}
-            normalized[camel] = v
-        result.append(normalized)
-    return result
+    return _ecs_api_form(list(cdefs or []))
 
 
 def _ecs_task_def_create(logical_id, props, stack_name):
@@ -8621,10 +8957,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
         "networkMode": props.get("NetworkMode", "bridge"),
         "executionRoleArn": props.get("ExecutionRoleArn", ""),
         "taskRoleArn": props.get("TaskRoleArn", ""),
-        "volumes": props.get("Volumes", []),
+        "volumes": _ecs_api_form(props.get("Volumes", [])),
         "pidMode": props.get("PidMode", ""),
         "ipcMode": props.get("IpcMode", ""),
-        "placementConstraints": props.get("PlacementConstraints", []),
+        "placementConstraints": _ecs_api_form(props.get("PlacementConstraints", [])),
         "registeredAt": now_iso(),
         "registeredBy": f"arn:aws:iam::{get_account_id()}:root",
     }
@@ -8632,6 +8968,10 @@ def _ecs_task_def_create(logical_id, props, stack_name):
                       ("Memory", "memory")):
         if prop in props:
             td[key] = props[prop]
+    for prop in ("RuntimePlatform", "EphemeralStorage", "ProxyConfiguration", "InferenceAccelerators",
+                 "EnableFaultInjection"):
+        if prop in props:
+            td[_cfn_to_camel(prop)] = _ecs_api_form(props[prop])
     _ecs._task_defs[td_key] = td
     _ecs._tags[arn] = _pascal_to_camel(props.get("Tags") or [])
     return arn, {"TaskDefinitionArn": arn}
@@ -9124,7 +9464,7 @@ def _lambda_layer_create(logical_id, props, stack_name):
     import hashlib
     zip_data = None
     if s3_bucket and s3_key:
-        zip_data = _s3._get_object_data(s3_bucket, s3_key)
+        zip_data = _s3._get_object_data_for_caller(s3_bucket, s3_key)
 
     layer_arn = f"arn:aws:lambda:{get_region()}:{get_account_id()}:layer:{layer_name}"
     version_arn = f"{layer_arn}:{ver}"
@@ -9256,7 +9596,7 @@ def _sfn_definition(props):
         if bucket and key:
             from ministack.services import s3 as _s3_svc
             try:
-                blob = _s3_svc._get_object_data(bucket, key, version_id=version)
+                blob = _s3_svc._get_object_data_for_caller(bucket, key, version_id=version)
             except Exception as e:
                 raise ValueError(
                     f"AWS::StepFunctions::StateMachine DefinitionS3Location fetch failed "
@@ -9759,6 +10099,20 @@ _LISTENER_RULE_TRANSFORM_CONFIGS = ("HostHeaderRewriteConfig", "UrlRewriteConfig
 def _schema_type(value):
     """The type name CloudFormation's schema check reports for a template value."""
     return "JSONArray" if isinstance(value, list) else "JSONObject" if isinstance(value, dict) else "String"
+
+
+def _schema_integer_type(value):
+    """The type CloudFormation's schema check reports for a value that is not
+    an integer, or None. A string of digits passes, as a template scalar."""
+    if isinstance(value, bool):
+        return "Boolean"
+    if isinstance(value, int):
+        return None
+    if isinstance(value, float):
+        return "Float"
+    if isinstance(value, str):
+        return None if re.fullmatch(r"-?\d+", value) else "String"
+    return _schema_type(value)
 
 
 def _schema_string_errors(obj, keys, path):
@@ -12496,12 +12850,35 @@ def _asg_create(logical_id, props, stack_name):
     return name, {"AutoScalingGroupARN": arn, "Arn": arn}
 
 
-def _asg_fields(props):
-    """The group members a template sets, for create and update alike."""
+def _asg_mixed_instances_policy(policy, stored=None):
+    from ministack.services.autoscaling import resolve_mixed_instances_policy
+
+    if not policy:
+        return None
+    distribution = dict(policy.get("InstancesDistribution") or {})
+    for key in ("OnDemandBaseCapacity", "OnDemandPercentageAboveBaseCapacity", "SpotInstancePools"):
+        if key in distribution:
+            distribution[key] = int(distribution[key])
+    resolved, error = resolve_mixed_instances_policy({**policy, "InstancesDistribution": distribution}, stored)
+    if error:
+        raise ValueError(error)
+    return resolved
+
+
+def _asg_fields(props, stored_policy=None):
+    """The group members a template sets, for create and update alike; an update passes the group's
+    MixedInstancesPolicy, which keeps the members the template no longer sets."""
+    from ministack.services.autoscaling import _SOURCE_ERROR
+
+    has_lt, has_mixed = bool(props.get("LaunchTemplate")), bool(props.get("MixedInstancesPolicy"))
+    if (has_lt and has_mixed) or not (has_lt or has_mixed or props.get("LaunchConfigurationName")
+                                      or props.get("InstanceId")):
+        raise ValueError(_SOURCE_ERROR)
     zone_id = props.get("VPCZoneIdentifier", "")
     return {
         "LaunchConfigurationName": props.get("LaunchConfigurationName", ""),
         "LaunchTemplate": _asg_launch_template(props.get("LaunchTemplate")),
+        "MixedInstancesPolicy": _asg_mixed_instances_policy(props.get("MixedInstancesPolicy"), stored_policy),
         "MinSize": int(props.get("MinSize", 0)),
         "MaxSize": int(props.get("MaxSize", 0)),
         "DesiredCapacity": int(props.get("DesiredCapacity", props.get("MinSize", 0))),
@@ -12516,21 +12893,15 @@ def _asg_fields(props):
 
 
 def _asg_launch_template(spec):
-    """The launch template's id and name, whichever of the two the group was given."""
-    if not spec:
-        return {}
-    lt_id = spec.get("LaunchTemplateId", "")
-    lt_name = spec.get("LaunchTemplateName", "")
-    record = _ec2._launch_templates.get(lt_id) if lt_id else next(
-        (t for t in _ec2._launch_templates.values()
-         if t.get("LaunchTemplateName") == lt_name), None)
-    if record:
-        lt_id, lt_name = record["LaunchTemplateId"], record["LaunchTemplateName"]
-    return {
-        "LaunchTemplateId": lt_id or lt_name,
-        "LaunchTemplateName": lt_name,
-        "Version": spec.get("Version", "$Default"),
-    }
+    from ministack.services.autoscaling import resolve_launch_template
+
+    spec = spec or {}
+    resolved, error = resolve_launch_template(
+        spec.get("LaunchTemplateId"), spec.get("LaunchTemplateName"),
+        None if spec.get("Version") is None else str(spec["Version"]))
+    if error:
+        raise ValueError(error)
+    return resolved
 
 
 def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
@@ -12546,7 +12917,7 @@ def _asg_update(physical_id, old_props, new_props, stack_name, logical_id=None):
     )
     if replaced is not None:
         return replaced
-    asg.update(_asg_fields(new_props))
+    asg.update(_asg_fields(new_props, asg.get("MixedInstancesPolicy")))
     # Tags from CreateOrUpdateTags stay.
     tags = _asg._tags.get(physical_id)
     if tags is None:
@@ -13051,14 +13422,16 @@ def _ec_query(props, renames=None):
 
 def _ec_call(fn, params, resource_type, action):
     _ec._seed_default_param_groups()
+    _ec._seed_default_user()
     status, _headers, body = fn(params)
     if status >= 400:
         text = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
         code = re.search(r"<Code>(.*?)</Code>", text)
         message = re.search(r"<Message>(.*?)</Message>", text, re.S)
-        raise ValueError(
-            f"{resource_type} {action} failed: "
-            f"{code.group(1) if code else status}: {message.group(1) if message else text}")
+        # The handler's reason (real AWS, us-east-1, AWS::ElastiCache::UserGroup).
+        message = html.unescape(message.group(1)) if message else text
+        raise ValueError(f'Resource handler returned message: "{_sdk_error(message, "ElastiCache", status)}" '
+                         f"(RequestToken: {new_uuid()}, HandlerErrorCode: GeneralServiceException)")
 
 
 def _ec_sync_tags(arn, old_props, new_props, resource_type):
@@ -13445,10 +13818,17 @@ def _ec_user_group_update(physical_id, old_props, new_props, stack_name, logical
         _ec_user_group_create, _ec_user_group_delete)
     if replaced:
         return replaced
-    old_users = list(old_props.get("UserIds") or [])
+    # Only a change to the set of users or to Engine resets the group to the template's users (real AWS, us-east-1).
+    live_users = list((_ec._user_groups.get(physical_id) or {}).get("UserIds") or [])
     new_users = list(new_props.get("UserIds") or [])
-    params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in old_users],
-                        "UserIdsToRemove": [u for u in old_users if u not in new_users]})
+    params = {}
+    if (set(new_users) != set(old_props.get("UserIds") or [])
+            or new_props.get("Engine") != old_props.get("Engine")):
+        params = _ec_query({"UserIdsToAdd": [u for u in new_users if u not in live_users],
+                            "UserIdsToRemove": [u for u in live_users if u not in new_users]})
+    live_engine = (_ec._user_groups.get(physical_id) or {}).get("Engine")
+    if new_props.get("Engine") and str(new_props["Engine"]) != live_engine:
+        params["Engine"] = str(new_props["Engine"])
     if params:
         _ec_call(_ec._modify_user_group, {"UserGroupId": physical_id, **params},
                  "AWS::ElastiCache::UserGroup", "update")
@@ -13498,6 +13878,56 @@ def _glue_reset_dropped(old_props, new_props, defaults):
     glue.py's Update* calls change only the members they are given, so a
     removed property would otherwise keep its old value."""
     return {k: v for k, v in defaults.items() if k in old_props and k not in new_props}
+
+
+def _athena_workgroup_attributes(name):
+    workgroup = _athena._workgroups[name]
+    engine = (workgroup.get("Configuration") or {}).get("EngineVersion") or {}
+    selected = engine.get("SelectedEngineVersion")
+    effective = engine.get("EffectiveEngineVersion") or (
+        selected if selected and selected != "AUTO" else "Athena engine version 3")
+    return {
+        "CreationTime": str(workgroup["CreationTime"]),
+        "WorkGroupConfiguration.EngineVersion.EffectiveEngineVersion": effective,
+        "WorkGroupConfigurationUpdates.EngineVersion.EffectiveEngineVersion": effective,
+    }
+
+
+def _athena_workgroup_apply(name, props):
+    """The properties AWS updates in place (template reference: Update requires No interruption)."""
+    workgroup = _athena._workgroups[name]
+    workgroup["Description"] = props.get("Description", "")
+    workgroup["State"] = props.get("State") or "ENABLED"
+    workgroup["Configuration"] = copy.deepcopy(props.get("WorkGroupConfiguration") or {})
+    arn = _athena._arn_workgroup(name)
+    tags = _tag_map(props.get("Tags"))
+    if tags:
+        _athena._tags[arn] = tags
+    else:
+        _athena._tags.pop(arn, None)
+
+
+def _athena_workgroup_create(logical_id, props, stack_name):
+    name = props.get("Name")
+    if not name:
+        raise ValueError("Property validation failure: [The property {/Name} is required]")
+    _glue_call(_athena._create_workgroup, {"Name": name}, "AWS::Athena::WorkGroup", "create")
+    _athena_workgroup_apply(name, props)
+    return name, _athena_workgroup_attributes(name)
+
+
+def _athena_workgroup_update(physical_id, old_props, new_props, stack_name, logical_id=None):
+    if new_props.get("Name") != physical_id or physical_id not in _athena._workgroups:
+        created = _athena_workgroup_create(logical_id or physical_id, new_props, stack_name)
+        if physical_id in _athena._workgroups and created[0] != physical_id:
+            _delete_predecessor(_athena_workgroup_delete, physical_id, old_props)
+        return created
+    _athena_workgroup_apply(physical_id, new_props)
+    return physical_id, _athena_workgroup_attributes(physical_id)
+
+
+def _athena_workgroup_delete(physical_id, props):
+    _athena._delete_workgroup({"WorkGroup": physical_id, "RecursiveDeleteOption": bool(props.get("RecursiveDeleteOption"))})
 
 
 def _glue_database_name(logical_id, props, stack_name):
@@ -14933,6 +15363,8 @@ def _location_tracker_delete(physical_id, props):
 
 # Per type, the create-only properties (Always): a change replaces the resource.
 _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
+    "AWS::Events::Archive": ("ArchiveName", "SourceArn"),
+    "AWS::CloudFormation::StackSet": ("PermissionModel", "StackSetName"),
     "AWS::DocDB::DBCluster": ("AvailabilityZones", "DBClusterIdentifier", "DBSubnetGroupName", "KmsKeyId",
                               "MasterUsername", "SnapshotIdentifier", "SourceDBClusterIdentifier",
                               "StorageEncrypted"),
@@ -14948,6 +15380,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::Cognito::UserPoolGroup": ("GroupName", "UserPoolId"),
     "AWS::Cognito::UserPoolResourceServer": ("Identifier", "UserPoolId"),
     "AWS::Cognito::UserPoolDomain": ("Domain", "UserPoolId"),
+    "AWS::Cognito::ManagedLoginBranding": ("ClientId", "UserPoolId"),
     "AWS::Scheduler::ScheduleGroup": ("Name",),
     "AWS::IoT::Thing": ("ThingName",),
     "AWS::IoT::Certificate": (
@@ -15031,6 +15464,7 @@ _REPLACING_PROPERTIES: dict[str, tuple[str, ...]] = {
     "AWS::RDS::DBInstance": _RDS_DB_INSTANCE_CREATE_ONLY,
     # Table, Partition and Connection replace on nested members
     # (TableInput.Name, PartitionInput.Values, ConnectionInput.Name).
+    "AWS::Athena::WorkGroup": ("Name",),
     "AWS::Glue::Database": ("DatabaseName",),
     "AWS::Glue::Crawler": ("Name",),
     "AWS::Glue::Job": ("Name",),
@@ -15146,6 +15580,12 @@ _RESOURCE_HANDLERS = {
         "update": _ec_user_group_update,
         "update_with_logical_id": True,
         "delete": _ec_user_group_delete,
+    },
+    "AWS::Athena::WorkGroup": {
+        "create": _athena_workgroup_create,
+        "update": _athena_workgroup_update,
+        "update_with_logical_id": True,
+        "delete": _athena_workgroup_delete,
     },
     "AWS::Glue::Database": {
         "create": _glue_database_create,
@@ -15351,6 +15791,7 @@ _RESOURCE_HANDLERS = {
         "delete": _cwlogs_metric_filter_delete,
     },
     "AWS::Events::EventBus": {"create": _eb_event_bus_create, "update": _eb_event_bus_update, "delete": _eb_event_bus_delete},
+    "AWS::Events::Archive": {"create": _eb_archive_create, "update": _eb_archive_update, "delete": _eb_archive_delete},
     "AWS::Kinesis::Stream": {"create": _kinesis_stream_create, "update": _kinesis_stream_update, "delete": _kinesis_stream_delete},
     "AWS::Events::Rule": {
         "create": _eb_rule_create,
@@ -15378,6 +15819,9 @@ _RESOURCE_HANDLERS = {
     },
     "AWS::CloudFormation::WaitCondition": {"create": _cfn_wait_condition_create, "update": _cfn_wait_condition_update},
     "AWS::CloudFormation::WaitConditionHandle": {"create": _cfn_wait_condition_handle_create, "delete": _cfn_wait_condition_handle_delete},
+    "AWS::CloudFormation::StackSet": {
+        "create": _stack_set_create, "update": _stack_set_update, "delete": _stack_set_delete,
+    },
     "AWS::CloudFormation::Stack": {
         "create": _cfn_nested_stack_create,
         "update": _cfn_nested_stack_update,
@@ -15570,6 +16014,11 @@ _RESOURCE_HANDLERS = {
         "create": _cognito_user_pool_domain_create,
         "update": _cognito_user_pool_domain_update,
         "delete": _cognito_user_pool_domain_delete,
+    },
+    "AWS::Cognito::ManagedLoginBranding": {
+        "create": _cognito_managed_login_branding_create,
+        "update": _cognito_managed_login_branding_update,
+        "delete": _cognito_managed_login_branding_delete,
     },
     "AWS::ECR::Repository": {
         "create": _ecr_repo_create,

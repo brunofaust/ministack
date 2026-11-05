@@ -590,6 +590,9 @@ def _append_log_events(stream, events):
     if not events:
         return
     ordered = sorted(events, key=_event_timestamp)
+    # Every stored event has an eventId, as on AWS; internal writers come without one.
+    for event in ordered:
+        event.setdefault("eventId", new_uuid())
     first, last = ordered[0]["timestamp"], ordered[-1]["timestamp"]
     with _log_events_lock:
         history = stream["events"]

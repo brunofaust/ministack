@@ -30,10 +30,12 @@ endpoint; its certificate chains to the CA served at
 
 import contextvars
 import copy
+import hashlib
 import io
 import ipaddress
 import logging
 import os
+import re
 import tarfile
 import time
 from urllib.parse import parse_qs
@@ -330,10 +332,11 @@ def _ensure_live_containers_locked():
             node_groups = rg.get("NodeGroups") or []
             for ng in node_groups:
                 ng_id = ng.get("NodeGroupId", "0001")
-                _, _, cid = _spawn_redis_container(
+                host, port, cid = _spawn_redis_container(
                     name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                     engine=engine, engine_version=engine_version,
                     transit=rg.get("TransitEncryptionEnabled", False), auth_token=_record_auth(rg),
+                    acl=_engine_acl(rg, account_id, region),
                     labels={
                         **container_reaper.own_labels("elasticache"), "rg_id": rg_id,
                         "node_group": ng_id, "account_id": account_id,
@@ -342,6 +345,13 @@ def _ensure_live_containers_locked():
                 )
                 if cid:
                     rg["_docker_container_ids"].append(cid)
+                    # The new container has a new address; report it, as the cache cluster respawn above does.
+                    old, new = dict(ng.get("PrimaryEndpoint") or {}), {"Address": host, "Port": port}
+                    ng["PrimaryEndpoint"], ng["ReaderEndpoint"] = dict(new), dict(new)
+                    for member in ng.get("NodeGroupMembers") or []:
+                        member["ReadEndpoint"] = dict(new)
+                    if rg.get("ConfigurationEndpoint") == old:
+                        rg["ConfigurationEndpoint"] = dict(new)
             log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
         except Exception:
             log.warning(
@@ -376,6 +386,16 @@ def _seed_default_param_groups():
                 "ARN": _arn_param_group(_name),
             }
             _param_group_params[_name] = _default_params_for_family(_family)
+
+
+def _seed_default_user():
+    """The account's built-in `default` user (real AWS, us-east-1)."""
+    if "default" not in _users:
+        _users["default"] = {
+            "UserId": "default", "UserName": "default", "Engine": "redis", "Status": "active",
+            "AccessString": "on ~* +@all", "UserGroupIds": [], "Authentication": {"Type": "no-password"},
+            "ARN": _arn_user("default"), "_PasswordHashes": [], "_builtin": True,
+        }
 
 
 def _stamp_replication_group_on_user_groups(rg_id, user_group_ids):
@@ -466,6 +486,7 @@ _DOCKER_BACKED_ACTIONS = {
     "ModifyReplicationGroup", "IncreaseReplicaCount", "DecreaseReplicaCount",
     "DescribeCacheClusters", "DescribeReplicationGroups",
     "CreateServerlessCache", "DeleteServerlessCache", "ModifyServerlessCache",
+    "ModifyUser", "DeleteUser", "ModifyUserGroup", "DeleteUserGroup",  # configure attached engines
 }
 
 
@@ -529,8 +550,13 @@ _NODE_TLS_WRAPPER = (
 )
 
 
-def _node_server_args(port, transit, auth_token):
-    args = []
+# A replication group's engine users, `default` included: written before the engine starts and
+# whenever they change, then the engine is restarted to read it.
+_ACL_FILE = "/ministack-elasticache.acl"
+
+
+def _node_server_args(port, transit, auth_token, acl=False):
+    args = ["--aclfile", _ACL_FILE] if acl else []
     if transit:
         args += ["--port", "0", "--tls-port", str(port),
                  "--tls-cert-file", f"{_NODE_TLS_DIR}/server.crt",
@@ -538,7 +564,7 @@ def _node_server_args(port, transit, auth_token):
                  "--tls-ca-cert-file", f"{_NODE_TLS_DIR}/ca.crt",
                  "--tls-auth-clients", "no", "--tls-replication", "yes"]
     if auth_token:
-        args += ["--requirepass", auth_token, "--masterauth", auth_token]
+        args += (["--masterauth", auth_token] if acl else ["--requirepass", auth_token, "--masterauth", auth_token])
     return args
 
 
@@ -568,7 +594,51 @@ def _record_auth(record):
     return tokens[-1] if tokens and not record.get("_auth_optional") else None
 
 
-def _spawn_redis_container(name, engine, engine_version, labels, transit=False, auth_token=None):
+_port_counter_lock = _threading.Lock()
+
+
+def _next_host_port():
+    """The next host port from the counter that no other process holds, so a docker run
+    does not fail with "port is already allocated"."""
+    from ministack.services.rds import _is_host_port_free
+
+    with _port_counter_lock:
+        port = _port_counter[0]
+        for _ in range(1000):
+            if _is_host_port_free(port):
+                break
+            port += 1
+        _port_counter[0] = port + 1
+        return port
+
+
+def _write_acl_file(container, acl):
+    archive, data = io.BytesIO(), acl.encode()
+    with tarfile.open(fileobj=archive, mode="w") as bundle:
+        entry = tarfile.TarInfo(_ACL_FILE.lstrip("/"))
+        entry.mode, entry.size = 0o644, len(data)
+        bundle.addfile(entry, io.BytesIO(data))
+    if not container.put_archive("/", archive.getvalue()):
+        raise RuntimeError("Docker rejected the ACL file")
+
+
+def _run_with_acl(docker_client, run_kwargs, acl):
+    """containers.run, with the ACL file in place before the engine starts: it refuses to start without it."""
+    if not acl:
+        return docker_client.containers.run(**run_kwargs)
+    if not _image_is_local(docker_client, run_kwargs["image"]):
+        docker_client.images.pull(run_kwargs["image"])  # as containers.run would
+    container = docker_client.containers.create(**run_kwargs)
+    try:
+        _write_acl_file(container, acl)
+        container.start()
+    except Exception:
+        container.remove(force=True, v=True)
+        raise
+    return container
+
+
+def _spawn_redis_container(name, engine, engine_version, labels, transit=False, auth_token=None, acl=None):
     """Start a redis/valkey/memcached container.
 
     Returns ``(host, port, container_id)``. On any failure (docker unavailable,
@@ -581,14 +651,14 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
     if not docker_client:
         return REDIS_DEFAULT_HOST, default_port, None
 
-    host_port = _port_counter[0]
-    _port_counter[0] += 1
+    host_port = _next_host_port()
     endpoint_host = _MINISTACK_HOST
     endpoint_port = host_port
 
     image, container_port = _engine_image_and_port(engine, engine_version)
     redis_like = engine in ("redis", "valkey")
     tls = transit and redis_like
+    acl = acl if redis_like else None
     container = None
 
     try:
@@ -599,14 +669,14 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             labels=labels,
             volumes={},
         )
-        server_args = _node_server_args(container_port, tls, auth_token if redis_like else None)
+        server_args = _node_server_args(container_port, tls, auth_token if redis_like else None, bool(acl))
         if server_args:
             run_kwargs["command"] = server_args
         if tls:
             run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
-        container = docker_client.containers.run(**run_kwargs)
+        container = _run_with_acl(docker_client, run_kwargs, acl)
         container_ip = ""
         if DOCKER_NETWORK:
             container.reload()
@@ -632,7 +702,7 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
         return REDIS_DEFAULT_HOST, default_port, None
 
 
-def _spawn_redis_cluster_node(name, engine, engine_version, labels, transit=False, auth_token=None):
+def _spawn_redis_cluster_node(name, engine, engine_version, labels, transit=False, auth_token=None, acl=None):
     """Spawn a redis/valkey container with cluster-mode enabled.
 
     Requires DOCKER_NETWORK to be set so nodes can reach each other on the
@@ -655,7 +725,7 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels, transit=Fals
         "--port", str(port),
         "--appendonly", "no",
         "--protected-mode", "no",
-        *_node_server_args(port, transit, auth_token),
+        *_node_server_args(port, transit, auth_token, bool(acl)),
     ]
     if transit:
         cmd += ["--tls-cluster", "yes"]
@@ -670,7 +740,7 @@ def _spawn_redis_cluster_node(name, engine, engine_version, labels, transit=Fals
         )
         if transit:
             run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
-        container = docker_client.containers.run(**run_kwargs)
+        container = _run_with_acl(docker_client, run_kwargs, acl)
         container.reload()
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
         container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
@@ -705,7 +775,8 @@ def _wait_redis_ready(container, timeout=15, cli_args=()):
     while time.time() < deadline:
         try:
             result = container.exec_run(["redis-cli", *cli_args, "-p", "6379", "PING"])
-            if result.exit_code == 0 and b"PONG" in result.output:
+            # Answered, as `default` may be off or unable to PING.
+            if result.exit_code == 0 and any(r in result.output for r in (b"PONG", b"NOAUTH", b"NOPERM")):
                 return True
         except Exception:
             pass
@@ -768,7 +839,7 @@ def _teardown_containers(docker_client, container_ids):
 
 
 def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, replicas_per_shard,
-                           transit=False, auth_token=None):
+                           transit=False, auth_token=None, acl=None):
     """Spawn cluster-enabled nodes and run ``redis-cli --cluster create``.
 
     Returns ``(node_groups, container_ids)`` on success, or
@@ -808,7 +879,7 @@ def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, repli
             engine=engine,
             engine_version=engine_version,
             labels={**common_labels, "node_group": ng_id, "role": "primary"},
-            transit=transit, auth_token=auth_token,
+            transit=transit, auth_token=auth_token, acl=acl,
         )
         if not cid:
             return None, container_ids
@@ -830,7 +901,7 @@ def _build_real_cluster_rg(rg_id, engine, engine_version, num_node_groups, repli
                     "role": "replica",
                     "replica_idx": str(r),
                 },
-                transit=transit, auth_token=auth_token,
+                transit=transit, auth_token=auth_token, acl=acl,
             )
             if not cid:
                 return None, container_ids
@@ -996,6 +1067,7 @@ async def handle_request(method, path, headers, body, query_params):
     # from disk (issue #853). Cheap fast-path when nothing's pending.
     _ensure_live_containers()
     _seed_default_param_groups()
+    _seed_default_user()
     params = dict(query_params)
     if method == "POST" and body:
         form_params = parse_qs(body.decode("utf-8", errors="replace"))
@@ -1381,10 +1453,14 @@ def _create_replication_group(p):
             num_node_groups, rg_id,
         )
 
+    # The engines start without the user groups, which are applied once the group is recorded:
+    # a real cluster is bootstrapped through `default`.
+    acl = _engine_acl({"Engine": engine, "EngineVersion": engine_version,
+                       "_auth_tokens": [auth_token] if auth_token else []}, None, None)
     if use_real_cluster:
         node_groups, container_ids = _build_real_cluster_rg(
             rg_id, engine, engine_version, num_node_groups, replicas_per_node_group,
-            transit=transit, auth_token=auth_token or None,
+            transit=transit, auth_token=auth_token or None, acl=acl,
         )
         if node_groups is None:
             # Bootstrap failed — clean up partial state and fall back.
@@ -1406,6 +1482,7 @@ def _create_replication_group(p):
                 engine_version=engine_version,
                 transit=transit,
                 auth_token=auth_token or None,
+                acl=acl,
                 labels={
                     **container_reaper.own_labels("elasticache"),
                     "rg_id": rg_id,
@@ -1544,6 +1621,8 @@ def _create_replication_group(p):
 
     _record_event(rg_id, "replication-group", "Replication group created")
     _stamp_replication_group_on_user_groups(rg_id, user_group_ids)
+    if user_group_ids:
+        _apply_user_groups(_replication_groups[rg_id], get_account_id(), get_region())
     return _xml(200, "CreateReplicationGroupResponse",
         f"<CreateReplicationGroupResult><ReplicationGroup>{_rg_xml(_replication_groups[rg_id])}</ReplicationGroup></CreateReplicationGroupResult>")
 
@@ -1627,6 +1706,7 @@ def _modify_replication_group(p):
     user_group_ids_to_remove = _extract_configs(p, "UserGroupIdsToRemove", ("member",))
 
     rg_user_group_ids = rg.setdefault("UserGroupIds", [])
+    groups_before = list(rg_user_group_ids)
     for group_id in user_group_ids_to_add:
         if group_id not in rg_user_group_ids:
             rg_user_group_ids.append(group_id)
@@ -1638,8 +1718,16 @@ def _modify_replication_group(p):
         _unstamp_replication_group_from_user_groups(rg_id, [group_id])
 
     _record_event(rg_id, "replication-group", "Replication group modified")
+    shown = rg
+    if groups_before != rg_user_group_ids:
+        _apply_user_groups(rg, get_account_id(), get_region())
+        # AWS answers with the group still modifying and the change pending (real AWS, us-west-2);
+        # MiniStack settles at once.
+        shown = {**rg, "Status": "modifying", "UserGroupIds": groups_before, "PendingModifiedValues": {"UserGroups": {
+            "UserGroupIdsToAdd": [g for g in rg_user_group_ids if g not in groups_before],
+            "UserGroupIdsToRemove": [g for g in groups_before if g not in rg_user_group_ids]}}}
     return _xml(200, "ModifyReplicationGroupResponse",
-        f"<ModifyReplicationGroupResult><ReplicationGroup>{_rg_xml(rg)}</ReplicationGroup></ModifyReplicationGroupResult>")
+        f"<ModifyReplicationGroupResult><ReplicationGroup>{_rg_xml(shown)}</ReplicationGroup></ModifyReplicationGroupResult>")
 
 
 def _update_auth_token(rg, token, strategy):
@@ -1665,9 +1753,12 @@ def _update_auth_token(rg, token, strategy):
     if not docker_client:
         return
     new_login = rg["_auth_tokens"][-1] if rg["_auth_tokens"] else None
+    acl = _engine_acl(rg, get_account_id(), get_region())
     for cid in rg.get("_docker_container_ids") or []:
         try:
             container = docker_client.containers.get(cid)
+            if acl:
+                _write_acl_file(container, acl)  # for the next start; the engine changes below
             container.exec_run(["redis-cli", *_node_cli_args(True, login), "-p", "6379",
                                 "ACL", "SETUSER", "default", "on", *rules])
             container.exec_run(["redis-cli", *_node_cli_args(True, new_login), "-p", "6379",
@@ -1753,16 +1844,16 @@ def _resolve_subnets(p):
 
 def _subnet_group_xml(sg):
     subnets_xml = "".join(
-        f"<Subnet><SubnetIdentifier>{s['SubnetIdentifier']}</SubnetIdentifier>"
-        f"<SubnetAvailabilityZone><Name>{s['SubnetAvailabilityZone']['Name']}</Name></SubnetAvailabilityZone></Subnet>"
+        f"<Subnet><SubnetIdentifier>{xml_escape(str(s['SubnetIdentifier']))}</SubnetIdentifier>"
+        f"<SubnetAvailabilityZone><Name>{xml_escape(str(s['SubnetAvailabilityZone']['Name']))}</Name></SubnetAvailabilityZone></Subnet>"
         for s in sg.get("Subnets", [])
     )
     return (
-        f"<CacheSubnetGroupName>{sg['CacheSubnetGroupName']}</CacheSubnetGroupName>"
+        f"<CacheSubnetGroupName>{xml_escape(str(sg['CacheSubnetGroupName']))}</CacheSubnetGroupName>"
         f"<CacheSubnetGroupDescription>{xml_escape(sg.get('CacheSubnetGroupDescription', ''))}</CacheSubnetGroupDescription>"
-        f"<VpcId>{sg.get('VpcId', '')}</VpcId>"
+        f"<VpcId>{xml_escape(str(sg.get('VpcId', '')))}</VpcId>"
         f"<Subnets>{subnets_xml}</Subnets>"
-        f"<ARN>{sg.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(sg.get('ARN', '')))}</ARN>"
     )
 
 
@@ -1854,10 +1945,10 @@ def _create_param_group(p):
 
     return _xml(200, "CreateCacheParameterGroupResponse",
         f"<CreateCacheParameterGroupResult><CacheParameterGroup>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
-        f"<CacheParameterGroupFamily>{family}</CacheParameterGroupFamily>"
-        f"<Description>{desc}</Description>"
-        f"<ARN>{arn}</ARN>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(family))}</CacheParameterGroupFamily>"
+        f"<Description>{xml_escape(str(desc))}</Description>"
+        f"<ARN>{xml_escape(str(arn))}</ARN>"
         f"</CacheParameterGroup></CreateCacheParameterGroupResult>")
 
 
@@ -1868,10 +1959,10 @@ def _describe_param_groups(p):
     groups = [_param_groups[name]] if name and name in _param_groups else list(_param_groups.values())
     # CacheParameterGroupList.member.locationName = "CacheParameterGroup"
     members = "".join(
-        f"<CacheParameterGroup><CacheParameterGroupName>{g['CacheParameterGroupName']}</CacheParameterGroupName>"
-        f"<CacheParameterGroupFamily>{g.get('CacheParameterGroupFamily', '')}</CacheParameterGroupFamily>"
-        f"<Description>{g.get('Description', '')}</Description>"
-        f"<ARN>{g.get('ARN', '')}</ARN></CacheParameterGroup>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(g['CacheParameterGroupName']))}</CacheParameterGroupName>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(g.get('CacheParameterGroupFamily', '')))}</CacheParameterGroupFamily>"
+        f"<Description>{xml_escape(str(g.get('Description', '')))}</Description>"
+        f"<ARN>{xml_escape(str(g.get('ARN', '')))}</ARN></CacheParameterGroup>"
         for g in groups
     )
     return _xml(200, "DescribeCacheParameterGroupsResponse",
@@ -1903,14 +1994,14 @@ def _describe_cache_parameters(p):
     for pname, pval in params.items():
         members += (
             f"<Parameter>"
-            f"<ParameterName>{pname}</ParameterName>"
-            f"<ParameterValue>{pval.get('Value', '')}</ParameterValue>"
-            f"<Description>{pval.get('Description', '')}</Description>"
-            f"<Source>{pval.get('Source', 'system')}</Source>"
-            f"<DataType>{pval.get('DataType', 'string')}</DataType>"
-            f"<AllowedValues>{pval.get('AllowedValues', '')}</AllowedValues>"
-            f"<IsModifiable>{str(pval.get('IsModifiable', True)).lower()}</IsModifiable>"
-            f"<MinimumEngineVersion>{pval.get('MinimumEngineVersion', '5.0.0')}</MinimumEngineVersion>"
+            f"<ParameterName>{xml_escape(str(pname))}</ParameterName>"
+            f"<ParameterValue>{xml_escape(str(pval.get('Value', '')))}</ParameterValue>"
+            f"<Description>{xml_escape(str(pval.get('Description', '')))}</Description>"
+            f"<Source>{xml_escape(str(pval.get('Source', 'system')))}</Source>"
+            f"<DataType>{xml_escape(str(pval.get('DataType', 'string')))}</DataType>"
+            f"<AllowedValues>{xml_escape(str(pval.get('AllowedValues', '')))}</AllowedValues>"
+            f"<IsModifiable>{xml_escape(str(str(pval.get('IsModifiable', True)).lower()))}</IsModifiable>"
+            f"<MinimumEngineVersion>{xml_escape(str(pval.get('MinimumEngineVersion', '5.0.0')))}</MinimumEngineVersion>"
             f"</Parameter>"
         )
     return _xml(200, "DescribeCacheParametersResponse",
@@ -1941,7 +2032,7 @@ def _modify_cache_parameter_group(p):
 
     return _xml(200, "ModifyCacheParameterGroupResponse",
         f"<ModifyCacheParameterGroupResult>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
         f"</ModifyCacheParameterGroupResult>")
 
 
@@ -1971,7 +2062,7 @@ def _reset_cache_parameter_group(p):
 
     return _xml(200, "ResetCacheParameterGroupResponse",
         f"<ResetCacheParameterGroupResult>"
-        f"<CacheParameterGroupName>{name}</CacheParameterGroupName>"
+        f"<CacheParameterGroupName>{xml_escape(str(name))}</CacheParameterGroupName>"
         f"</ResetCacheParameterGroupResult>")
 
 
@@ -2020,8 +2111,8 @@ def _describe_engine_versions(p):
     }
     # CacheEngineVersionList.member.locationName = "CacheEngineVersion"
     members = "".join(
-        f"<CacheEngineVersion><Engine>{engine}</Engine><EngineVersion>{v}</EngineVersion>"
-        f"<CacheParameterGroupFamily>{_param_group_family_for_engine(engine, v)}</CacheParameterGroupFamily></CacheEngineVersion>"
+        f"<CacheEngineVersion><Engine>{xml_escape(str(engine))}</Engine><EngineVersion>{xml_escape(str(v))}</EngineVersion>"
+        f"<CacheParameterGroupFamily>{xml_escape(str(_param_group_family_for_engine(engine, v)))}</CacheParameterGroupFamily></CacheEngineVersion>"
         for v in versions.get(engine, ["7.0.12"])
     )
     return _xml(200, "DescribeCacheEngineVersionsResponse",
@@ -2148,7 +2239,7 @@ def _list_tags(p):
         return err
     tags = _tags.get(arn, [])
     # TagList.member.locationName = "Tag"
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "ListTagsForResourceResponse",
         f"<ListTagsForResourceResult><TagList>{tag_xml}</TagList></ListTagsForResourceResult>")
 
@@ -2161,7 +2252,7 @@ def _add_tags(p):
     new_tags = _extract_tags(p)
     tags = _merge_tags_for_arn(arn, new_tags)
 
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "AddTagsToResourceResponse",
         f"<AddTagsToResourceResult><TagList>{tag_xml}</TagList></AddTagsToResourceResult>")
 
@@ -2177,7 +2268,7 @@ def _remove_tags(p):
         keys_to_remove.add(_p(p, f"TagKeys.member.{idx}"))
         idx += 1
     tags = _remove_tag_keys_for_arn(arn, keys_to_remove)
-    tag_xml = "".join(f"<Tag><Key>{t['Key']}</Key><Value>{t['Value']}</Value></Tag>" for t in tags)
+    tag_xml = "".join(f"<Tag><Key>{xml_escape(str(t['Key']))}</Key><Value>{xml_escape(str(t['Value']))}</Value></Tag>" for t in tags)
     return _xml(200, "RemoveTagsFromResourceResponse",
         f"<RemoveTagsFromResourceResult><TagList>{tag_xml}</TagList></RemoveTagsFromResourceResult>")
 
@@ -2346,7 +2437,31 @@ def _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce):
     return archive.getvalue()
 
 
-def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True):
+# Until the cluster is up, `default` can only bootstrap it: no keys, no channels, no data commands.
+_SERVERLESS_BOOTSTRAP_DEFAULT = ("user default on nopass resetkeys resetchannels -@all +ping +cluster|addslotsrange "
+                                 "+cluster|info +acl|load\n")
+_OPEN_DEFAULT_ACL = "user default on nopass ~* &* +@all\n"
+
+
+def _bootstrap_acl(acl):
+    """``acl`` with `default` limited to bringing the cluster up; the open ACL needs no bootstrap."""
+    if acl == _OPEN_DEFAULT_ACL:
+        return acl
+    return "".join(line + "\n" for line in acl.splitlines()
+                   if not line.startswith("user default ")) + _SERVERLESS_BOOTSTRAP_DEFAULT
+
+
+def _finish_serverless_acl(container, name, acl):
+    """Once the cluster is up under the bootstrap ACL, load the real one."""
+    if acl == _OPEN_DEFAULT_ACL:
+        return
+    _write_acl_file(container, acl)
+    result = container.exec_run(["redis-cli", *_SERVERLESS_TLS_CLI_ARGS, "-p", "6379", "ACL", "LOAD"])
+    if result.exit_code != 0 or result.output.strip() != b"OK":
+        raise RuntimeError(f"{name}: ACL LOAD answered {result.output[:200]!r}")
+
+
+def _spawn_serverless_container(name, engine, full_version, host_port, labels, wait=True, acl=_OPEN_DEFAULT_ACL):
     """Start a TLS-only Valkey/Redis container and return ``(address, port, id)``.
 
     Raises on any failure, after removing what it started: a serverless cache
@@ -2370,6 +2485,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
             "--tls-auth-clients", "no",
             "--protected-mode", "no",
             "--cluster-enabled", "yes", "--tls-cluster", "yes",
+            "--aclfile", _ACL_FILE,
         ],
     )
     if DOCKER_NETWORK:
@@ -2390,10 +2506,13 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
         cert_pem, key_pem, _public = sign_leaf_certificate(
             ca_pem, ca_key, common_name=dns_names[0], san_dns=dns_names, san_ips=ips)
         announce = _serverless_announce_flags(address, port)
+        bootstrap = acl != _OPEN_DEFAULT_ACL
+        _write_acl_file(container, _bootstrap_acl(acl))
         if not container.put_archive("/", _serverless_tls_archive(ca_pem, cert_pem, key_pem, announce)):
             raise RuntimeError("Docker rejected the TLS material")
-        if wait and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+        if (wait or bootstrap) and not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
             raise RuntimeError(f"{engine} in {name} never reported cluster_state:ok over TLS")
+        _finish_serverless_acl(container, name, acl)
     except Exception:
         _teardown_containers(docker_client, [container.id])
         raise
@@ -2402,10 +2521,157 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
     return address, port, container.id
 
 
+def _acl_setuser(user, deny=()):
+    """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
+    An iam user's token is not checked, as with AUTH=false elsewhere."""
+    tokens = _acl_split(user.get("AccessString", ""))  # as stored: NBSP stays inside a pattern
+    # A string without channel rules gets all channels (real AWS, us-west-2: "on ~* +@all" is
+    # "user app on ... ~* &* +@all" on the engine); reset alone would leave none. A string with a
+    # selector and no root channel rule gets none outside its selectors (real AWS, us-east-2, every
+    # serverless engine: "on ~* +@all (+get ~k)" reads back with root channels "").
+    rules, in_selector = ["reset"], False
+    if not any(t.startswith(("&", "(")) or t.lower() in ("allchannels", "resetchannels") for t in tokens):
+        rules.append("&*")
+    for token in tokens:  # each (selector) grants on its own: deny there too
+        if _is_credential_rule(token):
+            continue
+        in_selector = in_selector or token.startswith("(")
+        if deny and in_selector and token.endswith(")"):
+            rules += [token[:-1], *deny[:-1], deny[-1] + ")"]
+            in_selector = False
+        else:
+            rules.append(token)
+    rules += deny
+    if user.get("Authentication", {}).get("Type") == "password" and user.get("_PasswordHashes"):
+        rules += [f"#{h}" for h in user["_PasswordHashes"]]
+    else:
+        rules.append("nopass")
+    return ["ACL", "SETUSER", user.get("UserName") or user["UserId"], *rules]
+
+
+# Credentials come only from the user's authentication mode, never from its access string.
+_CREDENTIAL_KEYWORDS = frozenset(("nopass", "resetpass", "reset"))
+
+
+def _is_credential_rule(token):
+    return token[:1] in (">", "<", "#", "!") or token.lower() in _CREDENTIAL_KEYWORDS
+
+
+def _engine_user_name_ok(user):
+    # The ACL file holds one user per line: a name with whitespace or a control character would add lines.
+    return bool(re.fullmatch(r"[^\s\x00-\x1f\x7f]+", user.get("UserName") or user.get("UserId") or ""))
+
+
+def _user_group_acl_commands(account_id, region, group_ids, deny=()):
+    """The engine ACL for a cache with user groups: the groups' users, then `default` last. Groups
+    without a user named default turn it off (AWS RBAC docs: attaching a Valkey user group disables it)."""
+    if not any(group_ids or []):
+        return []
+    user_ids = dict.fromkeys(uid for gid in group_ids
+                             for uid in (_user_groups.get_scoped(account_id, region, gid) or {}).get("UserIds", []))
+    users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in user_ids) if u]
+    for u in users:
+        if not _engine_user_name_ok(u):
+            logger.warning("ElastiCache: user %r left off the engine: its name is not a valid engine user name",
+                           u.get("UserId"))
+    users = [u for u in users if _engine_user_name_ok(u)]
+    default = next((u for u in users if u.get("UserName") == "default"), None)
+    commands = [_acl_setuser(u, deny) for u in users if u.get("UserName") != "default"]
+    commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset", "&*"])
+    return commands
+
+
+# Restricted commands an application user could take over users or the server's auth with
+# (AWS docs, "Restricted commands"). Redis below 7 cannot deny a subcommand alone.
+_ACL_DENY = ("-acl|setuser", "-acl|deluser", "-acl|load", "-acl|save", "-config")
+_ACL_DENY_V6 = ("-acl", "-config")
+
+
+def _engine_acl(rg, account_id, region):
+    """The ACL file of a replication group's engines: the groups' users only, or, with no group
+    attached, `default` open or with the AUTH tokens. None for Redis below 6, which has no ACL."""
+    major = (rg.get("EngineVersion") or "7").split(".")[0]
+    if rg.get("Engine") == "redis" and major.isdigit() and int(major) < 6:
+        return None
+    deny = _ACL_DENY_V6 if rg.get("Engine") == "redis" and major.isdigit() and int(major) < 7 else _ACL_DENY
+    commands = _user_group_acl_commands(account_id, region, rg.get("UserGroupIds"), deny)
+    if not commands:
+        tokens = [] if rg.get("_auth_optional") else rg.get("_auth_tokens") or []
+        commands = [["ACL", "SETUSER", "default", "reset", "on", "~*", "&*", "+@all",
+                     *([f"#{hashlib.sha256(t.encode()).hexdigest()}" for t in tokens] or ["nopass"])]]
+    version = tuple(int(n) for n in re.findall(r"\d+", rg.get("EngineVersion") or "7")[:2] + ["0"])[:2]
+    lacking = _ACL_MODULE_NAMES | {c for since, names in _ACL_COMMANDS_SINCE if version < since for c in names.split()}
+    return "".join(f"user {' '.join(_engine_rules(command[2:], lacking))}\n" for command in commands)
+
+
+def _engine_rules(rules, lacking):
+    """The rules without the commands and categories the engine lacks (the JSON and Bloom modules
+    MiniStack's images do not load, commands newer than the engine), which it would refuse; a
+    (selector) they open or close is kept."""
+    kept, opening = [], ""
+    for rule in rules:
+        core = rule.strip("()")
+        if core[:1] in ("+", "-") and core[1:].lstrip("@").split("|")[0].lower() in lacking:
+            opening += rule[:len(rule) - len(rule.lstrip("("))]
+            closing = rule[len(rule.rstrip(")")):]
+            if closing and opening:
+                kept.append(opening + closing)
+                opening = ""
+            elif closing:
+                kept[-1] += closing
+            continue
+        kept.append(opening + rule)
+        opening = ""
+    return kept
+
+
+def _apply_user_groups(rg, account_id, region):
+    """Rewrite a replication group's ACL file and restart its engines, which read it on start; the
+    data is kept by the default save points. Without a lock: once written, the file is worked out
+    again and rewritten until it no longer changes, so an older write landing last is put right."""
+    docker_client = _get_docker()
+    if not docker_client or _engine_acl(rg, account_id, region) is None:
+        return
+    containers = []
+    for cid in rg.get("_docker_container_ids") or []:
+        try:
+            containers.append(docker_client.containers.get(cid))
+        except Exception as e:
+            logger.warning("ElastiCache: user groups not applied on %s: %s", cid, e)
+    written = None
+    while True:
+        acl = _engine_acl(rg, account_id, region)
+        if acl is None or acl == written:
+            break
+        for container in containers:
+            try:
+                _write_acl_file(container, acl)
+            except Exception as e:
+                logger.warning("ElastiCache: user groups not applied on %s: %s", container.id, e)
+        written = acl
+    for container in containers:
+        try:
+            container.restart(timeout=10)
+            if not _wait_redis_ready(container, cli_args=_node_cli_args(rg.get("TransitEncryptionEnabled"), None)):
+                logger.warning("ElastiCache: %s did not come back after its users changed", container.id)
+        except Exception as e:
+            logger.warning("ElastiCache: user groups not applied on %s: %s", container.id, e)
+
+
+def _apply_user_groups_of(group_ids):
+    for rg in list(_replication_groups.values()):
+        if set(group_ids) & set(rg.get("UserGroupIds") or []):
+            _apply_user_groups(rg, get_account_id(), get_region())
+    for cache in list(_serverless_caches.values()):
+        if cache.get("UserGroupId") and cache["UserGroupId"] in group_ids:
+            _apply_serverless_acl(cache, get_account_id(), get_region())
+
+
 def _start_serverless_container(record, account_id, region, wait=True):
     """Start ``record``'s container and publish its endpoint, unless the cache
     was deleted meanwhile — then the container is removed instead."""
     name = record["ServerlessCacheName"]
+    acl = _serverless_acl(record, account_id, region)
     address, port, cid = _spawn_serverless_container(
         name=_serverless_container_name(account_id, region, name),
         engine=record["Engine"],
@@ -2418,6 +2684,7 @@ def _start_serverless_container(record, account_id, region, wait=True):
             "region": region,
         },
         wait=wait,
+        **({"acl": acl} if acl != _OPEN_DEFAULT_ACL else {}),
     )
     with resource_lock("elasticache-serverless", f"{account_id}/{region}/{name}"):
         orphaned = _serverless_caches.get_scoped(account_id, region, name) is not record
@@ -2428,6 +2695,34 @@ def _start_serverless_container(record, account_id, region, wait=True):
             record["Status"] = "available"
     if orphaned:
         _teardown_containers(_get_docker(), [cid])
+    elif _serverless_acl(record, account_id, region) != acl:  # users or groups changed while it started
+        _apply_serverless_acl(record, account_id, region)
+
+
+def _serverless_acl(record, account_id, region):
+    """The ACL file of a serverless cache: its user group's users with the restricted-command deny list, or
+    `default` open when no group is attached."""
+    if not record.get("UserGroupId"):
+        return _OPEN_DEFAULT_ACL
+    return _engine_acl({"Engine": record["Engine"], "EngineVersion": record.get("FullEngineVersion") or "7",
+                        "UserGroupIds": [record["UserGroupId"]]}, account_id, region) or _OPEN_DEFAULT_ACL
+
+
+def _apply_serverless_acl(record, account_id, region):
+    """Rewrite a running serverless cache's ACL file and restart its engine, which reads it on start."""
+    docker_client, cid = _get_docker(), record.get("_docker_container_id")
+    if not docker_client or not cid:
+        return  # not started yet: the start reads the current users
+    try:
+        container = docker_client.containers.get(cid)
+        acl = _serverless_acl(record, account_id, region)
+        _write_acl_file(container, _bootstrap_acl(acl))
+        container.restart(timeout=10)
+        if not _wait_cluster_ok(container, timeout=30, cli_args=_SERVERLESS_TLS_CLI_ARGS):
+            raise RuntimeError("the cluster did not come back after the restart")
+        _finish_serverless_acl(container, record["ServerlessCacheName"], acl)
+    except Exception as e:
+        logger.warning("ElastiCache: users not applied on serverless cache %s: %s", record["ServerlessCacheName"], e)
 
 
 def _provision_serverless_cache(record, account_id, region, replaced_container_id=None):
@@ -2529,8 +2824,7 @@ def _create_serverless_cache(p):
         return _error("InvalidParameterValue", "Invalid numeric parameter value.", 400)
 
     arn = _arn_serverless_cache(name)
-    host_port = _port_counter[0]
-    _port_counter[0] += 1
+    host_port = _next_host_port()
     record = {
         "ServerlessCacheName": name,
         "Description": _p(p, "Description"),
@@ -2587,7 +2881,7 @@ def _describe_serverless_caches(p):
     page = caches[start:start + max_results]
     token = ""
     if start + max_results < len(caches):
-        token = f"<NextToken>{start + max_results}</NextToken>"
+        token = f"<NextToken>{xml_escape(str(start + max_results))}</NextToken>"
     members = "".join(f"<member>{_serverless_cache_xml(c)}</member>" for c in page)
     return _xml(200, "DescribeServerlessCachesResponse",
                 f"<DescribeServerlessCachesResult>{token}<ServerlessCaches>{members}</ServerlessCaches>"
@@ -2652,6 +2946,8 @@ def _modify_serverless_cache(p):
         return _error("InvalidParameterCombination", "No modifications were requested", 400)
 
     cache.update(changes)
+    if "UserGroupId" in changes and engine_change is None:
+        _apply_serverless_acl(cache, get_account_id(), get_region())
     if engine_change is not None:
         cache["Engine"], cache["MajorEngineVersion"], cache["FullEngineVersion"] = engine_change
         if cache.get("_docker_container_id") or _get_docker() is not None:
@@ -2698,7 +2994,7 @@ def _serverless_cache_xml(c):
         e = c.get(tag)
         if not e:
             return ""
-        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{e['Port']}</Port></{tag}>"
+        return f"<{tag}><Address>{xml_escape(e['Address'])}</Address><Port>{xml_escape(str(e['Port']))}</Port></{tag}>"
 
     def optional(tag, value):
         return f"<{tag}>{xml_escape(str(value))}</{tag}>" if value not in (None, "") else ""
@@ -2717,23 +3013,23 @@ def _serverless_cache_xml(c):
     return (
         f"<ServerlessCacheName>{xml_escape(c['ServerlessCacheName'])}</ServerlessCacheName>"
         f"{optional('Description', c.get('Description'))}"
-        f"<CreateTime>{created}</CreateTime>"
-        f"<Status>{c['Status']}</Status>"
-        f"<Engine>{c['Engine']}</Engine>"
-        f"<MajorEngineVersion>{c['MajorEngineVersion']}</MajorEngineVersion>"
-        f"<FullEngineVersion>{c['FullEngineVersion']}</FullEngineVersion>"
+        f"<CreateTime>{xml_escape(str(created))}</CreateTime>"
+        f"<Status>{xml_escape(str(c['Status']))}</Status>"
+        f"<Engine>{xml_escape(str(c['Engine']))}</Engine>"
+        f"<MajorEngineVersion>{xml_escape(str(c['MajorEngineVersion']))}</MajorEngineVersion>"
+        f"<FullEngineVersion>{xml_escape(str(c['FullEngineVersion']))}</FullEngineVersion>"
         f"{limits_xml}"
         f"{optional('KmsKeyId', c.get('KmsKeyId'))}"
         f"<StorageEncryptionType>{'sse-kms' if c.get('KmsKeyId') else 'sse-elasticache'}</StorageEncryptionType>"
         f"<SecurityGroupIds>{security_groups}</SecurityGroupIds>"
         f"{endpoint('Endpoint')}"
         f"{endpoint('ReaderEndpoint')}"
-        f"<ARN>{c['ARN']}</ARN>"
+        f"<ARN>{xml_escape(str(c['ARN']))}</ARN>"
         f"{optional('UserGroupId', c.get('UserGroupId'))}"
         f"<SubnetIds>{subnets}</SubnetIds>"
-        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
         f"{optional('DailySnapshotTime', c.get('DailySnapshotTime'))}"
-        f"<NetworkType>{c.get('NetworkType', 'ipv4')}</NetworkType>"
+        f"<NetworkType>{xml_escape(str(c.get('NetworkType', 'ipv4')))}</NetworkType>"
     )
 
 
@@ -2754,10 +3050,10 @@ def _describe_events(p):
     # EventList.member.locationName = "Event"
     members = "".join(
         f"<Event>"
-        f"<SourceIdentifier>{e['SourceIdentifier']}</SourceIdentifier>"
-        f"<SourceType>{e['SourceType']}</SourceType>"
-        f"<Message>{e['Message']}</Message>"
-        f"<Date>{e['Date']}</Date>"
+        f"<SourceIdentifier>{xml_escape(str(e['SourceIdentifier']))}</SourceIdentifier>"
+        f"<SourceType>{xml_escape(str(e['SourceType']))}</SourceType>"
+        f"<Message>{xml_escape(str(e['Message']))}</Message>"
+        f"<Date>{xml_escape(str(e['Date']))}</Date>"
         f"</Event>"
         for e in filtered
     )
@@ -2775,6 +3071,124 @@ def _arn_user_group(group_id):
     return f"arn:aws:elasticache:{get_region()}:{get_account_id()}:usergroup:{group_id}"
 
 
+def _user_authentication(p, user_id, user_name, engine):
+    """(Authentication, error) from AuthenticationMode or the legacy Passwords / NoPasswordRequired."""
+    passwords = [v for k, v in sorted(p.items()) if v and (
+        k.startswith("Passwords.member.") or k.startswith("AuthenticationMode.Passwords.member."))]
+    mode = _p(p, "AuthenticationMode.Type")
+    if mode == "iam":
+        if user_name != user_id:
+            return None, _error("InvalidParameterCombination",
+                                "User Id and User name must be same for authentication type: iam", 400)
+        if passwords:
+            return None, _error("InvalidParameterCombination",
+                                "Password field is not allowed with authentication type: iam", 400)
+        return {"Type": "iam"}, None
+    if mode == "no-password-required" or _p(p, "NoPasswordRequired") == "true":
+        if engine == "valkey":
+            return None, _error("InvalidParameterCombination",
+                                "No-password-required is not allowed for a user with engine Valkey", 400)
+        return {"Type": "no-password", "PasswordCount": 0}, None
+    if passwords:
+        return {"Type": "password", "PasswordCount": len(passwords)}, None
+    return None, None
+
+
+def _password_hashes(p):
+    keys = [k for k in sorted(p) if k.startswith(("Passwords.member.", "AuthenticationMode.Passwords.member."))]
+    return [hashlib.sha256(_p(p, k).encode()).hexdigest() for k in keys if _p(p, k)]
+
+
+# What an access string may name: the commands of the valkey/valkey:8.1 image's `COMMAND LIST`
+# with valkey/valkey-bundle:8.1's JSON and Bloom commands and the ones valkey/valkey:9.0 adds, and the categories of the engine's
+# `ACL CAT` on AWS (real AWS, us-west-2, Valkey 8.1). `all` is no category but is accepted.
+_ACL_COMMANDS = frozenset((
+    "acl append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists "
+    "bf.reserve bgrewriteaof bgsave bitcount bitfield bitfield_ro bitop bitpos blmove blmpop blpop brpop "
+    "brpoplpush bzmpop bzpopmax bzpopmin client cluster command commandlog config copy dbsize debug decr "
+    "decrby del discard dump echo eval eval_ro evalsha evalsha_ro exec exists expire expireat expiretime "
+    "failover fcall fcall_ro flushall flushdb function geoadd geodist geohash geopos georadius "
+    "georadius_ro georadiusbymember georadiusbymember_ro geosearch geosearchstore get getbit getdel getex "
+    "getrange getset hdel hello hexists hget hgetall hincrby hincrbyfloat hkeys hlen hmget hmset "
+    "hrandfield hscan hset hsetnx hstrlen hvals incr incrby incrbyfloat info json.arrappend json.arrindex "
+    "json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.debug json.del json.forget "
+    "json.get json.mget json.mset json.numincrby json.nummultby json.objkeys json.objlen json.resp "
+    "json.set json.strappend json.strlen json.toggle json.type keys lastsave latency lcs lindex linsert "
+    "llen lmove lmpop lolwut lpop lpos lpush lpushx lrange lrem lset ltrim memory mget migrate module "
+    "monitor move mset msetnx multi object persist pexpire pexpireat pexpiretime pfadd pfcount pfdebug "
+    "pfmerge pfselftest ping psetex psubscribe psync pttl publish pubsub punsubscribe quit randomkey "
+    "readonly readwrite rename renamenx replconf replicaof reset restore restore-asking role rpop "
+    "rpoplpush rpush rpushx sadd save scan scard script sdiff sdiffstore select set setbit setex setnx "
+    "setrange shutdown sinter sintercard sinterstore sismember slaveof slowlog smembers smismember smove "
+    "sort sort_ro spop spublish srandmember srem sscan ssubscribe strlen subscribe substr sunion "
+    "sunionstore sunsubscribe swapdb sync time touch ttl type unlink unsubscribe unwatch wait "
+    "watch xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup xrevrange "
+    "xsetid xtrim zadd zcard zcount zdiff zdiffstore zincrby zinter zintercard zinterstore zlexcount "
+    "zmpop zmscore zpopmax zpopmin zrandmember zrange zrangebylex zrangebyscore zrangestore zrank zrem "
+    "zremrangebylex zremrangebyrank zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore zrevrank "
+    "zscan zscore zunion zunionstore "
+).split())
+# Commands an older engine lacks, by the version that added them (the redis:6, redis:7 and
+# valkey/valkey:7.2-9.0 images' command lists); they are left out of its ACL, where they couldn't run.
+_ACL_COMMANDS_SINCE = (
+    ((7, 0), "blmpop bzmpop eval_ro evalsha_ro expiretime fcall fcall_ro function lcs lmpop pexpiretime quit "
+             "sintercard sort_ro spublish ssubscribe sunsubscribe zintercard zmpop"),
+    ((8, 1), "commandlog"),
+    ((9, 0), "delifeq hexpire hexpireat hexpiretime hgetex hpersist hpexpire hpexpireat hpexpiretime hpttl "
+             "hsetex httl"),
+)
+_ACL_COMMANDS |= {c for _since, names in _ACL_COMMANDS_SINCE for c in names.split()}
+_ACL_CATEGORIES = frozenset((
+    "all keyspace read write set sortedset list hash string bitmap hyperloglog geo stream pubsub admin fast "
+    "slow blocking dangerous connection transaction scripting json bloom search").split())
+_ACL_MODULE_NAMES = frozenset({"json", "bloom", "search"} | {c for c in _ACL_COMMANDS if c.startswith(("json.", "bf."))})
+_ACL_KEYWORDS = frozenset((
+    "on off nopass resetpass reset allkeys allchannels resetkeys resetchannels allcommands nocommands "
+    "clearselectors").split())
+
+
+def _access_string_error(access):
+    """AWS's refusal of an access string naming an unknown command or category, or of its syntax
+    (real AWS, us-west-2); a subcommand is not checked (`+get|nosub` is accepted)."""
+    for token in access.split():
+        rule = token.strip("()")  # (selector) rules too
+        if rule[:2] in ("+@", "-@"):
+            if rule[2:].lower() not in _ACL_CATEGORIES:
+                return _error("InvalidParameterValue", "Access string contains invalid category(s). "
+                              "Please verify the list of available category in user-api.", 400)
+        elif rule[:1] in ("+", "-"):
+            if rule[1:].split("|")[0].lower() not in _ACL_COMMANDS:
+                return _error("InvalidParameterValue", "Access string contains invalid command(s). "
+                              "Please verify the list of available commands in user-api.", 400)
+        elif rule and rule[0] not in "~%&><#!" and rule.lower() not in _ACL_KEYWORDS:
+            return _error("InvalidParameterValue", "The access-string is invalid.", 400)
+    return None
+
+
+def _reported_access_string(access):
+    """The access string as AWS reports it, with the `-@all` its command rules build on (real AWS,
+    us-west-2: `on ~app:* +@read` is reported as `on ~app:* -@all +@read`)."""
+    tokens = access.split()
+    if any(t.lower() in ("+@all", "-@all", "allcommands", "nocommands") for t in tokens):
+        return access
+    i = next((i for i, t in enumerate(tokens) if t[:1] in "+-("), len(tokens))  # before any (selector)
+    return " ".join(tokens[:i] + ["-@all"] + tokens[i:])
+
+
+def _minimum_engine_version(user):
+    if user.get("_builtin"):
+        return "6.0"
+    if user.get("Engine") == "valkey":
+        floor = "7.2"
+    elif user.get("Authentication", {}).get("Type") == "iam":
+        floor = "7.0"
+    else:
+        floor = "6.0"  # password and no-password Redis users alike (us-east-2, issue #2551)
+    # An append's rules can need a later engine (real AWS, issue #2551: +hgetex reports 9.0).
+    version = user.get("_AclVersion")
+    return version if version and _acl_version_key(version) > _acl_version_key(floor) else floor
+
+
 def _create_user(p):
     user_id = _p(p, "UserId")
     if not user_id:
@@ -2782,16 +3196,23 @@ def _create_user(p):
     if user_id in _users:
         return _error("UserAlreadyExists", f"User {user_id} already exists", 400)
 
+    user_name = _p(p, "UserName") or user_id
+    engine = _p(p, "Engine") or "redis"
+    auth, err = _user_authentication(p, user_id, user_name, engine)
+    err = err or _access_string_error(_p(p, "AccessString"))
+    if err:
+        return err
     arn = _arn_user(user_id)
     user = {
         "UserId": user_id,
-        "UserName": _p(p, "UserName") or user_id,
-        "Engine": _p(p, "Engine") or "redis",
+        "UserName": user_name,
+        "Engine": engine,
         "Status": "active",
-        "AccessString": _p(p, "AccessString") or "on ~* +@all",
+        "AccessString": _reported_access_string(_p(p, "AccessString") or "on ~* +@all"),
         "UserGroupIds": [],
-        "Authentication": {"Type": "password", "PasswordCount": 1} if _p(p, "Passwords.member.1") else {"Type": "no-password", "PasswordCount": 0},
+        "Authentication": auth or {"Type": "no-password", "PasswordCount": 0},
         "ARN": arn,
+        "_PasswordHashes": _password_hashes(p),
     }
     _users[user_id] = user
 
@@ -2807,7 +3228,7 @@ def _describe_users(p):
     if user_id:
         user = _users.get(user_id)
         if not user:
-            return _error("UserNotFound", f"User {user_id} not found", 404)
+            return _error("UserNotFound", f"User {user_id} not found.", 404)
         users = [user]
     else:
         users = list(_users.values())
@@ -2821,26 +3242,509 @@ def _describe_users(p):
 
 def _delete_user(p):
     user_id = _p(p, "UserId")
-    user = _users.pop(user_id, None)
+    user = _users.get(user_id)
     if not user:
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
+    if user.get("_builtin"):  # real AWS, us-east-1
+        return _error("InvalidParameterValue", "default user can't be deleted.", 400)
+    if user.get("UserName") == "default" and user.get("UserGroupIds"):  # real AWS, us-west-2
+        return _error("DefaultUserAssociatedToUserGroup",
+                      "User is associated to user group(s) as a default user and can't be deleted.", 400)
+    if _users.pop(user_id, None) is None:  # deleted meanwhile by a concurrent request
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
+    for gid in user.get("UserGroupIds", []):  # the groups drop a deleted member (real AWS, us-east-1)
+        group = _user_groups.get(gid)
+        if group and user_id in group["UserIds"]:
+            group["UserIds"].remove(user_id)
+    _apply_user_groups_of(user.get("UserGroupIds", []))
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
+
+
+_ACL_SELECTOR_KEYWORDS = frozenset((
+    "allkeys", "resetkeys", "allchannels", "resetchannels", "allcommands", "nocommands"))
+_ACL_ROOT_KEYWORDS = _ACL_SELECTOR_KEYWORDS | {"on", "off", "clearselectors"}
+_ACL_PATTERN_AFTER_STAR = ("Adding a pattern '{}' after the * pattern (or the '{}' flag) is not valid and does not "
+                           "have any effect. Try '{}' to start with an empty list of {}")
+
+
+# The engine version MinimumEngineVersion reports for each rule (real AWS, us-east-2).
+_ACL_RULE_VERSIONS = {
+    **dict.fromkeys((
+        "@json blmove copy failover geosearch geosearchstore getdel getex hrandfield json.arrappend "
+        "json.arrindex json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.debug json.del "
+        "json.forget json.get json.mget json.numincrby json.nummultby json.objkeys json.objlen json.resp "
+        "json.set json.strappend json.strlen json.toggle json.type lmove lpos reset smismember xautoclaim "
+        "zdiff zdiffstore zinter zmscore zrandmember zrangestore zunion "
+    ).split(), "6.2"),
+    **{c: ".".join(map(str, since)) for since, names in _ACL_COMMANDS_SINCE for c in names.split()},
+    **dict.fromkeys((
+        "@bloom bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve json.mset "
+    ).split(), "8.1"),
+    **dict.fromkeys((
+        "@search "
+    ).split(), "8.2"),
+}
+# The subcommands AWS accepts in a -command|subcommand rule, and those needing more than 7.0 there.
+_ACL_SUBCOMMANDS = frozenset((
+    "acl|cat acl|deluser acl|dryrun acl|genpass acl|getuser acl|help acl|list acl|load acl|log acl|save "
+    "acl|setuser acl|users acl|whoami client|caching client|capa client|getname client|getredir "
+    "client|help client|id client|info client|kill client|list client|no-evict client|no-touch "
+    "client|pause client|reply client|setinfo client|setname client|tracking client|trackinginfo "
+    "client|unblock client|unpause cluster|addslots cluster|addslotsrange cluster|bumpepoch "
+    "cluster|count-failure-reports cluster|countkeysinslot cluster|delslots cluster|delslotsrange "
+    "cluster|failover cluster|flushslot cluster|flushslots cluster|forget cluster|getkeysinslot "
+    "cluster|help cluster|info cluster|keyslot cluster|links cluster|meet cluster|myid cluster|myshardid "
+    "cluster|nodes cluster|replicas cluster|replicate cluster|reset cluster|saveconfig "
+    "cluster|set-config-epoch cluster|setslot cluster|shards cluster|slaves cluster|slot-stats "
+    "cluster|slots commandlog|get commandlog|help commandlog|len commandlog|reset command|count "
+    "command|docs command|getkeys command|getkeysandflags command|help command|info command|list "
+    "config|get config|help config|resetstat config|rewrite config|set function|delete function|dump "
+    "function|flush function|help function|kill function|list function|load function|restore "
+    "function|stats latency|doctor latency|graph latency|help latency|histogram latency|history "
+    "latency|latest latency|reset memory|doctor memory|help memory|malloc-stats memory|purge memory|stats "
+    "memory|usage module|help module|list module|load module|loadex module|unload object|encoding "
+    "object|freq object|help object|idletime object|refcount pubsub|channels pubsub|help pubsub|numpat "
+    "pubsub|numsub pubsub|shardchannels pubsub|shardnumsub script|debug script|exists script|flush "
+    "script|help script|kill script|load script|show slowlog|get slowlog|help slowlog|len slowlog|reset "
+    "xgroup|create xgroup|createconsumer xgroup|delconsumer xgroup|destroy xgroup|help xgroup|setid "
+    "xinfo|consumers xinfo|groups xinfo|help xinfo|stream "
+).split())
+_ACL_SUBCOMMAND_VERSIONS = {
+    **dict.fromkeys("client|no-touch client|setinfo cluster|myshardid".split(), "7.2"),
+    **dict.fromkeys("client|capa cluster|slot-stats script|show".split(), "8.0"),
+    **dict.fromkeys("commandlog|get commandlog|help commandlog|len commandlog|reset".split(), "8.1"),
+    **dict.fromkeys("cluster|flushslot".split(), "9.0"),
+}
+# Each category's commands as AWS counts them for subcommand rules (real AWS, us-east-2).
+_ACL_CATEGORY_COMMANDS = {
+    "admin": frozenset((
+        "acl bgrewriteaof bgsave client cluster commandlog config debug failover json.debug lastsave "
+        "latency module monitor pfdebug pfselftest psync replconf replicaof save shutdown slaveof "
+        "slowlog sync"
+    ).split()),
+    "bitmap": frozenset("bitcount bitfield bitfield_ro bitop bitpos getbit setbit".split()),
+    "blocking": frozenset("blmove blmpop blpop brpop brpoplpush bzmpop bzpopmax bzpopmin xread xreadgroup".split()),
+    "bloom": frozenset("bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve".split()),
+    "connection": frozenset("auth client command echo hello ping quit reset".split()),
+    "dangerous": frozenset((
+        "acl bgrewriteaof bgsave client cluster commandlog config debug failover flushall flushdb "
+        "info keys lastsave latency migrate module monitor pfdebug pfselftest psync replconf "
+        "replicaof restore restore-asking role save shutdown slaveof slowlog sort sort_ro swapdb sync"
+    ).split()),
+    "fast": frozenset((
+        "append asking auth bf.add bf.card bf.exists bf.info bf.insert bf.madd bf.mexists bf.reserve "
+        "bitfield_ro bzpopmax bzpopmin dbsize decr decrby delifeq discard echo exists expire expireat "
+        "expiretime get getbit getdel getex getset hdel hello hexists hexpire hexpireat hexpiretime "
+        "hget hgetex hincrby hincrbyfloat hlen hmget hmset hpersist hpexpire hpexpireat hpexpiretime "
+        "hpttl hset hsetex hsetnx hstrlen httl incr incrby incrbyfloat json.arrappend json.arrindex "
+        "json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear json.del json.forget json.get "
+        "json.mget json.numincrby json.nummultby json.objkeys json.objlen json.resp json.strappend "
+        "json.strlen json.toggle json.type lastsave llen lolwut lpop lpush lpushx mget move multi "
+        "persist pexpire pexpireat pexpiretime pfadd ping pttl publish quit readonly readwrite "
+        "renamenx reset role rpop rpush rpushx sadd scard select setnx sismember smismember smove "
+        "spop spublish srem strlen swapdb time touch ttl type unlink unwatch watch xack xadd "
+        "xautoclaim xclaim xdel xlen xsetid zadd zcard zcount zincrby zlexcount zmscore zpopmax "
+        "zpopmin zrank zrem zrevrank zscore"
+    ).split()),
+    "geo": frozenset((
+        "geoadd geodist geohash geopos georadius georadius_ro georadiusbymember georadiusbymember_ro "
+        "geosearch geosearchstore"
+    ).split()),
+    "hash": frozenset((
+        "hdel hexists hexpire hexpireat hexpiretime hget hgetall hgetex hincrby hincrbyfloat hkeys "
+        "hlen hmget hmset hpersist hpexpire hpexpireat hpexpiretime hpttl hrandfield hscan hset "
+        "hsetex hsetnx hstrlen httl hvals"
+    ).split()),
+    "hyperloglog": frozenset("pfadd pfcount pfmerge pfselftest".split()),
+    "json": frozenset((
+        "json.arrappend json.arrindex json.arrinsert json.arrlen json.arrpop json.arrtrim json.clear "
+        "json.debug json.del json.forget json.get json.mget json.mset json.numincrby json.nummultby "
+        "json.objkeys json.objlen json.resp json.set json.strappend json.strlen json.toggle json.type"
+    ).split()),
+    "keyspace": frozenset((
+        "copy dbsize del dump exists expire expireat expiretime flushall flushdb keys migrate move "
+        "object persist pexpire pexpireat pexpiretime pttl randomkey rename renamenx restore "
+        "restore-asking scan swapdb touch ttl type unlink"
+    ).split()),
+    "list": frozenset((
+        "blmove blmpop blpop brpop brpoplpush lindex linsert llen lmove lmpop lpop lpos lpush lpushx "
+        "lrange lrem lset ltrim rpop rpoplpush rpush rpushx sort sort_ro"
+    ).split()),
+    "pubsub": frozenset((
+        "psubscribe publish pubsub punsubscribe spublish ssubscribe subscribe sunsubscribe "
+        "unsubscribe"
+    ).split()),
+    "read": frozenset((
+        "bf.card bf.exists bf.info bf.mexists bitcount bitfield_ro bitpos dbsize dump exists "
+        "expiretime geodist geohash geopos georadius_ro georadiusbymember_ro geosearch get getbit "
+        "getrange hexists hexpiretime hget hgetall hkeys hlen hmget hpexpiretime hpttl hrandfield "
+        "hscan hstrlen httl hvals json.arrindex json.arrlen json.debug json.get json.mget "
+        "json.objkeys json.objlen json.resp json.strlen json.type keys lcs lindex llen lolwut lpos "
+        "lrange memory mget object pexpiretime pfcount pttl randomkey scan scard sdiff sinter "
+        "sintercard sismember smembers smismember sort_ro srandmember sscan strlen substr sunion "
+        "touch ttl type xinfo xlen xpending xrange xread xrevrange zcard zcount zdiff zinter "
+        "zintercard zlexcount zmscore zrandmember zrange zrangebylex zrangebyscore zrank zrevrange "
+        "zrevrangebylex zrevrangebyscore zrevrank zscan zscore zunion"
+    ).split()),
+    "scripting": frozenset("eval eval_ro evalsha evalsha_ro fcall fcall_ro function script".split()),
+    "set": frozenset((
+        "sadd scard sdiff sdiffstore sinter sintercard sinterstore sismember smembers smismember "
+        "smove sort sort_ro spop srandmember srem sscan sunion sunionstore"
+    ).split()),
+    "slow": frozenset((
+        "acl bgrewriteaof bgsave bitcount bitfield bitop bitpos blmove blmpop blpop brpop brpoplpush "
+        "bzmpop client cluster command commandlog config copy debug del dump eval eval_ro evalsha "
+        "evalsha_ro exec failover fcall fcall_ro flushall flushdb function geoadd geodist geohash "
+        "geopos georadius georadius_ro georadiusbymember georadiusbymember_ro geosearch "
+        "geosearchstore getrange hgetall hkeys hrandfield hscan hvals info json.debug json.mset "
+        "json.set keys latency lcs lindex linsert lmove lmpop lpos lrange lrem lset ltrim memory "
+        "migrate module monitor mset msetnx object pfcount pfdebug pfmerge pfselftest psetex "
+        "psubscribe psync pubsub punsubscribe randomkey rename replconf replicaof restore "
+        "restore-asking rpoplpush save scan script sdiff sdiffstore set setbit setex setrange "
+        "shutdown sinter sintercard sinterstore slaveof slowlog smembers sort sort_ro srandmember "
+        "sscan ssubscribe subscribe substr sunion sunionstore sunsubscribe sync unsubscribe wait "
+        "xgroup xinfo xpending xrange xread xreadgroup xrevrange xtrim zdiff zdiffstore zinter "
+        "zintercard zinterstore zmpop zrandmember zrange zrangebylex zrangebyscore zrangestore "
+        "zremrangebylex zremrangebyrank zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore "
+        "zscan zunion zunionstore"
+    ).split()),
+    "sortedset": frozenset((
+        "bzmpop bzpopmax bzpopmin sort sort_ro zadd zcard zcount zdiff zdiffstore zincrby zinter "
+        "zintercard zinterstore zlexcount zmpop zmscore zpopmax zpopmin zrandmember zrange "
+        "zrangebylex zrangebyscore zrangestore zrank zrem zremrangebylex zremrangebyrank "
+        "zremrangebyscore zrevrange zrevrangebylex zrevrangebyscore zrevrank zscan zscore zunion "
+        "zunionstore"
+    ).split()),
+    "stream": frozenset((
+        "xack xadd xautoclaim xclaim xdel xgroup xinfo xlen xpending xrange xread xreadgroup "
+        "xrevrange xsetid xtrim"
+    ).split()),
+    "string": frozenset((
+        "append decr decrby delifeq get getdel getex getrange getset incr incrby incrbyfloat lcs mget "
+        "mset msetnx psetex set setex setnx setrange strlen substr"
+    ).split()),
+    "transaction": frozenset("discard exec multi unwatch watch".split()),
+    "write": frozenset((
+        "append bf.add bf.insert bf.madd bf.reserve bitfield bitop blmove blmpop blpop brpop "
+        "brpoplpush bzmpop bzpopmax bzpopmin copy decr decrby del delifeq expire expireat flushall "
+        "flushdb function geoadd georadius georadiusbymember geosearchstore getdel getex getset hdel "
+        "hexpire hexpireat hgetex hincrby hincrbyfloat hmset hpersist hpexpire hpexpireat hset hsetex "
+        "hsetnx incr incrby incrbyfloat json.arrappend json.arrinsert json.arrpop json.arrtrim "
+        "json.clear json.del json.forget json.mset json.numincrby json.nummultby json.set "
+        "json.strappend json.toggle linsert lmove lmpop lpop lpush lpushx lrem lset ltrim migrate "
+        "move mset msetnx persist pexpire pexpireat pfadd pfdebug pfmerge psetex rename renamenx "
+        "restore restore-asking rpop rpoplpush rpush rpushx sadd sdiffstore set setbit setex setnx "
+        "setrange sinterstore smove sort spop srem sunionstore swapdb unlink xack xadd xautoclaim "
+        "xclaim xdel xgroup xreadgroup xsetid xtrim zadd zdiffstore zincrby zinterstore zmpop zpopmax "
+        "zpopmin zrangestore zrem zremrangebylex zremrangebyrank zremrangebyscore zunionstore"
+    ).split()),
+}
+# +command|arg pairs needing a later engine after +@category (real AWS, us-east-2).
+_ACL_CATEGORY_ARG_VERSIONS = {
+    **dict.fromkeys((("read", c) for c in "echo lastsave role time".split()), "6.2"),
+    **dict.fromkeys((("keyspace", c) for c in "asking readonly readwrite select wait".split()), "7.0"),
+}
+_ACL_WHITESPACE = " \t\n\r\x0b\x0c"  # AWS splits rules on these only; NBSP and other spaces stay in a rule
+
+
+_XML_QUOTE = {'"': "&quot;"}  # AWS's user bodies escape `"` as well as & < >
+
+
+def _acl_split(text):
+    return [w for w in "".join(" " if c in _ACL_WHITESPACE else c for c in text).split(" ") if w]
+
+
+def _acl_rules(access):
+    """An access string's rules, each selector as a list of its rules; None if a selector is empty or
+    unclosed. A selector runs from a `(` that starts a rule to the next `)`, so `(~x +get)(~y +set)`
+    is two."""
+    rules, word, i = [], "", 0
+    while i < len(access):
+        if access[i] == "(" and not word:
+            end = access.find(")", i)
+            inner = _acl_split(access[i + 1:end]) if end >= 0 else []
+            if not inner:
+                return None
+            rules.append(inner)
+            i = end + 1
+            continue
+        if access[i] in _ACL_WHITESPACE:
+            rules += [word] if word else []
+            word = ""
+        else:
+            word += access[i]
+        i += 1
+    return rules + ([word] if word else [])
+
+
+def _acl_key(rule):
+    """A key rule as AWS stores it (`%RW~` becomes `~`), or None if `rule` is not a key pattern."""
+    if rule.startswith("~") and len(rule) > 1:
+        return rule
+    perm, _, pattern = rule[1:].partition("~")
+    if rule.startswith("%") and pattern and perm.upper() in ("R", "W", "RW"):
+        return f"~{pattern}" if perm.upper() == "RW" else rule
+    return None
+
+
+def _acl_refusal(rule, keywords):
+    """The message refusing one rule on its own, before any rule is applied."""
+    message = _acl_aws_refusal(rule, keywords)
+    if message is None and any(c < " " or c in "\ufffe\uffff" or "\ud800" <= c <= "\udfff" for c in rule):
+        # MiniStack-only: XML can't carry these characters.
+        return "The access-string is invalid."
+    return message
+
+
+def _acl_aws_refusal(rule, keywords):
+    """AWS's message refusing one rule on its own."""
+    low = rule.lower()
+    if low == "reset":
+        return "reset rule is not supported in Elasticache user api."
+    if low in ("nopass", "resetpass") or rule[0] in "><#!":
+        return ("Password rules are not supported in Elasticache access string. "
+                "Please use Passwords parameter to set/modify user password.")
+    if low in ("sanitize-payload", "skip-sanitize-payload"):
+        return "sanitize-payload and skip-sanitize-payload rules are not supported in user api."
+    if rule[0] in "+-" and low[1:2] == "@":
+        return None if low[2:] in _ACL_CATEGORIES else (
+            "Access string contains invalid category(s). Please verify the list of available category in user-api.")
+    if rule[0] in "+-":
+        command, bar, subcommand = low[1:].partition("|")
+        # -command|subcommand must name a real subcommand; +command|anything only a non-empty one.
+        valid = not bar or (low[1:] in _ACL_SUBCOMMANDS if rule[0] == "-" else subcommand)
+        return None if command in _ACL_COMMANDS and valid else (
+            "Access string contains invalid command(s). Please verify the list of available commands in user-api.")
+    if rule.startswith("~") and "\u2028" in rule:  # NBSP and em space stay in a pattern (us-east-2, round 23)
+        return "The access-string is invalid."
+    if low in keywords or _acl_key(rule) or (rule.startswith("&") and len(rule) > 1):
+        return None
+    return "The access-string is invalid."
+
+
+def _acl_apply(scope, rule):
+    """Apply one rule to a root or selector scope; AWS's message if it is refused."""
+    low = rule.lower()
+    key = _acl_key(rule)
+    if low in ("on", "off"):
+        scope["flag"] = low
+    elif low == "allkeys" or key == "~*":
+        scope["allkeys"], scope["keys"] = True, []
+    elif low == "resetkeys":
+        scope["allkeys"], scope["keys"] = False, []
+    elif key:
+        if scope["allkeys"]:
+            return _ACL_PATTERN_AFTER_STAR.format(rule, "allkeys", "resetkeys", "patterns")
+        if key not in scope["keys"]:
+            scope["keys"].append(key)
+    elif low == "allchannels" or rule == "&*":
+        scope["channels"], scope["patterns"] = "all", []
+    elif low == "resetchannels":
+        scope["channels"], scope["patterns"] = "reset", []
+    elif rule.startswith("&"):
+        if scope["channels"] == "all":
+            return _ACL_PATTERN_AFTER_STAR.format(rule, "allchannels", "resetchannels", "channels")
+        scope["channels"] = "reset"
+        if rule not in scope["patterns"]:
+            scope["patterns"].append(rule)
+    elif low in ("allcommands", "+@all", "nocommands", "-@all"):
+        scope["base"], scope["commands"] = ("+" if low in ("allcommands", "+@all") else "-"), []
+    elif low == "clearselectors":
+        scope["selectors"] = []
+    else:
+        sign, name = low[0], low[1:]
+        family = name.split("|")[0]
+        if "|" in name:
+            # +command|sub is refused once the command is granted, -command|sub until something granted it.
+            full = granted = scope["base"] == "+"
+            version = None
+            for command in scope["commands"]:
+                if command[1:] == family:
+                    full = granted = command[0] == "+"
+                    version = None
+                elif command[1] == "@" and family in _ACL_CATEGORY_COMMANDS.get(command[2:], ()):
+                    full = command[0] == "+"
+                    granted = granted or full
+                    version = None
+                elif command[1] == "@" and (command[2:], family) in _ACL_CATEGORY_ARG_VERSIONS:
+                    version = _ACL_CATEGORY_ARG_VERSIONS[command[2:], family] if command[0] == "+" else None
+            if sign == "+" and full:
+                return (f"Adding a subcommand({low}) of a command already fully added is not allowed. "
+                        "Remove the command to start. Example: -DEBUG +DEBUG|DIGEST")
+            if sign == "-" and not granted:
+                return (f"Removing a subcommand({low}) of a command not fully added is not allowed. "
+                        "Add the command to start. Example: +DEBUG -DEBUG|DIGEST")
+            if sign == "+" and version:
+                scope["versions"].append(version)
+        # A rule replaces its earlier one; one repeating the base without touching a remaining rule is dropped.
+        scope["commands"] = [c for c in scope["commands"]
+                             if c[1:] != name and ("|" in name or not c[1:].startswith(f"{name}|"))]
+        if sign != scope["base"] or any(name[0] == "@" or c[1] == "@" or c[1:].split("|")[0] == family
+                                        for c in scope["commands"]):
+            scope["commands"].append(f"{sign}{name}")
+    return None
+
+
+def _acl_scope(flag=None):
+    return {"flag": flag, "allkeys": False, "keys": [], "channels": None, "patterns": [],
+            "base": "-", "commands": [], "selectors": [], "versions": []}
+
+
+def _acl_describe(scope, default_channels):
+    parts = [scope["flag"]] if scope["flag"] else []
+    parts += ["~*"] if scope["allkeys"] else scope["keys"]
+    if scope["channels"] == "all":
+        parts.append("&*")
+    elif scope["channels"]:
+        parts += ["resetchannels", *scope["patterns"]]
+    elif default_channels:
+        parts.append(default_channels)
+    parts += [f"{scope['base']}@all", *scope["commands"], *scope["selectors"]]
+    return " ".join(parts)
+
+
+def _acl_apply_rule(root, rule):
+    """Apply a root rule or a selector to ``root``; AWS's message if it is refused."""
+    if not isinstance(rule, list):
+        return _acl_apply(root, rule)
+    selector = _acl_scope()
+    for inner in rule:
+        message = _acl_apply(selector, inner)
+        if message:
+            return message
+    root["selectors"].append(f"({_acl_describe(selector, 'resetchannels')})")
+    root["versions"] += selector["versions"]
+    return None
+
+
+def _acl_version_key(version):
+    return tuple(int(part) for part in version.split("."))
+
+
+def _acl_version(rule):
+    """The engine version AWS reports for one rule or selector, or None if it needs no more than the floor."""
+    if isinstance(rule, list):
+        return max(["7.0", *filter(None, map(_acl_version, rule))], key=_acl_version_key)
+    low = rule.lower()
+    if rule.startswith("%") or low == "clearselectors" or (rule.startswith("&") and rule != "&*"):
+        return "7.0"
+    if low in ("resetchannels", "allchannels", "&*"):
+        return "6.2"
+    if rule[0] not in "+-":
+        return None
+    command, bar, _ = low[1:].partition("|")
+    if bar and rule[0] == "-":
+        return _ACL_SUBCOMMAND_VERSIONS.get(low[1:], "7.0")
+    return _ACL_RULE_VERSIONS.get(command)
+
+
+def _acl_refused(rule):
+    keywords = _ACL_SELECTOR_KEYWORDS if isinstance(rule, list) else _ACL_ROOT_KEYWORDS
+    return next(filter(None, (_acl_refusal(inner, keywords) for inner in (rule if isinstance(rule, list) else [rule]))),
+                None)
+
+
+def _append_access_string(access, append):
+    """(AccessString, version, None): the stored AccessString with AppendAccessString's rules applied,
+    written as AWS stores it (real-AWS captures in issue #2551), with the engine version its rules need
+    (None for the floor); or (None, None, AWS's message) refusing the appended rules."""
+    rules = _acl_rules(append)
+    if rules is None:
+        return None, None, "The access-string is invalid."
+    message = next(filter(None, map(_acl_refused, rules)), None)
+    if message:
+        return None, None, message
+    # MiniStack-only: a stored rule AWS would have refused is skipped.
+    stored = _acl_rules(access)
+    stored = [rule for rule in (_acl_split(access) if stored is None else stored) if not _acl_refused(rule)]
+    root = _acl_scope(flag="off")
+    for rule in stored:
+        _acl_apply_rule(root, rule)  # a refusal returns before changing anything, so the rule is skipped
+    for rule in rules:
+        message = _acl_apply_rule(root, rule)
+        if message:
+            return None, None, message
+    # Every rule present counts, even one a later rule dropped (real AWS, us-east-2).
+    version = max(filter(None, [*map(_acl_version, [*stored, *rules]), *root["versions"]]),
+                  key=_acl_version_key, default=None)
+    default = None if not version else "&*" if version == "6.2" else "resetchannels"
+    return _acl_describe(root, default), version, None
 
 
 def _modify_user(p):
     user_id = _p(p, "UserId")
     user = _users.get(user_id)
     if not user:
-        return _error("UserNotFound", f"User {user_id} not found", 404)
+        return _error("UserNotFound", f"User {user_id} not found.", 404)
+    if user.get("_builtin"):  # real AWS, us-east-1
+        return _error("InvalidParameterValue", "default user can't be modified.", 400)
 
+    auth, err = _user_authentication(p, user_id, user.get("UserName", user_id), user.get("Engine", "redis"))
+    if not err and _p(p, "AccessString") and _p(p, "AppendAccessString"):
+        err = _error("InvalidParameterCombination",
+                     "Both AccessString and AppendAccessString provided together. Pass either one of them.", 400)
+    err = err or _access_string_error(_p(p, "AccessString"))
+    if err:
+        return err
+    appended = None
+    if _acl_split(_p(p, "AppendAccessString")):
+        appended, version, message = _append_access_string(user.get("AccessString", ""), _p(p, "AppendAccessString"))
+        if message:
+            return _error("InvalidParameterValue", message, 400)
     if _p(p, "AccessString"):
-        user["AccessString"] = _p(p, "AccessString")
-    if _p(p, "Passwords.member.1"):
-        user["Authentication"] = {"Type": "password", "PasswordCount": 1}
+        user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
+        user.pop("_AclVersion", None)
+    if appended is not None:
+        user["AccessString"], user["_AclVersion"] = appended, version
+    if auth:
+        user["Authentication"] = auth
+        user["_PasswordHashes"] = _password_hashes(p)
+    _apply_user_groups_of(user.get("UserGroupIds", []))
 
-    return _xml(200, "ModifyUserResponse", f"<ModifyUserResult>{_user_xml(user)}</ModifyUserResult>")
+    # AWS answers a modify with the user still modifying; MiniStack settles at once.
+    return _xml(200, "ModifyUserResponse",
+                f"<ModifyUserResult>{_user_xml({**user, 'Status': 'modifying'})}</ModifyUserResult>")
+
+
+def _redis_user(user):
+    return bool(user) and (user.get("Engine") or "").lower() == "redis"
+
+
+def _user_group_needs_default_user(user_ids):
+    """Whether these Redis users have none named exactly `default`; False when AWS would refuse them first."""
+    users = [_users.get(uid) for uid in user_ids]
+    if not all(_redis_user(u) for u in users):
+        return False
+    names = [u.get("UserName") for u in users]
+    return len(set(names)) == len(names) and "default" not in names
+
+
+def _user_group_input_checked(group_id, p):
+    """Whether CreateUserGroup passes the id and tag checks AWS makes before DefaultUserRequired (real AWS)."""
+    if len(group_id) > 40 or not re.fullmatch(r"[A-Za-z](?:-?[A-Za-z0-9])*-?", group_id):
+        return False
+    for key in p:
+        tag = re.fullmatch(r"(Tags\.(?:member|Tag)\.\d+\.)(Key|Value)", key)
+        if not tag:
+            continue
+        tag_key, value = _p(p, tag.group(1) + "Key"), _p(p, tag.group(1) + "Value")
+        allowed = all(c.isalpha() or c.isdecimal() or c in " _.:/=+-@" for c in tag_key)
+        if (not 1 <= len(tag_key) <= 128 or not allowed or tag_key.lower().startswith("aws:")
+                or len(value) > 256):
+            return False
+    return True
+
+
+def _user_group_attached(group_id):
+    group = _user_groups.get(group_id) or {}
+    return bool(group.get("ReplicationGroups")) or any(
+        c.get("UserGroupId") == group_id for c in _serverless_caches.values())
+
+
+def _default_user_required():
+    return _error("DefaultUserRequired", "Redis user group needs to contain a user with the user name default.", 400)
 
 
 def _create_user_group(p):
@@ -2848,7 +3752,7 @@ def _create_user_group(p):
     if not group_id:
         return _error("InvalidParameterValue", "UserGroupId is required", 400)
     if group_id in _user_groups:
-        return _error("UserGroupAlreadyExists", f"User group {group_id} already exists", 400)
+        return _error("UserGroupAlreadyExists", f"User group {group_id} already exists. Please retry with another name.", 400)
 
     arn = _arn_user_group(group_id)
     user_ids = []
@@ -2856,6 +3760,14 @@ def _create_user_group(p):
     while _p(p, f"UserIds.member.{idx}"):
         user_ids.append(_p(p, f"UserIds.member.{idx}"))
         idx += 1
+    if len(set(user_ids)) != len(user_ids):  # duplicates before unknown users (real AWS, us-east-1)
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+    for uid in user_ids:
+        if uid not in _users:
+            return _error("UserNotFound", f"User {uid} not found.", 404)
+    if (_p(p, "Engine").lower() == "redis" and _user_group_input_checked(group_id, p)
+            and _user_group_needs_default_user(user_ids)):
+        return _default_user_required()
 
     group = {
         "UserGroupId": group_id,
@@ -2895,8 +3807,13 @@ def _describe_user_groups(p):
 
 def _delete_user_group(p):
     group_id = _p(p, "UserGroupId")
-    group = _user_groups.pop(group_id, None)
+    group = _user_groups.get(group_id)
     if not group:
+        return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
+    if group.get("ReplicationGroups") or any(c.get("UserGroupId") == group_id for c in _serverless_caches.values()):
+        return _error("InvalidUserGroupState", f"User group {group_id} can't be deleted because it is still "
+                      "associated with at least 1 replication group or serverless cache.", 400)  # real AWS, us-west-2
+    if _user_groups.pop(group_id, None) is None:  # deleted meanwhile by a concurrent request
         return _error("UserGroupNotFound", f"User group {group_id} not found", 404)
     _tags.pop(group.get("ARN", ""), None)
 
@@ -2907,6 +3824,7 @@ def _delete_user_group(p):
                 gids.remove(group_id)
 
     group["Status"] = "deleting"
+    _apply_user_groups_of([group_id])
     return _xml(200, "DeleteUserGroupResponse", f"<DeleteUserGroupResult>{_user_group_xml(group)}</DeleteUserGroupResult>")
 
 
@@ -2928,49 +3846,97 @@ def _modify_user_group(p):
         to_remove.append(_p(p, f"UserIdsToRemove.member.{idx}"))
         idx += 1
 
+    # Refused before anything changes, in this order, naming the first bad entry (real AWS, us-east-1).
     for uid in to_add:
+        if uid in group["UserIds"]:
+            return _error("InvalidParameterCombination", f"{uid} is already a member of {group_id}.", 400)
+    if len(set(to_add)) != len(to_add):
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+    for uid in to_add:
+        if uid not in _users:
+            return _error("UserNotFound", f"User {uid} not found.", 404)
+    for uid in to_remove:
         if uid not in group["UserIds"]:
-            group["UserIds"].append(uid)
-        if uid in _users:
-            _users[uid].setdefault("UserGroupIds", []).append(group_id)
+            return _error("InvalidParameterValue", f"User {uid} is not a member of user group {group_id}.", 400)
+    if len(set(to_remove)) != len(to_remove):
+        return _error("InvalidParameterValue", "Duplicate user id specified.", 400)
+
+    # The default-user rule and an Engine change (real AWS, us-east-2).
+    members = group["UserIds"]
+    after = [u for u in members if u not in to_remove] + to_add
+    current = group.get("Engine", "").lower()
+    sent = _p(p, "Engine").lower()
+    # Any Engine but `valkey` keeps the rule, even on a Valkey group; with none, the group's engine decides.
+    redis_rule_applies = sent != "valkey" if sent else current == "redis"
+    has_default = any(_redis_user(_users.get(u)) and _users[u].get("UserName") == "default" for u in members)
+    to_redis = current == "valkey" and _p(p, "Engine") == "redis"  # only lower case was captured
+    if redis_rule_applies and (has_default or to_redis) and _user_group_needs_default_user(after):
+        return _default_user_required()
+    # An Engine change is stored only in the captured shape.
+    engine = "valkey" if sent == "valkey" else "redis" if _p(p, "Engine") == "redis" else current
+    after_users = [_users.get(u) for u in after]
+    names = [u.get("UserName") for u in after_users if u]
+    change_engine = (engine != current and not _user_group_attached(group_id)
+                     and all(_redis_user(u) for u in after_users) and len(set(names)) == len(names)
+                     and (engine == "valkey" or "default" in names))
+
+    before = list(group["UserIds"])
+    for uid in to_add:
+        group["UserIds"].append(uid)
+        if uid in _users and group_id not in _users[uid].setdefault("UserGroupIds", []):
+            _users[uid]["UserGroupIds"].append(group_id)
 
     for uid in to_remove:
-        if uid in group["UserIds"]:
-            group["UserIds"].remove(uid)
+        group["UserIds"].remove(uid)
         if uid in _users:
             gids = _users[uid].get("UserGroupIds", [])
             if group_id in gids:
                 gids.remove(group_id)
 
-    return _xml(200, "ModifyUserGroupResponse", f"<ModifyUserGroupResult>{_user_group_xml(group)}</ModifyUserGroupResult>")
+    if change_engine:
+        group["Engine"] = engine
+    _apply_user_groups_of([group_id])
+    # AWS answers with the group still modifying and the change pending (real AWS, us-west-2);
+    # MiniStack settles at once.
+    pending = {"UserIdsToAdd": [u for u in group["UserIds"] if u not in before],
+               "UserIdsToRemove": [u for u in before if u not in group["UserIds"]]}
+    shown = {**group, "Status": "modifying", "UserIds": before, "PendingChanges": pending} if group["UserIds"] != before else group
+    return _xml(200, "ModifyUserGroupResponse", f"<ModifyUserGroupResult>{_user_group_xml(shown)}</ModifyUserGroupResult>")
 
 
 def _user_xml(u):
-    group_ids_xml = "".join(f"<member>{gid}</member>" for gid in u.get("UserGroupIds", []))
+    group_ids_xml = "".join(f"<member>{xml_escape(str(gid))}</member>" for gid in u.get("UserGroupIds", []))
     auth = u.get("Authentication", {})
     return (
-        f"<UserId>{u['UserId']}</UserId>"
-        f"<UserName>{u.get('UserName', '')}</UserName>"
-        f"<Engine>{u.get('Engine', 'redis')}</Engine>"
-        f"<Status>{u.get('Status', 'active')}</Status>"
-        f"<AccessString>{u.get('AccessString', '')}</AccessString>"
+        f"<UserId>{xml_escape(str(u['UserId']))}</UserId>"
+        f"<UserName>{xml_escape(str(u.get('UserName', '')))}</UserName>"
+        f"<Engine>{xml_escape(str(u.get('Engine', 'redis')))}</Engine>"
+        f"<Status>{xml_escape(str(u.get('Status', 'active')))}</Status>"
+        f"<AccessString>{xml_escape(u.get('AccessString', ''), _XML_QUOTE)}</AccessString>"
         f"<UserGroupIds>{group_ids_xml}</UserGroupIds>"
-        f"<Authentication><Type>{auth.get('Type', 'no-password')}</Type>"
-        f"<PasswordCount>{auth.get('PasswordCount', 0)}</PasswordCount></Authentication>"
-        f"<ARN>{u.get('ARN', '')}</ARN>"
+        + (f"<MinimumEngineVersion>{xml_escape(str(_minimum_engine_version(u)))}</MinimumEngineVersion>"
+           if _minimum_engine_version(u) else "")
+        + f"<Authentication><Type>{xml_escape(str(auth.get('Type', 'no-password')))}</Type>"
+        + (f"<PasswordCount>{xml_escape(str(auth['PasswordCount']))}</PasswordCount>" if "PasswordCount" in auth
+           else "" if auth.get("Type") == "iam" or u.get("_builtin") else "<PasswordCount>0</PasswordCount>")
+        + "</Authentication>"
+        f"<ARN>{xml_escape(str(u.get('ARN', '')))}</ARN>"
     )
 
 
 def _user_group_xml(g):
-    user_ids_xml = "".join(f"<member>{uid}</member>" for uid in g.get("UserIds", []))
-    rg_xml = "".join(f"<member>{rg}</member>" for rg in g.get("ReplicationGroups", []))
+    user_ids_xml = "".join(f"<member>{xml_escape(str(uid))}</member>" for uid in g.get("UserIds", []))
+    rg_xml = "".join(f"<member>{xml_escape(str(rg))}</member>" for rg in g.get("ReplicationGroups", []))
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{xml_escape(str(u))}</member>" for u in ids) + f"</{k}>"
+                          for k, ids in (g.get("PendingChanges") or {}).items() if ids)
     return (
-        f"<UserGroupId>{g['UserGroupId']}</UserGroupId>"
-        f"<Status>{g.get('Status', 'active')}</Status>"
-        f"<Engine>{g.get('Engine', 'redis')}</Engine>"
+        f"<UserGroupId>{xml_escape(str(g['UserGroupId']))}</UserGroupId>"
+        f"<Status>{xml_escape(str(g.get('Status', 'active')))}</Status>"
+        f"<Engine>{xml_escape(str(g.get('Engine', 'redis')))}</Engine>"
         f"<UserIds>{user_ids_xml}</UserIds>"
-        f"<ReplicationGroups>{rg_xml}</ReplicationGroups>"
-        f"<ARN>{g.get('ARN', '')}</ARN>"
+        + (f"<PendingChanges>{pending_xml}</PendingChanges>" if pending_xml else "")
+        + f"<ReplicationGroups>{rg_xml}</ReplicationGroups>"
+        f"<ARN>{xml_escape(str(g.get('ARN', '')))}</ARN>"
     )
 
 
@@ -2980,8 +3946,8 @@ def _security_groups_xml(groups):
     xml = ""
     for g in groups or []:
         xml += (
-            f"<member><SecurityGroupId>{g.get('SecurityGroupId', '')}</SecurityGroupId>"
-            f"<Status>{g.get('Status', 'active')}</Status></member>"
+            f"<member><SecurityGroupId>{xml_escape(str(g.get('SecurityGroupId', '')))}</SecurityGroupId>"
+            f"<Status>{xml_escape(str(g.get('Status', 'active')))}</Status></member>"
         )
     return xml
 
@@ -2996,17 +3962,17 @@ def _log_delivery_configs_xml(configs):
         if log_group:
             destination_xml = (
                 f"<DestinationDetails><CloudWatchLogsDetails>"
-                f"<LogGroup>{log_group}</LogGroup>"
+                f"<LogGroup>{xml_escape(str(log_group))}</LogGroup>"
                 f"</CloudWatchLogsDetails></DestinationDetails>"
             )
         items.append(
             f"<LogDeliveryConfiguration>"
             f"{destination_xml}"
-            f"<DestinationType>{config.get('DestinationType', 'cloudwatch-logs')}</DestinationType>"
-            f"<LogFormat>{config.get('LogFormat', 'text')}</LogFormat>"
-            f"<LogType>{config.get('LogType', '')}</LogType>"
-            f"<Status>{config.get('Status', 'active')}</Status>"
-            f"<Message>{config.get('Message', '')}</Message>"
+            f"<DestinationType>{xml_escape(str(config.get('DestinationType', 'cloudwatch-logs')))}</DestinationType>"
+            f"<LogFormat>{xml_escape(str(config.get('LogFormat', 'text')))}</LogFormat>"
+            f"<LogType>{xml_escape(str(config.get('LogType', '')))}</LogType>"
+            f"<Status>{xml_escape(str(config.get('Status', 'active')))}</Status>"
+            f"<Message>{xml_escape(str(config.get('Message', '')))}</Message>"
             f"</LogDeliveryConfiguration>"
         )
     return "".join(items)
@@ -3028,16 +3994,16 @@ def _cluster_xml_inner(c):
         node_az = node.get("CustomerAvailabilityZone") or az
         pgs = node.get("ParameterGroupStatus", "in-sync")
         src = node.get("SourceCacheNodeId") or ""
-        src_xml = f"<SourceCacheNodeId>{src}</SourceCacheNodeId>" if src else ""
+        src_xml = f"<SourceCacheNodeId>{xml_escape(str(src))}</SourceCacheNodeId>" if src else ""
         nodes_xml += (
             f"<CacheNode>"
-            f"<CacheNodeId>{node['CacheNodeId']}</CacheNodeId>"
-            f"<CacheNodeStatus>{node['CacheNodeStatus']}</CacheNodeStatus>"
-            f"<CacheNodeCreateTime>{created_iso}</CacheNodeCreateTime>"
-            f"<Endpoint><Address>{nep.get('Address', 'localhost')}</Address>"
-            f"<Port>{nep.get('Port', 6379)}</Port></Endpoint>"
-            f"<ParameterGroupStatus>{pgs}</ParameterGroupStatus>"
-            f"<CustomerAvailabilityZone>{node_az}</CustomerAvailabilityZone>"
+            f"<CacheNodeId>{xml_escape(str(node['CacheNodeId']))}</CacheNodeId>"
+            f"<CacheNodeStatus>{xml_escape(str(node['CacheNodeStatus']))}</CacheNodeStatus>"
+            f"<CacheNodeCreateTime>{xml_escape(str(created_iso))}</CacheNodeCreateTime>"
+            f"<Endpoint><Address>{xml_escape(str(nep.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(nep.get('Port', 6379)))}</Port></Endpoint>"
+            f"<ParameterGroupStatus>{xml_escape(str(pgs))}</ParameterGroupStatus>"
+            f"<CustomerAvailabilityZone>{xml_escape(str(node_az))}</CustomerAvailabilityZone>"
             f"{src_xml}"
             f"</CacheNode>"
         )
@@ -3052,36 +4018,36 @@ def _cluster_xml_inner(c):
     else:
         cluster_created_iso = str(cluster_created)
     return (
-        f"<CacheClusterId>{c['CacheClusterId']}</CacheClusterId>"
-        f"<CacheClusterStatus>{c['CacheClusterStatus']}</CacheClusterStatus>"
-        f"<CacheClusterCreateTime>{cluster_created_iso}</CacheClusterCreateTime>"
-        f"<Engine>{c['Engine']}</Engine>"
-        f"<EngineVersion>{c['EngineVersion']}</EngineVersion>"
-        f"<CacheNodeType>{c['CacheNodeType']}</CacheNodeType>"
-        f"<NumCacheNodes>{c['NumCacheNodes']}</NumCacheNodes>"
-        f"<CacheClusterArn>{c['CacheClusterArn']}</CacheClusterArn>"
-        f"<ARN>{c.get('CacheClusterArn', '')}</ARN>"
-        f"<PreferredAvailabilityZone>{c.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
-        f"<PreferredMaintenanceWindow>{c.get('PreferredMaintenanceWindow', '')}</PreferredMaintenanceWindow>"
-        f"<CacheParameterGroup><CacheParameterGroupName>{parameter_group.get('CacheParameterGroupName', '')}</CacheParameterGroupName>"
-        f"<ParameterApplyStatus>{parameter_group.get('ParameterApplyStatus', 'in-sync')}</ParameterApplyStatus></CacheParameterGroup>"
-        f"<CacheSubnetGroupName>{c.get('CacheSubnetGroupName', '')}</CacheSubnetGroupName>"
+        f"<CacheClusterId>{xml_escape(str(c['CacheClusterId']))}</CacheClusterId>"
+        f"<CacheClusterStatus>{xml_escape(str(c['CacheClusterStatus']))}</CacheClusterStatus>"
+        f"<CacheClusterCreateTime>{xml_escape(str(cluster_created_iso))}</CacheClusterCreateTime>"
+        f"<Engine>{xml_escape(str(c['Engine']))}</Engine>"
+        f"<EngineVersion>{xml_escape(str(c['EngineVersion']))}</EngineVersion>"
+        f"<CacheNodeType>{xml_escape(str(c['CacheNodeType']))}</CacheNodeType>"
+        f"<NumCacheNodes>{xml_escape(str(c['NumCacheNodes']))}</NumCacheNodes>"
+        f"<CacheClusterArn>{xml_escape(str(c['CacheClusterArn']))}</CacheClusterArn>"
+        f"<ARN>{xml_escape(str(c.get('CacheClusterArn', '')))}</ARN>"
+        f"<PreferredAvailabilityZone>{xml_escape(str(c.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
+        f"<PreferredMaintenanceWindow>{xml_escape(str(c.get('PreferredMaintenanceWindow', '')))}</PreferredMaintenanceWindow>"
+        f"<CacheParameterGroup><CacheParameterGroupName>{xml_escape(str(parameter_group.get('CacheParameterGroupName', '')))}</CacheParameterGroupName>"
+        f"<ParameterApplyStatus>{xml_escape(str(parameter_group.get('ParameterApplyStatus', 'in-sync')))}</ParameterApplyStatus></CacheParameterGroup>"
+        f"<CacheSubnetGroupName>{xml_escape(str(c.get('CacheSubnetGroupName', '')))}</CacheSubnetGroupName>"
         f"<SecurityGroups>{security_groups_xml}</SecurityGroups>"
-        f"<ReplicationGroupId>{c.get('ReplicationGroupId', '')}</ReplicationGroupId>"
-        f"<SnapshotRetentionLimit>{c.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
-        f"<SnapshotWindow>{c.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<ReplicationGroupId>{xml_escape(str(c.get('ReplicationGroupId', '')))}</ReplicationGroupId>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(c.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
+        f"<SnapshotWindow>{xml_escape(str(c.get('SnapshotWindow', '')))}</SnapshotWindow>"
         f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
-        f"<AuthTokenEnabled>{str(c.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
-        f"<TransitEncryptionEnabled>{str(c.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"<AuthTokenEnabled>{xml_escape(str(str(c.get('AuthTokenEnabled', False)).lower()))}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{xml_escape(str(str(c.get('TransitEncryptionEnabled', False)).lower()))}</TransitEncryptionEnabled>"
         f"{_transit_mode_xml(c)}"
-        f"<AtRestEncryptionEnabled>{str(c.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
+        f"<AtRestEncryptionEnabled>{xml_escape(str(str(c.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
         f"<CacheNodes>{nodes_xml}</CacheNodes>"
     )
 
 
 def _transit_mode_xml(record):
     mode = record.get("TransitEncryptionMode")
-    return f"<TransitEncryptionMode>{mode}</TransitEncryptionMode>" if mode else ""
+    return f"<TransitEncryptionMode>{xml_escape(str(mode))}</TransitEncryptionMode>" if mode else ""
 
 
 def _cluster_xml(c):
@@ -3102,24 +4068,24 @@ def _rg_xml(rg):
             rep = m.get("ReadEndpoint", {})
             members_xml += (
                 f"<NodeGroupMember>"
-                f"<CacheClusterId>{m.get('CacheClusterId', '')}</CacheClusterId>"
-                f"<CacheNodeId>{m.get('CacheNodeId', '0001')}</CacheNodeId>"
-                f"<CurrentRole>{m.get('CurrentRole', 'primary')}</CurrentRole>"
-                f"<PreferredAvailabilityZone>{m.get('PreferredAvailabilityZone', '')}</PreferredAvailabilityZone>"
-                f"<ReadEndpoint><Address>{rep.get('Address', 'localhost')}</Address>"
-                f"<Port>{rep.get('Port', 6379)}</Port></ReadEndpoint>"
+                f"<CacheClusterId>{xml_escape(str(m.get('CacheClusterId', '')))}</CacheClusterId>"
+                f"<CacheNodeId>{xml_escape(str(m.get('CacheNodeId', '0001')))}</CacheNodeId>"
+                f"<CurrentRole>{xml_escape(str(m.get('CurrentRole', 'primary')))}</CurrentRole>"
+                f"<PreferredAvailabilityZone>{xml_escape(str(m.get('PreferredAvailabilityZone', '')))}</PreferredAvailabilityZone>"
+                f"<ReadEndpoint><Address>{xml_escape(str(rep.get('Address', 'localhost')))}</Address>"
+                f"<Port>{xml_escape(str(rep.get('Port', 6379)))}</Port></ReadEndpoint>"
                 f"</NodeGroupMember>"
             )
         pep = ng.get("PrimaryEndpoint", {})
         rdr = ng.get("ReaderEndpoint", {})
         node_groups_xml += (
             f"<NodeGroup>"
-            f"<NodeGroupId>{ng['NodeGroupId']}</NodeGroupId>"
-            f"<Status>{ng['Status']}</Status>"
-            f"<PrimaryEndpoint><Address>{pep.get('Address', 'localhost')}</Address>"
-            f"<Port>{pep.get('Port', 6379)}</Port></PrimaryEndpoint>"
-            f"<ReaderEndpoint><Address>{rdr.get('Address', 'localhost')}</Address>"
-            f"<Port>{rdr.get('Port', 6379)}</Port></ReaderEndpoint>"
+            f"<NodeGroupId>{xml_escape(str(ng['NodeGroupId']))}</NodeGroupId>"
+            f"<Status>{xml_escape(str(ng['Status']))}</Status>"
+            f"<PrimaryEndpoint><Address>{xml_escape(str(pep.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(pep.get('Port', 6379)))}</Port></PrimaryEndpoint>"
+            f"<ReaderEndpoint><Address>{xml_escape(str(rdr.get('Address', 'localhost')))}</Address>"
+            f"<Port>{xml_escape(str(rdr.get('Port', 6379)))}</Port></ReaderEndpoint>"
             f"<NodeGroupMembers>{members_xml}</NodeGroupMembers>"
             f"</NodeGroup>"
         )
@@ -3128,40 +4094,44 @@ def _rg_xml(rg):
     cep = rg.get("ConfigurationEndpoint")
     if cep:
         config_ep_xml = (
-            f"<ConfigurationEndpoint><Address>{cep['Address']}</Address>"
-            f"<Port>{cep['Port']}</Port></ConfigurationEndpoint>"
+            f"<ConfigurationEndpoint><Address>{xml_escape(str(cep['Address']))}</Address>"
+            f"<Port>{xml_escape(str(cep['Port']))}</Port></ConfigurationEndpoint>"
         )
 
     member_clusters_xml = ""
     for cluster_id in rg.get("MemberClusters", []):
-        member_clusters_xml += f"<ClusterId>{cluster_id}</ClusterId>"
+        member_clusters_xml += f"<ClusterId>{xml_escape(str(cluster_id))}</ClusterId>"
     user_group_ids_xml = ""
     for user_group_id in rg.get("UserGroupIds", []):
-        user_group_ids_xml += f"<member>{user_group_id}</member>"
+        user_group_ids_xml += f"<member>{xml_escape(str(user_group_id))}</member>"
     log_delivery_configs_xml = _log_delivery_configs_xml(rg.get("LogDeliveryConfigurations", []))
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{xml_escape(str(g))}</member>" for g in ids) + f"</{k}>"
+                          for k, ids in (rg.get("PendingModifiedValues") or {}).get("UserGroups", {}).items())
     return (
-        f"<ReplicationGroupId>{rg['ReplicationGroupId']}</ReplicationGroupId>"
-        f"<Description>{rg.get('Description', '')}</Description>"
-        f"<Status>{rg['Status']}</Status>"
-        f"<Engine>{rg.get('Engine', 'redis')}</Engine>"
-        f"<CacheNodeType>{rg.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
-        f"<AutomaticFailover>{rg.get('AutomaticFailover', 'disabled')}</AutomaticFailover>"
-        f"<AutoMinorVersionUpgrade>{str(rg.get('AutoMinorVersionUpgrade', False)).lower()}</AutoMinorVersionUpgrade>"
-        f"<MultiAZ>{rg.get('MultiAZ', 'disabled')}</MultiAZ>"
-        f"<ClusterEnabled>{str(rg.get('ClusterEnabled', False)).lower()}</ClusterEnabled>"
-        f"<ClusterMode>{rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')}</ClusterMode>"
-        f"<AuthTokenEnabled>{str(rg.get('AuthTokenEnabled', False)).lower()}</AuthTokenEnabled>"
-        f"<TransitEncryptionEnabled>{str(rg.get('TransitEncryptionEnabled', False)).lower()}</TransitEncryptionEnabled>"
+        f"<ReplicationGroupId>{xml_escape(str(rg['ReplicationGroupId']))}</ReplicationGroupId>"
+        f"<Description>{xml_escape(str(rg.get('Description', '')))}</Description>"
+        f"<Status>{xml_escape(str(rg['Status']))}</Status>"
+        f"<Engine>{xml_escape(str(rg.get('Engine', 'redis')))}</Engine>"
+        f"<CacheNodeType>{xml_escape(str(rg.get('CacheNodeType', 'cache.t3.micro')))}</CacheNodeType>"
+        f"<AutomaticFailover>{xml_escape(str(rg.get('AutomaticFailover', 'disabled')))}</AutomaticFailover>"
+        f"<AutoMinorVersionUpgrade>{xml_escape(str(str(rg.get('AutoMinorVersionUpgrade', False)).lower()))}</AutoMinorVersionUpgrade>"
+        f"<MultiAZ>{xml_escape(str(rg.get('MultiAZ', 'disabled')))}</MultiAZ>"
+        f"<ClusterEnabled>{xml_escape(str(str(rg.get('ClusterEnabled', False)).lower()))}</ClusterEnabled>"
+        f"<ClusterMode>{xml_escape(str(rg.get('ClusterMode', 'enabled' if rg.get('ClusterEnabled', False) else 'disabled')))}</ClusterMode>"
+        f"<AuthTokenEnabled>{xml_escape(str(str(rg.get('AuthTokenEnabled', False)).lower()))}</AuthTokenEnabled>"
+        f"<TransitEncryptionEnabled>{xml_escape(str(str(rg.get('TransitEncryptionEnabled', False)).lower()))}</TransitEncryptionEnabled>"
         f"{_transit_mode_xml(rg)}"
-        f"<AtRestEncryptionEnabled>{str(rg.get('AtRestEncryptionEnabled', False)).lower()}</AtRestEncryptionEnabled>"
-        f"<SnapshotRetentionLimit>{rg.get('SnapshotRetentionLimit', 0)}</SnapshotRetentionLimit>"
-        f"<SnapshotWindow>{rg.get('SnapshotWindow', '')}</SnapshotWindow>"
+        f"<AtRestEncryptionEnabled>{xml_escape(str(str(rg.get('AtRestEncryptionEnabled', False)).lower()))}</AtRestEncryptionEnabled>"
+        f"<SnapshotRetentionLimit>{xml_escape(str(rg.get('SnapshotRetentionLimit', 0)))}</SnapshotRetentionLimit>"
+        f"<SnapshotWindow>{xml_escape(str(rg.get('SnapshotWindow', '')))}</SnapshotWindow>"
         f"{config_ep_xml}"
         f"<MemberClusters>{member_clusters_xml}</MemberClusters>"
         f"<NodeGroups>{node_groups_xml}</NodeGroups>"
         f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
-        f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>"
-        f"<ARN>{rg['ARN']}</ARN>"
+        # AWS leaves UserGroupIds out once none is attached (real AWS, us-west-2).
+        + (f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>" if user_group_ids_xml else "")
+        + (f"<PendingModifiedValues><UserGroups>{pending_xml}</UserGroups></PendingModifiedValues>" if pending_xml else "")
+        + f"<ARN>{xml_escape(str(rg['ARN']))}</ARN>"
     )
 
 
@@ -3171,22 +4141,22 @@ def _snapshot_xml(snap):
     for ns in snap.get("NodeSnapshots", []):
         nodes_xml += (
             f"<NodeSnapshot>"
-            f"<CacheNodeId>{ns.get('CacheNodeId', '0001')}</CacheNodeId>"
-            f"<SnapshotCreateTime>{ns.get('SnapshotCreateTime', 0)}</SnapshotCreateTime>"
-            f"<CacheSize>{ns.get('CacheSize', '0 MB')}</CacheSize>"
+            f"<CacheNodeId>{xml_escape(str(ns.get('CacheNodeId', '0001')))}</CacheNodeId>"
+            f"<SnapshotCreateTime>{xml_escape(str(ns.get('SnapshotCreateTime', 0)))}</SnapshotCreateTime>"
+            f"<CacheSize>{xml_escape(str(ns.get('CacheSize', '0 MB')))}</CacheSize>"
             f"</NodeSnapshot>"
         )
     return (
-        f"<SnapshotName>{snap['SnapshotName']}</SnapshotName>"
-        f"<SnapshotStatus>{snap['SnapshotStatus']}</SnapshotStatus>"
-        f"<SnapshotSource>{snap.get('SnapshotSource', 'manual')}</SnapshotSource>"
-        f"<CacheClusterId>{snap.get('CacheClusterId', '')}</CacheClusterId>"
-        f"<ReplicationGroupId>{snap.get('ReplicationGroupId', '')}</ReplicationGroupId>"
-        f"<CacheNodeType>{snap.get('CacheNodeType', 'cache.t3.micro')}</CacheNodeType>"
-        f"<Engine>{snap.get('Engine', 'redis')}</Engine>"
-        f"<EngineVersion>{snap.get('EngineVersion', '7.0.12')}</EngineVersion>"
+        f"<SnapshotName>{xml_escape(str(snap['SnapshotName']))}</SnapshotName>"
+        f"<SnapshotStatus>{xml_escape(str(snap['SnapshotStatus']))}</SnapshotStatus>"
+        f"<SnapshotSource>{xml_escape(str(snap.get('SnapshotSource', 'manual')))}</SnapshotSource>"
+        f"<CacheClusterId>{xml_escape(str(snap.get('CacheClusterId', '')))}</CacheClusterId>"
+        f"<ReplicationGroupId>{xml_escape(str(snap.get('ReplicationGroupId', '')))}</ReplicationGroupId>"
+        f"<CacheNodeType>{xml_escape(str(snap.get('CacheNodeType', 'cache.t3.micro')))}</CacheNodeType>"
+        f"<Engine>{xml_escape(str(snap.get('Engine', 'redis')))}</Engine>"
+        f"<EngineVersion>{xml_escape(str(snap.get('EngineVersion', '7.0.12')))}</EngineVersion>"
         f"<NodeSnapshots>{nodes_xml}</NodeSnapshots>"
-        f"<ARN>{snap.get('ARN', '')}</ARN>"
+        f"<ARN>{xml_escape(str(snap.get('ARN', '')))}</ARN>"
     )
 
 
@@ -3203,7 +4173,7 @@ def _xml(status, root_tag, inner):
     body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <{root_tag} xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
     {inner}
-    <ResponseMetadata><RequestId>{new_uuid()}</RequestId></ResponseMetadata>
+    <ResponseMetadata><RequestId>{xml_escape(str(new_uuid()))}</RequestId></ResponseMetadata>
 </{root_tag}>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 
@@ -3212,8 +4182,8 @@ def _error(code, message, status):
     # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
     fault_type = "Sender" if 400 <= status < 500 else "Receiver"
     body = f"""<ErrorResponse xmlns="http://elasticache.amazonaws.com/doc/2015-02-02/">
-    <Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>
-    <RequestId>{new_uuid()}</RequestId>
+    <Error><Type>{xml_escape(str(fault_type))}</Type><Code>{xml_escape(str(code))}</Code><Message>{xml_escape(str(message))}</Message></Error>
+    <RequestId>{xml_escape(str(new_uuid()))}</RequestId>
 </ErrorResponse>""".encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
 

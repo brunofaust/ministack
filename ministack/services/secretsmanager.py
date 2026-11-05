@@ -17,6 +17,7 @@ import copy
 import json
 import logging
 import os
+import re
 import secrets as stdlib_secrets
 import string
 import time
@@ -110,13 +111,16 @@ def _secret_arn_for_region(secret, region):
     return f"arn:{spec.partition}:secretsmanager:{region}:{spec.account_id}:{spec.resource}"
 
 
-def _resolve(secret_id, *, use_arn_scope=False):
+def _resolve(secret_id, *, use_arn_scope=False, cross_account=False):
     """Look up a secret by name or ARN.  Returns (storage_key, record) or (None, None).
 
     Supports three lookup modes (matching real AWS behaviour):
       1. By name:        "my-secret"
       2. By full ARN:    "arn:aws:secretsmanager:...:secret:my-secret-A1B2C3"
       3. By partial ARN: "arn:aws:secretsmanager:...:secret:my-secret" (no random suffix)
+
+    ``use_arn_scope`` searches the region in the ARN. ``cross_account`` also
+    lets the ARN name another account.
     """
     if not secret_id:
         return None, None
@@ -125,7 +129,7 @@ def _resolve(secret_id, *, use_arn_scope=False):
         if not scope:
             return None, None
         spec, _ = scope
-        if spec.account_id != get_account_id():
+        if spec.account_id != get_account_id() and not cross_account:
             return None, None
         if use_arn_scope:
             candidates = _secrets.items_scoped(spec.account_id, spec.region)
@@ -136,8 +140,15 @@ def _resolve(secret_id, *, use_arn_scope=False):
         for key, s in candidates:
             if s["ARN"] == secret_id:
                 return key, s
+        # A partial ARN is the full ARN minus the "-XXXXXX" suffix that
+        # CreateSecret appends, so it must match exactly that and nothing
+        # longer. A bare prefix test also matched "my-secret-admin-XXXXXX"
+        # for "my-secret" and returned whichever was stored first.
+        suffix_len = len("-") + 6
         for key, s in candidates:
-            if s["ARN"].startswith(secret_id):
+            arn = s["ARN"]
+            if (len(arn) == len(secret_id) + suffix_len
+                    and arn.startswith(secret_id + "-")):
                 return key, s
         return None, None
     if secret_id in _secrets:
@@ -156,16 +167,17 @@ def _find_stage_version(secret, stage):
     return None, None
 
 
-def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None):
+def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None, cross_account=False):
     """Return the SecretString for *secret_id* at *version_stage* (or the
     version *version_id*), or None.
 
     Used by other services (e.g. ECS, CloudFormation dynamic references) that
     need to read a secret value in-process without going through the HTTP API.
+    With *cross_account*, an ARN is read in the account it names.
     Returns None if the secret does not exist, is scheduled for deletion, or
     has no value for the stage / version.
     """
-    _, secret = _resolve(secret_id, use_arn_scope=True)
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=cross_account)
     if not secret or secret.get("DeletedDate"):
         return None
     if version_id:
@@ -175,6 +187,50 @@ def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None
     if not ver:
         return None
     return ver.get("SecretString")
+
+
+def _resolve_for_reader(secret_id):
+    """``_resolve`` as Secrets Manager reads a SecretId for another service: an
+    ARN whose name ends in a hyphen and six letters, digits or underscores is
+    read as a full ARN, so it never matches as a partial one."""
+    key, secret = _resolve(secret_id)
+    if secret and secret_id.startswith("arn:") and secret["ARN"] != secret_id:
+        scope = _secret_scope_from_arn(secret_id)
+        if not scope or re.search(r"-[A-Za-z0-9_]{6}\Z", scope[1]):
+            return None, None
+    return key, secret
+
+
+def resolve_secret_version(secret_id, version_id):
+    """Return ``(secret, version)`` for the version *version_id* of
+    *secret_id*, ``(secret, None)`` when *version_id* is None or unknown, or
+    ``(None, None)``.
+
+    Used by AppConfig to read a deployed version in-process. Only the
+    caller's account and region are searched, and a secret scheduled for
+    deletion resolves to ``(None, None)``.
+    """
+    _, secret = _resolve_for_reader(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        return None, None
+    return secret, secret["Versions"].get(version_id)
+
+
+def find_secret(secret_id):
+    """The secret *secret_id* names in the caller's account and region,
+    whatever its state, or None."""
+    return _resolve_for_reader(secret_id)[1]
+
+
+def secret_exists(secret_id):
+    """True if *secret_id* (name, full or partial ARN) names a secret in the
+    caller's account and region that is not scheduled for deletion and has a
+    current value (a secret created without one has no version on AWS)."""
+    _, secret = _resolve_for_reader(secret_id)
+    if not secret or secret.get("DeletedDate"):
+        return False
+    _, ver = _find_stage_version(secret, "AWSCURRENT")
+    return bool(ver) and (ver.get("SecretString") is not None or ver.get("SecretBinary") is not None)
 
 
 def create_secret_in_process(name, secret_string, description=""):
@@ -707,8 +763,8 @@ def _list_secrets(data):
         }
         if s.get("DeletedDate"):
             entry["DeletedDate"] = s["DeletedDate"]
-        if s.get("_PrimaryRegion"):
-            entry["PrimaryRegion"] = s["_PrimaryRegion"]
+        if _primary_region(s):
+            entry["PrimaryRegion"] = _primary_region(s)
         secret_list.append(entry)
 
     resp: dict = {"SecretList": secret_list}
@@ -844,6 +900,18 @@ def _update_secret(data):
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "VersionId": vid})
 
 
+def _primary_region(secret):
+    """The Region AWS reports as a secret's PrimaryRegion: a replica's source Region, the secret's own
+    Region when it has replicas, and nothing for a secret that is not replicated."""
+    if secret.get("_PrimaryRegion"):
+        return secret["_PrimaryRegion"]
+    region = secret["ARN"].split(":")[3]
+    # Only replicas elsewhere count: a legacy status naming the secret's own Region is not a replica.
+    if any(r.get("Region") != region for r in secret.get("ReplicationStatus") or []):
+        return region
+    return None
+
+
 def _describe_secret(data):
     secret_id = data.get("SecretId")
     _, secret = _resolve(secret_id)
@@ -866,8 +934,8 @@ def _describe_secret(data):
     }
     if secret.get("DeletedDate"):
         result["DeletedDate"] = secret["DeletedDate"]
-    if secret.get("_PrimaryRegion"):
-        result["PrimaryRegion"] = secret["_PrimaryRegion"]
+    if _primary_region(secret):
+        result["PrimaryRegion"] = _primary_region(secret)
     if secret.get("KmsKeyId"):
         result["KmsKeyId"] = secret["KmsKeyId"]
     if secret.get("RotationLambdaARN"):
@@ -1313,6 +1381,42 @@ def secret_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     if not secret or secret["ARN"] != resource_arn:
         return None
     return _resource_policies.get(resource_arn) or "", get_account_id()
+
+
+def foreign_secret_readable(secret_id: str) -> bool:
+    """Under AUTH=true, whether the caller may read a secret another account owns: an explicit Allow in its
+    resource policy, the caller's own GetSecretValue and kms:Decrypt, and a customer managed key whose policy
+    allows the caller, since the AWS managed key cannot be used across accounts (Secrets Manager guide)."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import EvalContext, _verified_key, caller_arn, enforce, resource_policy_allows
+    from ministack.services import kms
+    if not AUTH:
+        return True
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=True)
+    if not secret:
+        return True  # not found is reported by the caller
+    spec, _ = _secret_scope_from_arn(secret["ARN"])
+    if spec.account_id == get_account_id():
+        return True
+    caller = caller_arn()
+    ctx = EvalContext(principal_arn=caller, principal_account=caller.split(":")[4],
+                      principal_type="Root" if caller.endswith(":root") else
+                      "AssumedRole" if ":assumed-role/" in caller else "User",
+                      action="secretsmanager:GetSecretValue", resource_arn=secret["ARN"], region=spec.region)
+    policy = _resource_policies.get_scoped(spec.account_id, spec.region, secret["ARN"])
+    if not resource_policy_allows(policy, ctx, same_account=False):
+        return False
+    kms_key = secret.get("KmsKeyId") or ""
+    if not kms_key or kms_key.endswith("alias/aws/secretsmanager"):
+        return False
+    if not kms_key.startswith("arn:"):
+        kms_key = f"arn:aws:kms:{spec.region}:{spec.account_id}:{'' if kms_key.startswith('alias/') else 'key/'}{kms_key}"
+    _owner, key = kms._foreign_key(kms_key)
+    if not key or not kms.key_policy_allows_caller(key, "Decrypt", caller):
+        return False
+    identity = _verified_key.get()
+    return (enforce(identity, "secretsmanager:GetSecretValue", "secretsmanager", spec.region, secret["ARN"]) is None
+            and enforce(identity, "kms:Decrypt", "kms", spec.region, kms_key) is None)
 
 
 def _put_resource_policy(data):

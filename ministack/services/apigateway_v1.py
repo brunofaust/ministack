@@ -99,6 +99,8 @@ import ipaddress
 import json
 import logging
 import re
+import secrets
+import string
 import time
 import urllib.error
 import urllib.parse
@@ -168,6 +170,8 @@ _gateway_responses = AccountRegionScopedDict()   # rest_api_id -> {response_type
 _deployed_gateway_responses = AccountRegionScopedDict()
 _documentation_parts = AccountRegionScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
 _request_validators = AccountRegionScopedDict()   # rest_api_id -> {validator_id -> RequestValidator}
+_client_certificates = AccountRegionScopedDict()  # client_certificate_id -> ClientCertificate
+_access_associations = AccountRegionScopedDict()  # association ARN -> DomainNameAccessAssociation
 
 
 _GATEWAY_RESPONSE_TYPES = (
@@ -813,6 +817,8 @@ def get_state():
         "gateway_responses": copy.deepcopy(_gateway_responses),
         "deployed_gateway_responses": copy.deepcopy(_deployed_gateway_responses),
         "documentation_parts": copy.deepcopy(_documentation_parts),
+        "client_certificates": copy.deepcopy(_client_certificates),
+        "access_associations": copy.deepcopy(_access_associations),
     }
 
 
@@ -901,6 +907,14 @@ def _restore_child_store(store, restored, parent_regions, parent_name_from_key=l
         parent_name = parent_name_from_key(key)
         region = parent_regions.get((account_id, parent_name), boot_region)
         store.set_scoped(account_id, region, key, value)
+
+
+def find_api_owner(api_id):
+    """The account owning REST API ``api_id``, or None. Only for invoking it."""
+    for (stored_account, _region, stored_api_id), _api in _rest_apis.all_items():
+        if stored_api_id == api_id:
+            return stored_account
+    return None
 
 
 def find_api_scope(api_id):
@@ -1081,6 +1095,8 @@ def load_persisted_state(data):
     _restore_child_store(_usage_plan_keys, data.get("usage_plan_keys", {}), plan_regions)
     _restore_child_store(_base_path_mappings, data.get("base_path_mappings", {}), domain_regions)
     _restore_child_store(_account_settings, data.get("account_settings", {}), {})
+    _restore_child_store(_client_certificates, data.get("client_certificates", {}), {})
+    _restore_child_store(_access_associations, data.get("access_associations", {}), {})
 
 
 def reset():
@@ -1103,6 +1119,8 @@ def reset():
     _gateway_responses.clear()
     _deployed_gateway_responses.clear()
     _documentation_parts.clear()
+    _client_certificates.clear()
+    _access_associations.clear()
 
 
 # ---- Control plane router ----
@@ -1184,6 +1202,35 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PATCH":
                 return _update_usage_plan(plan_id, data)
 
+    if top == "clientcertificates":
+        cert_id = parts[1] if len(parts) > 1 else None
+        if not cert_id:
+            if method == "GET":
+                return _get_client_certificates(query_params)
+            if method == "POST":
+                return _generate_client_certificate(data)
+        else:
+            if method == "GET":
+                return _get_client_certificate(cert_id)
+            if method == "PATCH":
+                return _update_client_certificate(cert_id, data)
+            if method == "DELETE":
+                return _delete_client_certificate(cert_id)
+
+    if top == "domainnameaccessassociations":
+        association_arn = urllib.parse.unquote("/".join(parts[1:])) if len(parts) > 1 else None
+        if not association_arn:
+            if method == "GET":
+                return _get_access_associations(query_params)
+            if method == "POST":
+                return _create_access_association(data)
+        elif method == "DELETE":
+            return _delete_access_association(association_arn)
+
+    if top == "rejectdomainnameaccessassociations" and method == "POST":
+        return _reject_access_association(_qp(query_params, "domainNameAccessAssociationArn", ""),
+                                          _qp(query_params, "domainNameArn", ""))
+
     if top == "domainnames":
         domain_name = parts[1] if len(parts) > 1 else None
         sub = parts[2] if len(parts) > 2 else None
@@ -1214,6 +1261,8 @@ async def handle_request(method, path, headers, body, query_params):
     if top == "restapis":
         # /restapis
         if len(parts) == 1:
+            if method == "POST" and _qp(query_params, "mode") == "import":
+                return _import_rest_api_request(body)
             if method == "POST":
                 return _create_rest_api(data)
             if method == "GET":
@@ -1229,6 +1278,8 @@ async def handle_request(method, path, headers, body, query_params):
                 return _delete_rest_api(api_id)
             if method == "PATCH":
                 return _update_rest_api(api_id, data)
+            if method == "PUT":
+                return _put_rest_api(api_id, body, query_params)
 
         sub = parts[2] if len(parts) > 2 else None
 
@@ -1598,6 +1649,22 @@ def authentication_error_response(api_id, stage_name, error, headers, query_para
     }
     with request_scope(*scope):
         return _gateway_error_response(_GatewayError(response_type, error.message, error_type), request)
+
+
+def cross_account_denial_response(api_id, stage_name, denied, headers, query_params, owner_scope):
+    """AWS's 403 for another account's call no policy allows; None (an explicit Deny) keeps the default."""
+    if denied.decision == "Deny":
+        return None
+    with request_scope(*owner_scope):
+        stage = stages_for_api(api_id).get(stage_name)
+        if stage is None:
+            return None
+        request = {
+            "api_id": api_id, "stage_name": stage_name, "stage": stage, "headers": headers or {},
+            "query_params": query_params or {}, "path_params": {}, "resource_path": "", "request_id": new_uuid(),
+        }
+        message = f"User: {denied.principal_arn} is not authorized to access this resource"
+        return _gateway_error_response(_GatewayError("ACCESS_DENIED", message), request)
 
 
 def method_authorization_type(api_id, stage_name, method, path):
@@ -3814,11 +3881,70 @@ def _import_rest_api(spec, base_data=None):
 
     _status, _headers, body = _create_rest_api(data)
     api_id = json.loads(body)["id"]
+    _import_definition(api_id, spec)
+    return api_id
+
+
+def _import_definition(api_id, spec):
     scheme_map = _import_security_schemes(api_id, spec)
     default_security = spec.get("security")
     for path, path_item in (spec.get("paths") or {}).items():
         _import_path_item(api_id, path, path_item, scheme_map, default_security)
-    return api_id
+
+
+def _parse_definition(body):
+    """The OpenAPI or Swagger document of an ImportRestApi/PutRestApi body (JSON or YAML), or None."""
+    try:
+        text = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else (body or "")
+        spec = yaml.safe_load(text)
+    except (UnicodeDecodeError, yaml.YAMLError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _import_rest_api_request(body):
+    spec = _parse_definition(body)
+    if spec is None:
+        return _v1_error("BadRequestException", "Unable to determine OAS/Swagger version", 400)
+    api_id = _import_rest_api(spec)
+    return _v1_response(_rest_api_view(_rest_apis.get(api_id)), 201)
+
+
+def _put_rest_api(api_id, body, query_params):
+    """PutRestApi: merge (the default) adds the definition to the API; overwrite replaces its resources,
+    methods and authorizers with it."""
+    mode = _qp(query_params, "mode") or "merge"
+    if mode not in ("merge", "overwrite"):
+        return _v1_error("ValidationException",
+                         f"1 validation error detected: Value '{mode}' at 'mode' failed to satisfy constraint: "
+                         "Member must satisfy enum value set: [overwrite, merge]", 400)
+    api = _rest_apis.get(api_id)
+    if not api:
+        return _v1_error("NotFoundException", f"Invalid API identifier specified {get_account_id()}:{api_id}", 404)
+    spec = _parse_definition(body)
+    if spec is None:
+        return _v1_error("BadRequestException", "Unable to determine OAS/Swagger version", 400)
+    if mode == "overwrite":
+        root = next(r for r in _resources.get(api_id, {}).values() if r.get("path") == "/")
+        root["resourceMethods"] = {}
+        _resources[api_id] = {root["id"]: root}
+        _authorizers_v1[api_id] = {}
+    else:
+        replaced = set(_security_schemes(spec))
+        _authorizers_v1[api_id] = {aid: a for aid, a in _authorizers_v1.get(api_id, {}).items()
+                                   if a.get("name") not in replaced}
+    _import_definition(api_id, spec)
+    # The definition's info names and describes the API, in either mode.
+    info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
+    if info.get("title"):
+        api["name"] = info["title"]
+    if info.get("description"):
+        api["description"] = info["description"]
+    else:
+        api.pop("description", None)
+    if info.get("version"):
+        api["version"] = str(info["version"])
+    return _v1_response(_rest_api_view(api))
 
 
 def _import_path_item(api_id, path, path_item, scheme_map=None, default_security=None):
@@ -3842,9 +3968,14 @@ def _import_path_item(api_id, path, path_item, scheme_map=None, default_security
             resource_id = child
 
     for method, operation in path_item.items():
-        if method.lower() in _OPENAPI_HTTP_METHODS:
-            _import_operation(api_id, resource_id, method.upper(), operation,
-                              scheme_map, default_security)
+        if method == "x-amazon-apigateway-any-method":
+            http_method = "ANY"
+        elif method.lower() in _OPENAPI_HTTP_METHODS:
+            http_method = method.upper()
+        else:
+            continue
+        _import_operation(api_id, resource_id, http_method, operation,
+                          scheme_map, default_security)
 
 
 def _import_operation(api_id, resource_id, http_method, operation,
@@ -4620,6 +4751,9 @@ def _update_stage(api_id, stage_name, data):
     if not stage:
         return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
+    for op in patch_ops:
+        if op.get("path") == "/clientCertificateId" and op.get("value") and op["value"] not in _client_certificates:
+            return _v1_error("BadRequestException", "Invalid client certificate id specified", 400)
     _apply_stage_patch(stage, patch_ops)
     stage["lastUpdatedDate"] = _now_unix()
     return _v1_response(stage)
@@ -5155,15 +5289,17 @@ def _create_domain_name(data):
     domain_name = data.get("domainName", "")
     if not domain_name:
         return _v1_error("BadRequestException", "Domain name is required", 400)
+    token = new_uuid().replace("-", "")
     dn = {
         "domainName": domain_name,
         "certificateName": data.get("certificateName", ""),
         "certificateArn": data.get("certificateArn", ""),
+        "certificateUploadDate": _now_unix(),
         "regionalCertificateName": data.get("regionalCertificateName", ""),
         "regionalCertificateArn": data.get("regionalCertificateArn", ""),
-        "distributionDomainName": f"{domain_name}.cloudfront.net",
+        "distributionDomainName": f"d{token[:13]}.cloudfront.net",
         "distributionHostedZoneId": "Z2FDTNDATAQYW2",
-        "regionalDomainName": f"{domain_name}.execute-api.{get_region()}.amazonaws.com",
+        "regionalDomainName": f"d-{token[13:23]}.execute-api.{get_region()}.amazonaws.com",
         "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
         "endpointConfiguration": data.get("endpointConfiguration", {"types": ["REGIONAL"]}),
         "endpointAccessMode": data.get("endpointAccessMode", ""),
@@ -5174,22 +5310,80 @@ def _create_domain_name(data):
         # new values (e.g. SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 in
         # 2026-03). Accept whatever the caller sends; default mirrors AWS.
         "securityPolicy": data.get("securityPolicy", "TLS_1_2"),
+        "domainNameStatus": "AVAILABLE",
         "tags": data.get("tags", {}),
     }
+    # Only a private custom domain name has an id, and its ARN carries the account and id.
+    if "PRIVATE" in (dn["endpointConfiguration"] or {}).get("types", []):
+        dn["endpointConfiguration"] = {"ipAddressType": "dualstack", **dn["endpointConfiguration"]}
+        dn["domainNameId"] = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10))
+        dn["domainNameArn"] = (f"arn:aws:apigateway:{get_region()}:{get_account_id()}:"
+                               f"/domainnames/{domain_name}+{dn['domainNameId']}")
+        if data.get("policy"):
+            dn["policy"] = _private_domain_policy(data["policy"], domain_name, dn["domainNameId"])
     _domain_names[domain_name] = dn
     _base_path_mappings[domain_name] = {}
-    return _v1_response(dn, 201)
+    return _v1_response(_domain_name_view(dn, with_tags=bool(dn["tags"])), 201)
+
+
+def _private_domain_policy(policy, domain_name, domain_name_id):
+    """The policy as AWS stores it: compact, with an "execute-api:/*" resource naming this domain."""
+    try:
+        doc = json.loads(policy)
+    except (TypeError, ValueError):
+        return policy
+    arn = f"arn:aws:execute-api:{get_region()}:{get_account_id()}:/domainnames/{domain_name}+{domain_name_id}"
+    for statement in doc.get("Statement", []) if isinstance(doc, dict) else []:
+        if isinstance(statement, dict) and statement.get("Resource") in ("execute-api:/*", ["execute-api:/*"]):
+            statement["Resource"] = arn
+    return json.dumps(doc, separators=(",", ":"))
+
+
+def _domain_name_view(dn, with_tags=True):
+    """The fields AWS returns for the domain's endpoint type, none empty (AWS capture, REGIONAL and PRIVATE)."""
+    endpoint = dict(dn.get("endpointConfiguration") or {"types": ["REGIONAL"]})
+    types = endpoint.get("types") or ["REGIONAL"]
+    endpoint.setdefault("ipAddressType", "ipv4")
+    name = dn["domainName"]
+    arn = dn.get("domainNameArn") or f"arn:aws:apigateway:{get_region()}::/domainnames/{name}"
+    view = {"domainName": name}
+    if dn.get("domainNameId"):
+        view["domainNameId"] = dn["domainNameId"]
+    view["domainNameArn"] = arn
+    for key in ("certificateName", "certificateArn", "certificateUploadDate"):
+        if dn.get(key):
+            view[key] = dn[key]
+    if "REGIONAL" in types:
+        for key in ("regionalDomainName", "regionalHostedZoneId", "regionalCertificateName", "regionalCertificateArn"):
+            if dn.get(key):
+                view[key] = dn[key]
+    if "EDGE" in types:
+        for key in ("distributionDomainName", "distributionHostedZoneId"):
+            if dn.get(key):
+                view[key] = dn[key]
+    view["endpointConfiguration"] = endpoint
+    view["domainNameStatus"] = "AVAILABLE"
+    view["securityPolicy"] = dn.get("securityPolicy") or "TLS_1_2"
+    for key in ("endpointAccessMode", "mutualTlsAuthentication", "ownershipVerificationCertificateArn", "policy"):
+        if dn.get(key):
+            view[key] = dn[key]
+    tags = dict(_v1_tags.get(arn) or dn.get("tags") or {})
+    if with_tags or tags:
+        view["tags"] = tags
+    view["routingMode"] = dn.get("routingMode") or "BASE_PATH_MAPPING_ONLY"
+    return view
 
 
 def _get_domain_names(query_params):
-    return _v1_paginated_response(list(_domain_names.values()), query_params)
+    return _v1_paginated_response([_domain_name_view(dn, with_tags=False) for dn in _domain_names.values()],
+                                  query_params)
 
 
 def _get_domain_name(domain_name):
     dn = _domain_names.get(domain_name)
     if not dn:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    return _v1_response(dn)
+    return _v1_response(_domain_name_view(dn))
 
 
 def _delete_domain_name(domain_name):
@@ -5197,6 +5391,149 @@ def _delete_domain_name(domain_name):
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     _domain_names.pop(domain_name, None)
     _base_path_mappings.pop(domain_name, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Client certificates ----
+
+_CLIENT_CERTIFICATE_NOT_FOUND = "Invalid client certificate id specified"
+
+
+def _client_certificate_arn(cert_id):
+    return f"arn:aws:apigateway:{get_region()}::/clientcertificates/{cert_id}"
+
+
+def _client_certificate_view(cert):
+    return {**cert, "tags": dict(_v1_tags.get(_client_certificate_arn(cert["clientCertificateId"]), {}))}
+
+
+def _generate_client_certificate(data):
+    from ministack.core import x509_utils
+
+    cert_id = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    created = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    try:
+        expires = created.replace(year=created.year + 1)
+    except ValueError:  # Feb 29
+        expires = created.replace(year=created.year + 1, day=28)
+    cert = {"clientCertificateId": cert_id, "description": data.get("description", ""),
+            "createdDate": created.timestamp(), "expirationDate": expires.timestamp()}
+    if x509_utils.HAS_CRYPTO:
+        # AWS: self-signed C=US, L=Seattle, CN=ApiGateway, PEM with CRLF line endings
+        pem = x509_utils.generate_self_signed("US", "Seattle", "ApiGateway", created, expires)
+        cert["pemEncodedCertificate"] = pem.strip().replace("\n", "\r\n")
+    _client_certificates[cert_id] = cert
+    _v1_tags[_client_certificate_arn(cert_id)] = dict(data.get("tags") or {})
+    return _v1_response(_client_certificate_view(cert), 201)
+
+
+def _get_client_certificate(cert_id):
+    cert = _client_certificates.get(cert_id)
+    if not cert:
+        return _v1_error("NotFoundException", _CLIENT_CERTIFICATE_NOT_FOUND, 404)
+    return _v1_response(_client_certificate_view(cert))
+
+
+def _get_client_certificates(query_params):
+    return _v1_paginated_response([_client_certificate_view(c) for c in _client_certificates.values()],
+                                  query_params)
+
+
+def _update_client_certificate(cert_id, data):
+    cert = _client_certificates.get(cert_id)
+    if not cert:
+        return _v1_error("NotFoundException", _CLIENT_CERTIFICATE_NOT_FOUND, 404)
+    for op in data.get("patchOperations", []):
+        if op.get("path") != "/description":
+            return _v1_error("BadRequestException", f"Invalid patch path  '{op.get('path')}' specified for op "
+                             f"'{op.get('op')}'. Must be one of: [/description]", 400)
+    for op in data.get("patchOperations", []):
+        if op.get("op") in ("replace", "add"):
+            cert["description"] = op.get("value", "")
+    return _v1_response(_client_certificate_view(cert))
+
+
+def _delete_client_certificate(cert_id):
+    if cert_id not in _client_certificates:
+        return _v1_error("NotFoundException", _CLIENT_CERTIFICATE_NOT_FOUND, 404)
+    _client_certificates.pop(cert_id, None)
+    _v1_tags.pop(_client_certificate_arn(cert_id), None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Domain name access associations (private custom domains) ----
+
+def _private_domain_by_arn(domain_name_arn):
+    for name, dn in _domain_names.items():
+        if dn.get("domainNameArn") == domain_name_arn:
+            return name, dn
+    return None, None
+
+
+def _vpc_endpoint_exists(vpce_id):
+    from ministack.services import ec2
+    return vpce_id in ec2._vpc_endpoints
+
+
+def _access_association_view(association):
+    arn = association["domainNameAccessAssociationArn"]
+    return {**association, "tags": dict(_v1_tags.get(arn, {}))}
+
+
+def _create_access_association(data):
+    domain_name_arn = data.get("domainNameArn", "")
+    source_type = data.get("accessAssociationSourceType", "")
+    source = data.get("accessAssociationSource", "")
+    if source_type != "VPCE":
+        return _v1_error("BadRequestException", f"Invalid accessAssociationSourceType: {source_type}", 400)
+    name, dn = _private_domain_by_arn(domain_name_arn)
+    if name is None:
+        return _v1_error("BadRequestException", "Domain not found", 400)
+    if not _vpc_endpoint_exists(source):
+        return _v1_error("BadRequestException", f"{source} is not a valid VPC endpoint id", 400)
+    arn = (f"arn:aws:apigateway:{get_region()}:{get_account_id()}:/domainnameaccessassociations/"
+           f"domainname/{name}+{dn['domainNameId']}/vpcesource/{source}")
+    if arn in _access_associations:
+        return _v1_error("BadRequestException",
+                         "The domain name access association between this VPC endpoint and domain name already exists.",
+                         400)
+    association = {"domainNameAccessAssociationArn": arn, "domainNameArn": domain_name_arn,
+                   "accessAssociationSourceType": source_type, "accessAssociationSource": source}
+    _access_associations[arn] = association
+    _v1_tags[arn] = dict(data.get("tags") or {})
+    return _v1_response(_access_association_view(association), 201)
+
+
+def _get_access_associations(query_params):
+    owner = _qp(query_params, "resourceOwner") or "SELF"
+    if owner == "OTHER_ACCOUNTS":
+        # Associations other accounts made to this account's domains; MiniStack's are all made by the owner.
+        items = []
+    else:
+        items = [_access_association_view(a) for a in _access_associations.values()]
+    return _v1_paginated_response(items, query_params)
+
+
+_NO_ACCESS_ASSOCIATIONS = "This private custom domain name doesn't have any domain name access associations."
+
+
+def _delete_access_association(association_arn):
+    if association_arn not in _access_associations:
+        return _v1_error("NotFoundException", _NO_ACCESS_ASSOCIATIONS, 404)
+    _access_associations.pop(association_arn, None)
+    _v1_tags.pop(association_arn, None)
+    return 202, {}, b""
+
+
+def _reject_access_association(association_arn, domain_name_arn):
+    association = _access_associations.get(association_arn)
+    # The owner's own associations are not rejectable: AWS answers 404 and keeps them.
+    if (not association or association.get("domainNameArn") != domain_name_arn
+            or _private_domain_by_arn(domain_name_arn)[0] is None
+            or association_arn.split(":")[4] == get_account_id()):
+        return _v1_error("NotFoundException", _NO_ACCESS_ASSOCIATIONS, 404)
+    _access_associations.pop(association_arn, None)
+    _v1_tags.pop(association_arn, None)
     return 202, {}, b""
 
 
@@ -5245,6 +5582,12 @@ def _resolve_v1_tag_resource_arn(resource_arn):
     except ArnParseError:
         return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
 
+    if (spec.service == "apigateway" and spec.account_id == get_account_id() and spec.region == get_region()
+            and spec.resource.startswith("/domainnameaccessassociations/")):
+        if resource_arn not in _access_associations:
+            return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+        return resource_arn, None
+
     if (
         spec.partition != "aws"
         or spec.service != "apigateway"
@@ -5274,6 +5617,10 @@ def _resolve_v1_tag_resource_arn(resource_arn):
             if not _domain_names.contains_scoped(account_id, spec.region, resource_id):
                 return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
             return f"arn:aws:apigateway:{spec.region}::/domainnames/{resource_id}", None
+        if resource_type == "clientcertificates":
+            if not _client_certificates.contains_scoped(account_id, spec.region, resource_id):
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/clientcertificates/{resource_id}", None
         return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
 
     if (

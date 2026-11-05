@@ -3,8 +3,10 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
@@ -1585,6 +1587,125 @@ def test_api_policy_signed_call_on_a_method_without_authorization_contract(auth_
                     assert status == 200
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def _account_client(service, account):
+    """A client whose 12-digit access key selects the MiniStack account."""
+    return boto3.client(service, endpoint_url=_endpoint, aws_access_key_id=account,
+                        aws_secret_access_key="test", region_name="us-east-1")
+
+
+def _mock_ping_api(apigw, authorization):
+    """A REST API deployed to stage ``s`` whose GET /ping answers 200 {"pong": true} from a MOCK."""
+    api_id = apigw.create_rest_api(name=f"any-caller-{_uuid_mod.uuid4().hex[:8]}")["id"]
+    root_id = next(r["id"] for r in apigw.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw.create_resource(restApiId=api_id, parentId=root_id, pathPart="ping")["id"]
+    method = {"restApiId": api_id, "resourceId": resource_id, "httpMethod": "GET"}
+    apigw.put_method(**method, authorizationType=authorization)
+    apigw.put_integration(**method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+    apigw.put_method_response(**method, statusCode="200")
+    apigw.put_integration_response(**method, statusCode="200",
+                                   responseTemplates={"application/json": '{"pong": true}'})
+    apigw.create_deployment(restApiId=api_id, stageName="s")
+    return api_id
+
+
+def _http_get(api_id, path, headers):
+    """GET /s/<path> of a deployed API over HTTP with *headers*, unsigned."""
+    import urllib.error
+    import urllib.request
+
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    request = urllib.request.Request(f"http://{host}/s/{path}", headers={"Host": host, **headers}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_method_without_authorization_answers_any_caller_account_contract(auth_enabled):
+    """A REST API in another account answers an unsigned call (capture A1) and one carrying another
+    account's Authorization header (capture A2): AWS answered 200 {"pong": true} to both."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "NONE")
+    other_account = ("AWS4-HMAC-SHA256 Credential=444455556666/20260101/us-east-1/execute-api/aws4_request, "
+                     "SignedHeaders=host, Signature=0")
+    try:
+        for headers in ({}, {"Authorization": other_account}):
+            status, body = _http_get(api_id, "ping", headers)
+            assert (status, json.loads(body)) == (200, {"pong": True}), (headers, body)
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@contextlib.contextmanager
+def _other_account_user(account):
+    """``(credentials, ARN)`` of an IAM user in *account* allowed to invoke any API; deleted on exit."""
+    from botocore.credentials import Credentials
+
+    iam = _account_client("iam", account)
+    name = f"other-account-{_uuid_mod.uuid4().hex[:8]}"
+    arn = iam.create_user(UserName=name)["User"]["Arn"]
+    iam.put_user_policy(UserName=name, PolicyName="invoke", PolicyDocument=json.dumps(_ALLOW_INVOKE))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    try:
+        yield Credentials(key["AccessKeyId"], key["SecretAccessKey"]), arn
+    finally:
+        iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user_policy(UserName=name, PolicyName="invoke")
+        iam.delete_user(UserName=name)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_method_without_authorization_answers_another_accounts_user_contract(auth_enabled):
+    """A call signed by an IAM user of another account reaches a method without authorization
+    (capture A3: AWS answered 200 {"pong": true}); its valid key is checked in its own account."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "NONE")
+    try:
+        with _other_account_user("444455556666") as (credentials, _arn):
+            status, _headers, body = _contract_invoke(api_id, "ping", credentials)
+        assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_of_another_account_contract(auth_enabled):
+    """An AWS_IAM method of another account with no REST API policy refuses the caller under AUTH=true
+    (capture A4: 403 AccessDeniedException {"Message": "User: <caller> is not authorized to access this resource"})."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "AWS_IAM")
+    try:
+        with _other_account_user("444455556666") as (credentials, arn):
+            status, headers, body = _contract_invoke(api_id, "ping", credentials)
+        if auth_enabled:
+            assert (status, headers.get("x-amzn-ErrorType")) == (403, "AccessDeniedException"), body
+            assert json.loads(body) == {"Message": f"User: {arn} is not authorized to access this resource"}
+        else:
+            assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_allowed_to_another_account_by_api_policy_contract(auth_enabled):
+    """A REST API policy allowing another account lets its user call an AWS_IAM method
+    (capture A5: AWS answered 200 {"pong": true})."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "AWS_IAM")
+    owner.update_rest_api(restApiId=api_id, patchOperations=[{
+        "op": "replace", "path": "/policy",
+        "value": json.dumps(_api_policy(("Allow", {"AWS": "arn:aws:iam::444455556666:root"})))}])
+    owner.create_deployment(restApiId=api_id, stageName="s")
+    try:
+        with _other_account_user("444455556666") as (credentials, _arn):
+            status, _headers, body = _contract_invoke(api_id, "ping", credentials)
+        assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
 
 
 def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):
@@ -6275,3 +6396,326 @@ def test_apigwv1_execute_sqs_integration_without_integration_responses_is_500(ap
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
         sqs.delete_queue(QueueUrl=qurl)
+
+
+def test_apigwv1_domain_name_status_and_private_id(apigw_v1):
+    """A domain reports domainNameStatus AVAILABLE; only a private one has a domainNameId, and its ARN carries
+    the account and id (AWS CLI reference, create-domain-name examples)."""
+    public = apigw_v1.create_domain_name(domainName=f"pub-{_uuid_mod.uuid4().hex[:6]}.example.com",
+                                         endpointConfiguration={"types": ["REGIONAL"]})
+    try:
+        # Captured on AWS: a REGIONAL domain has an ARN with no account, and only the fields below;
+        # GetDomainName adds tags.
+        regional_keys = {"domainName", "domainNameArn", "certificateUploadDate", "regionalDomainName",
+                         "regionalHostedZoneId", "endpointConfiguration", "domainNameStatus", "securityPolicy",
+                         "routingMode"}
+        assert set(public) - {"ResponseMetadata"} == regional_keys
+        assert public["domainNameArn"] == f"arn:aws:apigateway:us-east-1::/domainnames/{public['domainName']}"
+        assert re.fullmatch(r"d-[a-z0-9]{10}\.execute-api\.us-east-1\.amazonaws\.com", public["regionalDomainName"])
+        assert public["endpointConfiguration"] == {"types": ["REGIONAL"], "ipAddressType": "ipv4"}
+        assert (public["domainNameStatus"], public["securityPolicy"], public["routingMode"]) == (
+            "AVAILABLE", "TLS_1_2", "BASE_PATH_MAPPING_ONLY")
+        got = apigw_v1.get_domain_name(domainName=public["domainName"])
+        assert set(got) - {"ResponseMetadata"} == regional_keys | {"tags"} and got["tags"] == {}
+        listed = {d["domainName"]: d for d in apigw_v1.get_domain_names()["items"]}
+        assert set(listed[public["domainName"]]) == regional_keys
+
+        name = f"priv-{_uuid_mod.uuid4().hex[:6]}.example.com"
+        private = apigw_v1.create_domain_name(domainName=name, endpointConfiguration={"types": ["PRIVATE"]})
+        try:
+            assert re.fullmatch(r"[a-z0-9]{10}", private["domainNameId"])
+            assert private["endpointConfiguration"] == {"types": ["PRIVATE"], "ipAddressType": "dualstack"}
+            account = make_client("sts").get_caller_identity()["Account"]
+            assert private["domainNameArn"] == (
+                f"arn:aws:apigateway:us-east-1:{account}:/domainnames/{name}+{private['domainNameId']}")
+            got = apigw_v1.get_domain_name(domainName=name)
+            assert (got["domainNameId"], got["domainNameArn"]) == (private["domainNameId"], private["domainNameArn"])
+        finally:
+            apigw_v1.delete_domain_name(domainName=name)
+    finally:
+        apigw_v1.delete_domain_name(domainName=public["domainName"])
+
+
+_PUT_REST_API_SPEC = {
+    "openapi": "3.0.1", "info": {"title": "repro", "version": "1"},
+    "paths": {"/ping": {"get": {"x-amazon-apigateway-integration": {
+        "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"}}}}},
+}
+
+
+def _api_paths(apigw_v1, api_id):
+    return sorted(r["path"] for r in apigw_v1.get_resources(restApiId=api_id)["items"])
+
+
+def test_apigwv1_put_rest_api_names_the_api_from_the_definition(apigw_v1):
+    """Captured on AWS: PutRestApi, in either mode, takes the API's name and description from info, removes a
+    description the definition doesn't give, clears authorizers on overwrite, and ignores unknown extensions."""
+    api_id = apigw_v1.create_rest_api(name=f"put-name-{_uuid_mod.uuid4().hex[:8]}", description="before")["id"]
+    try:
+        apigw_v1.create_authorizer(restApiId=api_id, name="keep-me", type="TOKEN",
+                                   identitySource="method.request.header.Authorization",
+                                   authorizerUri="arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                                                 "arn:aws:lambda:us-east-1:000000000000:function:none/invocations")
+        spec = {**_PUT_REST_API_SPEC, "info": {"title": "renamed", "description": "from the definition", "version": "1"}}
+        api = apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=json.dumps(spec))
+        assert (api["name"], api["description"], api["version"]) == ("renamed", "from the definition", "1")
+        assert apigw_v1.get_authorizers(restApiId=api_id)["items"] == []
+        api = apigw_v1.put_rest_api(restApiId=api_id, body=b"openapi: 3.0.1\ninfo: {title: y, version: '1'}\npaths: {}\n")
+        assert api["name"] == "y" and "description" not in api
+        api = apigw_v1.put_rest_api(restApiId=api_id, mode="merge", failOnWarnings=True,
+                                    body=json.dumps({**spec, "x-unknown-ext": 1}))
+        assert api["name"] == "renamed"
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_private_domain_policy_names_the_domain(apigw_v1):
+    """Captured on AWS: a private domain's policy is stored compact, with an execute-api:/* resource
+    rewritten to the domain's execute-api ARN."""
+    name = f"pol-{_uuid_mod.uuid4().hex[:6]}.example.internal"
+    policy = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*",
+                                                                  "Action": "execute-api:Invoke",
+                                                                  "Resource": ["execute-api:/*"]}]})
+    domain = apigw_v1.create_domain_name(domainName=name, endpointConfiguration={"types": ["PRIVATE"]}, policy=policy)
+    try:
+        region, account = domain["domainNameArn"].split(":")[3:5]
+        assert domain["policy"] == json.dumps({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": "*", "Action": "execute-api:Invoke",
+            "Resource": f"arn:aws:execute-api:{region}:{account}:/domainnames/{name}+{domain['domainNameId']}"}]},
+            separators=(",", ":"))
+    finally:
+        apigw_v1.delete_domain_name(domainName=name)
+
+
+def test_apigwv1_update_stage_needs_an_existing_client_certificate(apigw_v1):
+    """Captured on AWS: UpdateStage with a clientCertificateId that does not exist answers 400."""
+    api_id = apigw_v1.create_rest_api(name=f"stage-cc-{_uuid_mod.uuid4().hex[:8]}")["id"]
+    try:
+        root = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+        apigw_v1.put_method(restApiId=api_id, resourceId=root, httpMethod="GET", authorizationType="NONE")
+        apigw_v1.put_integration(restApiId=api_id, resourceId=root, httpMethod="GET", type="MOCK")
+        apigw_v1.create_deployment(restApiId=api_id, stageName="s")
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.update_stage(restApiId=api_id, stageName="s", patchOperations=[
+                {"op": "replace", "path": "/clientCertificateId", "value": "zzzzzz"}])
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "BadRequestException", "Invalid client certificate id specified")
+        cert = apigw_v1.generate_client_certificate(description="stage")["clientCertificateId"]
+        stage = apigw_v1.update_stage(restApiId=api_id, stageName="s", patchOperations=[
+            {"op": "replace", "path": "/clientCertificateId", "value": cert}])
+        assert stage["clientCertificateId"] == cert
+        apigw_v1.delete_client_certificate(clientCertificateId=cert)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_put_rest_api_merge_and_overwrite(apigw_v1):
+    """#2485: PutRestApi loads an OpenAPI body into an existing API, as Terraform's
+    aws_api_gateway_rest_api with a body does; merge (the default) adds, overwrite replaces."""
+    api_id = apigw_v1.create_rest_api(name=f"put-{_uuid_mod.uuid4().hex[:8]}")["id"]
+    try:
+        api = apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=json.dumps(_PUT_REST_API_SPEC))
+        assert api["id"] == api_id and api["rootResourceId"]
+        assert _api_paths(apigw_v1, api_id) == ["/", "/ping"]
+        ping = next(r for r in apigw_v1.get_resources(restApiId=api_id)["items"] if r["path"] == "/ping")
+        assert apigw_v1.get_integration(restApiId=api_id, resourceId=ping["id"], httpMethod="GET")["type"] == "MOCK"
+
+        more = {**_PUT_REST_API_SPEC, "paths": {"/pong": {"post": {}}}}
+        apigw_v1.put_rest_api(restApiId=api_id, body=yaml.safe_dump(more))
+        assert _api_paths(apigw_v1, api_id) == ["/", "/ping", "/pong"]
+        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=json.dumps(more), failOnWarnings=True)
+        assert _api_paths(apigw_v1, api_id) == ["/", "/pong"]
+
+        # Errors as captured on AWS (us-east-1, 2026-10-29).
+        account = make_client("sts").get_caller_identity()["Account"]
+        for kwargs, code, message in (
+                ({"restApiId": "nosuchapi", "body": json.dumps(_PUT_REST_API_SPEC)}, "NotFoundException",
+                 f"Invalid API identifier specified {account}:nosuchapi"),
+                ({"restApiId": api_id, "body": b"not an api definition"}, "BadRequestException",
+                 "Unable to determine OAS/Swagger version"),
+                ({"restApiId": api_id, "mode": "replace", "body": json.dumps(_PUT_REST_API_SPEC)}, "ValidationException",
+                 "1 validation error detected: Value 'replace' at 'mode' failed to satisfy constraint: "
+                 "Member must satisfy enum value set: [overwrite, merge]")):
+            with pytest.raises(ClientError) as exc:
+                apigw_v1.put_rest_api(**kwargs)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (code, message)
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_import_rest_api_loads_the_definition(apigw_v1):
+    """ImportRestApi creates the API from the definition: its title as the name and its paths as resources."""
+    api = apigw_v1.import_rest_api(body=json.dumps(_PUT_REST_API_SPEC))
+    try:
+        assert api["name"] == "repro"
+        assert _api_paths(apigw_v1, api["id"]) == ["/", "/ping"]
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api["id"])
+
+
+_MOCK_OPERATION = {"x-amazon-apigateway-integration": {
+    "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
+    "responses": {"default": {"statusCode": "200"}}}}
+_ANY_METHOD_SPEC = {
+    "swagger": "2.0", "info": {"title": "any-method", "version": "1"},
+    "paths": {
+        "/orgs/{proxy+}": {"x-amazon-apigateway-any-method": _MOCK_OPERATION, "options": _MOCK_OPERATION},
+        "/both": {"get": _MOCK_OPERATION, "x-amazon-apigateway-any-method": _MOCK_OPERATION},
+    },
+}
+
+
+def _resource_methods(apigw_v1, api_id):
+    return {r["path"]: sorted(r.get("resourceMethods") or {})
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]}
+
+
+@pytest.mark.parametrize("mode", ["import", "put"])
+def test_apigwv1_import_creates_the_any_method(apigw_v1, mode):
+    """Captured on AWS: ImportRestApi and PutRestApi make x-amazon-apigateway-any-method an ANY method,
+    and a request with a verb that has no method of its own goes to ANY."""
+    body = json.dumps(_ANY_METHOD_SPEC)
+    if mode == "import":
+        api_id = apigw_v1.import_rest_api(body=body)["id"]
+    else:
+        api_id = apigw_v1.create_rest_api(name=f"any-{_uuid_mod.uuid4().hex[:8]}")["id"]
+        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=body)
+    try:
+        methods = _resource_methods(apigw_v1, api_id)
+        assert methods["/orgs/{proxy+}"] == ["ANY", "OPTIONS"]
+        assert methods["/both"] == ["ANY", "GET"]
+
+        proxy_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+                        if r["path"] == "/orgs/{proxy+}")
+        method = apigw_v1.get_method(restApiId=api_id, resourceId=proxy_id, httpMethod="ANY")
+        assert method["httpMethod"] == "ANY"
+        assert method["methodIntegration"]["type"] == "MOCK"
+
+        apigw_v1.create_deployment(restApiId=api_id, stageName="test")
+        url = f"{_endpoint}/restapis/{api_id}/test/_user_request_/orgs/org1/a"
+        req = urllib.request.Request(url, data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def test_apigwv1_client_certificate_lifecycle(apigw_v1):
+    """#2486: GenerateClientCertificate and the get, list, update and delete calls, tags included,
+    and a stage takes the certificate."""
+    cert = apigw_v1.generate_client_certificate(description="repro", tags={"env": "dev"})
+    cert_id = cert["clientCertificateId"]
+    try:
+        assert cert["description"] == "repro" and cert["tags"] == {"env": "dev"}
+        # As captured on AWS: a 6-character id, valid until the same date next year, self-signed
+        # C=US, L=Seattle, CN=ApiGateway with CRLF line endings.
+        assert len(cert_id) == 6 and cert_id.isalnum() and cert_id == cert_id.lower()
+        created, expires = cert["createdDate"], cert["expirationDate"]
+        assert (expires.year, expires.month, expires.day) == (created.year + 1, created.month, created.day)
+        if cert.get("pemEncodedCertificate"):
+            pem = cert["pemEncodedCertificate"]
+            assert pem.startswith("-----BEGIN CERTIFICATE-----\r\n") and "\n" not in pem.replace("\r\n", "")
+            from cryptography import x509
+            parsed = x509.load_pem_x509_certificate(pem.encode())
+            assert parsed.subject.rfc4514_string() == parsed.issuer.rfc4514_string() == "CN=ApiGateway,L=Seattle,C=US"
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.update_client_certificate(
+                clientCertificateId=cert_id, patchOperations=[{"op": "replace", "path": "/nope", "value": "x"}])
+        assert exc.value.response["Error"]["Message"] == (
+            "Invalid patch path  '/nope' specified for op 'replace'. Must be one of: [/description]")
+        assert apigw_v1.get_client_certificate(clientCertificateId=cert_id)["description"] == "repro"
+        assert cert_id in [c["clientCertificateId"] for c in apigw_v1.get_client_certificates()["items"]]
+        updated = apigw_v1.update_client_certificate(
+            clientCertificateId=cert_id, patchOperations=[{"op": "replace", "path": "/description", "value": "new"}])
+        assert updated["description"] == "new"
+        region = apigw_v1.meta.region_name
+        assert apigw_v1.get_tags(resourceArn=f"arn:aws:apigateway:{region}::/clientcertificates/{cert_id}")[
+            "tags"] == {"env": "dev"}
+
+        api_id = apigw_v1.create_rest_api(name=f"cert-{_uuid_mod.uuid4().hex[:8]}")["id"]
+        try:
+            deployment = apigw_v1.create_deployment(restApiId=api_id)["id"]
+            apigw_v1.create_stage(restApiId=api_id, stageName="dev", deploymentId=deployment)
+            stage = apigw_v1.update_stage(restApiId=api_id, stageName="dev", patchOperations=[
+                {"op": "replace", "path": "/clientCertificateId", "value": cert_id}])
+            assert stage["clientCertificateId"] == cert_id
+        finally:
+            apigw_v1.delete_rest_api(restApiId=api_id)
+    finally:
+        apigw_v1.delete_client_certificate(clientCertificateId=cert_id)
+    for call in (apigw_v1.get_client_certificate, apigw_v1.delete_client_certificate):
+        with pytest.raises(ClientError) as exc:
+            call(clientCertificateId=cert_id)
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "NotFoundException", "Invalid client certificate id specified")
+
+
+def test_apigwv1_domain_name_access_association_lifecycle(apigw_v1, ec2):
+    """#2487: a VPC endpoint is associated with a private custom domain name by its domainNameArn,
+    listed, tagged, rejected and deleted."""
+    name = f"assoc-{_uuid_mod.uuid4().hex[:6]}.example.internal"
+    domain = apigw_v1.create_domain_name(domainName=name, endpointConfiguration={"types": ["PRIVATE"]})
+    vpc = ec2.describe_vpcs()["Vpcs"][0]["VpcId"]
+    vpce, vpce2 = (ec2.create_vpc_endpoint(VpcId=vpc, ServiceName="com.amazonaws.us-east-1.execute-api",
+                                           VpcEndpointType="Interface")["VpcEndpoint"]["VpcEndpointId"]
+                   for _ in range(2))
+    try:
+        created = apigw_v1.create_domain_name_access_association(
+            domainNameArn=domain["domainNameArn"], accessAssociationSourceType="VPCE",
+            accessAssociationSource=vpce, tags={"k": "v"})
+        arn = created["domainNameAccessAssociationArn"]
+        region, account = domain["domainNameArn"].split(":")[3:5]
+        assert arn == (f"arn:aws:apigateway:{region}:{account}:/domainnameaccessassociations/"
+                       f"domainname/{name}+{domain['domainNameId']}/vpcesource/{vpce}")
+        assert (created["domainNameArn"], created["tags"]) == (domain["domainNameArn"], {"k": "v"})
+        listed = apigw_v1.get_domain_name_access_associations(resourceOwner="SELF")["items"]
+        assert arn in [a["domainNameAccessAssociationArn"] for a in listed]
+        assert apigw_v1.get_domain_name_access_associations(resourceOwner="OTHER_ACCOUNTS")["items"] == []
+        assert apigw_v1.get_tags(resourceArn=arn)["tags"] == {"k": "v"}
+
+        # Captured on AWS: all three are 400 BadRequestException.
+        for domain_arn, source, message in (
+                (domain["domainNameArn"], vpce,
+                 "The domain name access association between this VPC endpoint and domain name already exists."),
+                (domain["domainNameArn"] + "x", vpce, "Domain not found"),
+                (domain["domainNameArn"], "vpce-0123456789abcdef0",
+                 "vpce-0123456789abcdef0 is not a valid VPC endpoint id")):
+            with pytest.raises(ClientError) as exc:
+                apigw_v1.create_domain_name_access_association(
+                    domainNameArn=domain_arn, accessAssociationSourceType="VPCE", accessAssociationSource=source)
+            assert (exc.value.response["ResponseMetadata"]["HTTPStatusCode"], exc.value.response["Error"]["Code"],
+                    exc.value.response["Error"]["Message"]) == (400, "BadRequestException", message)
+
+        # Captured on AWS: rejecting an association of your own answers 404 and keeps it.
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.reject_domain_name_access_association(domainNameAccessAssociationArn=arn,
+                                                          domainNameArn=domain["domainNameArn"])
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+        assert arn in [a["domainNameAccessAssociationArn"]
+                       for a in apigw_v1.get_domain_name_access_associations()["items"]]
+        apigw_v1.delete_domain_name_access_association(domainNameAccessAssociationArn=arn)
+        assert arn not in [a["domainNameAccessAssociationArn"]
+                           for a in apigw_v1.get_domain_name_access_associations()["items"]]
+
+        # Captured on AWS (us-east-1, 2026-10-29): a domain with associations can be deleted; afterwards
+        # reject answers 404, delete still answers 202 once, then 404.
+        last = apigw_v1.create_domain_name_access_association(
+            domainNameArn=domain["domainNameArn"], accessAssociationSourceType="VPCE",
+            accessAssociationSource=vpce2)["domainNameAccessAssociationArn"]
+        apigw_v1.delete_domain_name(domainName=name)
+        no_associations = "This private custom domain name doesn't have any domain name access associations."
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.reject_domain_name_access_association(domainNameAccessAssociationArn=last,
+                                                          domainNameArn=domain["domainNameArn"])
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "NotFoundException", no_associations)
+        apigw_v1.delete_domain_name_access_association(domainNameAccessAssociationArn=last)
+        with pytest.raises(ClientError) as exc:
+            apigw_v1.delete_domain_name_access_association(domainNameAccessAssociationArn=last)
+        assert exc.value.response["Error"]["Message"] == no_associations
+    finally:
+        try:
+            apigw_v1.delete_domain_name(domainName=name)
+        except ClientError:
+            pass
+        ec2.delete_vpc_endpoints(VpcEndpointIds=[vpce, vpce2])

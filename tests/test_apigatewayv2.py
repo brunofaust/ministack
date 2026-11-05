@@ -1387,8 +1387,9 @@ def test_http_api_response_request_id_header(apigw, lam):
 
 
 def test_apigw_raw_query_string_percent_encoded(apigw, lam):
-    """rawQueryString must stay percent-encoded like AWS: a space in a value comes
-    back as %20, not a literal space (which breaks lambda_http / http::Uri) — #1035."""
+    """rawQueryString is the query string as the client sent it: a space in a value stays
+    %20, not a literal space (which breaks lambda_http / http::Uri) — #1035 — and a bare key
+    gains no "="."""
     import urllib.request as _urlreq
     import uuid as _uuid
 
@@ -1418,6 +1419,9 @@ def test_apigw_raw_query_string_percent_encoded(apigw, lam):
         body = json.loads(resp.read())
         assert "openid%20profile" in body["rawQs"]
         assert "openid profile" not in body["rawQs"]  # no literal space
+        req = _urlreq.Request(url.split("?")[0] + "?flag&a=1", method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        assert json.loads(_urlreq.urlopen(req).read())["rawQs"] == "flag&a=1"
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=fname)
@@ -1807,7 +1811,8 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
         b"def handler(event, context):\n"
         b"    tok = event.get('headers', {}).get('authorization', '')\n"
         b"    if tok == 'allow-me':\n"
-        b"        return {'isAuthorized': True, 'context': {'user': 'alice', 'admin': True}}\n"
+        b"        return {'isAuthorized': True, 'context': {'user': 'alice', 'admin': True,\n"
+        b"                                                  'rawQueryString': event.get('rawQueryString')}}\n"
         b"    return {'isAuthorized': False}\n"
     )
     int_code = (
@@ -1855,8 +1860,8 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
         host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
         url = f"http://{host}/$default/private"
 
-        def _call(token):
-            req = _urlreq.Request(url, method="GET")
+        def _call(token, query=""):
+            req = _urlreq.Request(url + query, method="GET")
             req.add_header("Host", host)
             if token is not None:
                 req.add_header("Authorization", token)
@@ -1872,10 +1877,10 @@ def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, 
 
         # Valid token -> isAuthorized: true -> 200, context reaches the
         # integration under requestContext.authorizer.lambda.
-        status, body = _call("allow-me")
+        status, body = _call("allow-me", "?flag&a=1")
         assert status == 200
         auth = json.loads(body)
-        assert auth == {"lambda": {"user": "alice", "admin": True}}
+        assert auth == {"lambda": {"user": "alice", "admin": True, "rawQueryString": "flag&a=1"}}
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=auth_fn)
@@ -5273,3 +5278,33 @@ def test_apigwv2_domain_names_and_api_mappings_paginate(apigw):
         for name in names:
             apigw.delete_domain_name(DomainName=name)
         apigw.delete_api(ApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv2_route_without_authorization_answers_any_caller_account_contract(auth_enabled):
+    """An HTTP API in another account answers an unsigned call and one carrying another account's
+    Authorization header, as a REST API does: an execute-api URL reaches its API from any caller."""
+    owner = boto3.client("apigatewayv2", endpoint_url=_endpoint, aws_access_key_id="111122223333",
+                         aws_secret_access_key="test", region_name="us-east-1")
+    server, _thread, captured = _start_echo_server()
+    api_id = owner.create_api(Name=f"any-caller-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    other_account = ("AWS4-HMAC-SHA256 Credential=444455556666/20260101/us-east-1/execute-api/aws4_request, "
+                     "SignedHeaders=host, Signature=0")
+    try:
+        integration_id = owner.create_integration(
+            ApiId=api_id, IntegrationType="HTTP_PROXY", IntegrationMethod="GET",
+            IntegrationUri=f"http://127.0.0.1:{server.server_address[1]}", PayloadFormatVersion="1.0",
+        )["IntegrationId"]
+        owner.create_route(ApiId=api_id, RouteKey="GET /ping", Target=f"integrations/{integration_id}")
+        owner.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        for headers in ({}, {"Authorization": other_account}):
+            captured["path"] = None
+            request = urllib.request.Request(f"http://{host}/ping", headers={"Host": host, **headers})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status == 200, headers
+            assert captured["path"] is not None, headers  # reached the integration
+    finally:
+        owner.delete_api(ApiId=api_id)
+        server.shutdown()

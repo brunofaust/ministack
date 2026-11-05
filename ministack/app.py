@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import uuid
+from email.utils import formatdate
 from urllib.parse import parse_qs, quote, unquote, urlencode
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
@@ -244,6 +245,7 @@ from ministack.core.iam_evaluator import (
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
+    _request_account_id,
     fix_error_content_type,
     fix_success_content_type,
     set_request_account_id,
@@ -256,6 +258,40 @@ from ministack.core.sigv4 import decode_header_value
 # Must run before hypercorn emits its first Expect: 100-continue reply.
 # See ministack/core/hypercorn_compat.py for the rationale (issue #389).
 _install_hypercorn_compat()
+
+# AWS endpoints never answer with Hypercorn's Server header; a service that sends one sets its own.
+# Set on the class so every start path (ministack, ministack -d, python -m hypercorn) gets it.
+from hypercorn.config import Config as _HypercornConfig
+
+_HypercornConfig.include_server_header = False
+# Hypercorn appends its own Date even when the response has one; the app adds one when it is missing.
+_HypercornConfig.include_date_header = False
+
+import h11 as _h11
+from hypercorn.protocol.events import EndBody as _EndBody
+from hypercorn.protocol.events import Response as _StreamResponse
+from hypercorn.protocol.h11 import H11Protocol as _H11Protocol
+from hypercorn.protocol.ws_stream import WSStream as _WSStream
+
+
+async def _send_error_response(self, status_code: int) -> None:
+    """Hypercorn's own error response (a malformed request's 400), with the Date its config no longer adds."""
+    await self._send_h11_event(_h11.Response(status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"),
+        (b"date", formatdate(usegmt=True).encode()), *self.config.response_headers("h11")]))
+    await self._send_h11_event(_h11.EndOfMessage())
+
+
+async def _send_ws_error_response(self, status_code: int) -> None:
+    """Hypercorn's own WebSocket handshake refusal (websocket.close before accept), with its Date."""
+    await self.send(_StreamResponse(stream_id=self.stream_id, status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"), (b"date", formatdate(usegmt=True).encode())]))
+    await self.send(_EndBody(stream_id=self.stream_id))
+    await self.config.log.access(self.scope, {"status": status_code, "headers": []}, time.time() - self.start_time)
+
+
+_H11Protocol._send_error_response = _send_error_response
+_WSStream._send_error_response = _send_ws_error_response
 
 # ---------------------------------------------------------------------------
 # Lazy service loader — modules are imported on first request, not at startup.
@@ -801,7 +837,7 @@ def _asgi_header_list(headers: dict) -> list:
     return header_list
 
 
-async def _send_response(send, status, headers, body):
+async def _send_response(send, status, headers, body, *, head=False):
     """Send ASGI HTTP response."""
     from ministack.core.responses import StreamingResponse
 
@@ -809,7 +845,7 @@ async def _send_response(send, status, headers, body):
         raise TypeError("StreamingResponse requires _send_streaming_response(send, receive, ...)")
 
     body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
-    if "content-length" not in {k.lower() for k in headers}:
+    if not head and "content-length" not in {k.lower() for k in headers}:
         headers["Content-Length"] = str(len(body_bytes))
     await send(
         {
@@ -852,7 +888,7 @@ async def _send_streaming_response(send, receive, status, headers, streaming):
             pass
 
 
-async def _send_if_handled(send, response, receive=None) -> bool:
+async def _send_if_handled(send, response, receive=None, *, head=False) -> bool:
     """Send a response tuple and report whether the request was handled."""
     if response is None:
         return False
@@ -864,7 +900,7 @@ async def _send_if_handled(send, response, receive=None) -> bool:
             raise TypeError("StreamingResponse requires the ASGI receive channel")
         await _send_streaming_response(send, receive, status, headers, body)
     else:
-        await _send_response(send, status, headers, body)
+        await _send_response(send, status, headers, body, head=head)
     return True
 
 
@@ -1301,14 +1337,16 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
     # so the API's own corsConfiguration is applied (#406). A Function URL owns its
-    # CORS config the same way, as does a registered custom domain. Skip the generic
-    # wildcard preflight in all three cases.
+    # CORS config the same way, as does a registered custom domain. An OPTIONS
+    # request to a load balancer goes on to its target. Skip the generic wildcard preflight for each.
     host = headers.get("host", "")
     owns_cors = (
         _parse_execute_api_url(host, path) is not None
         or _parse_lambda_url(host, path) is not None
         or _resolve_custom_domain_request(host, path) is not None
         or _parse_cloudfront_dataplane_host(host) is not None
+        or _resolve_cloudfront_alias_request(host) is not None
+        or _is_potential_alb_request(host, path)
     )
     for response in (
         None if owns_cors else _handle_options_request(method, path, headers, query_params, request_id),
@@ -1648,6 +1686,23 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             or handler(method, path, headers, body, query_params)
         )
         return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
+    if s3.is_account_public_access_block_path(path):
+        headers = headers or {}
+        if AUTH:
+            action = s3._ACCOUNT_PAB_ACTIONS.get(method)
+            if action:
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id)
+                if denied:
+                    return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or s3.handle_account_public_access_block(method, path, body)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
     if failure := _authenticate_only("s3", headers, query_params, request_id):
         return failure
 
@@ -1883,7 +1938,8 @@ def _execute_api_authorization_type(api_id: str, stage: str, method: str, execut
 
 def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
                          headers: dict, query_params: dict,
-                         iam_action: str = "execute-api:Invoke"):
+                         iam_action: str = "execute-api:Invoke",
+                         caller_account: str | None = None):
     """Authorize an execute-api call against its own ARN.
 
     ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
@@ -1916,15 +1972,26 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
         refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
         if refused:
             return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
-    return _enforce_data_plane(
-        "apigateway", iam_action, headers, query_params, "",
-        resource_arn=execute_api_arn(
-            extract_region(headers, query_params), get_account_id(),
-            api_id, stage, method, execute_path,
-        ),
-        auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
-            api_id, stage, error, headers, query_params),
+    # The ARN names the API's owner; the caller is authenticated in its own account.
+    resource_arn = execute_api_arn(
+        extract_region(headers, query_params), get_account_id(),
+        api_id, stage, method, execute_path,
     )
+    owner_scope = _get_module("apigateway_v1").find_api_scope(api_id) if caller_account else None
+    token = _request_account_id.set(caller_account) if caller_account else None
+    try:
+        return _enforce_data_plane(
+            "apigateway", iam_action, headers, query_params, "",
+            resource_arn=resource_arn,
+            auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+                api_id, stage, error, headers, query_params),
+            denied_response=(lambda denied: _get_module("apigateway_v1").cross_account_denial_response(
+                api_id, stage, denied, headers, query_params, owner_scope))
+            if owner_scope else None,
+        )
+    finally:
+        if token is not None:
+            _request_account_id.reset(token)
 
 
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
@@ -1983,17 +2050,18 @@ def _parse_cloudfront_dataplane_host(host: str) -> str | None:
     return m.group(1) if m else None
 
 
-async def _handle_cloudfront_dataplane_request(
-    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+def _resolve_cloudfront_alias_request(host: str):
+    """The distribution that claims ``host`` as an alternate domain name, or None."""
+    hostname = host.split(":")[0].lower()
+    if not hostname or "." not in hostname:
+        return None
+    return _get_module("cloudfront").find_distribution_for_alias(hostname)
+
+
+async def _serve_cloudfront_distribution(
+    dist, path: str, raw_path: str, raw_query_string: str, method: str,
     headers: dict, body: bytes, query_params: dict, client_ip: str,
 ):
-    """Serve a CloudFront distribution's viewer traffic, matched by Host."""
-    label = _parse_cloudfront_dataplane_host(host)
-    if label is None:
-        return None
-    dist = _get_module("cloudfront").find_distribution_for_label(label)
-    if dist is None:
-        return None
     try:
         return await _get_module("cloudfront").handle_viewer_request(
             dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
@@ -2003,9 +2071,53 @@ async def _handle_cloudfront_dataplane_request(
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
+async def _handle_cloudfront_dataplane_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str,
+):
+    """Serve a CloudFront distribution's viewer traffic, matched by its ``<label>.cloudfront.net`` Host."""
+    label = _parse_cloudfront_dataplane_host(host)
+    dist = _get_module("cloudfront").find_distribution_for_label(label) if label is not None else None
+    if dist is None:
+        return None
+    return await _serve_cloudfront_distribution(
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+
+
+async def _handle_cloudfront_alias_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str,
+):
+    """Serve a request whose Host is a distribution's alternate domain name. Runs after every other Host-claiming
+    handler: on AWS DNS sends those hosts to their own service, here the Host is the only signal."""
+    # A signed AWS API call is never viewer traffic, even when an alias covers the host clients reach MiniStack by.
+    if (headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            or any(k.lower() == "x-amz-credential" for k in (query_params or {}))):
+        return None
+    dist = _resolve_cloudfront_alias_request(host)
+    if dist is None:
+        return None
+    return await _serve_cloudfront_distribution(
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+
+
+def _invoke_as_api_owner(api_id: str) -> str | None:
+    """Run an API another account owns as its owner; returns the caller's account, or None."""
+    apigw_v1 = _get_module("apigateway_v1")
+    apigw_v2 = _get_module("apigateway")
+    if apigw_v1.find_api_scope(api_id) is not None or apigw_v2.find_api_scope(api_id) is not None:
+        return None
+    owner = apigw_v1.find_api_owner(api_id) or apigw_v2.find_api_owner(api_id)
+    if not owner:
+        return None
+    caller_account = _request_account_id.get()
+    _request_account_id.set(owner)
+    return caller_account
+
+
 async def _handle_execute_api_request(
     host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
-    raw_path: str | None = None,
+    raw_path: str | None = None, raw_query_string: str | None = None,
 ):
     """Handle API Gateway execute-api data plane requests (Host-based,
     path-based, and registered custom domains)."""
@@ -2027,6 +2139,7 @@ async def _handle_execute_api_request(
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
+    caller_account = _invoke_as_api_owner(api_id)
 
     # WebSocket @connections management API — /{stage}/@connections/{id}.
     # The @connections prefix is authoritative; skip $default resolution.
@@ -2052,6 +2165,7 @@ async def _handle_execute_api_request(
     denied = _enforce_execute_api(
         api_id, stage, method, execute_path, headers, query_params,
         iam_action="execute-api:ManageConnections" if connections else "execute-api:Invoke",
+        caller_account=caller_account,
     )
     if denied:
         return denied
@@ -2075,7 +2189,9 @@ async def _handle_execute_api_request(
             http_api_path = apigw_v2.decode_http_api_path(raw_path)
             if http_api_path.startswith(prefix):
                 execute_path = http_api_path[len(prefix):]
-        status, resp_headers, resp_body = await apigw_v2.handle_execute(api_id, stage, execute_path, method, headers, body, query_params)
+        status, resp_headers, resp_body = await apigw_v2.handle_execute(
+            api_id, stage, execute_path, method, headers, body, query_params, raw_query_string=raw_query_string,
+        )
         # An HTTP API names its request id apigw-requestid (16 base64 characters); x-amzn-requestid is a REST API's.
         resp_headers.setdefault("apigw-requestid", base64.b64encode(os.urandom(11)).decode())
         return status, resp_headers, resp_body
@@ -2176,7 +2292,10 @@ async def _handle_lambda_url_request(host: str, path: str, method: str, headers:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
-async def _handle_alb_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_alb_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict, raw_query_string: str | None = None,
+    raw_path: str | None = None,
+):
     """Handle ALB data-plane requests for host-based and /_alb-prefixed addressing."""
     if not _is_potential_alb_request(host, path):
         return None
@@ -2184,12 +2303,17 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
     alb_module = _get_module("alb")
     load_balancer = alb_module.find_lb_for_host(host)
     dispatch_path = path
+    # Instance and IP targets get the path as the client sent it, percent-encoding included.
+    raw_dispatch_path = raw_path
 
     if load_balancer is None and path.startswith(_ALB_PATH_PREFIX):
         path_parts = path[len(_ALB_PATH_PREFIX) :].split("/", 1)
         load_balancer = alb_module._find_lb_by_name(path_parts[0])
         if load_balancer:
             dispatch_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
+            if raw_path is not None and raw_path.startswith(_ALB_PATH_PREFIX):
+                raw_parts = raw_path[len(_ALB_PATH_PREFIX) :].split("/", 1)
+                raw_dispatch_path = "/" + raw_parts[1] if len(raw_parts) > 1 else "/"
 
     if load_balancer is None:
         return None
@@ -2203,7 +2327,8 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
 
     try:
         return await alb_module.dispatch_request(
-            load_balancer, method, dispatch_path, headers, body, query_params, alb_port
+            load_balancer, method, dispatch_path, headers, body, query_params, alb_port,
+            raw_query_string=raw_query_string, raw_path=raw_dispatch_path,
         )
     except Exception as e:
         logger.exception("Error in ALB data-plane dispatch: %s", e)
@@ -2356,9 +2481,10 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
 
     # IAM enforcement for S3 virtual-hosted requests
     if AUTH:
-        upload_error = _get_module("s3").validate_upload_request(method, vhost_path, headers, query_params)
-        if upload_error is not None:
-            return upload_error
+        object_error = (None if method in {"HEAD", "DELETE"} and access_point_region is not None else
+                        _get_module("s3").validate_object_request(method, vhost_path, headers, query_params))
+        if object_error is not None:
+            return object_error
         from ministack.core.iam_actions import (
             _s3_action,
             extract_resource_arn,
@@ -2475,6 +2601,7 @@ def _authenticate_only(service: str, headers: dict, query_params: dict, request_
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
     service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
+    denied_response=None,
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
@@ -2483,6 +2610,7 @@ def _enforce_data_plane(
     handler has to pass them, because it knows the resource the router does not.
     ``named_resource`` is the resource an identity-policy denial names, in the
     error Content-Type of the service, for the services that word it so.
+    ``denied_response(result)`` may word a policy denial; None keeps the default.
     """
     if not AUTH:
         return None
@@ -2496,6 +2624,9 @@ def _enforce_data_plane(
         if isinstance(denied, AuthError):
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
+        response = denied_response(denied) if denied_response else None
+        if response:
+            return response
         explicit = denied.decision == "Deny"
         message = ""
         if named_resource and not (explicit and denied.resource_policy_arn):
@@ -2647,7 +2778,8 @@ async def _handle_special_data_plane_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
         headers, body, query_params, client_ip,
     ):
-        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+        # A distribution adds its own headers (Via, X-Amz-Cf-Id, X-Amz-Cf-Pop, X-Cache), not an API's request ids.
+        return response
     # Before S3 virtual hosting, which would read the collection id as a bucket.
     if _AOSS_COLLECTION_HOST_RE.match(host) and (
         response := await _get_module("opensearchserverless").handle_dataplane(
@@ -2656,18 +2788,27 @@ async def _handle_special_data_plane_request(
     ):
         return _with_data_plane_headers(response, request_id)
     if response := await _handle_execute_api_request(
-        host, path, method, headers, body, query_params, raw_path=raw_path
+        host, path, method, headers, body, query_params, raw_path=raw_path, raw_query_string=raw_query_string
     ):
         return _with_data_plane_headers(response, request_id, wildcard_cors=False)
     if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+        # A Function URL names its own x-amzn-RequestId and X-Amzn-Trace-Id; it sends no other request ids.
+        status, resp_headers, resp_body = response
+        if not any(k.lower() == "x-amzn-requestid" for k in resp_headers):
+            resp_headers["x-amzn-RequestId"] = request_id
+        return status, resp_headers, resp_body
     if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
         if AUTH and (target := _s3_cors_target(host, path, path_style=False)):
             response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
         return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
-    if response := await _handle_alb_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id)
-    return None
+    if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string, raw_path):
+        # A load balancer passes its target's headers through; CORS and request ids are the application's.
+        return response
+    # A distribution's alternate domain name yields to every service that claims the Host.
+    return await _handle_cloudfront_alias_request(
+        host, path, raw_path if raw_path is not None else path, raw_query_string, method,
+        headers, body, query_params, client_ip,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2938,9 +3079,9 @@ async def _dispatch_service_request(
         return _unknown_query_error(body, request_id)
 
     if AUTH and service == "s3":
-        upload_error = _get_module("s3").validate_upload_request(method, path, headers, query_params)
-        if upload_error is not None:
-            return upload_error
+        object_error = _get_module("s3").validate_object_request(method, path, headers, query_params)
+        if object_error is not None:
+            return object_error
 
     # AppSync authorizes a GraphQL request by the API's own authorization types.
     appsync_graphql = service == "appsync" and method == "POST" and (
@@ -3164,10 +3305,14 @@ async def _dispatch_service_request(
         {
             **cors,
             "x-amzn-requestid": request_id,
-            "x-amz-request-id": request_id,
-            "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
         }
     )
+    if service == "s3":
+        resp_headers.setdefault("x-amz-request-id", request_id)
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        resp_headers["x-amz-request-id"] = request_id
+        resp_headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
     return status, resp_headers, resp_body
 
 
@@ -3176,8 +3321,25 @@ async def _dispatch_service_request(
 # ---------------------------------------------------------------------------
 
 
+_RESPONSE_START_MESSAGES = ("http.response.start", "websocket.accept", "websocket.http.response.start")
+
+
+def _with_date_header(send):
+    """AWS sends one Date per response: a proxied target's, or the endpoint's own when there is none."""
+    async def send_with_date(message):
+        if message["type"] in _RESPONSE_START_MESSAGES and not any(
+            name.lower() == b"date" for name, _ in message.get("headers", [])
+        ):
+            message = {**message, "headers": [*message.get("headers", []), (b"date", formatdate(usegmt=True).encode("ascii"))]}
+        await send(message)
+
+    return send_with_date
+
+
 async def app(scope, receive, send):
     """ASGI application entry point."""
+    if scope["type"] in ("http", "websocket"):
+        send = _with_date_header(send)
     if scope["type"] == "lifespan":
         await _handle_lifespan(scope, receive, send)
         return
@@ -3343,27 +3505,47 @@ async def app(scope, receive, send):
     ):
         return
 
-    if await _send_if_handled(
-        send,
-        await _handle_special_data_plane_request(
-            method, path, headers, body, query_params, request_id,
-            raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
-            raw_query_string=query_string,
-            client_ip=(scope.get("client") or ("127.0.0.1",))[0],
-        ),
-        receive,
-    ):
+    # Finalize ordinary S3 HEAD responses after both routing paths, including
+    # IAM denials. Presigns, access points and subresources keep their handlers.
+    head_path = None
+    # Iceberg routes are selected before S3, even when signed with scope s3.
+    if (method == "HEAD" and not path.startswith("/iceberg")
+            and detect_service(method, path, headers, query_params) == "s3"):
+        host = headers.get("host", "")
+        bucket = _extract_s3_vhost_bucket(host)
+        candidate = f"/{bucket}{path}" if bucket else path
+        ap_match = _ACCESS_POINT_HOST_RE.match(bucket) if bucket else None
+        has_access_point = ap_match is not None and _get_module("s3").resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), extract_region(headers)) is not None
+        if (not _MRAP_HOST_RE.match(host.split(":")[0].strip())
+                and not (bucket and (_S3_VHOST_EXCLUDE_RE.search(host) or has_access_point
+                             or bucket in _NON_S3_VHOST_NAMES))
+                and _get_module("s3").is_standard_object_request(method, candidate, headers, query_params)):
+            head_path = candidate
+
+    response = await _handle_special_data_plane_request(
+        method, path, headers, body, query_params, request_id,
+        raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+        raw_query_string=query_string,
+        client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+    )
+    if response is not None and head_path is not None:
+        response = _get_module("s3").format_head_response(head_path, headers, response)
+    if await _send_if_handled(send, response, receive, head=head_path is not None):
         return
 
     status, resp_headers, resp_body = await _dispatch_service_request(
         method, path, headers, body, query_params, request_id
     )
+    if head_path is not None:
+        status, resp_headers, resp_body = _get_module("s3").format_head_response(
+            head_path, headers, (status, resp_headers, resp_body))
     from ministack.core.responses import StreamingResponse
 
     if isinstance(resp_body, StreamingResponse):
         await _send_streaming_response(send, receive, status, resp_headers, resp_body)
     else:
-        await _send_response(send, status, resp_headers, resp_body)
+        await _send_response(send, status, resp_headers, resp_body, head=head_path is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -3942,6 +4124,8 @@ def main():
         config = HypercornConfig()
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
+        # AWS closes client connections by time, not request count
+        config.keep_alive_max_requests = 10_000_000
         config.loglevel = LOG_LEVEL.upper()
 
         # USE_SSL=1 enables HTTPS — matches the behaviour previously provided

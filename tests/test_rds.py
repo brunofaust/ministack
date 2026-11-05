@@ -5,6 +5,7 @@ import io
 import ipaddress
 import json
 import os
+import re
 import socket
 import ssl
 import sys
@@ -30,7 +31,7 @@ from ministack.services import rds as _imm_rds
 
 DEFAULT_AURORA_MYSQL_ENGINE_VERSION = "8.0.mysql_aurora.3.10.3"
 UNSUPPORTED_AURORA_MYSQL_ENGINE_VERSION = "9.0.mysql_aurora.9.0.1"
-DEFAULT_AURORA_POSTGRESQL_ENGINE_VERSION = "17.7"
+DEFAULT_AURORA_POSTGRESQL_ENGINE_VERSION = "17.9"
 DEFAULT_AURORA_POSTGRESQL_16_ENGINE_VERSION = "16.11"
 UNSUPPORTED_AURORA_POSTGRESQL_ENGINE_VERSION = "16.99"
 EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
@@ -47,6 +48,7 @@ EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "14.20": "aurora-postgresql14",
     "14.22": "aurora-postgresql14",
     "14.23": "aurora-postgresql14",
+    "14.24": "aurora-postgresql14",
     "15.10": "aurora-postgresql15",
     "15.12": "aurora-postgresql15",
     "15.13": "aurora-postgresql15",
@@ -54,6 +56,7 @@ EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "15.15": "aurora-postgresql15",
     "15.17": "aurora-postgresql15",
     "15.18": "aurora-postgresql15",
+    "15.19": "aurora-postgresql15",
     "16.4-limitless": "aurora-postgresql16",
     "16.6-limitless": "aurora-postgresql16",
     "16.8": "aurora-postgresql16",
@@ -67,14 +70,17 @@ EXPECTED_AURORA_POSTGRESQL_ENGINE_VERSIONS = {
     "16.13": "aurora-postgresql16",
     "16.13-limitless": "aurora-postgresql16",
     "16.14": "aurora-postgresql16",
+    "16.15": "aurora-postgresql16",
     "17.4": "aurora-postgresql17",
     "17.5": "aurora-postgresql17",
     "17.6": "aurora-postgresql17",
     "17.7": "aurora-postgresql17",
     "17.9": "aurora-postgresql17",
     "17.10": "aurora-postgresql17",
+    "17.11": "aurora-postgresql17",
     "18.3": "aurora-postgresql18",
     "18.4": "aurora-postgresql18",
+    "18.6": "aurora-postgresql18",
 }
 EXPECTED_AURORA_MYSQL_ENGINE_VERSIONS = {
     "5.7.mysql_aurora.2.11.1": "aurora-mysql5.7",
@@ -920,6 +926,27 @@ def test_rds_global_cluster_lifecycle(rds):
         rds.describe_global_clusters(GlobalClusterIdentifier="test-global-1")
     assert exc.value.response["Error"]["Code"] == "GlobalClusterNotFoundFault"
 
+def test_rds_global_cluster_shape_matches_aws(rds):
+    """#2464, captured on AWS (us-east-1): defaults, lifecycle support, encryption type and DatabaseName."""
+    plain = rds.create_global_cluster(GlobalClusterIdentifier="gc-shape-plain", Engine="aurora-postgresql")["GlobalCluster"]
+    enc = rds.create_global_cluster(GlobalClusterIdentifier="gc-shape-enc", Engine="aurora-postgresql",
+                                    StorageEncrypted=True, DatabaseName="appdb")["GlobalCluster"]
+    mysql = rds.create_global_cluster(GlobalClusterIdentifier="gc-shape-my", Engine="aurora-mysql")["GlobalCluster"]
+    try:
+        assert list(plain) == ["GlobalClusterIdentifier", "GlobalClusterResourceId", "GlobalClusterArn", "Status",
+                               "Engine", "EngineVersion", "EngineLifecycleSupport", "StorageEncrypted",
+                               "StorageEncryptionType", "DeletionProtection", "GlobalClusterMembers", "Endpoint",
+                               "TagList"]
+        assert re.fullmatch(r"cluster-[0-9a-f]{16}", plain["GlobalClusterResourceId"])
+        assert (plain["EngineVersion"], plain["EngineLifecycleSupport"], plain["StorageEncryptionType"]) == (
+            "17.9", "open-source-rds-extended-support", "sse-rds")
+        assert (enc["DatabaseName"], enc["StorageEncrypted"], enc["StorageEncryptionType"]) == ("appdb", True, "sse-kms")
+        assert (mysql["EngineVersion"], mysql["StorageEncryptionType"]) == ("8.0.mysql_aurora.3.10.3", "sse-rds")
+    finally:
+        for gc_id in ("gc-shape-plain", "gc-shape-enc", "gc-shape-my"):
+            rds.delete_global_cluster(GlobalClusterIdentifier=gc_id)
+
+
 @pytest.mark.parametrize("engine", ["aurora-postgresql", "aurora-mysql"])
 def test_rds_global_cluster_tags_lifecycle(rds, engine):
     global_id = f"global-tags-{uuid.uuid4().hex[:8]}"
@@ -1207,6 +1234,208 @@ def test_rds_reset_db_parameters(rds):
     assert max_connections["ParameterValue"] == "151"
 
 
+def test_rds_default_cluster_parameter_groups_exist_for_aurora_families(rds):
+    """Each Aurora engine family has a default cluster parameter group, which a new cluster uses."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="default-pg-cluster",
+        Engine="aurora-postgresql",
+        EngineVersion="16.8",
+        MasterUsername="admin",
+        MasterUserPassword="password1",
+    )
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="default-pg-cluster")["DBClusters"][0]
+    assert cluster["DBClusterParameterGroup"] == "default.aurora-postgresql16"
+    group = rds.describe_db_cluster_parameter_groups(
+        DBClusterParameterGroupName="default.aurora-postgresql16")["DBClusterParameterGroups"][0]
+    assert group["DBParameterGroupFamily"] == "aurora-postgresql16"
+    assert rds.describe_db_cluster_parameters(DBClusterParameterGroupName="default.aurora-mysql8.0")
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.not-a-family")
+    assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
+
+def _settled_cluster(client, cid):
+    """Describe a cluster until its major upgrade has finished (it takes two describes)."""
+    for _ in range(3):
+        cluster = client.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]
+        if "PendingModifiedValues" not in cluster:
+            return cluster
+    raise AssertionError("upgrade never settled")
+
+
+def test_rds_default_cluster_parameter_groups_listed_once_materialized_and_follow_major_upgrade():
+    """Real AWS (us-west-2): a default group is listed only once described by name or used by a cluster."""
+    rds = boto3.client("rds", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                       aws_access_key_id="424242424242", aws_secret_access_key="test", region_name="us-west-2")
+    def listed():
+        return {g["DBClusterParameterGroupName"]
+                for g in rds.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
+
+    assert not any(n.startswith("default.") for n in listed())
+    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.aurora-postgresql16")
+    assert {n for n in listed() if n.startswith("default.")} == {"default.aurora-postgresql16"}
+    rds.create_db_cluster(DBClusterIdentifier="mat-pg15", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    assert {n for n in listed() if n.startswith("default.")} == {
+        "default.aurora-postgresql15", "default.aurora-postgresql16"}
+
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="keep-me", DBParameterGroupFamily="aurora-mysql8.0", Description="x")
+    for cid in ("up-default", "up-custom"):
+        rds.create_db_cluster(DBClusterIdentifier=cid, Engine="aurora-mysql", EngineVersion="5.7.mysql_aurora.2.12.6",
+                              MasterUsername="admin", MasterUserPassword="password1",
+                              **({"DBClusterParameterGroupName": "keep-me"} if cid == "up-custom" else {}))
+        rds.modify_db_cluster(DBClusterIdentifier=cid, EngineVersion="8.0.mysql_aurora.3.10.3",
+                              AllowMajorVersionUpgrade=True, ApplyImmediately=True)
+    got = {cid: _settled_cluster(rds, cid)["DBClusterParameterGroup"] for cid in ("up-default", "up-custom")}
+    assert got == {"up-default": "default.aurora-mysql8.0", "up-custom": "keep-me"}
+    assert "default.aurora-mysql8.0" in listed()
+
+
+def test_rds_default_cluster_parameter_group_follows_prefix_and_global_upgrades(rds):
+    def make(cid, **kw):
+        rds.create_db_cluster(DBClusterIdentifier=cid, Engine="aurora-postgresql", EngineVersion="16.8",
+                              MasterUsername="admin", MasterUserPassword="password1", **kw)
+
+    def group(cid):
+        return _settled_cluster(rds, cid)["DBClusterParameterGroup"]
+
+    make("pfx-up")
+    rds.modify_db_cluster(DBClusterIdentifier="pfx-up", EngineVersion="17",
+                          AllowMajorVersionUpgrade=True, ApplyImmediately=True)
+    assert group("pfx-up") == "default.aurora-postgresql17"
+
+    rds.create_global_cluster(GlobalClusterIdentifier="gl-up", Engine="aurora-postgresql", EngineVersion="16.8")
+    make("gl-member", GlobalClusterIdentifier="gl-up")
+    rds.modify_global_cluster(GlobalClusterIdentifier="gl-up", EngineVersion="17",
+                              AllowMajorVersionUpgrade=True)
+    assert group("gl-member") == "default.aurora-postgresql17"
+
+
+def test_rds_major_upgrade_reports_pending_then_upgrading_then_new_family(rds):
+    """Real AWS (us-west-2, Aurora PostgreSQL 15.19 -> 16.15): available+pending, upgrading+pending, then done."""
+    rds.create_db_cluster(DBClusterIdentifier="seq-up", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    rds.create_db_instance(DBInstanceIdentifier="seq-up-1", DBInstanceClass="db.r6g.large",
+                           Engine="aurora-postgresql", DBClusterIdentifier="seq-up")
+    rds.create_db_instance(DBInstanceIdentifier="seq-up-custom", DBInstanceClass="db.r6g.large",
+                           Engine="aurora-postgresql", DBClusterIdentifier="seq-up")
+    rds.create_db_parameter_group(DBParameterGroupName="seq-up-pg", DBParameterGroupFamily="aurora-postgresql15",
+                                  Description="x")
+    rds.modify_db_instance(DBInstanceIdentifier="seq-up-custom", DBParameterGroupName="seq-up-pg",
+                           ApplyImmediately=True)
+    # With Docker the cluster's engine is still starting.
+    for _ in range(120):
+        if rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]["Status"] == "available":
+            break
+        time.sleep(1)
+
+    def steps(c):
+        return (c["Status"], c["EngineVersion"], c["DBClusterParameterGroup"], c.get("PendingModifiedValues"))
+
+    resp = rds.modify_db_cluster(DBClusterIdentifier="seq-up", EngineVersion="16.8",
+                                 AllowMajorVersionUpgrade=True, ApplyImmediately=True)["DBCluster"]
+    old = ("15.13", "default.aurora-postgresql15")
+    assert steps(resp) == ("available", *old, {"EngineVersion": "16.8"})
+    first = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
+    assert steps(first) == ("upgrading", *old, {"EngineVersion": "16.8"})
+    rds.create_db_instance(DBInstanceIdentifier="seq-other", DBInstanceClass="db.t3.micro", Engine="postgres")
+    rds.delete_db_instance(DBInstanceIdentifier="seq-other", SkipFinalSnapshot=True)  # refreshes every cluster
+    with pytest.raises(ClientError) as exc:
+        rds.stop_db_cluster(DBClusterIdentifier="seq-up")
+    assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+    last = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
+    assert steps(last) == ("available", "16.8", "default.aurora-postgresql16", None)
+    assert steps(rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]) == steps(last)
+
+    groups = {i["DBInstanceIdentifier"]: i["DBParameterGroups"][0]
+              for i in rds.describe_db_instances()["DBInstances"] if i["DBInstanceIdentifier"].startswith("seq-up-")}
+    assert groups["seq-up-1"] == {"DBParameterGroupName": "default.aurora-postgresql16",
+                                  "ParameterApplyStatus": "in-sync"}
+    assert groups["seq-up-custom"]["DBParameterGroupName"] == "seq-up-pg"
+    assert {i["EngineVersion"] for i in rds.describe_db_instances()["DBInstances"]
+            if i["DBInstanceIdentifier"].startswith("seq-up-")} == {"16.8"}
+
+
+def test_rds_major_upgrade_of_a_cluster_without_a_stored_parameter_group():
+    """Clusters made by CloudFormation carry no DBClusterParameterGroup; an upgrade must not fail."""
+    from ministack.services import rds as rds_service
+
+    cluster = {"Engine": "aurora-postgresql", "EngineVersion": "15.13", "DBClusterIdentifier": "no-pg-field"}
+    rds_service._set_cluster_engine_version(cluster, "16.8")
+    assert cluster["EngineVersion"] == "16.8"
+    assert "DBClusterParameterGroup" not in cluster
+
+
+def test_rds_pending_upgrade_does_not_leak_to_a_recreated_cluster_and_survives_status_refresh():
+    from ministack.services import rds as rds_service
+
+    arn = "arn:aws:rds:us-east-1:000000000000:cluster:leak"
+    old = {"DBClusterArn": arn, "Engine": "aurora-postgresql", "EngineVersion": "15.13", "Status": "available",
+           "DBClusterIdentifier": "leak"}
+    rds_service._set_cluster_engine_version(old, "16.8")
+    assert rds_service._upgrade_view(old, True)["Status"] == "upgrading"
+    assert old["Status"] == "upgrading"
+    new = {"DBClusterArn": arn, "Engine": "aurora-postgresql", "EngineVersion": "17.7", "Status": "available"}
+    assert rds_service._upgrade_view(new, True) is new
+    restored = json.loads(json.dumps(old))  # as persisted and loaded
+    assert rds_service._upgrade_view(restored, True)["Status"] == "available"
+    assert "_major_upgrade_pending" not in restored
+
+
+def test_rds_major_upgrade_needs_allow_major_version_upgrade(rds):
+    """AWS (Aurora in-place upgrade tutorial): a major version change without the flag is refused."""
+    rds.create_db_cluster(DBClusterIdentifier="amvu", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    try:
+        with pytest.raises(ClientError) as exc:
+            rds.modify_db_cluster(DBClusterIdentifier="amvu", EngineVersion="16.8", ApplyImmediately=True)
+        assert exc.value.response["Error"]["Code"] == "InvalidParameterCombination"
+        assert exc.value.response["Error"]["Message"] == (
+            "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.")
+        assert rds.describe_db_clusters(DBClusterIdentifier="amvu")["DBClusters"][0]["EngineVersion"] == "15.13"
+    finally:
+        rds.delete_db_cluster(DBClusterIdentifier="amvu", SkipFinalSnapshot=True)
+
+
+def test_rds_default_cluster_parameter_groups_are_immutable(rds):
+    """Captured on AWS (us-east-1): a default group cannot be modified or deleted; a reset succeeds."""
+    name = "default.aurora-mysql8.0"
+    with pytest.raises(ClientError) as exc:
+        rds.modify_db_cluster_parameter_group(DBClusterParameterGroupName=name, Parameters=[
+            {"ParameterName": "long_query_time", "ParameterValue": "100", "ApplyMethod": "immediate"}])
+    assert exc.value.response["Error"]["Code"] == "InvalidParameterValue"
+    assert exc.value.response["Error"]["Message"] == "Cannot modify a default parameter group."
+    with pytest.raises(ClientError) as exc:
+        rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName=name)
+    assert exc.value.response["Error"]["Code"] == "InvalidDBParameterGroupState"
+    assert exc.value.response["Error"]["Message"] == f"Default DBClusterParameterGroup cannot be deleted: {name}"
+    resp = rds.reset_db_cluster_parameter_group(DBClusterParameterGroupName=name, ResetAllParameters=True)
+    assert resp["DBClusterParameterGroupName"] == name
+    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName=name)
+    with pytest.raises(ClientError) as exc:
+        rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName="never-created-cpg")
+    assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
+    assert exc.value.response["Error"]["Message"] == "DBClusterParameterGroup not found: never-created-cpg"
+
+
+def test_rds_global_upgrade_materializes_default_group_in_each_members_region():
+    def client(region):
+        return boto3.client("rds", endpoint_url=ENDPOINT, aws_access_key_id="434343434343",
+                            aws_secret_access_key="test", region_name=region)
+
+    east, west = client("us-east-1"), client("us-west-2")
+    east.create_global_cluster(GlobalClusterIdentifier="gl-xr", Engine="aurora-postgresql", EngineVersion="16.8")
+    west.create_db_cluster(DBClusterIdentifier="xr-member", Engine="aurora-postgresql", EngineVersion="16.8",
+                           MasterUsername="admin", MasterUserPassword="password1",
+                           GlobalClusterIdentifier="gl-xr")
+    east.modify_global_cluster(GlobalClusterIdentifier="gl-xr", EngineVersion="17", AllowMajorVersionUpgrade=True)
+    cluster = _settled_cluster(west, "xr-member")
+    assert cluster["DBClusterParameterGroup"] == "default.aurora-postgresql17"
+    names = {g["DBClusterParameterGroupName"]
+             for g in west.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
+    assert "default.aurora-postgresql17" in names
+
+
 def test_rds_modify_and_describe_cluster_parameters(rds):
     """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
     rds.create_db_cluster_parameter_group(
@@ -1374,7 +1603,7 @@ def test_rds_describe_aurora_postgresql_engine_versions_by_major(rds):
         Engine="aurora-postgresql",
         EngineVersion="16",
     )["DBEngineVersions"]
-    assert len(major_versions) == 13
+    assert len(major_versions) == 14
     assert {version["EngineVersion"] for version in major_versions} == expected_versions
     assert all(version["DBParameterGroupFamily"] == family for version in major_versions)
     assert all(version["Status"] == "available" for version in major_versions)
@@ -4701,6 +4930,61 @@ def test_rds_modify_cluster_password(rds):
     resp = rds.describe_db_clusters(DBClusterIdentifier="pw-mod-cluster")
     cluster = resp["DBClusters"][0]
     assert cluster["DBClusterIdentifier"] == "pw-mod-cluster"
+
+
+def test_rds_cluster_password_reset_is_visible_before_it_settles(rds):
+    """Real AWS (us-west-2): pending ****, then resetting-master-credentials, then available."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-reset-status",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    modified = rds.modify_db_cluster(
+        DBClusterIdentifier="pw-reset-status", MasterUserPassword="new_pass")["DBCluster"]
+    assert modified["Status"] == "available"
+    assert modified["PendingModifiedValues"] == {"MasterUserPassword": "****"}
+    seen = [(c["Status"], c.get("PendingModifiedValues", {}))
+            for c in (rds.describe_db_clusters(DBClusterIdentifier="pw-reset-status")["DBClusters"][0]
+                      for _ in range(4))]
+    pending = {"MasterUserPassword": "****"}
+    assert seen == [("available", pending), ("resetting-master-credentials", pending),
+                    ("available", {}), ("available", {})]
+
+
+def test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster(rds):
+    kw = dict(DBClusterIdentifier="pw-reset-recreate", Engine="aurora-postgresql",
+              MasterUsername="admin", MasterUserPassword="old_pass")
+    rds.create_db_cluster(**kw)
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-recreate", MasterUserPassword="new_pass")
+    rds.delete_db_cluster(DBClusterIdentifier="pw-reset-recreate", SkipFinalSnapshot=True)
+    rds.create_db_cluster(**kw)
+    assert rds.describe_db_clusters(DBClusterIdentifier="pw-reset-recreate")["DBClusters"][0]["Status"] == "available"
+
+
+def test_rds_cluster_password_reset_on_stopped_cluster_is_rejected(rds):
+    """Real AWS: a stopped cluster refuses a password change; a stop clears a pending reset."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-reset-stop",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    def status():
+        return rds.describe_db_clusters(DBClusterIdentifier="pw-reset-stop")["DBClusters"][0]["Status"]
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="new_pass")
+    rds.stop_db_cluster(DBClusterIdentifier="pw-reset-stop")
+    assert status() != "resetting-master-credentials"
+    for _ in range(60):
+        if status() == "stopped":
+            break
+        time.sleep(0.5)
+    assert status() == "stopped"
+    with pytest.raises(ClientError) as exc:
+        rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="newer_pass")
+    assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+    assert exc.value.response["Error"]["Message"] == "Db cluster pw-reset-stop cannot be in the stopped state."
+    assert status() == "stopped"
 
 
 def test_rds_modify_instance_password(rds):
@@ -16719,6 +17003,667 @@ def test_rds_cluster_reader_alias_skipped_under_pg_replication(monkeypatch):
         name, "mydb.cluster-ro-abc123.us-east-2.rds.amazonaws.com"]
 
 
+_GLOBAL_ALIAS_NAME = "gdb.global-abc123def456.global.rds.amazonaws.com"
+
+
+def _global_alias_world(monkeypatch, writer="a", fail_first_connect=False):
+    """Two clusters in one global cluster, behind a fake Docker that models
+    network-scoped aliases: a container keeps them only until it leaves the
+    network, and rejoining hands out the next address. With
+    ``fail_first_connect`` the first connect raises."""
+    from ministack.services import rds as m
+
+    gc = {"GlobalClusterIdentifier": "gdb", "_EndpointToken": "abc123def456"}
+    clusters, containers, calls = {}, {}, []
+    for index, cid in enumerate(("a", "b"), start=1):
+        arn = f"arn:aws:rds:us-east-1:000000000000:cluster:{cid}"
+        clusters[arn] = {
+            "DBClusterIdentifier": cid, "DBClusterArn": arn,
+            "GlobalClusterIdentifier": "gdb", "Engine": "aurora-postgresql",
+            "Endpoint": f"{cid}.cluster-abc123.us-east-1.rds.amazonaws.com",
+            "_shared_container_id": f"c-{cid}",
+            "_shared_internal_address": f"10.0.0.{index}",
+            "_shared_container_ready": True,
+        }
+        container = type("FakeContainer", (), {})()
+        container.attrs = {"NetworkSettings": {"Networks": {"net": {
+            "Aliases": m._cluster_endpoint_aliases(clusters[arn])
+            + ([_GLOBAL_ALIAS_NAME] if cid == writer else []),
+            "IPAddress": f"10.0.0.{index}"}}}}
+        container.reload = lambda: None
+        containers[f"c-{cid}"] = container
+    gc["GlobalClusterMembers"] = [
+        {"DBClusterArn": arn, "IsWriter": c["DBClusterIdentifier"] == writer}
+        for arn, c in clusters.items()]
+
+    class Network:
+        next_ip = 50
+
+        def disconnect(self, container):
+            calls.append(("disconnect", container))
+            container.attrs["NetworkSettings"]["Networks"]["net"] = {}
+
+        def connect(self, container, aliases):
+            calls.append(("connect", container, list(aliases)))
+            if fail_first_connect and sum(c[0] == "connect" for c in calls) == 1:
+                raise RuntimeError("connect failed")
+            Network.next_ip += 1
+            container.attrs["NetworkSettings"]["Networks"]["net"] = {
+                "Aliases": list(aliases), "IPAddress": f"10.0.0.{Network.next_ip}"}
+
+    class Docker:
+        class containers:
+            get = staticmethod(lambda cid: containers[cid])
+
+        class networks:
+            get = staticmethod(lambda _name: Network())
+
+    monkeypatch.setattr(m, "_get_docker", lambda: Docker)
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: "net")
+    monkeypatch.setattr(m, "_global_clusters", {"gdb": gc})
+    monkeypatch.setattr(m, "_resolve_global_member_cluster",
+                        lambda member: clusters.get(member["DBClusterArn"]))
+    monkeypatch.setattr(m, "_cluster_member_instances", lambda _cluster: [])
+    replication = []
+    monkeypatch.setattr(m, "_configure_or_defer_mysql_replication",
+                        lambda cid, _cluster: replication.append(cid))
+    by_id = {c["DBClusterIdentifier"]: c for c in clusters.values()}
+    return m, gc, by_id, containers, calls, replication
+
+
+def test_rds_global_writer_endpoint_alias_only_for_the_writer_member(monkeypatch):
+    """Docker answers a name carried by several containers with all of their
+    addresses, so the global endpoint may sit on the writer's container alone."""
+    m, _gc, clusters, *_ = _global_alias_world(monkeypatch)
+    assert m._global_writer_endpoint_aliases(clusters["a"]) == [_GLOBAL_ALIAS_NAME]
+    assert m._global_writer_endpoint_aliases(clusters["b"]) == []
+    assert m._global_writer_endpoint_aliases(
+        {"DBClusterIdentifier": "solo", "DBClusterArn": "arn:x"}) == []
+
+
+def test_rds_global_writer_endpoint_alias_moves_with_the_writer(monkeypatch):
+    """After a switchover the global name must follow the new writer: the old
+    writer is rejoined without it first (so the name never resolves to two
+    containers), the new one gains it, and the internal address follows the
+    container to its new IP. A member already in the right state is left
+    alone, since rejoining the network costs it its address."""
+    m, gc, clusters, containers, calls, replication = _global_alias_world(monkeypatch)
+
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == [] and replication == []
+
+    for member in gc["GlobalClusterMembers"]:
+        member["IsWriter"] = not member["IsWriter"]
+    m._sync_global_writer_endpoint_aliases(gc)
+
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert connects[0][2] == m._cluster_endpoint_aliases(clusters["a"])
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+    assert clusters["a"]["_shared_internal_address"] == "10.0.0.51"
+    assert clusters["b"]["_shared_internal_address"] == "10.0.0.52"
+    # Replicas are re-pointed for the writer only.
+    assert replication == ["b"]
+
+
+def test_rds_leaving_a_global_cluster_drops_the_global_alias(monkeypatch):
+    """A cluster that leaves its global cluster must stop answering to the
+    global endpoint."""
+    m, _gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    m._move_global_writer_alias(_GLOBAL_ALIAS_NAME, [(clusters["a"], False)])
+    assert [c[0] for c in calls] == ["disconnect", "connect"]
+    assert _GLOBAL_ALIAS_NAME not in calls[1][2]
+
+
+def test_rds_cluster_launch_carries_the_global_writer_alias(monkeypatch):
+    """A writer launched (or relaunched) joins the network already holding the
+    global endpoint; a non-writer member does not."""
+    m, _gc, clusters, *_ = _global_alias_world(monkeypatch)
+    launches = {}
+
+    def run(_client, _engine, kwargs, tls_names=None):
+        launches[kwargs["name"]] = kwargs["networking_config"]["net"]["Aliases"]
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(m, "_run_rds_container", run)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    for cid in ("a", "b"):
+        cluster = dict(clusters[cid], MasterUsername="admin",
+                       _MasterUserPassword="password123", DatabaseName="mydb")
+        m._start_cluster_shared_container(cid, cluster)
+    with_global = {name for name, aliases in launches.items() if _GLOBAL_ALIAS_NAME in aliases}
+    assert len(launches) == 2 and len(with_global) == 1
+    assert next(iter(with_global)).endswith("-cluster-a")
+
+    # A writer whose Endpoint holds an address rather than a name still gets
+    # the global name, without the address becoming an alias.
+    launches.clear()
+    cluster = dict(clusters["a"], Endpoint="172.20.0.4", MasterUsername="admin",
+                   _MasterUserPassword="password123", DatabaseName="mydb")
+    m._start_cluster_shared_container("a", cluster)
+    assert list(launches.values()) == [[_GLOBAL_ALIAS_NAME]]
+
+
+def test_rds_every_global_member_certificate_lists_the_global_name(monkeypatch):
+    """On AWS each member's server certificate lists the global endpoint, a
+    secondary's included (AWS: tls-secondary-before-switchover); a cluster
+    outside a global cluster does not get it."""
+    m, gc, clusters, *_ = _global_alias_world(monkeypatch)
+    names = {}
+
+    def run(_client, _engine, kwargs, tls_names=()):
+        names[kwargs["name"]] = list(tls_names)
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(m, "_run_rds_container", run)
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    for cid in ("a", "b"):
+        cluster = dict(clusters[cid], MasterUsername="admin",
+                       _MasterUserPassword="password123", DatabaseName="mydb")
+        m._start_cluster_shared_container(cid, cluster)
+    assert len(names) == 2
+    assert all(_GLOBAL_ALIAS_NAME in tls for tls in names.values())
+
+    names.clear()
+    solo = dict(clusters["a"], MasterUsername="admin", _MasterUserPassword="password123",
+                DatabaseName="mydb")
+    solo.pop("GlobalClusterIdentifier")
+    m._start_cluster_shared_container("a", solo)
+    assert [_GLOBAL_ALIAS_NAME in tls for tls in names.values()] == [False]
+
+    # Without a network that takes aliases the cluster names stay out of the
+    # certificate, and so does the global name.
+    names.clear()
+    monkeypatch.setattr(m, "_network_supports_aliases", lambda _network: False)
+    m._start_cluster_shared_container("a", dict(clusters["a"], MasterUsername="admin",
+                                                _MasterUserPassword="password123", DatabaseName="mydb"))
+    assert [_GLOBAL_ALIAS_NAME in tls for tls in names.values()] == [False]
+
+
+def test_rds_global_name_left_out_of_the_certificate_when_not_ascii(monkeypatch):
+    """A non-ASCII global identifier, which AWS refuses, must not stop the member's certificate being signed."""
+    m, gc, clusters, *_ = _global_alias_world(monkeypatch)
+    cluster = next(iter(clusters.values()))
+    assert m._global_member_certificate_names(cluster) == [_GLOBAL_ALIAS_NAME]
+    gc["GlobalClusterIdentifier"] = "gdbé"
+    assert m._global_member_certificate_names(cluster) == []
+    m._pg_server_material([cluster["Endpoint"], *m._global_member_certificate_names(cluster)], ["127.0.0.1"])
+
+
+def test_rds_pg_reader_certificate_lists_the_global_name(monkeypatch):
+    """A hot-standby reader owns its container, and on AWS an instance's
+    certificate lists the global name whatever its role."""
+    m, _gc, clusters, *_ = _global_alias_world(monkeypatch)
+    names = []
+
+    def run(_client, _engine, _kwargs, tls_names=()):
+        names.append(list(tls_names))
+        raise RuntimeError("stop after launch")
+
+    monkeypatch.setattr(m, "_run_rds_container", run)
+    monkeypatch.setattr(m, "_next_port", lambda: 25999)
+    cluster = dict(clusters["b"], MasterUsername="admin", _MasterUserPassword="password123",
+                   DatabaseName="mydb", _shared_internal_port=5432)
+    m._start_pg_reader_container("b-2", cluster)
+    assert len(names) == 1 and _GLOBAL_ALIAS_NAME in names[0]
+
+
+def _flip_global_writer(gc):
+    for member in gc["GlobalClusterMembers"]:
+        member["IsWriter"] = not member["IsWriter"]
+
+
+def test_rds_global_alias_not_moved_while_a_pg_standby_depends_on_the_old_writer(monkeypatch):
+    """Rejoining the network can change the writer's address, which would strand
+    its hot standbys, so no container may move (half a move leaves the name on two)."""
+    m, gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [{"_pg_standby": True}] if cluster is clusters["a"] else [])
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+
+
+def test_rds_global_alias_failed_move_restores_the_previous_aliases(monkeypatch):
+    """A failed rejoin must not leave the cluster endpoint unreachable, must
+    follow the container to the address it came back on, and must not hand the
+    name to the new writer while the old one still carries it."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(
+        monkeypatch, fail_first_connect=True)
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    connects = [c for c in calls if c[0] == "connect"]
+    assert len(connects) == 2
+    assert connects[0][1] is connects[1][1] is containers["c-a"]
+    assert _GLOBAL_ALIAS_NAME not in connects[0][2]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+    restored = containers["c-a"].attrs["NetworkSettings"]["Networks"]["net"]["IPAddress"]
+    assert clusters["a"]["_shared_internal_address"] == restored
+    assert clusters["b"]["_shared_internal_address"] == "10.0.0.2"
+
+
+def test_rds_global_alias_replication_error_does_not_fail_the_writer_change(monkeypatch):
+    """The writer change is already committed when replicas are re-pointed, so
+    a failure there must not surface, nor skip the address refresh."""
+    m, gc, clusters, _containers, _calls, _ = _global_alias_world(monkeypatch)
+
+    def boom(_cid, _cluster):
+        raise RuntimeError("replication failed")
+
+    monkeypatch.setattr(m, "_configure_or_defer_mysql_replication", boom)
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert clusters["a"]["_shared_internal_address"] == "10.0.0.51"
+    assert clusters["b"]["_shared_internal_address"] == "10.0.0.52"
+
+
+def _global_switch_spy(monkeypatch):
+    """Stub the switch internals; return (m, live global cluster, synced list)."""
+    from ministack.services import rds as m
+
+    live = {"GlobalClusterIdentifier": "gdb"}
+    synced = []
+    monkeypatch.setattr(m, "_global_clusters", {"gdb": live})
+    monkeypatch.setattr(m, "_resolve_global_cluster", lambda gid: live if gid == "gdb" else None)
+    monkeypatch.setattr(m, "_global_cluster_xml", lambda gc: "<x/>")
+    monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases", synced.append)
+    return m, live, synced
+
+
+@pytest.mark.parametrize("handler, params, patched", [
+    ("_switchover_global_cluster", {"GlobalClusterIdentifier": ["gdb"]}, "_planned_mysql_global_writer_switch"),
+    ("_failover_global_cluster", {"GlobalClusterIdentifier": ["gdb"]}, "_planned_mysql_global_writer_switch"),
+    ("_failover_global_cluster", {"GlobalClusterIdentifier": ["gdb"], "AllowDataLoss": ["true"]},
+     "_switch_global_cluster_writer"),
+])
+def test_rds_global_switch_handlers_sync_aliases_on_the_live_global_cluster(
+        monkeypatch, handler, params, patched):
+    """The alias must follow the writer on the stored global cluster, not on the
+    copy the switch returns, and only when the switch succeeded."""
+    m, live, synced = _global_switch_spy(monkeypatch)
+    monkeypatch.setattr(m, patched, lambda *a, **k: dict(live))
+    assert getattr(m, handler)(params)[0] == 200
+    assert len(synced) == 1 and synced[0] is live
+
+    synced.clear()
+    error = (400, {}, b"error")
+    monkeypatch.setattr(m, patched, lambda *a, **k: error)
+    assert getattr(m, handler)(params) == error
+    assert synced == []
+
+
+def test_rds_global_alias_follows_a_rename(monkeypatch):
+    """A renamed global cluster hands out a new endpoint; the writer's container
+    must carry it in place of the old one, and the secondary stays untouched."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    gc["GlobalClusterIdentifier"] = "gdb2"
+    new_name = m._global_cluster_endpoint(gc)
+    assert new_name != _GLOBAL_ALIAS_NAME
+    m._sync_global_writer_endpoint_aliases(gc)
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"]]
+    assert connects[0][2] == m._cluster_endpoint_aliases(clusters["a"]) + [new_name]
+
+
+def test_rds_modify_global_cluster_rename_syncs_aliases(monkeypatch):
+    """Only a rename moves the alias; other modifications leave the network alone."""
+    m, live, synced = _global_switch_spy(monkeypatch)
+    live.update(GlobalClusterArn="arn:aws:rds::000000000000:global-cluster:gdb", GlobalClusterMembers=[])
+    monkeypatch.setattr(m, "_mysql_global_writer_switch_mutation_error", lambda _cluster: None)
+    monkeypatch.setattr(m, "_tags", {})
+    # Record the identifier at call time: the sync must see the renamed cluster.
+    monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases",
+                        lambda gc: synced.append((gc, gc["GlobalClusterIdentifier"])))
+    assert m._modify_global_cluster({"GlobalClusterIdentifier": ["gdb"], "DeletionProtection": ["true"]})[0] == 200
+    assert synced == []
+    assert m._modify_global_cluster(
+        {"GlobalClusterIdentifier": ["gdb"], "NewGlobalClusterIdentifier": ["gdb2"]})[0] == 200
+    assert len(synced) == 1 and synced[0][0] is live and synced[0][1] == "gdb2"
+    assert live["GlobalClusterIdentifier"] == "gdb2"
+
+
+def test_rds_global_alias_waits_for_a_starting_container(monkeypatch):
+    """The readiness probe holds a starting container's launch address, so a
+    move that involves it waits until it is ready, then runs."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    starting = {"DBInstanceStatus": "creating"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [starting] if cluster is clusters["b"] else [])
+    clusters["b"]["_shared_container_ready"] = False
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+
+    clusters["b"]["_shared_container_ready"] = True
+    starting["DBInstanceStatus"] = "available"
+    m._apply_deferred_global_writer_alias(clusters["b"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+
+
+def test_rds_global_alias_waits_for_a_rebooting_container(monkeypatch):
+    """A reboot restarts the container and probes its old address, so a ready
+    cluster with a rebooting instance is held back like a starting one."""
+    m, gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    rebooting = {"DBInstanceStatus": "rebooting"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [rebooting] if cluster is clusters["a"] else [])
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+    rebooting["DBInstanceStatus"] = "available"
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    assert [c[1] for c in calls if c[0] == "connect"] == [_containers["c-a"], _containers["c-b"]]
+
+
+def test_rds_failed_start_releases_a_held_back_move(monkeypatch):
+    """A starting writer that fails never becomes ready; once it has failed the
+    held-back move runs, so the new writer gets the name."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    instance = {"DBInstanceStatus": "creating"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [instance] if cluster is clusters["a"] else [])
+    clusters["a"].update(_shared_container_ready=False, Status="creating")
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+    # A failed first instance leaves the cluster "creating" (derived from its
+    # members), so only the member status shows the wait is over.
+    instance["DBInstanceStatus"] = "failed"
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+
+
+def test_rds_hook_drops_an_old_name_left_on_another_member(monkeypatch):
+    """A rename during a held-back switchover leaves the old name on the old
+    writer; the hook run for the new writer drops it there too."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    clusters["b"].update(_shared_container_ready=False, Status="starting")
+    _flip_global_writer(gc)
+    gc["GlobalClusterIdentifier"] = "gdb2"
+    for c in clusters.values():
+        c["GlobalClusterIdentifier"] = "gdb2"
+    monkeypatch.setattr(m, "_global_clusters", {"gdb2": gc})
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert calls == []
+    clusters["b"].update(_shared_container_ready=True, Status="available")
+    m._apply_deferred_global_writer_alias(clusters["b"])
+    aliases = {cid: containers[f"c-{cid}"].attrs["NetworkSettings"]["Networks"]["net"]["Aliases"] for cid in "ab"}
+    assert _GLOBAL_ALIAS_NAME not in aliases["a"] and _GLOBAL_ALIAS_NAME not in aliases["b"]
+    assert m._global_cluster_endpoint(gc) in aliases["b"]
+
+
+def test_rds_hook_keeps_the_current_name_on_the_old_writer_during_a_hold(monkeypatch):
+    """While a switchover waits on the new writer, the old writer keeps the
+    current name; the hook run for some other reason must not drop it early."""
+    m, gc, clusters, _containers, calls, _ = _global_alias_world(monkeypatch)
+    rebooting = {"DBInstanceStatus": "rebooting"}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [rebooting] if cluster is clusters["b"] else [])
+    _flip_global_writer(gc)
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    assert calls == []
+
+
+def test_rds_stopped_old_writer_does_not_hold_back_the_move(monkeypatch):
+    """No readiness probe polls a stopped or failed container, so a failover away
+    from one moves the name at once instead of waiting for a start that may
+    never come."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    clusters["a"].update(_shared_container_ready=False, Status="stopped")
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"], containers["c-b"]]
+    assert _GLOBAL_ALIAS_NAME in connects[1][2]
+
+
+def test_rds_ready_container_drops_a_global_name_it_no_longer_owns(monkeypatch):
+    """A writer that left its global cluster while stopped keeps the name across
+    the restart; once ready it rejoins without it. A container with only the
+    names it should carry is left alone."""
+    m, gc, clusters, containers, calls, _ = _global_alias_world(monkeypatch)
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    assert calls == []
+
+    gc["GlobalClusterMembers"] = [mem for mem in gc["GlobalClusterMembers"] if not mem["IsWriter"]]
+    clusters["a"].pop("GlobalClusterIdentifier")
+    m._apply_deferred_global_writer_alias(clusters["a"])
+    connects = [c for c in calls if c[0] == "connect"]
+    assert [c[1] for c in connects] == [containers["c-a"]]
+    assert connects[0][2] == m._cluster_endpoint_aliases(clusters["a"])
+
+
+def test_rds_global_alias_failed_writer_move_still_repoints_replicas(monkeypatch):
+    """When the writer's reconnect fails and the restore lands on another
+    address, replicas must follow it."""
+    m, gc, clusters, _containers, _calls, replication = _global_alias_world(
+        monkeypatch, fail_first_connect=True)
+    gc["GlobalClusterIdentifier"] = "gdb2"
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert clusters["a"]["_shared_internal_address"] == "10.0.0.51"
+    assert replication == ["a"]
+
+
+def test_rds_global_alias_move_follows_an_address_shaped_endpoint(monkeypatch):
+    """Without endpoint aliases the reported endpoint is the container address,
+    so it must follow the container to its new one."""
+    m, gc, clusters, _containers, _calls, _ = _global_alias_world(monkeypatch)
+    instance = {"_internal_address": "10.0.0.1", "Endpoint": {"Address": "10.0.0.1", "Port": 5432}}
+    monkeypatch.setattr(m, "_cluster_member_instances",
+                        lambda cluster: [instance] if cluster is clusters["a"] else [])
+    synced = []
+    monkeypatch.setattr(m, "_sync_cluster_endpoints", synced.append)
+    clusters["a"]["_shared_endpoint"] = {"Address": "10.0.0.1", "Port": 5432}
+    clusters["b"]["_shared_endpoint"] = {"Address": "b.cluster-abc123.us-east-1.rds.amazonaws.com", "Port": 5432}
+    _flip_global_writer(gc)
+    m._sync_global_writer_endpoint_aliases(gc)
+    assert clusters["a"]["_shared_endpoint"]["Address"] == "10.0.0.51"
+    assert instance["Endpoint"]["Address"] == instance["_internal_address"] == "10.0.0.51"
+    assert clusters["b"]["_shared_endpoint"]["Address"].startswith("b.cluster-")
+    # Both moved, and the reader endpoint can publish the internal address
+    # even when the writer publishes a name, so both are resynced.
+    assert synced == [clusters["a"], clusters["b"]]
+
+
+def test_rds_create_global_cluster_from_a_source_syncs_aliases(monkeypatch):
+    """A running source cluster becomes the writer and takes the global name."""
+    from ministack.services import rds as m
+
+    source = {"DBClusterIdentifier": "src", "DBClusterArn": "arn:aws:rds:us-east-1:000000000000:cluster:src",
+              "Engine": "aurora-postgresql", "EngineVersion": "16.4"}
+    synced = []
+    monkeypatch.setattr(m, "_global_clusters", {})
+    monkeypatch.setattr(m, "_tags", {})
+    monkeypatch.setattr(m, "_resolve_cluster_in_request_region", lambda cid: source if cid == "src" else None)
+    monkeypatch.setattr(m, "_unsupported_aurora_engine_version_error", lambda *a, **k: None)
+    monkeypatch.setattr(m, "_attach_cluster_to_global", lambda gc, cluster, is_writer: gc[
+        "GlobalClusterMembers"].append({"DBClusterArn": cluster["DBClusterArn"], "IsWriter": is_writer}))
+    monkeypatch.setattr(m, "_global_cluster_xml", lambda gc: "<x/>")
+    monkeypatch.setattr(m, "_sync_global_writer_endpoint_aliases", synced.append)
+    assert m._create_global_cluster({"GlobalClusterIdentifier": ["empty"]})[0] == 200
+    assert synced == []
+    assert m._create_global_cluster(
+        {"GlobalClusterIdentifier": ["fromsrc"], "SourceDBClusterIdentifier": ["src"]})[0] == 200
+    assert len(synced) == 1 and synced[0] is m._global_clusters["fromsrc"]
+
+
+def _wait_cluster_status(rds, cluster_id, status, timeout=180):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if rds.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["Status"] == status:
+            return
+        time.sleep(1)
+    raise AssertionError(f"cluster {cluster_id} never reached {status}")
+
+
+def _wait_instance_gone(rds, instance_id, timeout=60):
+    """Deleting a cluster fails while its instance still exists."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            rds.describe_db_instances(DBInstanceIdentifier=instance_id)
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "DBInstanceNotFound":
+                return
+            raise
+        time.sleep(1)
+
+
+@pytest.mark.data_plane
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_rds_global_endpoint_resolves_to_the_writer_until_removed(rds):
+    """DescribeGlobalClusters hands out a global endpoint; on AWS it resolves
+    to the primary's writer. Here it has to resolve inside the Docker network
+    too, and stop doing so once the cluster leaves the global cluster."""
+    docker = pytest.importorskip("docker").from_env()
+    suffix = uuid.uuid4().hex[:8]
+    gid, cid, did = f"gdbep-{suffix}", f"gdbep-{suffix}-c", f"gdbep-{suffix}-i"
+    renamed = f"{gid}-r"
+
+    def resolve(name):
+        try:
+            out = docker.containers.run(
+                "alpine:latest", ["getent", "hosts", name],
+                network=os.environ["DOCKER_NETWORK"], remove=True)
+        except Exception:
+            return None
+        return out.decode().split()[0]
+
+    try:
+        rds.create_global_cluster(GlobalClusterIdentifier=gid, Engine="aurora-postgresql")
+        rds.create_db_cluster(
+            DBClusterIdentifier=cid, Engine="aurora-postgresql",
+            MasterUsername="admin", MasterUserPassword=PASSWORD,
+            GlobalClusterIdentifier=gid)
+        rds.create_db_instance(
+            DBInstanceIdentifier=did, DBClusterIdentifier=cid,
+            DBInstanceClass="db.r6g.large", Engine="aurora-postgresql")
+        _wait_for_instance(rds, did)
+        global_name = rds.describe_global_clusters(
+            GlobalClusterIdentifier=gid)["GlobalClusters"][0]["Endpoint"]
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(global_name) == cluster_ip
+
+        # A stopped and restarted primary answers for the name again once it is up
+        # (AWS: dns-global-cluster-started).
+        rds.stop_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "stopped")
+        rds.start_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "available")
+        _wait_for_instance(rds, did)
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(global_name) == cluster_ip
+
+        # Renamed, the writer answers for the new name and no longer for the old
+        # one (AWS: dns-new-global-after-rename, dns-old-global-after-rename).
+        rds.modify_global_cluster(GlobalClusterIdentifier=gid, NewGlobalClusterIdentifier=renamed)
+        old_name, global_name = global_name, rds.describe_global_clusters(
+            GlobalClusterIdentifier=renamed)["GlobalClusters"][0]["Endpoint"]
+        assert global_name != old_name
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(global_name) == cluster_ip
+        assert resolve(old_name) is None
+
+        # Renamed back while stopped, the restarted writer carries the current name.
+        rds.stop_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "stopped")
+        rds.modify_global_cluster(GlobalClusterIdentifier=renamed, NewGlobalClusterIdentifier=gid)
+        rds.start_db_cluster(DBClusterIdentifier=cid)
+        _wait_cluster_status(rds, cid, "available")
+        _wait_for_instance(rds, did)
+        cluster_ip = resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+        assert cluster_ip
+        assert resolve(old_name) == cluster_ip
+        assert resolve(global_name) is None
+        renamed, global_name = gid, old_name
+
+        rds.remove_from_global_cluster(
+            GlobalClusterIdentifier=renamed,
+            DbClusterIdentifier=rds.describe_db_clusters(
+                DBClusterIdentifier=cid)["DBClusters"][0]["DBClusterArn"])
+        assert resolve(global_name) is None
+        assert resolve(rds.describe_db_clusters(
+            DBClusterIdentifier=cid)["DBClusters"][0]["Endpoint"])
+    finally:
+        # DeleteDBInstance is refused while the cluster is stopped.
+        try:
+            if rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]["Status"] == "stopped":
+                rds.start_db_cluster(DBClusterIdentifier=cid)
+                _wait_cluster_status(rds, cid, "available")
+        except (ClientError, AssertionError):
+            pass
+        for call, kwargs in (
+            *((rds.remove_from_global_cluster, {
+                "GlobalClusterIdentifier": g,
+                "DbClusterIdentifier": cid}) for g in (gid, renamed)),
+            (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
+            (_wait_instance_gone, {"rds": rds, "instance_id": did}),
+            (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
+            *((rds.delete_global_cluster, {"GlobalClusterIdentifier": g}) for g in (gid, renamed)),
+        ):
+            try:
+                call(**kwargs)
+            except ClientError:
+                pass
+
+
+@pytest.mark.data_plane
+@pytest.mark.skipif(not os.environ.get("DOCKER_NETWORK"), reason="DOCKER_NETWORK not set -- live Aurora")
+def test_rds_global_endpoint_verifies_against_the_server_certificate(rds, tmp_path):
+    """A client that verifies the hostname against the global endpoint, as
+    sslmode=verify-full does, connects: the certificate lists the global name
+    (AWS: tls-via-global)."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    suffix = uuid.uuid4().hex[:8]
+    gid, cid, did = f"gdbtls-{suffix}", f"gdbtls-{suffix}-c", f"gdbtls-{suffix}-i"
+    try:
+        rds.create_global_cluster(GlobalClusterIdentifier=gid, Engine="aurora-postgresql")
+        rds.create_db_cluster(
+            DBClusterIdentifier=cid, Engine="aurora-postgresql", DatabaseName="appdb",
+            MasterUsername="admin", MasterUserPassword=PASSWORD, GlobalClusterIdentifier=gid)
+        rds.create_db_instance(
+            DBInstanceIdentifier=did, DBClusterIdentifier=cid,
+            DBInstanceClass="db.r6g.large", Engine="aurora-postgresql")
+        endpoint = _wait_for_instance(rds, did)["Endpoint"]
+        global_name = rds.describe_global_clusters(
+            GlobalClusterIdentifier=gid)["GlobalClusters"][0]["Endpoint"]
+        dial_host, dial_port = _host_dialable(endpoint)
+        # libpq dials hostaddr and verifies the certificate against host.
+        connection = psycopg2.connect(
+            host=global_name, hostaddr=socket.gethostbyname(dial_host), port=dial_port, user="admin",
+            password=PASSWORD, dbname="appdb", sslmode="verify-full",
+            sslrootcert=_rds_ca_pem(tmp_path), connect_timeout=15)
+        try:
+            cursor = connection.cursor()
+            cursor.execute("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+            assert cursor.fetchone()[0] is True
+        finally:
+            connection.close()
+    finally:
+        for call, kwargs in (
+            (rds.remove_from_global_cluster, {"GlobalClusterIdentifier": gid, "DbClusterIdentifier": cid}),
+            (rds.delete_db_instance, {"DBInstanceIdentifier": did, "SkipFinalSnapshot": True}),
+            (_wait_instance_gone, {"rds": rds, "instance_id": did}),
+            (rds.delete_db_cluster, {"DBClusterIdentifier": cid, "SkipFinalSnapshot": True}),
+            (rds.delete_global_cluster, {"GlobalClusterIdentifier": gid}),
+        ):
+            try:
+                call(**kwargs)
+            except ClientError:
+                pass
+
+
 def _rds_ca_pem(tmp_path):
     """The CA that signs DB server certificates, written where libpq can read it."""
     import urllib.request
@@ -17118,6 +18063,113 @@ def test_rds_public_endpoint_cluster_reports_published_port(monkeypatch):
         m._clusters.clear()
 
 
+@pytest.mark.parametrize("engine", ["aurora-postgresql", "aurora-mysql"])
+@pytest.mark.parametrize("network", [None, "ms_net"])
+def test_rds_public_endpoint_cluster_endpoint_stable_across_first_instance(monkeypatch, network, engine):
+    """#2532: Endpoint, ReaderEndpoint and Port do not move when the first instance starts.
+
+    Real AWS (aurora-postgresql and aurora-mysql, us-east-1) reports the same three values in
+    captures `describe-cluster-just-created`, `describe-cluster-instance-creating`
+    and `describe-cluster-after-first-instance`. The {MINISTACK_HOST, host_port}
+    values themselves are MiniStack-only, from the flag.
+    """
+    import itertools
+
+    from ministack.services import rds as m
+
+    class FakeContainer:
+        id = "public-endpoint-stable-container"
+        status = "running"
+        attrs = {"NetworkSettings": {"Networks": {"ms_net": {"IPAddress": "172.31.77.51"}}}}
+
+        def reload(self):
+            pass
+
+    container = FakeContainer()
+    published_ports = []
+
+    class FakeContainers:
+        def run(self, **kwargs):
+            published_ports.extend(kwargs["ports"].values())
+            return container
+
+        def get(self, identifier):
+            if identifier == container.id:
+                return container
+            raise Exception("not found")
+
+    class FakeImages:
+        def get(self, _image):
+            return object()
+
+    class FakeDocker:
+        containers = FakeContainers()
+        images = FakeImages()
+
+    ports = itertools.count(16200)
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: FakeDocker())
+    monkeypatch.setattr(m, "_get_ministack_network", lambda _client: network)
+    monkeypatch.setattr(m, "_next_port", lambda: next(ports))
+    monkeypatch.setattr(m, "_is_host_port_free", lambda _port: True)
+    monkeypatch.setattr(m, "_wait_for_database_ready", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_ensure_mysql_compatibility", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(m, "_grant_mysql_master_user_privileges", lambda *_args: None)
+
+    m._instances.clear()
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "public-endpoint-stable",
+            "Engine": engine,
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters["public-endpoint-stable"]
+        created = (cluster["Endpoint"], cluster["ReaderEndpoint"], cluster["Port"])
+        assert created == (m._MINISTACK_HOST, m._MINISTACK_HOST, 16200)
+
+        m._create_db_instance({
+            "DBInstanceIdentifier": "public-endpoint-stable-1",
+            "DBClusterIdentifier": "public-endpoint-stable",
+            "DBInstanceClass": "db.t4g.medium",
+            "Engine": engine,
+        })
+        deadline = time.time() + 2
+        while time.time() < deadline and cluster["Status"] != "available":
+            time.sleep(0.01)
+        assert cluster["Status"] == "available"
+        assert published_ports == [16200]
+        assert (cluster["Endpoint"], cluster["ReaderEndpoint"], cluster["Port"]) == created
+    finally:
+        m._instances.clear()
+        m._clusters.clear()
+
+
+def test_rds_public_endpoint_cluster_without_docker_keeps_aws_names(monkeypatch):
+    """#2532: with no Docker no container is published, so CreateDBCluster keeps the AWS-shaped names."""
+    from ministack.services import rds as m
+
+    monkeypatch.setattr(m, "RDS_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(m, "_get_docker", lambda: None)
+
+    m._clusters.clear()
+    try:
+        m._create_db_cluster({
+            "DBClusterIdentifier": "public-endpoint-no-docker",
+            "Engine": "aurora-postgresql",
+            "MasterUsername": "admin",
+            "MasterUserPassword": "password123",
+        })
+        cluster = m._clusters["public-endpoint-no-docker"]
+        assert ".cluster-" in cluster["Endpoint"]
+        assert ".cluster-ro-" in cluster["ReaderEndpoint"]
+        assert cluster["Port"] == 5432
+        assert cluster["_shared_host_port"] is None
+    finally:
+        m._clusters.clear()
+
+
 # ---------------------------------------------------------------------------
 # ModifyDBInstance settings that apply immediately (synthetic instances)
 # ---------------------------------------------------------------------------
@@ -17338,3 +18390,107 @@ def test_rds_settings_outside_pending_modified_values_apply_immediately(imm_stat
     assert status == 200
     assert instance[param] == stored
     assert instance["PendingModifiedValues"] == {}
+
+
+# AWS observations (2026-10-27, us-east-1, disposable Aurora MySQL 3.10.3 /
+# PostgreSQL 17.9): same-value ModifyDBCluster handoff preserves seven-day PI,
+# a new reader inherits the policy, and cluster disablement reaches both members.
+# CreateDBCluster explicit settings follow the documented cluster-level API;
+# tests deliberately leave omission as legacy instance-managed behavior.
+@pytest.mark.parametrize("engine", ["aurora-mysql", "aurora-postgresql"])
+def test_rds_cluster_performance_insights_handoff(imm_state, monkeypatch, engine):
+    monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+    client = _imm_sdk()
+    cluster_id = "pi-handoff"
+    key = f"arn:aws:kms:{_IMM_REGION}:{_IMM_ACCOUNT}:key/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    cluster = client.create_db_cluster(
+        DBClusterIdentifier=cluster_id, Engine=engine,
+        MasterUsername="admin", MasterUserPassword="password123",
+    )["DBCluster"]
+    assert cluster["PerformanceInsightsEnabled"] is False
+    writer = client.create_db_instance(
+        DBInstanceIdentifier="pi-writer", DBClusterIdentifier=cluster_id,
+        Engine=engine, DBInstanceClass="db.r6g.large",
+        EnablePerformanceInsights=True, PerformanceInsightsRetentionPeriod=7,
+        PerformanceInsightsKMSKeyId=key,
+    )["DBInstance"]
+    assert writer["PerformanceInsightsEnabled"] is True
+    assert writer["PerformanceInsightsKMSKeyId"] == key
+    assert writer["PerformanceInsightsRetentionPeriod"] == 7
+    migrated = client.modify_db_cluster(
+        DBClusterIdentifier=cluster_id, ApplyImmediately=True,
+        EnablePerformanceInsights=True, PerformanceInsightsRetentionPeriod=7,
+        PerformanceInsightsKMSKeyId=key,
+    )["DBCluster"]
+    assert migrated["PerformanceInsightsEnabled"] is True
+    assert migrated["PerformanceInsightsKMSKeyId"] == key
+    assert migrated["PerformanceInsightsRetentionPeriod"] == 7
+    assert migrated["DatabaseInsightsMode"] == "standard"
+    client.create_db_instance(
+        DBInstanceIdentifier="pi-reader", DBClusterIdentifier=cluster_id,
+        Engine=engine, DBInstanceClass="db.r6g.large",
+    )
+    for instance in client.describe_db_instances()["DBInstances"]:
+        assert instance["PerformanceInsightsEnabled"] is True
+        assert instance["PerformanceInsightsKMSKeyId"] == key
+        assert instance["PerformanceInsightsRetentionPeriod"] == 7
+        assert instance["DatabaseInsightsMode"] == "standard"
+    client.modify_db_cluster(DBClusterIdentifier=cluster_id, EnablePerformanceInsights=False)
+    for instance in client.describe_db_instances()["DBInstances"]:
+        assert instance["PerformanceInsightsEnabled"] is False
+        assert "PerformanceInsightsKMSKeyId" not in instance
+        assert "PerformanceInsightsRetentionPeriod" not in instance
+    # Disabling remains cluster-managed after the last member is removed.
+    for identifier in ("pi-writer", "pi-reader"):
+        client.delete_db_instance(DBInstanceIdentifier=identifier, SkipFinalSnapshot=True)
+    replacement = client.create_db_instance(
+        DBInstanceIdentifier="pi-replacement", DBClusterIdentifier=cluster_id,
+        Engine=engine, DBInstanceClass="db.r6g.large",
+    )["DBInstance"]
+    assert replacement["PerformanceInsightsEnabled"] is False
+    assert client.describe_db_clusters(DBClusterIdentifier=cluster_id)["DBClusters"][0]["DatabaseInsightsMode"] == "standard"
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_rds_cluster_performance_insights_explicit_create(imm_state, monkeypatch, enabled):
+    monkeypatch.setattr(_imm_rds, "_get_docker", lambda: None)
+    client = _imm_sdk()
+    cluster = client.create_db_cluster(
+        DBClusterIdentifier="pi-new", Engine="aurora-mysql",
+        MasterUsername="admin", MasterUserPassword="password123",
+        EnablePerformanceInsights=enabled,
+    )["DBCluster"]
+    member = client.create_db_instance(
+        DBInstanceIdentifier="pi-new-member", DBClusterIdentifier="pi-new",
+        Engine="aurora-mysql", DBInstanceClass="db.r6g.large",
+    )["DBInstance"]
+    assert cluster["PerformanceInsightsEnabled"] is enabled
+    assert member["PerformanceInsightsEnabled"] is enabled
+    if enabled:
+        assert member["PerformanceInsightsRetentionPeriod"] == 7
+        assert member["PerformanceInsightsKMSKeyId"] == cluster["PerformanceInsightsKMSKeyId"]
+        assert member["PerformanceInsightsKMSKeyId"].startswith(f"arn:aws:kms:{_IMM_REGION}:{_IMM_ACCOUNT}:key/")
+    else:
+        assert "PerformanceInsightsKMSKeyId" not in cluster
+        assert "PerformanceInsightsRetentionPeriod" not in member
+
+
+def test_rds_global_cluster_has_an_endpoint_without_members(rds):
+    """#2464, captured on AWS: an empty global cluster already has
+    <id>.global-<12 lowercase alphanumerics>.global.rds.amazonaws.com, stable across describes."""
+    gid = f"gc-endpoint-{_uuid_mod.uuid4().hex[:8]}"
+    created = rds.create_global_cluster(GlobalClusterIdentifier=gid, Engine="aurora-postgresql")["GlobalCluster"]
+    try:
+        assert re.fullmatch(rf"{gid}\.global-[a-z0-9]{{12}}\.global\.rds\.amazonaws\.com", created["Endpoint"])
+        described = rds.describe_global_clusters(GlobalClusterIdentifier=gid)["GlobalClusters"][0]
+        assert described["Endpoint"] == created["Endpoint"]
+    finally:
+        rds.delete_global_cluster(GlobalClusterIdentifier=gid)
+
+
+@pytest.mark.parametrize("version", ["14.24", "15.19", "16.15", "17.11", "18.6"])
+def test_rds_aurora_postgresql_lists_the_current_minors(rds, version):
+    """#2488, captured on AWS (us-east-1 and eu-west-1, 2026-10-29)."""
+    listed = rds.describe_db_engine_versions(Engine="aurora-postgresql", EngineVersion=version)["DBEngineVersions"]
+    assert [(v["EngineVersion"], v["DBParameterGroupFamily"]) for v in listed] == [
+        (version, f"aurora-postgresql{version.split('.')[0]}")]

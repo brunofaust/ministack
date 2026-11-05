@@ -88,6 +88,7 @@ def test_autoscaling_groups_and_tags_are_region_scoped():
         MinSize=1,
         MaxSize=3,
         AvailabilityZones=["us-east-1a"],
+        LaunchConfigurationName="dummy-lc",
         Tags=[{"Key": "region", "Value": "east", "PropagateAtLaunch": True}],
     )
     west.create_auto_scaling_group(
@@ -95,6 +96,7 @@ def test_autoscaling_groups_and_tags_are_region_scoped():
         MinSize=2,
         MaxSize=4,
         AvailabilityZones=["us-west-2a"],
+        LaunchConfigurationName="dummy-lc",
         Tags=[{"Key": "region", "Value": "west", "PropagateAtLaunch": True}],
     )
     try:
@@ -1307,7 +1309,17 @@ def test_multiple_scheduled_actions(autoscaling):
 # ---------------------------------------------------------------------------
 
 
-def test_create_asg_with_launch_template(autoscaling):
+def _ensure_my_template(ec2):
+    try:
+        ec2.create_launch_template(LaunchTemplateName="my-template",
+                                   LaunchTemplateData={"InstanceType": "t3.micro", "ImageId": "ami-12345678"})
+    except ClientError as exc:
+        if "AlreadyExists" not in exc.response["Error"]["Code"]:
+            raise
+
+
+def test_create_asg_with_launch_template(autoscaling, ec2):
+    _ensure_my_template(ec2)
     asg = _uid("asg-lt")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg,
@@ -1329,12 +1341,379 @@ def test_create_asg_with_launch_template(autoscaling):
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
 
 
+def test_asg_launch_template_by_name_reports_its_id(autoscaling, ec2):
+    """A group given the template's name (or id) reports both, and UpdateAutoScalingGroup can switch it."""
+    first = ec2.create_launch_template(LaunchTemplateName=_uid("lt-a"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    second = ec2.create_launch_template(LaunchTemplateName=_uid("lt-b"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    asg = _uid("asg-lt-name")
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=asg, MinSize=0, MaxSize=1, AvailabilityZones=["us-east-1a"],
+        LaunchTemplate={"LaunchTemplateName": first["LaunchTemplateName"], "Version": "$Default"})
+    try:
+        def group_lt():
+            return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[asg])["AutoScalingGroups"][0][
+                "LaunchTemplate"]
+
+        assert group_lt() == {"LaunchTemplateId": first["LaunchTemplateId"],
+                              "LaunchTemplateName": first["LaunchTemplateName"], "Version": "$Default"}
+        autoscaling.update_auto_scaling_group(
+            AutoScalingGroupName=asg, LaunchTemplate={"LaunchTemplateId": second["LaunchTemplateId"], "Version": "1"})
+        assert group_lt() == {"LaunchTemplateId": second["LaunchTemplateId"],
+                              "LaunchTemplateName": second["LaunchTemplateName"], "Version": "1"}
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        for lt in (first, second):
+            ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_asg_launch_template_errors_and_version_follow_aws(autoscaling, ec2):
+    """Captured on AWS (us-east-1, 2026-10-28): a missing template or version is a ValidationError, and a group
+    given no Version reports none."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-err"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    asg = _uid("asg-lt-err")
+    try:
+        cases = [
+            ({"LaunchTemplateName": "no-such-template", "Version": "$Default"},
+             "The specified launch template, with template name no-such-template, does not exist."),
+            ({"LaunchTemplateId": "lt-0123456789abcdef0", "Version": "$Default"},
+             "Malformed launch template Id: lt-0123456789abcdef0"),
+            ({"LaunchTemplateId": lt["LaunchTemplateId"], "Version": "99"},
+             f"Could not find the specified version 99 for the launch template with ID {lt['LaunchTemplateId']}."),
+        ]
+        for spec, message in cases:
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                                      AvailabilityZones=["us-east-1a"], LaunchTemplate=spec)
+            assert exc.value.response["Error"]["Code"] == "ValidationError"
+            assert exc.value.response["Error"]["Message"] == message
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                              AvailabilityZones=["us-east-1a"],
+                                              LaunchTemplate={"LaunchTemplateName": lt["LaunchTemplateName"]})
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[asg])["AutoScalingGroups"][0]
+        assert group["LaunchTemplate"] == {"LaunchTemplateId": lt["LaunchTemplateId"],
+                                           "LaunchTemplateName": lt["LaunchTemplateName"]}
+        with pytest.raises(ClientError) as exc:
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=asg,
+                                                  LaunchTemplate={"LaunchTemplateName": "no-such-template"})
+        assert exc.value.response["Error"]["Message"] == (
+            "The specified launch template, with template name no-such-template, does not exist.")
+    finally:
+        try:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        except ClientError:
+            pass
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_asg_mixed_instances_policy_follows_aws(autoscaling, ec2):
+    """#2452, captured on AWS (us-east-1, 2026-10-29): a MixedInstancesPolicy is kept with its launch
+    template resolved, AWS's InstancesDistribution defaults and Overrides [] when none; the group has no
+    LaunchTemplate; both or no launch source is refused."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-mix"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    base = dict(MinSize=0, MaxSize=0, DesiredCapacity=0, AvailabilityZones=["us-east-1a"])
+    defaults = {"OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+                "OnDemandPercentageAboveBaseCapacity": 100, "SpotAllocationStrategy": "lowest-price",
+                "SpotInstancePools": 2}
+    groups = []
+    try:
+        for suffix, policy, expected in (
+                ("min", {"LaunchTemplate": {
+                    "LaunchTemplateSpecification": {"LaunchTemplateName": lt["LaunchTemplateName"], "Version": "$Default"},
+                    "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]}},
+                 {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                     "LaunchTemplateId": lt["LaunchTemplateId"], "LaunchTemplateName": lt["LaunchTemplateName"],
+                     "Version": "$Default"}, "Overrides": [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]},
+                  "InstancesDistribution": defaults}),
+                ("id", {"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt["LaunchTemplateId"]}},
+                        "InstancesDistribution": {"OnDemandPercentageAboveBaseCapacity": 50}},
+                 {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                     "LaunchTemplateId": lt["LaunchTemplateId"], "LaunchTemplateName": lt["LaunchTemplateName"]},
+                     "Overrides": []},
+                  "InstancesDistribution": {**defaults, "OnDemandPercentageAboveBaseCapacity": 50}})):
+            name = _uid(f"asg-mix-{suffix}")
+            autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy=policy, **base)
+            groups.append(name)
+            group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
+            assert group["MixedInstancesPolicy"] == expected
+            assert "LaunchTemplate" not in group
+
+        message = ("Valid requests must contain either LaunchTemplate, LaunchConfigurationName, InstanceId or "
+                   "MixedInstancesPolicy parameter.")
+        for kwargs in ({"LaunchTemplate": {"LaunchTemplateId": lt["LaunchTemplateId"]},
+                        "MixedInstancesPolicy": {"LaunchTemplate": {"LaunchTemplateSpecification": {
+                            "LaunchTemplateId": lt["LaunchTemplateId"]}}}}, {}):
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=_uid("asg-mix-bad"), **base, **kwargs)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "ValidationError", message)
+    finally:
+        for name in groups:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+_POOLS_MESSAGE = "SpotInstancePools option is only available with the lowest-price allocation strategy."
+
+
+def _mixed_policy(lt_id, overrides=("t3.micro", "t3a.micro"), **distribution):
+    return {"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "$Latest"},
+                               "Overrides": [{"InstanceType": t} for t in overrides]},
+            "InstancesDistribution": {"OnDemandBaseCapacity": 0, "OnDemandPercentageAboveBaseCapacity": 0,
+                                      **distribution}}
+
+
+def _distribution(autoscaling, name):
+    return autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0][
+        "MixedInstancesPolicy"]
+
+
+def test_asg_spot_instance_pools_follow_allocation_strategy(autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04): SpotInstancePools defaults to 2 only for lowest-price
+    (m1b-describe-{pco-omit,co-omit,lp-omit,lp-three,default-omit}, m2-describe-nostrat-pools,
+    m2-describe-pco-spotmax), any other strategy with it is
+    refused (m1b-create-pco-zero, m5-create-pco-two, m2-create-cop-pools), and SpotMaxPrice "" stores none
+    (m2-describe-spotmax-empty)."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-pools"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    base = dict(MinSize=0, MaxSize=0, DesiredCapacity=0, AvailabilityZones=["us-east-1a"])
+    common = {"OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+              "OnDemandPercentageAboveBaseCapacity": 0}
+    groups = []
+    try:
+        for suffix, sent, expected in (
+                ("pco", {"SpotAllocationStrategy": "price-capacity-optimized"},
+                 {"SpotAllocationStrategy": "price-capacity-optimized"}),
+                ("co", {"SpotAllocationStrategy": "capacity-optimized"}, {"SpotAllocationStrategy": "capacity-optimized"}),
+                ("lp", {"SpotAllocationStrategy": "lowest-price"},
+                 {"SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 2}),
+                ("lp3", {"SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 3},
+                 {"SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 3}),
+                ("none", {}, {"SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 2}),
+                ("none4", {"SpotInstancePools": 4}, {"SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 4}),
+                ("pco-max", {"SpotAllocationStrategy": "price-capacity-optimized", "SpotMaxPrice": "0.05"},
+                 {"SpotAllocationStrategy": "price-capacity-optimized", "SpotMaxPrice": "0.05"}),
+                ("max-empty", {"SpotMaxPrice": ""}, {"SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 2})):
+            name = _uid(f"asg-pools-{suffix}")
+            autoscaling.create_auto_scaling_group(AutoScalingGroupName=name,
+                                                  MixedInstancesPolicy=_mixed_policy(lt["LaunchTemplateId"], **sent), **base)
+            groups.append(name)
+            assert _distribution(autoscaling, name)["InstancesDistribution"] == {**common, **expected}
+
+        for strategy, pools in (("price-capacity-optimized", 0), ("price-capacity-optimized", 2),
+                                ("capacity-optimized-prioritized", 2)):
+            name = _uid("asg-pools-bad")
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy=_mixed_policy(
+                    lt["LaunchTemplateId"], SpotAllocationStrategy=strategy, SpotInstancePools=pools), **base)
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "ValidationError", _POOLS_MESSAGE)
+            assert not autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"]
+    finally:
+        for name in groups:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+
+
+def test_asg_update_merges_mixed_instances_policy(autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04): UpdateAutoScalingGroup keeps the members it is not sent
+    (m1b-describe-lp-to-pco, m2-describe-after-a-*, m4-describe-after-c-spec-only, m8-describe-after-pools-only-lp;
+    a spec without Version drops the stored one, m8-describe-after-spec-no-version), drops SpotInstancePools
+    for another strategy and restores 2 for lowest-price, clears SpotMaxPrice on "", and refuses
+    SpotInstancePools under the stored or sent strategy without changing the group (m2-update-a-pools-on-pco,
+    m2-update-a-co-with-pools)."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-merge"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    lt_id = lt["LaunchTemplateId"]
+    name = _uid("asg-merge")
+    spec = {"LaunchTemplateId": lt_id, "LaunchTemplateName": lt["LaunchTemplateName"], "Version": "$Latest"}
+    overrides = [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]
+    dist = {"OnDemandAllocationStrategy": "lowest-price", "OnDemandBaseCapacity": 0,
+            "OnDemandPercentageAboveBaseCapacity": 0, "SpotAllocationStrategy": "lowest-price",
+            "SpotInstancePools": 3, "SpotMaxPrice": "0.05"}
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=name, MinSize=0, MaxSize=0, DesiredCapacity=0, AvailabilityZones=["us-east-1a"],
+        MixedInstancesPolicy=_mixed_policy(lt_id, OnDemandAllocationStrategy="lowest-price",
+                                           SpotAllocationStrategy="lowest-price", SpotInstancePools=3,
+                                           SpotMaxPrice="0.05"))
+    try:
+        def update(policy):
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy=policy)
+            return _distribution(autoscaling, name)
+
+        def refused(policy):
+            before = _distribution(autoscaling, name)
+            with pytest.raises(ClientError) as exc:
+                autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy=policy)
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "ValidationError", _POOLS_MESSAGE)
+            assert _distribution(autoscaling, name) == before
+
+        dist.pop("SpotInstancePools")
+        dist["SpotAllocationStrategy"] = "price-capacity-optimized"
+        assert update({"InstancesDistribution": {"SpotAllocationStrategy": "price-capacity-optimized"}}) == {
+            "LaunchTemplate": {"LaunchTemplateSpecification": spec, "Overrides": overrides},
+            "InstancesDistribution": dist}
+        refused({"InstancesDistribution": {"SpotInstancePools": 4}})
+        dist.update(SpotAllocationStrategy="lowest-price", SpotInstancePools=2)
+        assert update({"InstancesDistribution": {"SpotAllocationStrategy": "lowest-price"}})["InstancesDistribution"] == dist
+        refused({"InstancesDistribution": {"SpotAllocationStrategy": "capacity-optimized", "SpotInstancePools": 2}})
+        del dist["SpotMaxPrice"]
+        assert update({"InstancesDistribution": {"SpotMaxPrice": ""}})["InstancesDistribution"] == dist
+
+        overrides = overrides + [{"InstanceType": "t3.small"}]
+        assert update({"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "$Latest"},
+                                          "Overrides": overrides}}) == {
+            "LaunchTemplate": {"LaunchTemplateSpecification": spec, "Overrides": overrides},
+            "InstancesDistribution": dist}
+        overrides = [{"InstanceType": "t3.micro"}]
+        assert update({"LaunchTemplate": {"Overrides": overrides}})["LaunchTemplate"] == {
+            "LaunchTemplateSpecification": spec, "Overrides": overrides}
+        spec["Version"] = "1"
+        assert update({"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "1"}}})[
+            "LaunchTemplate"] == {"LaunchTemplateSpecification": spec, "Overrides": overrides}
+        dist["OnDemandPercentageAboveBaseCapacity"] = 50
+        assert update({"InstancesDistribution": {"OnDemandPercentageAboveBaseCapacity": 50}}) == {
+            "LaunchTemplate": {"LaunchTemplateSpecification": spec, "Overrides": overrides},
+            "InstancesDistribution": dist}
+        dist["SpotInstancePools"] = 6
+        assert update({"InstancesDistribution": {"SpotInstancePools": 6}})["InstancesDistribution"] == dist
+        del spec["Version"]
+        assert update({"LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt_id}}}) == {
+            "LaunchTemplate": {"LaunchTemplateSpecification": spec, "Overrides": overrides},
+            "InstancesDistribution": dist}
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
+def test_asg_mixed_instances_policy_needs_a_launch_template(autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04): with no stored policy, on create or on update of a group
+    with a plain LaunchTemplate, a MixedInstancesPolicy without LaunchTemplate is refused before SpotInstancePools
+    (m6-create-no-lt, m10-create-no-lt-pools, m5-update-plain-dist-only, m6-update-plain-no-lt-pools) and one with
+    only Overrides needs an
+    id or name, also before SpotInstancePools (m6-create-overrides-only, m6-update-plain-overrides,
+    m7-create-overrides-only-pools, m7-update-plain-overrides-pools); the group is unchanged
+    (m5-describe-after-plain-dist-only, m5-describe-after-plain-pools, m6-describe-after-plain-overrides,
+    m6-describe-after-plain-no-lt-pools, m7-describe-after-plain-overrides-pools). A full policy replaces the LaunchTemplate (m5-describe-after-plain-full),
+    and SpotInstancePools is refused there too (m5-update-plain-pools)."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-need"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    lt_id = lt["LaunchTemplateId"]
+    base = dict(MinSize=0, MaxSize=0, DesiredCapacity=0, AvailabilityZones=["us-east-1a"])
+    required = ("A launch template is required when configuring an Auto Scaling group with a mixed instances policy. "
+                "Add a launch template to the mixed instances policy and try again.")
+    id_or_name = "Valid requests must contain either launchTemplateId or LaunchTemplateName"
+    dist = {"OnDemandBaseCapacity": 0, "OnDemandPercentageAboveBaseCapacity": 0,
+            "SpotAllocationStrategy": "price-capacity-optimized"}
+    overrides = [{"InstanceType": "t3.micro"}, {"InstanceType": "t3a.micro"}]
+    name = _uid("asg-need")
+
+    def refused(call, message, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(AutoScalingGroupName=name, **kwargs)
+        assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+        assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+            "ValidationError", message)
+
+    try:
+        refused(autoscaling.create_auto_scaling_group, required, MixedInstancesPolicy={"InstancesDistribution": dist},
+                **base)
+        refused(autoscaling.create_auto_scaling_group, required, MixedInstancesPolicy={
+            "InstancesDistribution": {**dist, "SpotInstancePools": 2}}, **base)
+        refused(autoscaling.create_auto_scaling_group, id_or_name, MixedInstancesPolicy={
+            "LaunchTemplate": {"Overrides": overrides}, "InstancesDistribution": dist}, **base)
+        refused(autoscaling.create_auto_scaling_group, id_or_name, MixedInstancesPolicy={
+            "LaunchTemplate": {"Overrides": overrides}, "InstancesDistribution": {**dist, "SpotInstancePools": 2}}, **base)
+        assert not autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"]
+
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=name, LaunchTemplate={
+            "LaunchTemplateId": lt_id, "Version": "$Latest"}, **base)
+        before = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
+        update = autoscaling.update_auto_scaling_group
+        refused(update, required, MixedInstancesPolicy={"InstancesDistribution": dist})
+        refused(update, required, MixedInstancesPolicy={"InstancesDistribution": {**dist, "SpotInstancePools": 2}})
+        refused(update, id_or_name, MixedInstancesPolicy={"LaunchTemplate": {"Overrides": overrides},
+                                                          "InstancesDistribution": dist})
+        refused(update, id_or_name, MixedInstancesPolicy={"LaunchTemplate": {"Overrides": overrides},
+                                                          "InstancesDistribution": {**dist, "SpotInstancePools": 2}})
+        refused(update, _POOLS_MESSAGE, MixedInstancesPolicy={
+            "LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "$Latest"}},
+            "InstancesDistribution": {"SpotAllocationStrategy": "capacity-optimized", "SpotInstancePools": 2}})
+        assert autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0] == before
+
+        update(AutoScalingGroupName=name, MixedInstancesPolicy={
+            "LaunchTemplate": {"LaunchTemplateSpecification": {"LaunchTemplateId": lt_id, "Version": "$Latest"},
+                               "Overrides": overrides},
+            "InstancesDistribution": {"SpotAllocationStrategy": "price-capacity-optimized"}})
+        group = autoscaling.describe_auto_scaling_groups(AutoScalingGroupNames=[name])["AutoScalingGroups"][0]
+        assert "LaunchTemplate" not in group
+        assert group["MixedInstancesPolicy"] == {
+            "LaunchTemplate": {"LaunchTemplateSpecification": {
+                "LaunchTemplateId": lt_id, "LaunchTemplateName": lt["LaunchTemplateName"], "Version": "$Latest"},
+                "Overrides": overrides},
+            "InstancesDistribution": {"OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+                                      "OnDemandPercentageAboveBaseCapacity": 100,
+                                      "SpotAllocationStrategy": "price-capacity-optimized"}}
+    finally:
+        try:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+        except ClientError:
+            pass
+        ec2.delete_launch_template(LaunchTemplateId=lt_id)
+
+
+def test_asg_update_to_lowest_price_with_pools(autoscaling, ec2):
+    """#2577, captured on AWS (us-east-2, 2026-11-04, m2-describe-after-b-to-lp-pools): a price-capacity-optimized
+    group updated to lowest-price with SpotInstancePools keeps the pools sent, and re-sending lowest-price keeps them
+    (m11-describe-after-lp3-resend-lp, whose group was created lowest-price/3; that it holds after this update is
+    inferred). It also keeps the launch template it
+    was not sent, including an override naming another template by name, stored resolved (m1b-describe-lp-to-pco,
+    m5-describe-own-lt, m5-describe-after-own-lt-dist-only). The override capture is of an update to
+    price-capacity-optimized; that it holds for this update to lowest-price is inferred."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-tolp"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    lt2 = ec2.create_launch_template(LaunchTemplateName=_uid("lt-tolp2"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    name = _uid("asg-tolp")
+    policy = _mixed_policy(lt["LaunchTemplateId"], SpotAllocationStrategy="price-capacity-optimized")
+    policy["LaunchTemplate"]["Overrides"][1]["LaunchTemplateSpecification"] = {
+        "LaunchTemplateName": lt2["LaunchTemplateName"], "Version": "1"}
+    autoscaling.create_auto_scaling_group(
+        AutoScalingGroupName=name, MinSize=0, MaxSize=0, DesiredCapacity=0, AvailabilityZones=["us-east-1a"],
+        MixedInstancesPolicy=policy)
+    try:
+        before = _distribution(autoscaling, name)["LaunchTemplate"]
+        assert before["Overrides"][1] == {"InstanceType": "t3a.micro", "LaunchTemplateSpecification": {
+            "LaunchTemplateId": lt2["LaunchTemplateId"], "LaunchTemplateName": lt2["LaunchTemplateName"],
+            "Version": "1"}}
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy={"InstancesDistribution": {
+            "SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 5}})
+        assert _distribution(autoscaling, name)["LaunchTemplate"] == before
+        assert _distribution(autoscaling, name)["InstancesDistribution"] == {
+            "OnDemandAllocationStrategy": "prioritized", "OnDemandBaseCapacity": 0,
+            "OnDemandPercentageAboveBaseCapacity": 0, "SpotAllocationStrategy": "lowest-price", "SpotInstancePools": 5}
+        autoscaling.update_auto_scaling_group(AutoScalingGroupName=name, MixedInstancesPolicy={"InstancesDistribution": {
+            "SpotAllocationStrategy": "lowest-price"}})
+        assert _distribution(autoscaling, name)["InstancesDistribution"]["SpotInstancePools"] == 5
+    finally:
+        autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name, ForceDelete=True)
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+        ec2.delete_launch_template(LaunchTemplateId=lt2["LaunchTemplateId"])
+
+
 # ---------------------------------------------------------------------------
 # Instance Refresh
 # ---------------------------------------------------------------------------
 
 
-def test_start_and_describe_instance_refresh(autoscaling):
+def test_start_and_describe_instance_refresh(autoscaling, ec2):
+    _ensure_my_template(ec2)
     asg = _uid("asg-refresh")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg,
@@ -1375,7 +1754,8 @@ def test_start_instance_refresh_unknown_asg_fails(autoscaling):
     assert "ValidationError" in str(exc.value)
 
 
-def test_cancel_instance_refresh_when_none_active(autoscaling):
+def test_cancel_instance_refresh_when_none_active(autoscaling, ec2):
+    _ensure_my_template(ec2)
     asg = _uid("asg-cancel")
     autoscaling.create_auto_scaling_group(
         AutoScalingGroupName=asg,
@@ -1497,3 +1877,55 @@ def test_asg_instances_round_robin_azs(autoscaling):
         assert azs == ["us-east-1a", "us-east-1b", "us-east-1a", "us-east-1b"]
     finally:
         autoscaling.delete_auto_scaling_group(AutoScalingGroupName=name)
+
+
+def test_asg_launch_template_request_validation_follows_aws(autoscaling, ec2):
+    """#2482, captured on AWS: both or neither of id and name, a non-numeric version, a short lt- id and
+    another region's id answer AWS's ValidationError messages; malformed ids keep theirs."""
+    lt = ec2.create_launch_template(LaunchTemplateName=_uid("lt-2482"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    import boto3
+    from conftest import ENDPOINT
+
+    west = boto3.client("ec2", endpoint_url=ENDPOINT, region_name="us-west-2",
+                        aws_access_key_id="test", aws_secret_access_key="test")
+    west_lt = west.create_launch_template(LaunchTemplateName=_uid("lt-2482-west"), LaunchTemplateData={
+        "InstanceType": "t3.micro", "ImageId": "ami-12345678"})["LaunchTemplate"]
+    asg = _uid("asg-2482")
+    either = "Valid requests must contain either launchTemplateId or LaunchTemplateName"
+    cases = [
+        ({"LaunchTemplateId": lt["LaunchTemplateId"], "LaunchTemplateName": lt["LaunchTemplateName"]}, either),
+        ({"Version": "1"}, either),
+        ({"LaunchTemplateId": lt["LaunchTemplateId"], "Version": "abc"},
+         "Invalid launch template version: either '$Default', '$Latest', or a numeric version are allowed."),
+        ({"LaunchTemplateId": "lt-0123"}, "The specified launch template, with template ID lt-0123, does not exist."),
+        ({"LaunchTemplateId": west_lt["LaunchTemplateId"]},
+         f"The specified launch template, with template ID {west_lt['LaunchTemplateId']}, does not exist."),
+        ({"LaunchTemplateId": lt["LaunchTemplateName"]}, f"Malformed launch template Id: {lt['LaunchTemplateName']}"),
+        ({"LaunchTemplateId": "bogus"}, "Malformed launch template Id: bogus"),
+        ({"LaunchTemplateId": "lt-0123456789abcdef0"}, "Malformed launch template Id: lt-0123456789abcdef0"),
+        # Captured 2026-10-29: 17 or more digits, or not lowercase hex, is malformed whatever the length.
+        ({"LaunchTemplateId": "lt-0fedcba98765432100"}, "Malformed launch template Id: lt-0fedcba98765432100"),
+        ({"LaunchTemplateId": "lt-0123456789abcdef0123"}, "Malformed launch template Id: lt-0123456789abcdef0123"),
+        ({"LaunchTemplateId": "LT-0123456789ABCDEF0"}, "Malformed launch template Id: LT-0123456789ABCDEF0"),
+    ]
+    try:
+        for spec, message in cases:
+            with pytest.raises(ClientError) as exc:
+                autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                                      AvailabilityZones=["us-east-1a"], LaunchTemplate=spec)
+            assert (exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]) == (
+                "ValidationError", message), spec
+        autoscaling.create_auto_scaling_group(AutoScalingGroupName=asg, MinSize=0, MaxSize=0,
+                                              AvailabilityZones=["us-east-1a"],
+                                              LaunchTemplate={"LaunchTemplateId": lt["LaunchTemplateId"]})
+        with pytest.raises(ClientError) as exc:
+            autoscaling.update_auto_scaling_group(AutoScalingGroupName=asg, LaunchTemplate={"Version": "1"})
+        assert exc.value.response["Error"]["Message"] == either
+    finally:
+        try:
+            autoscaling.delete_auto_scaling_group(AutoScalingGroupName=asg)
+        except ClientError:
+            pass
+        ec2.delete_launch_template(LaunchTemplateId=lt["LaunchTemplateId"])
+        west.delete_launch_template(LaunchTemplateId=west_lt["LaunchTemplateId"])

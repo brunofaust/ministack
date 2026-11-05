@@ -820,14 +820,15 @@ def _start_query_execution(data):
     query = data.get("QueryString", "")
     query_id = new_uuid()
     workgroup = data.get("WorkGroup", "primary")
-    output_location = data.get("ResultConfiguration", {}).get(
-        "OutputLocation"
-    ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
-        "ResultConfiguration", {}
-    ).get("OutputLocation")
-    managed = (
-        _workgroups.get(workgroup, {}).get("Configuration", {}).get("ManagedQueryResultsConfiguration") or {}
-    )
+    wg_config = _workgroups.get(workgroup, {}).get("Configuration", {})
+    wg_output = wg_config.get("ResultConfiguration", {}).get("OutputLocation")
+    client_output = data.get("ResultConfiguration", {}).get("OutputLocation")
+    # An enforced workgroup overrides the client-side result location
+    if wg_config.get("EnforceWorkGroupConfiguration"):
+        output_location = wg_output or client_output
+    else:
+        output_location = client_output or wg_output
+    managed = wg_config.get("ManagedQueryResultsConfiguration") or {}
     if not output_location and managed.get("Enabled"):
         # Athena-managed results: AWS owns the storage and needs no location from the caller.
         output_location = f"s3://aws-athena-query-results-{get_account_id()}-{get_region()}/"
@@ -1340,11 +1341,8 @@ async def _save_query_results(query_id):
     # only LOOKS UP a bucket, so create the default one on first use.
     if s3_svc._ensure_bucket(bucket_name) is None:
         s3_svc._create_bucket(bucket_name, b"")
-    key_prefix = p.path.lstrip("/").rstrip("/")
-    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
-    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
-    # the files land at bucket root.
-    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    # OutputLocation already ends in <id>.csv
+    csv_key = p.path.lstrip("/")
     meta_key = f"{csv_key}.metadata"
 
     # Write directly to the S3 service's in-memory store via the public
