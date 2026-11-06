@@ -8,6 +8,7 @@ JSON-based API via X-Amz-Target (prefix: AmazonEC2ContainerRegistry_V20150921).
 import base64
 import copy
 import hashlib
+import io
 import json
 import logging
 import os
@@ -101,17 +102,26 @@ def _layer_size(value) -> int | None:
     return len(value)
 
 
-def _layer_bytes(value) -> bytes | None:
-    """Bytes of a stored layer, or None when its file is gone."""
+def _layer_file(value):
+    """An open binary file for a stored layer (a disk handle is opened, never read whole), or None when its
+    file is gone. Raw bytes (older persisted state) are wrapped."""
     if isinstance(value, dict):
         try:
-            with open(_layer_path(value[_LAYER_REF_KEY]), "rb") as f:
-                return f.read()
+            return open(_layer_path(value[_LAYER_REF_KEY]), "rb")
         except OSError:
             logger.error("ECR layer blob %s missing at %s", value[_LAYER_REF_KEY],
                          _layer_path(value[_LAYER_REF_KEY]))
             return None
-    return value
+    return io.BytesIO(value)
+
+
+def _layer_bytes(value) -> bytes | None:
+    """Bytes of a stored layer, or None when its file is gone."""
+    f = _layer_file(value)
+    if f is None:
+        return None
+    with f:
+        return f.read()
 
 
 def _layer_missing(digest):
@@ -1304,14 +1314,42 @@ def held_image_digest(image):
         return _resolve_manifest(repo, ref)[0]
 
 
+def _inflated_layer(value):
+    """A rewound temp file holding a stored layer inflated (gzip) or as-is, plus its sha256 hex; copied in
+    chunks so no layer is held in memory. None when the layer's file is gone."""
+    import gzip
+    import tempfile
+    src = _layer_file(value)
+    if src is None:
+        return None
+    out = tempfile.TemporaryFile()
+    try:
+        with src:
+            gzipped = src.read(2) == b"\x1f\x8b"
+            src.seek(0)
+            reader = gzip.GzipFile(fileobj=src) if gzipped else src
+            digest = hashlib.sha256()
+            while chunk := reader.read(_ARCHIVE_CHUNK):
+                digest.update(chunk)
+                out.write(chunk)
+        out.seek(0)
+        return out, digest.hexdigest()
+    except BaseException:
+        out.close()
+        raise
+
+
+_ARCHIVE_CHUNK = 1024 * 1024
+
+
 def held_image_archive(image, architecture):
     """A ``docker load`` archive of an image this MiniStack holds, for ``architecture`` (amd64, arm64, ...).
 
-    Returns ``(archive bytes, config digest)``, or None when the image is not held here or cannot be
-    assembled (missing blobs, or a layer compression Docker's loaders may not take)."""
-    import gzip
-    import io
+    Returns ``(open archive file, config digest)``, or None when the image is not held here or cannot be
+    assembled (missing blobs, or a layer compression Docker's loaders may not take). The archive and every
+    layer are temp files streamed in chunks, never held in memory; the caller closes the file, which deletes it."""
     import tarfile
+    import tempfile
 
     held = _held_image(image)
     if held is None:
@@ -1323,46 +1361,66 @@ def held_image_archive(image, architecture):
         manifests = _manifest_blobs.get(repo, {})
     if blob is None:
         return None
-    try:
-        manifest = json.loads(blob)
-        if manifest.get("mediaType", media_type) in _INDEX_MEDIA_TYPES or "manifests" in manifest:
-            chosen = next((m for m in manifest.get("manifests", [])
-                           if (m.get("platform") or {}).get("architecture") == architecture
-                           and (m.get("platform") or {}).get("os", "linux") == "linux"), None)
-            if chosen is None or chosen.get("digest") not in manifests:
-                return None
-            manifest = json.loads(manifests[chosen["digest"]])
-        config_digest = manifest["config"]["digest"]
-        if not _DIGEST_RE.fullmatch(config_digest):
-            return None
-        config = _layer_bytes(blobs[config_digest])
-        if config is None:
-            return None
-        layers = []
-        for layer in manifest.get("layers", []):
-            data = _layer_bytes(blobs[layer["digest"]])
-            if data is None or "zstd" in layer.get("mediaType", ""):
-                return None
-            layers.append(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
-    except (KeyError, ValueError, OSError):
-        return None
-
-    def add(tar, name, data):
-        info = tarfile.TarInfo(name)
-        info.size = len(data)
-        tar.addfile(info, io.BytesIO(data))
-
     tag = None if "@" in image.rsplit("/", 1)[-1] else image if ":" in image.rsplit("/", 1)[-1] else f"{image}:latest"
-    config_name = f"{config_digest.split(':', 1)[1]}.json"
-    layer_names = [f"{hashlib.sha256(data).hexdigest()}/layer.tar" for data in layers]
-    out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode="w") as tar:
-        add(tar, config_name, config)
-        for name, data in zip(layer_names, layers):
-            add(tar, name, data)
-        add(tar, "manifest.json", json.dumps([{"Config": config_name, "RepoTags": [tag] if tag else [],
-                                                "Layers": layer_names}]).encode())
-    return out.getvalue(), config_digest
+    layer_files = []
+    archive = tempfile.TemporaryFile()
+    try:
+        try:
+            manifest = json.loads(blob)
+            if manifest.get("mediaType", media_type) in _INDEX_MEDIA_TYPES or "manifests" in manifest:
+                chosen = next((m for m in manifest.get("manifests", [])
+                               if (m.get("platform") or {}).get("architecture") == architecture
+                               and (m.get("platform") or {}).get("os", "linux") == "linux"), None)
+                if chosen is None or chosen.get("digest") not in manifests:
+                    raise _NotAssembled
+                manifest = json.loads(manifests[chosen["digest"]])
+            config_digest = manifest["config"]["digest"]
+            if not _DIGEST_RE.fullmatch(config_digest):
+                raise _NotAssembled
+            config = _layer_bytes(blobs[config_digest])
+            if config is None:
+                raise _NotAssembled
+            for layer in manifest.get("layers", []):
+                if "zstd" in layer.get("mediaType", ""):
+                    raise _NotAssembled
+                inflated = _inflated_layer(blobs[layer["digest"]])
+                if inflated is None:
+                    raise _NotAssembled
+                layer_files.append(inflated)
+        except (KeyError, ValueError, OSError, _NotAssembled):
+            raise _NotAssembled from None
+
+        config_name = f"{config_digest.split(':', 1)[1]}.json"
+        layer_names = [f"{sha}/layer.tar" for _, sha in layer_files]
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            info = tarfile.TarInfo(config_name)
+            info.size = len(config)
+            tar.addfile(info, io.BytesIO(config))
+            for (fileobj, _), name in zip(layer_files, layer_names):
+                info = tarfile.TarInfo(name)
+                info.size = fileobj.seek(0, os.SEEK_END)
+                fileobj.seek(0)
+                tar.addfile(info, fileobj)
+            data = json.dumps([{"Config": config_name, "RepoTags": [tag] if tag else [],
+                                "Layers": layer_names}]).encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        archive.seek(0)
+        return archive, config_digest
+    except _NotAssembled:
+        archive.close()
+        return None
+    except BaseException:
+        archive.close()
+        raise
+    finally:
+        for fileobj, _ in layer_files:
+            fileobj.close()
+
+
+class _NotAssembled(Exception):
+    """The held image cannot be turned into a docker-load archive (missing, unsupported or malformed)."""
 
 
 def _v2_put_manifest(name, ref, headers, body):

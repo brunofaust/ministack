@@ -902,7 +902,7 @@ def test_ecr_held_image_archive_loads_as_its_repository_uri():
         assert ecr.held_image_archive(uri, "amd64") is None  # no amd64 image in the index
         archive, config_digest = ecr.held_image_archive(uri, "arm64")
         assert config_digest == digest(config)
-        with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
+        with archive, tarfile.open(fileobj=archive) as tar:
             manifest = _json.loads(tar.extractfile("manifest.json").read())[0]
             assert manifest["RepoTags"] == [uri]
             assert tar.extractfile(manifest["Layers"][0]).read() == layer
@@ -958,7 +958,7 @@ def test_ecr_held_image_archive_resolves_on_disk_blob_handles(ecr_blob_store):
         assert archive is not None
         data, config_digest = archive
         assert config_digest == digest(config)
-        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        with data, tarfile.open(fileobj=data) as tar:
             listing = _json.loads(tar.extractfile("manifest.json").read())[0]
             assert tar.extractfile(listing["Config"]).read() == config
             assert tar.extractfile(listing["Layers"][0]).read() == layer
@@ -969,3 +969,67 @@ def test_ecr_held_image_archive_resolves_on_disk_blob_handles(ecr_blob_store):
         with request_scope("111122223333", "us-east-2"):
             for store in (ecr_svc._repositories, ecr_svc._manifest_blobs, ecr_svc._images):
                 store.pop("pushed", None)
+
+
+def test_ecr_held_image_archive_streams_a_large_layer_through_temp_files(ecr_blob_store, monkeypatch):
+    """BD-3633: a multi-GB image must not be assembled in RAM (MiniStack was OOMKilled loading one). A 64 MiB
+    inflated layer is archived with a Python-heap peak far below its size, and never read through the
+    bytes-returning helper."""
+    import gzip
+    import io
+    import json as _json
+    import tarfile
+    import tracemalloc
+
+    from ministack.core.responses import request_scope
+
+    def digest(data):
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    size = 64 * 1024 * 1024
+    gz_path = ecr_blob_store.parent / "big.gz"
+    with gzip.open(gz_path, "wb") as f:
+        for _ in range(size // (1024 * 1024)):
+            f.write(os.urandom(1024 * 1024))
+    gz_bytes = gz_path.read_bytes()
+    config = b'{"rootfs": {"type": "layers"}}'
+    manifest = _json.dumps({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": digest(config)},
+        "layers": [{"digest": digest(gz_bytes), "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}],
+    }).encode()
+    uri = "111122223333.dkr.ecr.us-east-2.amazonaws.com/big:v1"
+    with request_scope("111122223333", "us-east-2"):
+        ecr_svc._repositories["big"] = {"repositoryName": "big"}
+        for blob in (config, gz_bytes):
+            assert ecr_svc._v2_start_blob_upload("big", {"digest": [digest(blob)]}, blob)[0] == 201
+        ecr_svc._manifest_blobs["big"] = {digest(manifest): manifest}
+        ecr_svc._images["big"] = [{"imageDigest": digest(manifest), "imageTags": ["v1"],
+                                   "imageManifestMediaType": "application/vnd.oci.image.manifest.v1+json"}]
+    del gz_bytes
+    real_layer_bytes = ecr_svc._layer_bytes
+
+    def config_only(value):
+        data = real_layer_bytes(value)
+        assert data is None or len(data) < 1024, "a layer was read whole through _layer_bytes"
+        return data
+
+    monkeypatch.setattr(ecr_svc, "_layer_bytes", config_only)
+    try:
+        tracemalloc.start()
+        archive, _ = ecr_svc.held_image_archive(uri, "amd64")
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        with archive:
+            assert archive.seek(0, os.SEEK_END) > size
+            archive.seek(0)
+            with tarfile.open(fileobj=archive) as tar:
+                layer = tar.getmember(_json.loads(tar.extractfile("manifest.json").read())[0]["Layers"][0])
+                assert layer.size == size
+        assert peak < 16 * 1024 * 1024, f"peak {peak} bytes: the archive was built in memory"
+    finally:
+        if tracemalloc.is_tracing():
+            tracemalloc.stop()
+        with request_scope("111122223333", "us-east-2"):
+            for store in (ecr_svc._repositories, ecr_svc._manifest_blobs, ecr_svc._images):
+                store.pop("big", None)

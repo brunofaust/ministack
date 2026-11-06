@@ -4534,11 +4534,14 @@ def test_ecs_runs_a_held_ecr_image_without_pulling(monkeypatch):
                         if image == uri else None)
     monkeypatch.setattr(ecr, "held_image_readable", lambda image, principal: True)
     monkeypatch.setattr(ecr, "held_image_archive",
-                        lambda image, arch: (b"archive", "sha256:cfg") if arch == "arm64" else None)
+                        lambda image, arch: (archive, "sha256:cfg") if arch == "arm64" else None)
+    import io
+    archive = io.BytesIO(b"archive")
     client = MagicMock()
     client.info.return_value = {"Architecture": "aarch64"}
     ecs._run_docker_container(client, {"image": uri}, {}, refresh_image=True)
-    client.images.load.assert_called_once_with(b"archive")
+    client.images.load.assert_called_once_with(archive)
+    assert archive.closed  # the temp archive is released once loaded
     client.images.pull.assert_not_called()
     client.containers.run.assert_called_once_with(uri)
 

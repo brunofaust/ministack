@@ -2393,7 +2393,8 @@ def _load_held_image(docker_client, image, platform, principal_arn=None):
     if built is None:
         raise _ImagePullError(f"{image}: not found in this MiniStack's ECR for linux/{architecture}")
     archive, config_digest = built
-    docker_client.images.load(archive)
+    with archive:  # a temp file streamed to the daemon; closing deletes it, load succeeds or not
+        docker_client.images.load(archive)
     return config_digest if "@" in image.rsplit("/", 1)[-1] else image
 
 
