@@ -1335,14 +1335,16 @@ def held_image_archive(image, architecture):
         config_digest = manifest["config"]["digest"]
         if not _DIGEST_RE.fullmatch(config_digest):
             return None
-        config = blobs[config_digest]
+        config = _layer_bytes(blobs[config_digest])
+        if config is None:
+            return None
         layers = []
         for layer in manifest.get("layers", []):
-            data = blobs[layer["digest"]]
-            if "zstd" in layer.get("mediaType", ""):
+            data = _layer_bytes(blobs[layer["digest"]])
+            if data is None or "zstd" in layer.get("mediaType", ""):
                 return None
             layers.append(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
-    except (KeyError, TypeError, ValueError, OSError):
+    except (KeyError, ValueError, OSError):
         return None
 
     def add(tar, name, data):
