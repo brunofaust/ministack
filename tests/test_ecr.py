@@ -920,3 +920,52 @@ def test_ecr_held_image_archive_loads_as_its_repository_uri():
         with request_scope("111122223333", "us-east-2"):
             for store in (ecr._repositories, ecr._layer_blobs, ecr._manifest_blobs, ecr._images):
                 store.pop("held", None)
+
+
+def test_ecr_held_image_archive_resolves_on_disk_blob_handles(ecr_blob_store):
+    """BD-3633: layers and config pushed over the v2 API are stored as disk handles (BD-3083); the
+    `docker load` archive must be assembled from their bytes, not report the image as not held."""
+    import gzip
+    import io
+    import json as _json
+    import tarfile
+
+    from ministack.core.responses import AccountRegionScopedDict, request_scope
+
+    def digest(data):
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    layer = b"pushed-layer-bytes"
+    gz_layer = gzip.compress(layer)
+    config = b'{"rootfs": {"type": "layers"}}'
+    manifest = _json.dumps({
+        "schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"digest": digest(config)},
+        "layers": [{"digest": digest(gz_layer), "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}],
+    }).encode()
+    uri = "111122223333.dkr.ecr.us-east-2.amazonaws.com/pushed:v1"
+    with request_scope("111122223333", "us-east-2"):
+        ecr_svc._repositories["pushed"] = {"repositoryName": "pushed"}
+        for blob in (config, gz_layer):
+            assert ecr_svc._v2_start_blob_upload("pushed", {"digest": [digest(blob)]}, blob)[0] == 201
+        assert ecr_svc._layer_blobs["pushed"][digest(config)] == {"ecr_blob_ref": digest(config)}
+        assert ecr_svc._layer_blobs["pushed"][digest(gz_layer)] == {"ecr_blob_ref": digest(gz_layer)}
+        ecr_svc._manifest_blobs["pushed"] = {digest(manifest): manifest}
+        ecr_svc._images["pushed"] = [{"imageDigest": digest(manifest), "imageTags": ["v1"],
+                                      "imageManifestMediaType": "application/vnd.oci.image.manifest.v1+json"}]
+    try:
+        archive = ecr_svc.held_image_archive(uri, "amd64")
+        assert archive is not None
+        data, config_digest = archive
+        assert config_digest == digest(config)
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            listing = _json.loads(tar.extractfile("manifest.json").read())[0]
+            assert tar.extractfile(listing["Config"]).read() == config
+            assert tar.extractfile(listing["Layers"][0]).read() == layer
+        # A handle whose file is gone is not held: None, not an exception.
+        os.remove(ecr_blob_store / digest(gz_layer).replace(":", "-"))
+        assert ecr_svc.held_image_archive(uri, "amd64") is None
+    finally:
+        with request_scope("111122223333", "us-east-2"):
+            for store in (ecr_svc._repositories, ecr_svc._manifest_blobs, ecr_svc._images):
+                store.pop("pushed", None)
